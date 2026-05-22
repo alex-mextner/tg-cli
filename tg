@@ -1,0 +1,155 @@
+#!/usr/bin/env bun
+import { readFileSync } from "fs"
+import { join } from "path"
+
+// --- Config loader ---
+function loadEnv(filePath: string): Record<string, string> {
+  const env: Record<string, string> = {}
+  try {
+    const lines = readFileSync(filePath, "utf8").split("\n")
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith("#")) continue
+      const eq = trimmed.indexOf("=")
+      if (eq === -1) continue
+      const key = trimmed.slice(0, eq).trim()
+      const value = trimmed.slice(eq + 1).trim()
+      if (key) env[key] = value
+    }
+  } catch {
+    // file doesn't exist — skip
+  }
+  return env
+}
+
+const configEnv = loadEnv(join(process.env.HOME ?? "~", ".config", "tg-cli", ".env"))
+const env = { ...configEnv, ...process.env }
+
+const BOT_TOKEN = env.TG_BOT_TOKEN
+const CHAT_ID = env.TG_CHAT_ID
+
+if (!BOT_TOKEN || !CHAT_ID) {
+  console.error("Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ~/.config/tg-cli/.env")
+  process.exit(1)
+}
+
+const API = `https://api.telegram.org/bot${BOT_TOKEN}`
+
+// --- Arg parsing ---
+interface Item {
+  type: "photo" | "document"
+  path: string
+}
+
+const args = process.argv.slice(2)
+
+if (args.length === 0) {
+  console.error(`Usage:
+  tg "text message"
+  tg --photo screen.png
+  tg --photo screen.png "caption"
+  tg --file doc.pdf
+  tg --file doc.pdf "caption"
+  tg --photo a.png --photo b.png "caption"
+  tg --file a.pdf --file b.pdf
+  tg --photo a.png --file doc.pdf "caption"
+`)
+  process.exit(1)
+}
+
+const items: Item[] = []
+const textParts: string[] = []
+
+let i = 0
+while (i < args.length) {
+  const arg = args[i]
+  if (arg === "--photo" || arg === "--file") {
+    const nextArg = args[i + 1]
+    if (!nextArg || nextArg.startsWith("--")) {
+      console.error(`Error: ${arg} requires a file path argument`)
+      process.exit(1)
+    }
+    items.push({ type: arg === "--photo" ? "photo" : "document", path: nextArg })
+    i += 2
+  } else {
+    textParts.push(arg)
+    i++
+  }
+}
+
+const caption = textParts.join(" ")
+
+// --- API calls ---
+async function checkResponse(resp: Response, method: string): Promise<void> {
+  if (!resp.ok) {
+    const body = await resp.text()
+    console.error(`Telegram API error (${method}): ${resp.status} ${body}`)
+    process.exit(1)
+  }
+  const json = await resp.json() as { ok: boolean; description?: string }
+  if (!json.ok) {
+    console.error(`Telegram API error (${method}): ${json.description ?? "unknown error"}`)
+    process.exit(1)
+  }
+}
+
+async function sendMessage(text: string): Promise<void> {
+  const resp = await fetch(`${API}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: CHAT_ID, text }),
+  })
+  await checkResponse(resp, "sendMessage")
+}
+
+async function sendPhoto(filePath: string, cap?: string): Promise<void> {
+  const form = new FormData()
+  form.append("chat_id", CHAT_ID)
+  form.append("photo", Bun.file(filePath))
+  if (cap) form.append("caption", cap)
+  const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
+  await checkResponse(resp, "sendPhoto")
+}
+
+async function sendDocument(filePath: string, cap?: string): Promise<void> {
+  const form = new FormData()
+  form.append("chat_id", CHAT_ID)
+  form.append("document", Bun.file(filePath))
+  if (cap) form.append("caption", cap)
+  const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
+  await checkResponse(resp, "sendDocument")
+}
+
+async function sendMediaGroup(mediaItems: Item[], cap?: string): Promise<void> {
+  const form = new FormData()
+  form.append("chat_id", CHAT_ID)
+  const mediaArr = mediaItems.map((item, idx) => ({
+    type: item.type,
+    media: `attach://file${idx}`,
+    ...(idx === 0 && cap ? { caption: cap } : {}),
+  }))
+  form.append("media", JSON.stringify(mediaArr))
+  for (const [idx, item] of mediaItems.entries()) {
+    form.append(`file${idx}`, Bun.file(item.path))
+  }
+  const resp = await fetch(`${API}/sendMediaGroup`, { method: "POST", body: form })
+  await checkResponse(resp, "sendMediaGroup")
+}
+
+// --- Dispatch ---
+if (items.length === 0) {
+  if (!caption) {
+    console.error("Error: no message text provided")
+    process.exit(1)
+  }
+  await sendMessage(caption)
+} else if (items.length === 1) {
+  const item = items[0]
+  if (item.type === "photo") {
+    await sendPhoto(item.path, caption || undefined)
+  } else {
+    await sendDocument(item.path, caption || undefined)
+  }
+} else {
+  await sendMediaGroup(items, caption || undefined)
+}
