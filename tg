@@ -43,8 +43,7 @@ interface Item {
 
 const args = process.argv.slice(2)
 
-if (args.length === 0) {
-  console.error(`Usage:
+const USAGE = `Usage:
   tg "text message"
   tg --photo screen.png
   tg --photo screen.png "caption"
@@ -53,8 +52,16 @@ if (args.length === 0) {
   tg --photo a.png --photo b.png "caption"
   tg --file a.pdf --file b.pdf
   tg --photo a.png --file doc.pdf "caption"
-`)
+`
+
+if (args.length === 0) {
+  console.error(USAGE)
   process.exit(1)
+}
+
+if (args[0] === "--help" || args[0] === "-h") {
+  console.log(USAGE)
+  process.exit(0)
 }
 
 const items: Item[] = []
