@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
-import { readFileSync } from "fs"
-import { join } from "path"
+import { readFileSync, statSync } from "fs"
+import { isAbsolute, join, resolve } from "path"
+
+export const VERSION = "1.0.0"
 
 // --- Config loader ---
 function loadEnv(filePath: string): Record<string, string> {
@@ -22,28 +24,7 @@ function loadEnv(filePath: string): Record<string, string> {
   return env
 }
 
-const configEnv = loadEnv(join(process.env.HOME ?? "~", ".config", "tg-cli", ".env"))
-const env = { ...configEnv, ...process.env }
-
-const BOT_TOKEN = env.TG_BOT_TOKEN
-const CHAT_ID = env.TG_CHAT_ID
-
-if (!BOT_TOKEN || !CHAT_ID) {
-  console.error("Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ~/.config/tg-cli/.env")
-  process.exit(1)
-}
-
-const API = `https://api.telegram.org/bot${BOT_TOKEN}`
-
-// --- Arg parsing ---
-interface Item {
-  type: "photo" | "document"
-  path: string
-}
-
-const args = process.argv.slice(2)
-
-const USAGE = `Usage:
+export const USAGE = `Usage:
   tg "text message"
   tg --photo screen.png
   tg --photo screen.png "caption"
@@ -52,111 +33,261 @@ const USAGE = `Usage:
   tg --photo a.png --photo b.png "caption"
   tg --file a.pdf --file b.pdf
   tg --photo a.png --file doc.pdf "caption"
+  tg "see /abs/path/shot.png"   # existing file paths in text are auto-attached
+
+Options:
+  --photo <path>   attach an image (repeatable)
+  --file <path>    attach a document (repeatable)
+  -v, --version    print version and exit
+  -h, --help       print this help and exit
+
+Notes:
+  - Unknown dashed tokens (e.g. --foo) are treated as plain message text.
+  - File paths in the message text that resolve to an existing file (absolute,
+    ~-expanded, or relative to the current directory) are auto-attached:
+    images become photos, everything else becomes a document. The path token
+    is removed from the caption. Explicit --photo/--file take precedence.
 `
 
-if (args.length === 0) {
-  console.error(USAGE)
-  process.exit(1)
+// --- Arg parsing (pure) ---
+export interface Item {
+  type: "photo" | "document"
+  path: string
 }
 
-if (args[0] === "--help" || args[0] === "-h") {
-  console.log(USAGE)
-  process.exit(0)
+export type ParseResult =
+  | { action: "help" }
+  | { action: "version" }
+  | { action: "send"; items: Item[]; caption: string }
+
+const IMAGE_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "svg",
+  "heic",
+  "heif",
+])
+
+function isImagePath(path: string): boolean {
+  const dot = path.lastIndexOf(".")
+  if (dot === -1) return false
+  return IMAGE_EXTENSIONS.has(path.slice(dot + 1).toLowerCase())
 }
 
-const items: Item[] = []
-const textParts: string[] = []
+function expandHome(token: string, home: string): string {
+  if (token === "~") return home
+  if (token.startsWith("~/")) return join(home, token.slice(2))
+  return token
+}
 
-let i = 0
-while (i < args.length) {
-  const arg = args[i]
-  if (arg === "--photo" || arg === "--file") {
-    const nextArg = args[i + 1]
-    if (!nextArg || nextArg.startsWith("--")) {
-      console.error(`Error: ${arg} requires a file path argument`)
+/**
+ * Resolve a text token to an existing file path, if it is one.
+ * Tries ~-expansion, absolute, and cwd-relative resolution.
+ * Returns the absolute path only when it resolves to a real file (not a dir).
+ */
+function resolveExistingFile(token: string, cwd: string, home: string): string | null {
+  if (!token) return null
+  const expanded = expandHome(token, home)
+  const candidate = isAbsolute(expanded) ? expanded : resolve(cwd, expanded)
+  try {
+    if (statSync(candidate).isFile()) return candidate
+  } catch {
+    // not a path / no access — treat as ordinary text
+  }
+  return null
+}
+
+/**
+ * Parse argv (already sliced past node/script) into an action.
+ * Never throws and never hard-errors: callers decide what to do with the
+ * result. Empty/no-op invocations resolve to `help` so the dispatcher can
+ * print usage with exit 0.
+ */
+export function parseArgs(args: string[], cwd: string, home: string): ParseResult {
+  // -h/--help and -v/--version win anywhere, before the empty check.
+  for (const a of args) {
+    if (a === "-h" || a === "--help") return { action: "help" }
+  }
+  for (const a of args) {
+    if (a === "-v" || a === "--version") return { action: "version" }
+  }
+
+  const explicit: Item[] = []
+  const textParts: string[] = []
+
+  let i = 0
+  while (i < args.length) {
+    const arg = args[i]
+    if (arg === "--photo" || arg === "--file") {
+      const nextArg = args[i + 1]
+      // Require a real path argument, but never crash. A dashed next token
+      // (e.g. `--photo --foo`) is only consumed as a path if it actually
+      // resolves to an existing file — so an odd-but-real filename like
+      // `--file -receipt.png` still attaches, while a stray unknown flag
+      // falls through to be handled as text on the next iteration. A missing
+      // next token just drops this flag, letting the invocation resolve to
+      // something valid (or to help).
+      const dashedButNotAFile =
+        !!nextArg && nextArg.startsWith("-") && resolveExistingFile(nextArg, cwd, home) === null
+      if (!nextArg || dashedButNotAFile) {
+        i += 1
+        continue
+      }
+      explicit.push({ type: arg === "--photo" ? "photo" : "document", path: nextArg })
+      i += 2
+      continue
+    }
+    // Anything else (including unknown --foo / -x) is plain text.
+    textParts.push(arg)
+    i += 1
+  }
+
+  // Auto-detect existing-file paths in the message text. Split the joined text
+  // on whitespace so both `tg /tmp/x.png` and `tg "look /tmp/x.png"` work.
+  const explicitResolved = new Set(
+    explicit
+      .map((it) => resolveExistingFile(it.path, cwd, home))
+      .filter((p): p is string => p !== null),
+  )
+  const autoItems: Item[] = []
+  // Tokenize the joined text but KEEP whitespace runs (incl. newlines) so the
+  // caption preserves the user's formatting — we only excise matched path
+  // tokens, never normalize spacing of plain text. Split with a capturing
+  // group: even indices are word tokens, odd indices are the whitespace gaps.
+  const segments = textParts.join(" ").split(/(\s+)/)
+  const kept: string[] = []
+  for (let s = 0; s < segments.length; s++) {
+    const seg = segments[s]
+    const isWhitespace = s % 2 === 1
+    if (isWhitespace) {
+      kept.push(seg)
+      continue
+    }
+    if (!seg) {
+      kept.push(seg)
+      continue
+    }
+    const resolved = resolveExistingFile(seg, cwd, home)
+    if (resolved) {
+      if (!explicitResolved.has(resolved)) {
+        explicitResolved.add(resolved) // dedup repeats within the text too
+        autoItems.push({ type: isImagePath(resolved) ? "photo" : "document", path: resolved })
+      }
+      // Excise the path token and the whitespace gap that followed it (if any)
+      // so we don't leave a doubled space behind.
+      if (s + 1 < segments.length) segments[s + 1] = ""
+      continue
+    }
+    kept.push(seg)
+  }
+
+  const items = [...explicit, ...autoItems]
+  // Trim only the outer edges; interior formatting (newlines, alignment) stays.
+  const caption = kept.join("").replace(/^\s+|\s+$/g, "")
+
+  if (items.length === 0 && !caption) return { action: "help" }
+  return { action: "send", items, caption }
+}
+
+// --- CLI entrypoint (only runs when executed directly, not when imported) ---
+if (import.meta.main) {
+  const args = process.argv.slice(2)
+  const home = process.env.HOME ?? "~"
+  const parsed = parseArgs(args, process.cwd(), home)
+
+  if (parsed.action === "help") {
+    console.log(USAGE)
+    process.exit(0)
+  }
+  if (parsed.action === "version") {
+    console.log(VERSION)
+    process.exit(0)
+  }
+
+  const configEnv = loadEnv(join(home, ".config", "tg-cli", ".env"))
+  const env = { ...configEnv, ...process.env }
+
+  const BOT_TOKEN = env.TG_BOT_TOKEN
+  const CHAT_ID = env.TG_CHAT_ID
+
+  if (!BOT_TOKEN || !CHAT_ID) {
+    console.error("Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ~/.config/tg-cli/.env")
+    process.exit(1)
+  }
+
+  const API = `https://api.telegram.org/bot${BOT_TOKEN}`
+
+  const checkResponse = async (resp: Response, method: string): Promise<void> => {
+    if (!resp.ok) {
+      const body = await resp.text()
+      console.error(`Telegram API error (${method}): ${resp.status} ${body}`)
       process.exit(1)
     }
-    items.push({ type: arg === "--photo" ? "photo" : "document", path: nextArg })
-    i += 2
+    const json = (await resp.json()) as { ok: boolean; description?: string }
+    if (!json.ok) {
+      console.error(`Telegram API error (${method}): ${json.description ?? "unknown error"}`)
+      process.exit(1)
+    }
+  }
+
+  const sendMessage = async (text: string): Promise<void> => {
+    const resp = await fetch(`${API}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: CHAT_ID, text }),
+    })
+    await checkResponse(resp, "sendMessage")
+  }
+
+  const sendPhoto = async (filePath: string, cap?: string): Promise<void> => {
+    const form = new FormData()
+    form.append("chat_id", CHAT_ID)
+    form.append("photo", Bun.file(filePath))
+    if (cap) form.append("caption", cap)
+    const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
+    await checkResponse(resp, "sendPhoto")
+  }
+
+  const sendDocument = async (filePath: string, cap?: string): Promise<void> => {
+    const form = new FormData()
+    form.append("chat_id", CHAT_ID)
+    form.append("document", Bun.file(filePath))
+    if (cap) form.append("caption", cap)
+    const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
+    await checkResponse(resp, "sendDocument")
+  }
+
+  const sendMediaGroup = async (mediaItems: Item[], cap?: string): Promise<void> => {
+    const form = new FormData()
+    form.append("chat_id", CHAT_ID)
+    const mediaArr = mediaItems.map((item, idx) => ({
+      type: item.type,
+      media: `attach://file${idx}`,
+      ...(idx === 0 && cap ? { caption: cap } : {}),
+    }))
+    form.append("media", JSON.stringify(mediaArr))
+    for (const [idx, item] of mediaItems.entries()) {
+      form.append(`file${idx}`, Bun.file(item.path))
+    }
+    const resp = await fetch(`${API}/sendMediaGroup`, { method: "POST", body: form })
+    await checkResponse(resp, "sendMediaGroup")
+  }
+
+  const { items, caption } = parsed
+  if (items.length === 0) {
+    await sendMessage(caption)
+  } else if (items.length === 1) {
+    const item = items[0]
+    if (item.type === "photo") {
+      await sendPhoto(item.path, caption || undefined)
+    } else {
+      await sendDocument(item.path, caption || undefined)
+    }
   } else {
-    textParts.push(arg)
-    i++
+    await sendMediaGroup(items, caption || undefined)
   }
-}
-
-const caption = textParts.join(" ")
-
-// --- API calls ---
-async function checkResponse(resp: Response, method: string): Promise<void> {
-  if (!resp.ok) {
-    const body = await resp.text()
-    console.error(`Telegram API error (${method}): ${resp.status} ${body}`)
-    process.exit(1)
-  }
-  const json = await resp.json() as { ok: boolean; description?: string }
-  if (!json.ok) {
-    console.error(`Telegram API error (${method}): ${json.description ?? "unknown error"}`)
-    process.exit(1)
-  }
-}
-
-async function sendMessage(text: string): Promise<void> {
-  const resp = await fetch(`${API}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: CHAT_ID, text }),
-  })
-  await checkResponse(resp, "sendMessage")
-}
-
-async function sendPhoto(filePath: string, cap?: string): Promise<void> {
-  const form = new FormData()
-  form.append("chat_id", CHAT_ID)
-  form.append("photo", Bun.file(filePath))
-  if (cap) form.append("caption", cap)
-  const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
-  await checkResponse(resp, "sendPhoto")
-}
-
-async function sendDocument(filePath: string, cap?: string): Promise<void> {
-  const form = new FormData()
-  form.append("chat_id", CHAT_ID)
-  form.append("document", Bun.file(filePath))
-  if (cap) form.append("caption", cap)
-  const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
-  await checkResponse(resp, "sendDocument")
-}
-
-async function sendMediaGroup(mediaItems: Item[], cap?: string): Promise<void> {
-  const form = new FormData()
-  form.append("chat_id", CHAT_ID)
-  const mediaArr = mediaItems.map((item, idx) => ({
-    type: item.type,
-    media: `attach://file${idx}`,
-    ...(idx === 0 && cap ? { caption: cap } : {}),
-  }))
-  form.append("media", JSON.stringify(mediaArr))
-  for (const [idx, item] of mediaItems.entries()) {
-    form.append(`file${idx}`, Bun.file(item.path))
-  }
-  const resp = await fetch(`${API}/sendMediaGroup`, { method: "POST", body: form })
-  await checkResponse(resp, "sendMediaGroup")
-}
-
-// --- Dispatch ---
-if (items.length === 0) {
-  if (!caption) {
-    console.error("Error: no message text provided")
-    process.exit(1)
-  }
-  await sendMessage(caption)
-} else if (items.length === 1) {
-  const item = items[0]
-  if (item.type === "photo") {
-    await sendPhoto(item.path, caption || undefined)
-  } else {
-    await sendDocument(item.path, caption || undefined)
-  }
-} else {
-  await sendMediaGroup(items, caption || undefined)
 }

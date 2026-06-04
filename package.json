@@ -1,0 +1,12 @@
+{
+  "name": "tg-cli",
+  "version": "1.0.0",
+  "description": "Simple Telegram CLI to send messages, photos, and files via a bot.",
+  "bin": {
+    "tg": "./tg"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "license": "MIT"
+}
