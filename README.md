@@ -77,10 +77,15 @@ tg -h
 
 ## Behavior notes
 
-- **Unknown dashed tokens are plain text.** A token starting with `-`/`--` that
-  is not a recognized flag (`--photo`, `--file`, `-v`/`--version`, `-h`/`--help`)
-  is appended to the message text rather than treated as an error. So
-  `tg "--foo is broken"` sends that literal text.
+- **Unknown dashed tokens are an error (prints help), not sent as text.** A
+  standalone token starting with `-`/`--` that is not a recognized flag
+  (`--photo`, `--file`, `-v`/`--version`, `-h`/`--help`) makes `tg` print this
+  help to **stderr** and exit non-zero — it is NOT sent as a message. So
+  `tg --foo` fails with usage rather than silently sending `--foo`. (To send a
+  literal dash-leading string as text, quote it inside a larger message whose
+  first token is not dashed, e.g. `tg "the --foo flag is broken"`.) A dashed
+  token in `--photo`/`--file` **value** position that resolves to a real file
+  (e.g. `tg --file -receipt.png`) is a flag value and stays valid.
 - **`-v` / `--version`** prints the version (`1.0.0`) and exits.
 - **`-h` / `--help`** (anywhere in the args), or a bare `tg` with nothing to
   send, prints this usage to stdout and exits 0. Real API errors (missing token,

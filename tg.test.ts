@@ -30,25 +30,31 @@ test('help/version flags win anywhere', () => {
   expect(parseArgs(['hi', '--version'], dir, HOME)).toEqual({ action: 'version' });
 });
 
-test('unknown dashed token becomes plain text', () => {
+test('unknown dashed token is an error, not plain text', () => {
   expect(parseArgs(['--foo'], dir, HOME)).toEqual({
-    action: 'send',
-    items: [],
-    caption: '--foo',
+    action: 'error',
+    flag: '--foo',
   });
+  // The first unknown flag in the args is reported; text after it is irrelevant.
   expect(parseArgs(['-x', 'hello'], dir, HOME)).toEqual({
-    action: 'send',
-    items: [],
-    caption: '-x hello',
+    action: 'error',
+    flag: '-x',
   });
 });
 
-test('--photo followed by unknown flag does not crash', () => {
-  // --photo has no real path → dropped; --foo is text.
+test('--bogus unknown flag → error + help (not sent)', () => {
+  expect(parseArgs(['--bogus'], dir, HOME)).toEqual({
+    action: 'error',
+    flag: '--bogus',
+  });
+});
+
+test('--photo followed by unknown flag → error (flag, not text)', () => {
+  // --photo has no real path → dropped; --foo then falls through as an unknown
+  // standalone flag and errors (it is NOT in flag-value position any more).
   expect(parseArgs(['--photo', '--foo'], dir, HOME)).toEqual({
-    action: 'send',
-    items: [],
-    caption: '--foo',
+    action: 'error',
+    flag: '--foo',
   });
 });
 
@@ -94,6 +100,20 @@ test('--file with a real dashed filename is still attached explicitly', () => {
     caption: '',
   });
   rmSync(dashed, { force: true });
+});
+
+test('--photo with a real RELATIVE dashed filename still attaches (flag value, not unknown flag)', () => {
+  // A bare "-realfile.png" starts with "-" but resolves against cwc=dir to a
+  // real file → it is a flag VALUE, must attach, must NOT trigger the
+  // unknown-flag error.
+  writeFileSync(join(dir, '-realfile.png'), 'fake');
+  const res = parseArgs(['--photo', '-realfile.png'], dir, HOME);
+  expect(res).toEqual({
+    action: 'send',
+    items: [{ type: 'photo', path: '-realfile.png' }],
+    caption: '',
+  });
+  rmSync(join(dir, '-realfile.png'), { force: true });
 });
 
 test('absolute image path in text → photo item, stripped from caption', () => {

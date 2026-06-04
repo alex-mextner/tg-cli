@@ -42,7 +42,10 @@ Options:
   -h, --help       print this help and exit
 
 Notes:
-  - Unknown dashed tokens (e.g. --foo) are treated as plain message text.
+  - Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
+    stderr and the process exits non-zero. They are NOT sent as message text.
+    (A dashed token in --photo/--file value position that resolves to a real
+    file, e.g. --file -receipt.png, is a flag value and stays valid.)
   - File paths in the message text that resolve to an existing file (absolute,
     ~-expanded, or relative to the current directory) are auto-attached:
     images become photos, everything else becomes a document. The path token
@@ -58,6 +61,7 @@ export interface Item {
 export type ParseResult =
   | { action: "help" }
   | { action: "version" }
+  | { action: "error"; flag: string }
   | { action: "send"; items: Item[]; caption: string }
 
 const IMAGE_EXTENSIONS = new Set([
@@ -103,9 +107,10 @@ function resolveExistingFile(token: string, cwd: string, home: string): string |
 
 /**
  * Parse argv (already sliced past node/script) into an action.
- * Never throws and never hard-errors: callers decide what to do with the
- * result. Empty/no-op invocations resolve to `help` so the dispatcher can
- * print usage with exit 0.
+ * Never throws and never calls process.exit: callers decide what to do with
+ * the result. Empty/no-op invocations resolve to `help` so the dispatcher can
+ * print usage with exit 0. An unknown standalone dashed token resolves to
+ * `error` so the dispatcher can print usage to stderr with a non-zero exit.
  */
 export function parseArgs(args: string[], cwd: string, home: string): ParseResult {
   // -h/--help and -v/--version win anywhere, before the empty check.
@@ -141,7 +146,11 @@ export function parseArgs(args: string[], cwd: string, home: string): ParseResul
       i += 2
       continue
     }
-    // Anything else (including unknown --foo / -x) is plain text.
+    // A standalone dashed token that is neither a known flag nor a flag value
+    // (those are consumed above) is an unknown flag → error. Help/version
+    // already won above, so this never shadows -h/-v.
+    if (arg.startsWith("-")) return { action: "error", flag: arg }
+    // Anything else is plain text.
     textParts.push(arg)
     i += 1
   }
@@ -206,6 +215,11 @@ if (import.meta.main) {
   if (parsed.action === "version") {
     console.log(VERSION)
     process.exit(0)
+  }
+  if (parsed.action === "error") {
+    console.error(`Error: unknown flag: ${parsed.flag}`)
+    console.error(USAGE)
+    process.exit(1)
   }
 
   const configEnv = loadEnv(join(home, ".config", "tg-cli", ".env"))
