@@ -85,6 +85,8 @@ tg -h
 - **`-h` / `--help`** (anywhere in the args), or a bare `tg` with nothing to
   send, prints this usage to stdout and exits 0. Real API errors (missing token,
   failed send) still go to stderr with exit 1.
+- **`OK` on success.** A successful send prints `OK` to stdout (the help/version
+  paths do not). Failures go to stderr with exit 1.
 - **Auto-attach by path.** Any token in the message text that resolves to an
   existing file is attached automatically — absolute paths, `~`-expanded home
   paths, or paths relative to the current directory. Image files (`png`, `jpg`,

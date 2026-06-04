@@ -290,4 +290,8 @@ if (import.meta.main) {
   } else {
     await sendMediaGroup(items, caption || undefined)
   }
+
+  // Every send path above either succeeded or already exited(1) via
+  // checkResponse, so reaching here means the send actually went through.
+  console.log("OK")
 }
