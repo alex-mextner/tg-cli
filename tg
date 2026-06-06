@@ -66,7 +66,7 @@ Emoji helpers:
   :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:
   :hyperide:
   to embed custom emoji icons from the HyperIDE.ai set.
-  Set: https://t.me/addemoji/agents_final_by_hyperidebot
+  Set: https://t.me/addemoji/agents_v9_by_UltraClaudeCodeBot
   Set emoji IDs via env vars: TG_EMOJI_ID_<model> or TG_EMOJI_IDS JSON.
   Run --ls-emoji-helpers to see available helpers and their current status.
 
@@ -129,39 +129,39 @@ while (i < args.length) {
 }
 
 // --- Embeddable emoji helpers ---
-// Default: HyperIDE.ai custom emoji set (https://t.me/addemoji/agents_final_by_hyperidebot)
+// Default: HyperIDE.ai custom emoji set (https://t.me/addemoji/agents_v9_by_UltraClaudeCodeBot)
 const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
-  hyperide: "5269350398841368161", // 🚁 HyperIDE (first icon)
-  codex: "5269637624779282998",   // 👐 OpenAI
-  openai: "5269637624779282998",  // 👐 OpenAI
-  claude: "5271605656103724652",  // ✳️ Claude
-  anthropic: "5271605656103724652", // ✳️ Claude
-  gemini: "5269295526339192861",  // ♊️ Gemini
-  google: "5269295526339192861",  // ♊️ Gemini
-  deepseek: "5269565954660018912", // 🐳 DeepSeek
-  qwen: "5269733767622207508",    // 🟣 Qwen
-  alibaba: "5269733767622207508", // 🟣 Qwen
-  kimi: "5269236487718740326",    // 🌙 Kimi
-  moonshot: "5269236487718740326", // 🌙 Kimi
-  o3: "5269637624779282998",      // 👐 OpenAI
-  o1: "5269637624779282998",      // 👐 OpenAI
-  gpt4: "5269637624779282998",    // 👐 OpenAI
-  gpt3: "5269637624779282998",    // 👐 OpenAI
-  llama: "5271503822429134542",   // 🦙 Meta/llama
-  meta: "5271503822429134542",    // 🦙 Meta
-  ollama: "5269678147795720722",  // 🦙 Ollama
-  mistral: "5271607434220182681", // Ⓜ️ Mistral
-  grok: "5269258525195939547",    // 🤘 Grok
-  xai: "5269258525195939547",     // 🤘 Grok
-  copilot: "5271677446482075288", // 🦾 Copilot
-  github: "5271677446482075288",   // 🦾 Copilot
-  perplexity: "5271981869469050518", // 🔮 Perplexity
-  cursor: "5269562162203894432",  // 👆 Cursor
-  windsurf: "5271795901680107857", // 🏄 Windsurf
-  devin: "5271605656103724652",   // ✳️ Cognition (fallback)
-  cognition: "5271605656103724652", // ✳️ Cognition (fallback)
-  aider: "5271605656103724652",    // ✳️ Aider (fallback)
-  continue: "5271605656103724652", // ✳️ Continue (fallback)
+  hyperide: "5269682120640471121", // 🚁 HyperIDE (first icon)
+  codex: "5271465537090655059",   // 👐 OpenAI
+  openai: "5271465537090655059",  // 👐 OpenAI
+  claude: "5271538457045409379",  // ✳️ Claude
+  anthropic: "5271538457045409379", // ✳️ Claude
+  gemini: "5269566641854788118",  // ♊️ Gemini
+  google: "5269566641854788118",  // ♊️ Gemini
+  deepseek: "5269618799937625373", // 🐳 DeepSeek
+  qwen: "5271822629261581082",    // 🟣 Qwen
+  alibaba: "5271822629261581082", // 🟣 Qwen
+  kimi: "5271985902443337475",    // 🌙 Kimi
+  moonshot: "5271985902443337475", // 🌙 Kimi
+  o3: "5271465537090655059",      // 👐 OpenAI
+  o1: "5271465537090655059",      // 👐 OpenAI
+  gpt4: "5271465537090655059",    // 👐 OpenAI
+  gpt3: "5271465537090655059",    // 👐 OpenAI
+  llama: "5269343677217546822",   // 🦙 Meta/llama
+  meta: "5269343677217546822",    // 🦙 Meta
+  ollama: "5271929698501315947",  // 🦙 Ollama
+  mistral: "5271749344234613902", // Ⓜ️ Mistral
+  grok: "5271751590502505422",    // 🤘 Grok
+  xai: "5271751590502505422",     // 🤘 Grok
+  copilot: "5269565117141395387", // 🦾 Copilot
+  github: "5269565117141395387",   // 🦾 Copilot
+  perplexity: "5271794892362783190", // 🔮 Perplexity
+  cursor: "5269648984967782982",  // 👆 Cursor
+  windsurf: "5269740338922169982", // 🏄 Windsurf
+  devin: "5271538457045409379",   // ✳️ Cognition (fallback)
+  cognition: "5271538457045409379", // ✳️ Cognition (fallback)
+  aider: "5271538457045409379",    // ✳️ Aider (fallback)
+  continue: "5271538457045409379", // ✳️ Continue (fallback)
 }
 // Override with env vars if provided
 if (env.TG_EMOJI_IDS) {
