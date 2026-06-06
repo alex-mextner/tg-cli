@@ -153,8 +153,24 @@ function decodeTextEscapes(value: string): string {
 
 function replaceEmojiHelpers(text: string): string {
   return text.replace(/:([a-zA-Z0-9_-]+):/g, (match, name) => {
-    const id = EMBEDDABLE_EMOJI_MAP[name.toLowerCase()]
+    const lower = name.toLowerCase()
+    // 1. Custom embeddable emoji (tg-emoji) if configured
+    const id = EMBEDDABLE_EMOJI_MAP[lower]
     if (id) return `<tg-emoji emoji-id="${id}"></tg-emoji>`
+    // 2. Fallback to Unicode emoji mapping
+    const unicodeMap: Record<string, string> = {
+      claude: "🤖",
+      codex: "👐",
+      gemini: "♊️",
+      deepseek: "🐳",
+      qwen: "🟣",
+      kimi: "🌙",
+      glm: "🗂",
+      gpt: "⚡",
+      openai: "⚡",
+    }
+    const emoji = unicodeMap[lower]
+    if (emoji) return emoji
     return match
   })
 }
