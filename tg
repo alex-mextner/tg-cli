@@ -132,17 +132,33 @@ const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
   codex: "5271883441703525028",   // 👐 OpenAI
   openai: "5271883441703525028",  // 👐 OpenAI
   claude: "5269279415916865021",  // 🤖 Claude
+  anthropic: "5269279415916865021", // 🤖 Claude
   gemini: "5269605910740771158",  // ♊️ Gemini
+  google: "5269605910740771158",  // ♊️ Gemini
   deepseek: "5269276697202566281", // 🐳 DeepSeek
   qwen: "5269463545459812385",    // 🟣 Qwen
+  alibaba: "5269463545459812385", // 🟣 Qwen
   kimi: "5271639813978630049",    // 🌙 Kimi
+  moonshot: "5271639813978630049", // 🌙 Kimi
   o3: "5271883441703525028",      // 👐 OpenAI
   o1: "5271883441703525028",      // 👐 OpenAI
   gpt4: "5271883441703525028",    // 👐 OpenAI
   gpt3: "5271883441703525028",    // 👐 OpenAI
-  llama: "5269279415916865021",   // 🤖 Claude (fallback)
-  mistral: "5269605910740771158", // ♊️ Gemini (fallback)
-  grok: "5269276697202566281",    // 🐳 DeepSeek (fallback)
+  llama: "5269293954381160064",   // 🦙 Meta/llama
+  meta: "5269293954381160064",    // 🦙 Meta
+  ollama: "5271609212336646116",  // 🦙 Ollama
+  mistral: "5271544555898969984", // Ⓜ️ Mistral
+  grok: "5269232493399154211",    // 🤘 Grok
+  xai: "5269232493399154211",     // 🤘 Grok
+  copilot: "5271550895270697637", // 🦾 Copilot
+  github: "5271550895270697637",   // 🦾 Copilot
+  perplexity: "5269424779084998604", // 🔮 Perplexity
+  cursor: "5271629982798485764",  // 👆 Cursor
+  windsurf: "5271558501657779072", // 🏄 Windsurf
+  devin: "5269279415916865021",   // 🤖 Cognition (fallback)
+  cognition: "5269279415916865021", // 🤖 Cognition (fallback)
+  aider: "5269279415916865021",    // 🤖 Aider (fallback)
+  continue: "5269279415916865021", // 🤖 Continue (fallback)
 }
 // Override with env vars if provided
 if (env.TG_EMOJI_IDS) {
@@ -162,12 +178,23 @@ for (const [key, val] of Object.entries(env)) {
 
 // Unicode emoji fallback map
 const UNICODE_EMOJI_MAP: Record<string, string> = {
-  claude: "🤖", codex: "👐", openai: "👐", gemini: "♊️",
-  deepseek: "🐳", qwen: "🟣", kimi: "🌙", glm: "🗂",
-  gpt: "⚡", o3: "⚡", o1: "⚡", gpt4: "⚡", gpt3: "⚡",
-  llama: "🦙", mistral: "Ⓜ️", grok: "🤘", anthropic: "🤖",
-  copilot: "🦾", perplexity: "🔮", cursor: "👆", windsurf: "🏄",
-  devin: "🧑‍💻", aider: "🤝", continue: "⏩",
+  claude: "🤖", anthropic: "🤖",
+  codex: "👐", openai: "👐", o3: "👐", o1: "👐", gpt4: "👐", gpt3: "👐",
+  gemini: "♊️", google: "♊️",
+  deepseek: "🐳",
+  qwen: "🟣", alibaba: "🟣",
+  kimi: "🌙", moonshot: "🌙",
+  glm: "🗂", chatglm: "🗂",
+  llama: "🦙", meta: "🦙", ollama: "🦙",
+  mistral: "Ⓜ️",
+  grok: "🤘", xai: "🤘",
+  copilot: "🦾", github: "🦾",
+  perplexity: "🔮",
+  cursor: "👆",
+  windsurf: "🏄",
+  devin: "🧑‍💻", cognition: "🧑‍💻",
+  aider: "🤝",
+  continue: "⏩",
 }
 
 interface EmojiEntity {
@@ -247,6 +274,9 @@ function detectAiModel(): string {
   // 2b. Detect other known CLI tools
   if (isProcessRunning("aider")) return "aider"
   if (isProcessRunning("cursor")) return "cursor"
+  if (isProcessRunning("windsurf")) return "windsurf"
+  if (isProcessRunning("llama")) return "llama"
+  if (isProcessRunning("ollama")) return "ollama"
 
   // 3. Try to extract from opencode config if available
   if (process.env.OPENCODE) {
@@ -301,7 +331,7 @@ const MODEL_EMOJI_MAP: Record<string, string> = {
   qwen: "🟣", alibaba: "🟣",
   kimi: "🌙", moonshot: "🌙",
   glm: "🗂", chatglm: "🗂",
-  llama: "🦙", meta: "🦙",
+  llama: "🦙", meta: "🦙", ollama: "🦙",
   mistral: "Ⓜ️",
   grok: "🤘", xai: "🤘",
   copilot: "🦾", github: "🦾",
