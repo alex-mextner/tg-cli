@@ -41,6 +41,9 @@ TG_CHAT_ID=<your chat or user ID>
 # Send a text message
 tg "Hello from the terminal"
 
+# Send formatted HTML
+tg --format html "<b>Status</b>\nDone"
+
 # Send a photo
 tg --photo screenshot.png
 
@@ -62,6 +65,9 @@ tg --file a.pdf --file b.pdf
 # Mix photos and files
 tg --photo diagram.png --file data.csv "Diagram and data"
 ```
+
+Message text and captions decode `\n`, `\r`, `\t`, and `\\` into real newlines, carriage
+returns, tabs, and backslashes. File paths are not decoded.
 
 ## License
 

@@ -55,6 +55,10 @@ const USAGE = `Usage:
   tg [--format plain|html] --file a.pdf --file b.pdf
   tg [--format plain|html] --photo a.png --file doc.pdf "caption"
 
+Text escape handling:
+  Message text and captions convert \\n, \\r, \\t, and \\\\ into real newlines,
+  carriage returns, tabs, and backslashes. File paths are not decoded.
+
 Formats:
   plain  Send text as-is. This is the default.
   html   Send with Telegram Bot API parse_mode=HTML.
@@ -113,7 +117,16 @@ while (i < args.length) {
   }
 }
 
-const caption = textParts.join(" ")
+function decodeTextEscapes(value: string): string {
+  return value.replace(/\\([nrt\\])/g, (_match: string, escaped: string) => {
+    if (escaped === "n") return "\n"
+    if (escaped === "r") return "\r"
+    if (escaped === "t") return "\t"
+    return "\\"
+  })
+}
+
+const caption = decodeTextEscapes(textParts.join(" "))
 
 // --- API calls ---
 function parseModeFor(formatValue: Format): "HTML" | undefined {
