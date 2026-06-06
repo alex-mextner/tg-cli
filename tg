@@ -133,7 +133,10 @@ function detectAiModel(): string {
   // 1. Explicit env var wins
   if (env.TG_AI_MODEL) return env.TG_AI_MODEL
 
-  // 2. Try to extract from opencode config if available
+  // 2. Detect Codex CLI from running processes
+  if (process.env.CODEX || isProcessRunning("codex")) return "codex"
+
+  // 3. Try to extract from opencode config if available
   if (process.env.OPENCODE) {
     try {
       const result = Bun.spawnSync(["opencode", "debug", "config"], {
@@ -163,16 +166,29 @@ function detectAiModel(): string {
   return ""
 }
 
+function isProcessRunning(name: string): boolean {
+  try {
+    const result = Bun.spawnSync(["pgrep", "-x", name], {
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    return result.exitCode === 0
+  } catch {
+    return false
+  }
+}
+
 const MODEL = detectAiModel()
 
-// --- AI emoji mapping ---
+// --- AI emoji mapping (plum11 convention) ---
 const MODEL_EMOJI_MAP: Record<string, string> = {
   claude: "🤖",
-  gemini: "💎",
-  codex: "📦",
-  deepseek: "🔍",
-  qwen: "🌟",
+  codex: "👐",
+  gemini: "♊️",
+  deepseek: "🐳",
+  qwen: "🟣",
   kimi: "🌙",
+  glm: "🗂",
   fireworks: "🎆",
   openai: "⚡",
   gpt: "⚡",
