@@ -54,10 +54,17 @@ const USAGE = `Usage:
   tg [--format plain|html] --photo a.png --photo b.png "caption"
   tg [--format plain|html] --file a.pdf --file b.pdf
   tg [--format plain|html] --photo a.png --file doc.pdf "caption"
+  tg --ls-emoji-helpers
 
 Text escape handling:
   Message text and captions convert \\n, \\r, \\t, and \\\\ into real newlines,
   carriage returns, tabs, and backslashes. File paths are not decoded.
+
+Emoji helpers:
+  Use :codex:, :gemini:, :claude:, :deepseek:, :qwen:, :kimi:, :glm:
+  in text (with --format html) to embed custom <tg-emoji> tags.
+  Set emoji IDs via env vars: TG_EMOJI_ID_<model> or TG_EMOJI_IDS JSON.
+  Run --ls-emoji-helpers to see available helpers and their current status.
 
 Formats:
   plain  Send text as-is. This is the default.
@@ -126,7 +133,8 @@ function decodeTextEscapes(value: string): string {
   })
 }
 
-const caption = decodeTextEscapes(textParts.join(" "))
+const rawCaption = decodeTextEscapes(textParts.join(" "))
+const caption = replaceEmojiHelpers(rawCaption)
 
 // --- AI model detection ---
 function detectAiModel(): string {
@@ -194,6 +202,23 @@ const MODEL_EMOJI_MAP: Record<string, string> = {
   gpt: "⚡",
 }
 
+// --- Embeddable emoji ID helpers (custom Telegram emoji set) ---
+// Load from env: TG_EMOJI_ID_claude, TG_EMOJI_ID_codex, ...
+// Or from JSON: TG_EMOJI_IDS='{"claude":"123","codex":"456"}'
+const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {}
+if (env.TG_EMOJI_IDS) {
+  try {
+    const parsed = JSON.parse(env.TG_EMOJI_IDS)
+    Object.assign(EMBEDDABLE_EMOJI_MAP, parsed)
+  } catch {
+    // ignore malformed JSON
+  }
+}
+for (const [key, _emoji] of Object.entries(MODEL_EMOJI_MAP)) {
+  const envId = env[`TG_EMOJI_ID_${key}`]
+  if (envId) EMBEDDABLE_EMOJI_MAP[key] = envId
+}
+
 function detectAiEmoji(): string {
   // 1. Explicit env var wins
   if (env.TG_AI_EMOJI) return env.TG_AI_EMOJI
@@ -210,6 +235,42 @@ function detectAiEmoji(): string {
 }
 
 const AI_EMOJI = detectAiEmoji()
+
+// --- Emoji helpers ---
+// Replace :codex: → <tg-emoji emoji-id="..."> in text
+function replaceEmojiHelpers(text: string): string {
+  return text.replace(/:([a-zA-Z0-9_-]+):/g, (match, name) => {
+    const id = EMBEDDABLE_EMOJI_MAP[name.toLowerCase()]
+    if (id) return `<tg-emoji emoji-id="${id}"></tg-emoji>`
+    return match
+  })
+}
+
+function listEmojiHelpers(): string {
+  const lines = [
+    "Available emoji helpers:",
+    "",
+  ]
+  for (const [key, emoji] of Object.entries(MODEL_EMOJI_MAP)) {
+    const id = EMBEDDABLE_EMOJI_MAP[key]
+    if (id) {
+      lines.push(`  :${key}: → ${emoji} <tg-emoji emoji-id="${id}">`)
+    } else {
+      lines.push(`  :${key}: → ${emoji} (no emoji-id set — add TG_EMOJI_ID_${key})`)
+    }
+  }
+  lines.push("")
+  lines.push("Set emoji IDs via env vars:")
+  lines.push("  TG_EMOJI_ID_claude=123456789")
+  lines.push("  TG_EMOJI_IDS='{\"claude\":\"123\",\"codex\":\"456\"}'")
+  return lines.join("\n")
+}
+
+// Handle --ls-emoji-helpers after all helpers are defined
+if (args[0] === "--ls-emoji-helpers") {
+  console.log(listEmojiHelpers())
+  process.exit(0)
+}
 
 // --- Tmux context ---
 function getTmuxPrefix(): string {
