@@ -124,12 +124,38 @@ while (i < args.length) {
   }
 }
 
+// --- Embeddable emoji helpers ---
+const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {}
+if (env.TG_EMOJI_IDS) {
+  try {
+    const parsed = JSON.parse(env.TG_EMOJI_IDS)
+    Object.assign(EMBEDDABLE_EMOJI_MAP, parsed)
+  } catch {
+    // ignore malformed JSON
+  }
+}
+// Load individual TG_EMOJI_ID_* vars
+for (const [key, val] of Object.entries(env)) {
+  if (key.startsWith("TG_EMOJI_ID_")) {
+    const model = key.slice("TG_EMOJI_ID_".length).toLowerCase()
+    if (model) EMBEDDABLE_EMOJI_MAP[model] = val
+  }
+}
+
 function decodeTextEscapes(value: string): string {
   return value.replace(/\\([nrt\\])/g, (_match: string, escaped: string) => {
     if (escaped === "n") return "\n"
     if (escaped === "r") return "\r"
     if (escaped === "t") return "\t"
     return "\\"
+  })
+}
+
+function replaceEmojiHelpers(text: string): string {
+  return text.replace(/:([a-zA-Z0-9_-]+):/g, (match, name) => {
+    const id = EMBEDDABLE_EMOJI_MAP[name.toLowerCase()]
+    if (id) return `<tg-emoji emoji-id="${id}"></tg-emoji>`
+    return match
   })
 }
 
@@ -200,23 +226,6 @@ const MODEL_EMOJI_MAP: Record<string, string> = {
   fireworks: "🎆",
   openai: "⚡",
   gpt: "⚡",
-}
-
-// --- Embeddable emoji ID helpers (custom Telegram emoji set) ---
-// Load from env: TG_EMOJI_ID_claude, TG_EMOJI_ID_codex, ...
-// Or from JSON: TG_EMOJI_IDS='{"claude":"123","codex":"456"}'
-const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {}
-if (env.TG_EMOJI_IDS) {
-  try {
-    const parsed = JSON.parse(env.TG_EMOJI_IDS)
-    Object.assign(EMBEDDABLE_EMOJI_MAP, parsed)
-  } catch {
-    // ignore malformed JSON
-  }
-}
-for (const [key, _emoji] of Object.entries(MODEL_EMOJI_MAP)) {
-  const envId = env[`TG_EMOJI_ID_${key}`]
-  if (envId) EMBEDDABLE_EMOJI_MAP[key] = envId
 }
 
 function detectAiEmoji(): string {
