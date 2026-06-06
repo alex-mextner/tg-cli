@@ -64,8 +64,9 @@ Emoji helpers:
   Use :codex:, :gemini:, :claude:, :deepseek:, :qwen:, :kimi:, :glm:
   :o3:, :o1:, :gpt4:, :gpt3:, :llama:, :mistral:, :grok:, :copilot:
   :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:
+  :hyperide:
   to embed custom emoji icons from the HyperIDE.ai set.
-  Set: https://t.me/addemoji/hyperide
+  Set: https://t.me/addemoji/hyperide_by_UltraClaudeCodeBot
   Set emoji IDs via env vars: TG_EMOJI_ID_<model> or TG_EMOJI_IDS JSON.
   Run --ls-emoji-helpers to see available helpers and their current status.
 
@@ -128,12 +129,12 @@ while (i < args.length) {
 }
 
 // --- Embeddable emoji helpers ---
-// Default: HyperIDE.ai custom emoji set (https://t.me/addemoji/hyperide)
+// Default: HyperIDE.ai custom emoji set (https://t.me/addemoji/hyperide_by_UltraClaudeCodeBot)
 const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
   codex: "5271568423032234676",   // 👐 OpenAI
   openai: "5271568423032234676",  // 👐 OpenAI
-  claude: "5269219952094650490",  // 🤖 Claude
-  anthropic: "5269219952094650490", // 🤖 Claude
+  claude: "5269219952094650490",  // ✳️ Claude
+  anthropic: "5269219952094650490", // ✳️ Claude
   gemini: "5269671185653737998",  // ♊️ Gemini
   google: "5269671185653737998",  // ♊️ Gemini
   deepseek: "5271996240429625259", // 🐳 DeepSeek
@@ -156,6 +157,7 @@ const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
   perplexity: "5269386274703189510", // 🔮 Perplexity
   cursor: "5271567083002437924",  // 👆 Cursor
   windsurf: "5269548839215340868", // 🏄 Windsurf
+  hyperide: "5271613000497795922", // 🚁 HyperIDE
   devin: "5269219952094650490",   // 🤖 Cognition (fallback)
   cognition: "5269219952094650490", // 🤖 Cognition (fallback)
   aider: "5269219952094650490",    // 🤖 Aider (fallback)
@@ -179,7 +181,7 @@ for (const [key, val] of Object.entries(env)) {
 
 // Unicode emoji fallback map
 const UNICODE_EMOJI_MAP: Record<string, string> = {
-  claude: "🤖", anthropic: "🤖",
+  claude: "✳️", anthropic: "✳️",
   codex: "👐", openai: "👐", o3: "👐", o1: "👐", gpt4: "👐", gpt3: "👐",
   gemini: "♊️", google: "♊️",
   deepseek: "🐳",
@@ -196,6 +198,7 @@ const UNICODE_EMOJI_MAP: Record<string, string> = {
   devin: "🧑‍💻", cognition: "🧑‍💻",
   aider: "🤝",
   continue: "⏩",
+  hyperide: "🚁",
 }
 
 interface EmojiEntity {
@@ -325,7 +328,7 @@ const MODEL = detectAiModel()
 
 // --- AI emoji mapping (plum11 convention + extended) ---
 const MODEL_EMOJI_MAP: Record<string, string> = {
-  claude: "🤖", anthropic: "🤖",
+  claude: "✳️", anthropic: "✳️",
   codex: "👐", openai: "👐", o3: "👐", o1: "👐", gpt4: "👐", gpt3: "👐",
   gemini: "♊️", google: "♊️",
   deepseek: "🐳",
@@ -342,6 +345,7 @@ const MODEL_EMOJI_MAP: Record<string, string> = {
   devin: "🧑‍💻", cognition: "🧑‍💻",
   aider: "🤝",
   continue: "⏩",
+  hyperide: "🚁",
   fireworks: "🎆",
   gpt: "⚡",
 }
