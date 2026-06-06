@@ -425,7 +425,16 @@ function buildPrefix(): ParsedText {
   if (AI_EMOJI) {
     // Convert AI_EMOJI (Unicode) to custom emoji if available
     const lower = MODEL.toLowerCase()
-    const emojiId = EMBEDDABLE_EMOJI_MAP[lower] || EMBEDDABLE_EMOJI_MAP[detectAiModel().toLowerCase()]
+    let emojiId = EMBEDDABLE_EMOJI_MAP[lower]
+    // If not found by exact key, try substring matching
+    if (!emojiId) {
+      for (const [key, id] of Object.entries(EMBEDDABLE_EMOJI_MAP)) {
+        if (lower.includes(key)) {
+          emojiId = id
+          break
+        }
+      }
+    }
     if (emojiId) {
       entities.push({
         type: "custom_emoji",
