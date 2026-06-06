@@ -60,13 +60,16 @@ Text escape handling:
   Message text and captions convert \\n, \\r, \\t, and \\\\ into real newlines,
   carriage returns, tabs, and backslashes. File paths are not decoded.
 
-Emoji helpers:
-  Use :codex:, :gemini:, :claude:, :deepseek:, :qwen:, :kimi:, :glm:
-  :o3:, :o1:, :gpt4:, :gpt3:, :llama:, :mistral:, :grok:, :copilot:
+Emoji helpers (custom emoji):
+  Use :codex:, :gemini:, :claude:, :deepseek:, :qwen:, :kimi:
+  :o3:, :o1:, :gpt4:, :gpt3:, :gpt:, :llama:, :ollama:, :mistral:, :grok:, :copilot:
   :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:
   :hyperide:
   to embed custom emoji icons from the HyperIDE.ai set.
-  Set: https://t.me/addemoji/agents_v9_by_UltraClaudeCodeBot
+  Set: https://t.me/addemoji/agents_v10_by_UltraClaudeCodeBot
+
+Unicode-only helpers (no custom emoji ID):
+  :glm: → 🗂, :chatglm: → 🗂, :fireworks: → 🎆
   Set emoji IDs via env vars: TG_EMOJI_ID_<model> or TG_EMOJI_IDS JSON.
   Run --ls-emoji-helpers to see available helpers and their current status.
 
@@ -129,60 +132,88 @@ while (i < args.length) {
 }
 
 // --- Embeddable emoji helpers ---
-// Default: HyperIDE.ai custom emoji set (https://t.me/addemoji/agents_v9_by_UltraClaudeCodeBot)
+// WARNING: The structure of these maps is regex-parsed by tests in tests/emoji_map.test.ts.
+// If you change formatting (e.g., add nested braces, comments containing `}`, or remove trailing commas),
+// tests may break. Update tests in lockstep with any structural changes here.
+// Default: HyperIDE.ai custom emoji set (https://t.me/addemoji/agents_v10_by_UltraClaudeCodeBot)
 const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
-  hyperide: "5269682120640471121", // 🚁 HyperIDE (first icon)
-  codex: "5271465537090655059",   // 👐 OpenAI
-  openai: "5271465537090655059",  // 👐 OpenAI
-  claude: "5271538457045409379",  // ✳️ Claude
-  anthropic: "5271538457045409379", // ✳️ Claude
-  gemini: "5269566641854788118",  // ♊️ Gemini
-  google: "5269566641854788118",  // ♊️ Gemini
-  deepseek: "5269618799937625373", // 🐳 DeepSeek
-  qwen: "5271822629261581082",    // 🟣 Qwen
-  alibaba: "5271822629261581082", // 🟣 Qwen
-  kimi: "5271985902443337475",    // 🌙 Kimi
-  moonshot: "5271985902443337475", // 🌙 Kimi
-  o3: "5271465537090655059",      // 👐 OpenAI
-  o1: "5271465537090655059",      // 👐 OpenAI
-  gpt4: "5271465537090655059",    // 👐 OpenAI
-  gpt3: "5271465537090655059",    // 👐 OpenAI
-  llama: "5269343677217546822",   // 🦙 Meta/llama
-  meta: "5269343677217546822",    // 🦙 Meta
-  ollama: "5271929698501315947",  // 🦙 Ollama
-  mistral: "5271749344234613902", // Ⓜ️ Mistral
-  grok: "5271751590502505422",    // 🤘 Grok
-  xai: "5271751590502505422",     // 🤘 Grok
-  copilot: "5269565117141395387", // 🦾 Copilot
-  github: "5269565117141395387",   // 🦾 Copilot
-  perplexity: "5271794892362783190", // 🔮 Perplexity
-  cursor: "5269648984967782982",  // 👆 Cursor
-  windsurf: "5269740338922169982", // 🏄 Windsurf
-  devin: "5271538457045409379",   // ✳️ Cognition (fallback)
-  cognition: "5271538457045409379", // ✳️ Cognition (fallback)
-  aider: "5271538457045409379",    // ✳️ Aider (fallback)
-  continue: "5271538457045409379", // ✳️ Continue (fallback)
+  hyperide: "5269756337675346446", // 🚁 HyperIDE (first icon)
+  codex: "5269267767965556041",   // 👐 OpenAI
+  openai: "5269267767965556041",  // 👐 OpenAI
+  claude: "5271533015321842500",  // ✳️ Claude
+  anthropic: "5271533015321842500", // ✳️ Claude
+  gemini: "5271619099351358220",  // ♊️ Gemini
+  google: "5271619099351358220",  // ♊️ Gemini
+  deepseek: "5271683223213087502", // 🐳 DeepSeek
+  qwen: "5271783192871870913",    // 🟣 Qwen
+  alibaba: "5271783192871870913", // 🟣 Qwen
+  kimi: "5269705184614850043",    // 🌙 Kimi
+  moonshot: "5269705184614850043", // 🌙 Kimi
+  o3: "5269267767965556041",      // 👐 OpenAI
+  o1: "5269267767965556041",      // 👐 OpenAI
+  gpt4: "5269267767965556041",    // 👐 OpenAI
+  gpt3: "5269267767965556041",    // 👐 OpenAI
+  llama: "5271674856616794663",   // 🦙 Meta/llama
+  meta: "5271674856616794663",    // 🦙 Meta
+  ollama: "5271946500413365403",  // 🦙 Ollama
+  mistral: "5271760476789841127", // Ⓜ️ Mistral
+  grok: "5271696550496611333",    // 🤘 Grok
+  xai: "5271696550496611333",     // 🤘 Grok
+  copilot: "5271673589601443183", // 🦾 Copilot
+  github: "5271673589601443183",   // 🦾 Copilot
+  perplexity: "5269534987945814166", // 🔮 Perplexity
+  cursor: "5271670853707276208",  // 👆 Cursor
+  windsurf: "5269760727131924567", // 🏄 Windsurf
+  devin: "5271533015321842500",   // Custom ID: shares Claude's ✳️ ID. Unicode: 🧑‍💻
+  cognition: "5271533015321842500", // Custom ID: shares Claude's ✳️ ID. Unicode: 🧑‍💻
+  aider: "5271533015321842500",    // Custom ID: shares Claude's ✳️ ID. Unicode: 🤝
+  continue: "5271533015321842500", // Custom ID: shares Claude's ✳️ ID. Unicode: ⏩
+  gpt: "5269267767965556041",       // Custom ID: shares OpenAI's 👐 ID. Unicode: ⚡
 }
 // Override with env vars if provided
 if (env.TG_EMOJI_IDS) {
   try {
     const parsed = JSON.parse(env.TG_EMOJI_IDS)
-    Object.assign(EMBEDDABLE_EMOJI_MAP, parsed)
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [model, id] of Object.entries(parsed)) {
+        if (["__proto__", "constructor", "tostring", "valueof"].includes(model.toLowerCase())) {
+          console.error(`Warning: Rejecting reserved key in TG_EMOJI_IDS: ${model}`)
+          continue
+        }
+        if (typeof id === "string" && /^\d{19}$/.test(id)) {
+          EMBEDDABLE_EMOJI_MAP[model] = id
+        } else if (typeof id === "string") {
+          console.error(`Warning: Ignoring invalid emoji ID in TG_EMOJI_IDS for ${model}: ${id} (expected 19 digits)`)
+        } else {
+          console.error(`Warning: Ignoring non-string emoji ID in TG_EMOJI_IDS for ${model}: ${id} (expected string)`)
+        }
+      }
+    } else {
+      console.error("Warning: TG_EMOJI_IDS must be a JSON object, not an array or primitive")
+    }
   } catch {
-    // ignore malformed JSON
+    console.error("Warning: TG_EMOJI_IDS contains invalid JSON, using default emoji IDs")
   }
 }
 for (const [key, val] of Object.entries(env)) {
   if (key.startsWith("TG_EMOJI_ID_")) {
     const model = key.slice("TG_EMOJI_ID_".length).toLowerCase()
-    if (model) EMBEDDABLE_EMOJI_MAP[model] = val
+    if (model && !["__proto__", "constructor", "tostring", "valueof"].includes(model)) {
+      if (val && /^\d{19}$/.test(val)) {
+        EMBEDDABLE_EMOJI_MAP[model] = val
+      } else {
+        console.error(`Warning: Ignoring invalid emoji ID for ${model}: ${val} (expected 19 digits)`)
+      }
+    } else if (model && ["__proto__", "constructor", "tostring", "valueof"].includes(model)) {
+      console.error(`Warning: Rejecting reserved key in TG_EMOJI_ID_${model}: ${val}`)
+    }
   }
 }
 
 // Unicode emoji fallback map
 const UNICODE_EMOJI_MAP: Record<string, string> = {
   claude: "✳️", anthropic: "✳️",
-  codex: "👐", openai: "👐", o3: "👐", o1: "👐", gpt4: "👐", gpt3: "👐",
+  codex: "👐", openai: "👐", o3: "👐", o1: "👐", gpt4: "👐", gpt3: "👐", gpt: "⚡",
   gemini: "♊️", google: "♊️",
   deepseek: "🐳",
   qwen: "🟣", alibaba: "🟣",
@@ -199,6 +230,7 @@ const UNICODE_EMOJI_MAP: Record<string, string> = {
   aider: "🤝",
   continue: "⏩",
   hyperide: "🚁",
+  fireworks: "🎆",
 }
 
 interface EmojiEntity {
@@ -383,8 +415,8 @@ function listEmojiHelpers(): string {
   }
   lines.push("")
   lines.push("Set emoji IDs via env vars:")
-  lines.push("  TG_EMOJI_ID_claude=123456789")
-  lines.push("  TG_EMOJI_IDS='{\"claude\":\"123\",\"codex\":\"456\"}'")
+  lines.push("  TG_EMOJI_ID_claude=5271533015321842500")
+  lines.push("  TG_EMOJI_IDS='{\"claude\":\"5271533015321842500\",\"codex\":\"5269267767965556041\"}'")
   return lines.join("\n")
 }
 
