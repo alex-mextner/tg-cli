@@ -62,6 +62,8 @@ Text escape handling:
 
 Emoji helpers:
   Use :codex:, :gemini:, :claude:, :deepseek:, :qwen:, :kimi:, :glm:
+  :o3:, :o1:, :gpt4:, :gpt3:, :llama:, :mistral:, :grok:, :copilot:
+  :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:
   in text (with --format html) to embed custom <tg-emoji> tags.
   Set emoji IDs via env vars: TG_EMOJI_ID_<model> or TG_EMOJI_IDS JSON.
   Run --ls-emoji-helpers to see available helpers and their current status.
@@ -134,6 +136,13 @@ const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
   deepseek: "5269276697202566281", // 🐳 DeepSeek
   qwen: "5269463545459812385",    // 🟣 Qwen
   kimi: "5271639813978630049",    // 🌙 Kimi
+  o3: "5271883441703525028",      // 👐 OpenAI
+  o1: "5271883441703525028",      // 👐 OpenAI
+  gpt4: "5271883441703525028",    // 👐 OpenAI
+  gpt3: "5271883441703525028",    // 👐 OpenAI
+  llama: "5269279415916865021",   // 🤖 Claude (fallback)
+  mistral: "5269605910740771158", // ♊️ Gemini (fallback)
+  grok: "5269276697202566281",    // 🐳 DeepSeek (fallback)
 }
 // Override with env vars if provided
 if (env.TG_EMOJI_IDS) {
@@ -151,6 +160,28 @@ for (const [key, val] of Object.entries(env)) {
   }
 }
 
+// Unicode emoji fallback map
+const UNICODE_EMOJI_MAP: Record<string, string> = {
+  claude: "🤖", codex: "👐", openai: "👐", gemini: "♊️",
+  deepseek: "🐳", qwen: "🟣", kimi: "🌙", glm: "🗂",
+  gpt: "⚡", o3: "⚡", o1: "⚡", gpt4: "⚡", gpt3: "⚡",
+  llama: "🦙", mistral: "Ⓜ️", grok: "🤘", anthropic: "🤖",
+  copilot: "🦾", perplexity: "🔮", cursor: "👆", windsurf: "🏄",
+  devin: "🧑‍💻", aider: "🤝", continue: "⏩",
+}
+
+interface EmojiEntity {
+  type: "custom_emoji"
+  offset: number
+  length: number
+  custom_emoji_id: string
+}
+
+interface ParsedText {
+  text: string
+  entities: EmojiEntity[]
+}
+
 function decodeTextEscapes(value: string): string {
   return value.replace(/\\([nrt\\])/g, (_match: string, escaped: string) => {
     if (escaped === "n") return "\n"
@@ -160,32 +191,51 @@ function decodeTextEscapes(value: string): string {
   })
 }
 
-function replaceEmojiHelpers(text: string): string {
-  return text.replace(/:([a-zA-Z0-9_-]+):/g, (match, name) => {
+function parseEmojiHelpers(text: string): ParsedText {
+  const entities: EmojiEntity[] = []
+  let result = ""
+  let offset = 0
+
+  const regex = /:([a-zA-Z0-9_-]+):/g
+  let match
+  let lastIndex = 0
+
+  while ((match = regex.exec(text)) !== null) {
+    const [fullMatch, name] = match
     const lower = name.toLowerCase()
-    // 1. Custom embeddable emoji (tg-emoji) if configured
-    const id = EMBEDDABLE_EMOJI_MAP[lower]
-    if (id) return `<tg-emoji emoji-id="${id}"></tg-emoji>`
-    // 2. Fallback to Unicode emoji mapping
-    const unicodeMap: Record<string, string> = {
-      claude: "🤖",
-      codex: "👐",
-      gemini: "♊️",
-      deepseek: "🐳",
-      qwen: "🟣",
-      kimi: "🌙",
-      glm: "🗂",
-      gpt: "⚡",
-      openai: "⚡",
+    const emojiId = EMBEDDABLE_EMOJI_MAP[lower]
+    const unicodeEmoji = UNICODE_EMOJI_MAP[lower]
+
+    // Append text before match
+    result += text.slice(lastIndex, match.index)
+
+    if (emojiId) {
+      // Use placeholder emoji for entity
+      const placeholder = unicodeEmoji || "🤖"
+      entities.push({
+        type: "custom_emoji",
+        offset: result.length,
+        length: placeholder.length,
+        custom_emoji_id: emojiId,
+      })
+      result += placeholder
+    } else if (unicodeEmoji) {
+      result += unicodeEmoji
+    } else {
+      result += fullMatch
     }
-    const emoji = unicodeMap[lower]
-    if (emoji) return emoji
-    return match
-  })
+
+    lastIndex = regex.lastIndex
+  }
+
+  // Append remaining text
+  result += text.slice(lastIndex)
+
+  return { text: result, entities }
 }
 
 const rawCaption = decodeTextEscapes(textParts.join(" "))
-const caption = replaceEmojiHelpers(rawCaption)
+const caption = rawCaption
 
 // --- AI model detection ---
 function detectAiModel(): string {
@@ -194,6 +244,9 @@ function detectAiModel(): string {
 
   // 2. Detect Codex CLI from running processes
   if (process.env.CODEX || isProcessRunning("codex")) return "codex"
+  // 2b. Detect other known CLI tools
+  if (isProcessRunning("aider")) return "aider"
+  if (isProcessRunning("cursor")) return "cursor"
 
   // 3. Try to extract from opencode config if available
   if (process.env.OPENCODE) {
@@ -239,17 +292,26 @@ function isProcessRunning(name: string): boolean {
 
 const MODEL = detectAiModel()
 
-// --- AI emoji mapping (plum11 convention) ---
+// --- AI emoji mapping (plum11 convention + extended) ---
 const MODEL_EMOJI_MAP: Record<string, string> = {
-  claude: "🤖",
-  codex: "👐",
-  gemini: "♊️",
+  claude: "🤖", anthropic: "🤖",
+  codex: "👐", openai: "👐", o3: "👐", o1: "👐", gpt4: "👐", gpt3: "👐",
+  gemini: "♊️", google: "♊️",
   deepseek: "🐳",
-  qwen: "🟣",
-  kimi: "🌙",
-  glm: "🗂",
+  qwen: "🟣", alibaba: "🟣",
+  kimi: "🌙", moonshot: "🌙",
+  glm: "🗂", chatglm: "🗂",
+  llama: "🦙", meta: "🦙",
+  mistral: "Ⓜ️",
+  grok: "🤘", xai: "🤘",
+  copilot: "🦾", github: "🦾",
+  perplexity: "🔮",
+  cursor: "👆",
+  windsurf: "🏄",
+  devin: "🧑‍💻", cognition: "🧑‍💻",
+  aider: "🤝",
+  continue: "⏩",
   fireworks: "🎆",
-  openai: "⚡",
   gpt: "⚡",
 }
 
@@ -271,15 +333,6 @@ function detectAiEmoji(): string {
 const AI_EMOJI = detectAiEmoji()
 
 // --- Emoji helpers ---
-// Replace :codex: → <tg-emoji emoji-id="..."> in text
-function replaceEmojiHelpers(text: string): string {
-  return text.replace(/:([a-zA-Z0-9_-]+):/g, (match, name) => {
-    const id = EMBEDDABLE_EMOJI_MAP[name.toLowerCase()]
-    if (id) return `<tg-emoji emoji-id="${id}"></tg-emoji>`
-    return match
-  })
-}
-
 function listEmojiHelpers(): string {
   const lines = [
     "Available emoji helpers:",
@@ -339,6 +392,9 @@ function buildPrefix(): string {
 
 const prefix = buildPrefix()
 const finalCaption = prefix + caption
+const parsedFinal = parseEmojiHelpers(finalCaption)
+const finalText = parsedFinal.text
+const finalEntities = parsedFinal.entities
 
 // --- API calls ---
 function parseModeFor(formatValue: Format): "HTML" | undefined {
@@ -358,43 +414,56 @@ async function checkResponse(resp: Response, method: string): Promise<void> {
   }
 }
 
-async function sendMessage(text: string, formatValue: Format): Promise<void> {
+async function sendMessage(text: string, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
   const parseMode = parseModeFor(formatValue)
+  const body: Record<string, unknown> = {
+    chat_id: CHAT_ID,
+    text,
+  }
+  if (parseMode) {
+    body.parse_mode = parseMode
+  } else if (entities.length > 0) {
+    body.entities = entities
+  }
   const resp = await fetch(`${API}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: CHAT_ID,
-      text,
-      ...(parseMode ? { parse_mode: parseMode } : {}),
-    }),
+    body: JSON.stringify(body),
   })
   await checkResponse(resp, "sendMessage")
 }
 
-async function sendPhoto(filePath: string, cap: string | undefined, formatValue: Format): Promise<void> {
+async function sendPhoto(filePath: string, cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
   const parseMode = parseModeFor(formatValue)
   const form = new FormData()
   form.append("chat_id", CHAT_ID)
   form.append("photo", Bun.file(filePath))
   if (cap) form.append("caption", cap)
-  if (cap && parseMode) form.append("parse_mode", parseMode)
+  if (parseMode) {
+    form.append("parse_mode", parseMode)
+  } else if (entities.length > 0) {
+    form.append("caption_entities", JSON.stringify(entities))
+  }
   const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
   await checkResponse(resp, "sendPhoto")
 }
 
-async function sendDocument(filePath: string, cap: string | undefined, formatValue: Format): Promise<void> {
+async function sendDocument(filePath: string, cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
   const parseMode = parseModeFor(formatValue)
   const form = new FormData()
   form.append("chat_id", CHAT_ID)
   form.append("document", Bun.file(filePath))
   if (cap) form.append("caption", cap)
-  if (cap && parseMode) form.append("parse_mode", parseMode)
+  if (parseMode) {
+    form.append("parse_mode", parseMode)
+  } else if (entities.length > 0) {
+    form.append("caption_entities", JSON.stringify(entities))
+  }
   const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
   await checkResponse(resp, "sendDocument")
 }
 
-async function sendMediaGroup(mediaItems: Item[], cap: string | undefined, formatValue: Format): Promise<void> {
+async function sendMediaGroup(mediaItems: Item[], cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
   const parseMode = parseModeFor(formatValue)
   const form = new FormData()
   form.append("chat_id", CHAT_ID)
@@ -402,7 +471,8 @@ async function sendMediaGroup(mediaItems: Item[], cap: string | undefined, forma
     type: item.type,
     media: `attach://file${idx}`,
     ...(idx === 0 && cap ? { caption: cap } : {}),
-    ...(idx === 0 && cap && parseMode ? { parse_mode: parseMode } : {}),
+    ...(idx === 0 && parseMode ? { parse_mode: parseMode } : {}),
+    ...(idx === 0 && !parseMode && entities.length > 0 ? { caption_entities: entities } : {}),
   }))
   form.append("media", JSON.stringify(mediaArr))
   for (const [idx, item] of mediaItems.entries()) {
@@ -414,18 +484,18 @@ async function sendMediaGroup(mediaItems: Item[], cap: string | undefined, forma
 
 // --- Dispatch ---
 if (items.length === 0) {
-  if (!finalCaption) {
+  if (!finalText) {
     console.error("Error: no message text provided")
     process.exit(1)
   }
-  await sendMessage(finalCaption, format)
+  await sendMessage(finalText, format, finalEntities)
 } else if (items.length === 1) {
   const item = items[0]
   if (item.type === "photo") {
-    await sendPhoto(item.path, finalCaption || undefined, format)
+    await sendPhoto(item.path, finalText || undefined, format, finalEntities)
   } else {
-    await sendDocument(item.path, finalCaption || undefined, format)
+    await sendDocument(item.path, finalText || undefined, format, finalEntities)
   }
 } else {
-  await sendMediaGroup(items, finalCaption || undefined, format)
+  await sendMediaGroup(items, finalText || undefined, format, finalEntities)
 }
