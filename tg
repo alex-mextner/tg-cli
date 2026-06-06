@@ -66,7 +66,7 @@ Emoji helpers:
   :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:
   :hyperide:
   to embed custom emoji icons from the HyperIDE.ai set.
-  Set: https://t.me/addemoji/agents_v2_by_hyperidebot
+  Set: https://t.me/addemoji/agents_v4_by_hyperidebot
   Set emoji IDs via env vars: TG_EMOJI_ID_<model> or TG_EMOJI_IDS JSON.
   Run --ls-emoji-helpers to see available helpers and their current status.
 
@@ -129,39 +129,39 @@ while (i < args.length) {
 }
 
 // --- Embeddable emoji helpers ---
-// Default: HyperIDE.ai custom emoji set (https://t.me/addemoji/agents_v2_by_hyperidebot)
+// Default: HyperIDE.ai custom emoji set (https://t.me/addemoji/agents_v4_by_hyperidebot)
 const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
-  hyperide: "5269482378891405635", // 🚁 HyperIDE (first icon)
-  codex: "5269673814173722108",   // 👐 OpenAI
-  openai: "5269673814173722108",  // 👐 OpenAI
-  claude: "5271734122870511729",  // ✳️ Claude
-  anthropic: "5271734122870511729", // ✳️ Claude
-  gemini: "5269526415191094567",  // ♊️ Gemini
-  google: "5269526415191094567",  // ♊️ Gemini
-  deepseek: "5271905852842877219", // 🐳 DeepSeek
-  qwen: "5269605717467242363",    // 🟣 Qwen
-  alibaba: "5269605717467242363", // 🟣 Qwen
-  kimi: "5269241156348191803",    // 🌙 Kimi
-  moonshot: "5269241156348191803", // 🌙 Kimi
-  o3: "5269673814173722108",      // 👐 OpenAI
-  o1: "5269673814173722108",      // 👐 OpenAI
-  gpt4: "5269673814173722108",    // 👐 OpenAI
-  gpt3: "5269673814173722108",    // 👐 OpenAI
-  llama: "5269237127668869090",   // 🦙 Meta/llama
-  meta: "5269237127668869090",    // 🦙 Meta
-  ollama: "5269644213259115043",  // 🦙 Ollama
-  mistral: "5269396269092087333", // Ⓜ️ Mistral
-  grok: "5269623876588969405",    // 🤘 Grok
-  xai: "5269623876588969405",     // 🤘 Grok
-  copilot: "5271570969947842380", // 🦾 Copilot
-  github: "5271570969947842380",   // 🦾 Copilot
-  perplexity: "5271573405194297577", // 🔮 Perplexity
-  cursor: "5271602001086553171",  // 👆 Cursor
-  windsurf: "5269741365419354140", // 🏄 Windsurf
-  devin: "5271734122870511729",   // ✳️ Cognition (fallback)
-  cognition: "5271734122870511729", // ✳️ Cognition (fallback)
-  aider: "5271734122870511729",    // ✳️ Aider (fallback)
-  continue: "5271734122870511729", // ✳️ Continue (fallback)
+  hyperide: "5271974379046083453", // 🚁 HyperIDE (first icon)
+  codex: "5269636606872035782",   // 👐 OpenAI
+  openai: "5269636606872035782",  // 👐 OpenAI
+  claude: "5269363146304302727",  // ✳️ Claude
+  anthropic: "5269363146304302727", // ✳️ Claude
+  gemini: "5271810191036291914",  // ♊️ Gemini
+  google: "5271810191036291914",  // ♊️ Gemini
+  deepseek: "5269350149733264081", // 🐳 DeepSeek
+  qwen: "5271604548002159309",    // 🟣 Qwen
+  alibaba: "5271604548002159309", // 🟣 Qwen
+  kimi: "5271678412849716015",    // 🌙 Kimi
+  moonshot: "5271678412849716015", // 🌙 Kimi
+  o3: "5269636606872035782",      // 👐 OpenAI
+  o1: "5269636606872035782",      // 👐 OpenAI
+  gpt4: "5269636606872035782",    // 👐 OpenAI
+  gpt3: "5269636606872035782",    // 👐 OpenAI
+  llama: "5271951435330788545",   // 🦙 Meta/llama
+  meta: "5271951435330788545",    // 🦙 Meta
+  ollama: "5269773513249562653",  // 🦙 Ollama
+  mistral: "5271990940439977314", // Ⓜ️ Mistral
+  grok: "5269421635168934614",    // 🤘 Grok
+  xai: "5269421635168934614",     // 🤘 Grok
+  copilot: "5269410678707364356", // 🦾 Copilot
+  github: "5269410678707364356",   // 🦾 Copilot
+  perplexity: "5271711978019136252", // 🔮 Perplexity
+  cursor: "5271975654651371880",  // 👆 Cursor
+  windsurf: "5271596911550310765", // 🏄 Windsurf
+  devin: "5269363146304302727",   // ✳️ Cognition (fallback)
+  cognition: "5269363146304302727", // ✳️ Cognition (fallback)
+  aider: "5269363146304302727",    // ✳️ Aider (fallback)
+  continue: "5269363146304302727", // ✳️ Continue (fallback)
 }
 // Override with env vars if provided
 if (env.TG_EMOJI_IDS) {
@@ -273,16 +273,7 @@ function detectAiModel(): string {
   // 1. Explicit env var wins
   if (env.TG_AI_MODEL) return env.TG_AI_MODEL
 
-  // 2. Detect Codex CLI from running processes
-  if (process.env.CODEX || isProcessRunning("codex")) return "codex"
-  // 2b. Detect other known CLI tools
-  if (isProcessRunning("aider")) return "aider"
-  if (isProcessRunning("cursor")) return "cursor"
-  if (isProcessRunning("windsurf")) return "windsurf"
-  if (isProcessRunning("llama")) return "llama"
-  if (isProcessRunning("ollama")) return "ollama"
-
-  // 3. Try to extract from opencode config if available
+  // 2. Opencode (current agent) — higher priority than codex
   if (process.env.OPENCODE) {
     try {
       const result = Bun.spawnSync(["opencode", "debug", "config"], {
@@ -308,6 +299,15 @@ function detectAiModel(): string {
       // ignore — opencode not available or config parse failed
     }
   }
+
+  // 3. Detect Codex CLI (only via explicit env, not pgrep — codex is often background)
+  if (process.env.CODEX) return "codex"
+  // 3b. Detect other known CLI tools
+  if (isProcessRunning("aider")) return "aider"
+  if (isProcessRunning("cursor")) return "cursor"
+  if (isProcessRunning("windsurf")) return "windsurf"
+  if (isProcessRunning("llama")) return "llama"
+  if (isProcessRunning("ollama")) return "ollama"
 
   return ""
 }
