@@ -416,20 +416,54 @@ function getTmuxPrefix(): string {
 
 const tmuxPrefix = getTmuxPrefix()
 
-// --- Build final prefix ---
-function buildPrefix(): string {
+// --- Build prefix with custom emoji ---
+function buildPrefix(): ParsedText {
   const parts: string[] = []
-  if (AI_EMOJI) parts.push(AI_EMOJI)
-  if (tmuxPrefix) parts.push(tmuxPrefix)
-  if (parts.length === 0) return ""
-  return parts.join(" ") + "\n"
+  const entities: EmojiEntity[] = []
+  let offset = 0
+
+  if (AI_EMOJI) {
+    // Convert AI_EMOJI (Unicode) to custom emoji if available
+    const lower = MODEL.toLowerCase()
+    const emojiId = EMBEDDABLE_EMOJI_MAP[lower] || EMBEDDABLE_EMOJI_MAP[detectAiModel().toLowerCase()]
+    if (emojiId) {
+      entities.push({
+        type: "custom_emoji",
+        offset: offset,
+        length: AI_EMOJI.length,
+        custom_emoji_id: emojiId,
+      })
+    }
+    parts.push(AI_EMOJI)
+    offset += AI_EMOJI.length
+  }
+
+  if (tmuxPrefix) {
+    if (parts.length > 0) {
+      parts.push(" ")
+      offset += 1
+    }
+    parts.push(tmuxPrefix)
+    offset += tmuxPrefix.length
+  }
+
+  if (parts.length === 0) return { text: "", entities: [] }
+  parts.push("\n")
+  return { text: parts.join(""), entities }
 }
 
 const prefix = buildPrefix()
-const finalCaption = prefix + caption
-const parsedFinal = parseEmojiHelpers(finalCaption)
-const finalText = parsedFinal.text
-const finalEntities = parsedFinal.entities
+
+// Combine prefix + caption with correct offsets
+const parsedCaption = parseEmojiHelpers(caption)
+const finalText = prefix.text + parsedCaption.text
+const finalEntities: EmojiEntity[] = [
+  ...prefix.entities,
+  ...parsedCaption.entities.map((e) => ({
+    ...e,
+    offset: e.offset + prefix.text.length,
+  })),
+]
 
 // --- API calls ---
 function parseModeFor(formatValue: Format): "HTML" | undefined {
