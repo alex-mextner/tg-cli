@@ -132,7 +132,9 @@ const caption = decodeTextEscapes(textParts.join(" "))
 function getTmuxPrefix(): string {
   if (!process.env.TMUX) return ""
   try {
-    const result = Bun.spawnSync(["tmux", "display-message", "-p", "#{window_name}"], {
+    const pane = process.env.TMUX_PANE
+    const result = Bun.spawnSync(
+      ["tmux", "display-message", "-p", "-t", pane, "#{window_name}"], {
       stdout: "pipe",
       stderr: "pipe",
     })
