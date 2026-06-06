@@ -125,7 +125,17 @@ while (i < args.length) {
 }
 
 // --- Embeddable emoji helpers ---
-const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {}
+// Default: HyperIDE.ai custom emoji set (https://t.me/addemoji/hyperide_ai)
+const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
+  codex: "5271883441703525028",   // 👐 OpenAI
+  openai: "5271883441703525028",  // 👐 OpenAI
+  claude: "5269279415916865021",  // 🤖 Claude
+  gemini: "5269605910740771158",  // ♊️ Gemini
+  deepseek: "5269276697202566281", // 🐳 DeepSeek
+  qwen: "5269463545459812385",    // 🟣 Qwen
+  kimi: "5271639813978630049",    // 🌙 Kimi
+}
+// Override with env vars if provided
 if (env.TG_EMOJI_IDS) {
   try {
     const parsed = JSON.parse(env.TG_EMOJI_IDS)
@@ -134,7 +144,6 @@ if (env.TG_EMOJI_IDS) {
     // ignore malformed JSON
   }
 }
-// Load individual TG_EMOJI_ID_* vars
 for (const [key, val] of Object.entries(env)) {
   if (key.startsWith("TG_EMOJI_ID_")) {
     const model = key.slice("TG_EMOJI_ID_".length).toLowerCase()
