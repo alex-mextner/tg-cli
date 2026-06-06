@@ -128,6 +128,73 @@ function decodeTextEscapes(value: string): string {
 
 const caption = decodeTextEscapes(textParts.join(" "))
 
+// --- AI model detection ---
+function detectAiModel(): string {
+  // 1. Explicit env var wins
+  if (env.TG_AI_MODEL) return env.TG_AI_MODEL
+
+  // 2. Try to extract from opencode config if available
+  if (process.env.OPENCODE) {
+    try {
+      const result = Bun.spawnSync(["opencode", "debug", "config"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      if (result.exitCode === 0) {
+        const cfg = JSON.parse(new TextDecoder().decode(result.stdout))
+        const providers = cfg.provider || {}
+        for (const [_name, p] of Object.entries(providers)) {
+          const prov = p as { models?: Record<string, unknown> }
+          if (prov.models) {
+            const ids = Object.keys(prov.models)
+            if (ids.length === 1) return ids[0]
+            // If multiple, prefer the one that looks like a router/default
+            const router = ids.find((id) => id.includes("router"))
+            if (router) return router
+            return ids[0]
+          }
+        }
+      }
+    } catch {
+      // ignore — opencode not available or config parse failed
+    }
+  }
+
+  return ""
+}
+
+const MODEL = detectAiModel()
+
+// --- AI emoji mapping ---
+const MODEL_EMOJI_MAP: Record<string, string> = {
+  claude: "🤖",
+  gemini: "💎",
+  codex: "📦",
+  deepseek: "🔍",
+  qwen: "🌟",
+  kimi: "🌙",
+  fireworks: "🎆",
+  openai: "⚡",
+  gpt: "⚡",
+}
+
+function detectAiEmoji(): string {
+  // 1. Explicit env var wins
+  if (env.TG_AI_EMOJI) return env.TG_AI_EMOJI
+
+  // 2. Derive from detected model name
+  if (MODEL) {
+    const lower = MODEL.toLowerCase()
+    for (const [key, emoji] of Object.entries(MODEL_EMOJI_MAP)) {
+      if (lower.includes(key)) return emoji
+    }
+  }
+
+  return "🗂"
+}
+
+const AI_EMOJI = detectAiEmoji()
+
 // --- Tmux context ---
 function getTmuxPrefix(): string {
   if (!process.env.TMUX) return ""
@@ -140,7 +207,7 @@ function getTmuxPrefix(): string {
     })
     if (result.exitCode === 0) {
       const name = new TextDecoder().decode(result.stdout).trim()
-      if (name) return `[${name}] `
+      if (name) return `[${name}]`
     }
   } catch {
     // ignore — tmux not available or not in a pane
@@ -149,7 +216,18 @@ function getTmuxPrefix(): string {
 }
 
 const tmuxPrefix = getTmuxPrefix()
-const finalCaption = tmuxPrefix + caption
+
+// --- Build final prefix ---
+function buildPrefix(): string {
+  const parts: string[] = []
+  if (AI_EMOJI) parts.push(AI_EMOJI)
+  if (tmuxPrefix) parts.push(tmuxPrefix)
+  if (parts.length === 0) return ""
+  return parts.join(" ") + "\n"
+}
+
+const prefix = buildPrefix()
+const finalCaption = prefix + caption
 
 // --- API calls ---
 function parseModeFor(formatValue: Format): "HTML" | undefined {
