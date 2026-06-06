@@ -41,17 +41,33 @@ interface Item {
   path: string
 }
 
+type Format = "plain" | "html"
+
 const args = process.argv.slice(2)
 
 const USAGE = `Usage:
-  tg "text message"
-  tg --photo screen.png
-  tg --photo screen.png "caption"
-  tg --file doc.pdf
-  tg --file doc.pdf "caption"
-  tg --photo a.png --photo b.png "caption"
-  tg --file a.pdf --file b.pdf
-  tg --photo a.png --file doc.pdf "caption"
+  tg [--format plain|html] "text message"
+  tg [--format plain|html] --photo screen.png
+  tg [--format plain|html] --photo screen.png "caption"
+  tg [--format plain|html] --file doc.pdf
+  tg [--format plain|html] --file doc.pdf "caption"
+  tg [--format plain|html] --photo a.png --photo b.png "caption"
+  tg [--format plain|html] --file a.pdf --file b.pdf
+  tg [--format plain|html] --photo a.png --file doc.pdf "caption"
+
+Formats:
+  plain  Send text as-is. This is the default.
+  html   Send with Telegram Bot API parse_mode=HTML.
+
+HTML tags supported by Telegram Bot API:
+  <b>, <strong>, <i>, <em>, <u>, <ins>, <s>, <strike>, <del>,
+  <span class="tg-spoiler">, <tg-spoiler>, <a href="...">,
+  <tg-emoji emoji-id="...">, <tg-time unix="..." format="...">,
+  <code>, <pre>, <pre><code class="language-...">,
+  <blockquote>, <blockquote expandable>
+
+Only those HTML tags are supported. Escape raw <, >, and & outside tags as
+&lt;, &gt;, and &amp;.
 `
 
 if (args.length === 0) {
@@ -66,11 +82,24 @@ if (args[0] === "--help" || args[0] === "-h") {
 
 const items: Item[] = []
 const textParts: string[] = []
+let format: Format = "plain"
 
 let i = 0
 while (i < args.length) {
   const arg = args[i]
-  if (arg === "--photo" || arg === "--file") {
+  if (arg === "--format") {
+    const nextArg = args[i + 1]
+    if (!nextArg || nextArg.startsWith("--")) {
+      console.error("Error: --format requires plain or html")
+      process.exit(1)
+    }
+    if (nextArg !== "plain" && nextArg !== "html") {
+      console.error(`Error: unsupported format '${nextArg}'. Accepted values: plain, html`)
+      process.exit(1)
+    }
+    format = nextArg
+    i += 2
+  } else if (arg === "--photo" || arg === "--file") {
     const nextArg = args[i + 1]
     if (!nextArg || nextArg.startsWith("--")) {
       console.error(`Error: ${arg} requires a file path argument`)
@@ -87,6 +116,10 @@ while (i < args.length) {
 const caption = textParts.join(" ")
 
 // --- API calls ---
+function parseModeFor(formatValue: Format): "HTML" | undefined {
+  return formatValue === "html" ? "HTML" : undefined
+}
+
 async function checkResponse(resp: Response, method: string): Promise<void> {
   if (!resp.ok) {
     const body = await resp.text()
@@ -100,40 +133,51 @@ async function checkResponse(resp: Response, method: string): Promise<void> {
   }
 }
 
-async function sendMessage(text: string): Promise<void> {
+async function sendMessage(text: string, formatValue: Format): Promise<void> {
+  const parseMode = parseModeFor(formatValue)
   const resp = await fetch(`${API}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: CHAT_ID, text }),
+    body: JSON.stringify({
+      chat_id: CHAT_ID,
+      text,
+      ...(parseMode ? { parse_mode: parseMode } : {}),
+    }),
   })
   await checkResponse(resp, "sendMessage")
 }
 
-async function sendPhoto(filePath: string, cap?: string): Promise<void> {
+async function sendPhoto(filePath: string, cap: string | undefined, formatValue: Format): Promise<void> {
+  const parseMode = parseModeFor(formatValue)
   const form = new FormData()
   form.append("chat_id", CHAT_ID)
   form.append("photo", Bun.file(filePath))
   if (cap) form.append("caption", cap)
+  if (cap && parseMode) form.append("parse_mode", parseMode)
   const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
   await checkResponse(resp, "sendPhoto")
 }
 
-async function sendDocument(filePath: string, cap?: string): Promise<void> {
+async function sendDocument(filePath: string, cap: string | undefined, formatValue: Format): Promise<void> {
+  const parseMode = parseModeFor(formatValue)
   const form = new FormData()
   form.append("chat_id", CHAT_ID)
   form.append("document", Bun.file(filePath))
   if (cap) form.append("caption", cap)
+  if (cap && parseMode) form.append("parse_mode", parseMode)
   const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
   await checkResponse(resp, "sendDocument")
 }
 
-async function sendMediaGroup(mediaItems: Item[], cap?: string): Promise<void> {
+async function sendMediaGroup(mediaItems: Item[], cap: string | undefined, formatValue: Format): Promise<void> {
+  const parseMode = parseModeFor(formatValue)
   const form = new FormData()
   form.append("chat_id", CHAT_ID)
   const mediaArr = mediaItems.map((item, idx) => ({
     type: item.type,
     media: `attach://file${idx}`,
     ...(idx === 0 && cap ? { caption: cap } : {}),
+    ...(idx === 0 && cap && parseMode ? { parse_mode: parseMode } : {}),
   }))
   form.append("media", JSON.stringify(mediaArr))
   for (const [idx, item] of mediaItems.entries()) {
@@ -149,14 +193,14 @@ if (items.length === 0) {
     console.error("Error: no message text provided")
     process.exit(1)
   }
-  await sendMessage(caption)
+  await sendMessage(caption, format)
 } else if (items.length === 1) {
   const item = items[0]
   if (item.type === "photo") {
-    await sendPhoto(item.path, caption || undefined)
+    await sendPhoto(item.path, caption || undefined, format)
   } else {
-    await sendDocument(item.path, caption || undefined)
+    await sendDocument(item.path, caption || undefined, format)
   }
 } else {
-  await sendMediaGroup(items, caption || undefined)
+  await sendMediaGroup(items, caption || undefined, format)
 }
