@@ -398,16 +398,30 @@ function detectAiEmoji(): string {
 
   // 2. Derive from detected model name
   if (MODEL) {
-    const lower = MODEL.toLowerCase()
-    // Try exact match first to avoid false positives (e.g., "kimi" inside "kimi-k2p6-turbo")
-    if (MODEL_EMOJI_MAP[lower]) return MODEL_EMOJI_MAP[lower]
+    const base = extractBaseModel(MODEL)
+    if (MODEL_EMOJI_MAP[base]) return MODEL_EMOJI_MAP[base]
     // Fallback to substring matching for partial matches
     for (const [key, emoji] of Object.entries(MODEL_EMOJI_MAP)) {
-      if (lower.includes(key)) return emoji
+      if (base.includes(key)) return emoji
     }
   }
 
   return "🗂"
+}
+
+function extractBaseModel(modelName: string): string {
+  const lower = modelName.toLowerCase()
+  // Exact match first
+  if (MODEL_EMOJI_MAP[lower]) return lower
+  if (EMBEDDABLE_EMOJI_MAP[lower]) return lower
+  // Try progressively shorter prefixes split by "-" or "_"
+  const parts = lower.split(/[-_]/)
+  for (let i = parts.length; i > 0; i--) {
+    const prefix = parts.slice(0, i).join("-")
+    if (MODEL_EMOJI_MAP[prefix]) return prefix
+    if (EMBEDDABLE_EMOJI_MAP[prefix]) return prefix
+  }
+  return lower
 }
 
 const AI_EMOJI = detectAiEmoji()
@@ -469,12 +483,12 @@ function buildPrefix(): ParsedText {
 
   if (AI_EMOJI) {
     // Convert AI_EMOJI (Unicode) to custom emoji if available
-    const lower = MODEL.toLowerCase()
-    let emojiId = EMBEDDABLE_EMOJI_MAP[lower]
+    const base = extractBaseModel(MODEL)
+    let emojiId = EMBEDDABLE_EMOJI_MAP[base]
     // If not found by exact key, try substring matching
     if (!emojiId) {
       for (const [key, id] of Object.entries(EMBEDDABLE_EMOJI_MAP)) {
-        if (lower.includes(key)) {
+        if (base.includes(key)) {
           emojiId = id
           break
         }
