@@ -64,7 +64,7 @@ Emoji helpers (custom emoji):
   Use :codex:, :gemini:, :claude:, :deepseek:, :qwen:, :kimi:
   :o3:, :o1:, :gpt4:, :gpt3:, :gpt:, :llama:, :ollama:, :mistral:, :grok:, :copilot:
   :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:
-  :hyperide:, :k2p6:
+  :hyperide:
   to embed custom emoji icons from the HyperIDE.ai set.
   Set: https://t.me/addemoji/agents_v10_by_UltraClaudeCodeBot
 
@@ -147,7 +147,6 @@ const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
   deepseek: "5271683223213087502", // 🐳 DeepSeek
   qwen: "5271783192871870913",    // 🟣 Qwen
   alibaba: "5271783192871870913", // 🟣 Qwen
-  k2p6: "5269705184614850043",    // 🌙 Kimi k2.6
   kimi: "5269705184614850043",    // 🌙 Kimi
   moonshot: "5269705184614850043", // 🌙 Kimi
   o3: "5269267767965556041",      // 👐 OpenAI
@@ -227,7 +226,6 @@ const UNICODE_EMOJI_MAP: Record<string, string> = {
   perplexity: "🔮",
   cursor: "👆",
   windsurf: "🏄",
-  k2p6: "🌙",
   devin: "🧑‍💻", cognition: "🧑‍💻",
   aider: "🤝",
   continue: "⏩",
@@ -377,7 +375,7 @@ const MODEL_EMOJI_MAP: Record<string, string> = {
   gemini: "♊️", google: "♊️",
   deepseek: "🐳",
   qwen: "🟣", alibaba: "🟣",
-  k2p6: "🌙", kimi: "🌙", moonshot: "🌙",
+  kimi: "🌙", moonshot: "🌙",
   glm: "🗂", chatglm: "🗂",
   llama: "🦙", meta: "🦙", ollama: "🦙",
   mistral: "Ⓜ️",
