@@ -152,24 +152,22 @@ tg --format html "<b>Important</b>: deployment complete"
 <table align="center" width="100%">
   <tr>
     <td align="center" width="33%">
-      <img src="screenshots/report-1.png" width="280" alt="Status report with HTML formatting" />
+      <img src="screenshots/report-1.png" width="300" alt="Status report with HTML formatting" />
       <br/>
       <sub><b>Status report</b> — HTML + custom emoji</sub>
     </td>
     <td align="center" width="33%">
-      <img src="screenshots/report-2.png" width="280" alt="Visual evidence with multiple photos" />
+      <img src="screenshots/report-2.png" width="300" alt="Visual evidence with multiple photos" />
       <br/>
       <sub><b>Visual evidence</b> — 3 photos + caption</sub>
     </td>
     <td align="center" width="33%">
-      <img src="screenshots/report-3.png" width="280" alt="Summary with formatted list" />
+      <img src="screenshots/report-3.png" width="300" alt="Summary with formatted list" />
       <br/>
       <sub><b>Summary</b> — structured findings</sub>
     </td>
   </tr>
 </table>
-
-> Save your screenshots as `screenshots/report-1.png`, `screenshots/report-2.png`, `screenshots/report-3.png` to match the paths above.
 
 ## License
 
