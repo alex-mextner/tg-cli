@@ -87,20 +87,20 @@ Everything works automatically — no manual configuration needed.
 
 ### Auto-detected models
 
-🌙 <b>Kimi</b> — Moonshot AI<br/>
-✳️ <b>Claude</b> — Anthropic<br/>
-👐 <b>Codex</b> — OpenAI<br/>
-♊️ <b>Gemini</b> — Google<br/>
-🐳 <b>DeepSeek</b><br/>
-🟣 <b>Qwen</b> — Alibaba<br/>
-Ⓜ️ <b>Mistral</b><br/>
-🤘 <b>Grok</b> — xAI<br/>
-🦾 <b>Copilot</b> — GitHub<br/>
-🔮 <b>Perplexity</b><br/>
-👆 <b>Cursor</b><br/>
-🏄 <b>Windsurf</b><br/>
-🦙 <b>Ollama</b><br/>
-🚁 <b>HyperIDE</b><br/>
+<img src="emoji-icons/mini_kimi.png" width="16" height="16" align="top" alt="Kimi" /> <b>Kimi</b> — Moonshot AI<br/>
+<img src="emoji-icons/mini_claude.png" width="16" height="16" align="top" alt="Claude" /> <b>Claude</b> — Anthropic<br/>
+<img src="emoji-icons/mini_codex.png" width="16" height="16" align="top" alt="Codex" /> <b>Codex</b> — OpenAI<br/>
+<img src="emoji-icons/mini_gemini.png" width="16" height="16" align="top" alt="Gemini" /> <b>Gemini</b> — Google<br/>
+<img src="emoji-icons/mini_deepseek.png" width="16" height="16" align="top" alt="DeepSeek" /> <b>DeepSeek</b><br/>
+<img src="emoji-icons/mini_qwen.png" width="16" height="16" align="top" alt="Qwen" /> <b>Qwen</b> — Alibaba<br/>
+<img src="emoji-icons/mini_mistral.png" width="16" height="16" align="top" alt="Mistral" /> <b>Mistral</b><br/>
+<img src="emoji-icons/mini_grok.png" width="16" height="16" align="top" alt="Grok" /> <b>Grok</b> — xAI<br/>
+<img src="emoji-icons/mini_copilot.png" width="16" height="16" align="top" alt="Copilot" /> <b>Copilot</b> — GitHub<br/>
+<img src="emoji-icons/mini_perplexity.png" width="16" height="16" align="top" alt="Perplexity" /> <b>Perplexity</b><br/>
+<img src="emoji-icons/mini_cursor.png" width="16" height="16" align="top" alt="Cursor" /> <b>Cursor</b><br/>
+<img src="emoji-icons/mini_windsurf.png" width="16" height="16" align="top" alt="Windsurf" /> <b>Windsurf</b><br/>
+<img src="emoji-icons/mini_ollama.png" width="16" height="16" align="top" alt="Ollama" /> <b>Ollama</b><br/>
+<img src="emoji-icons/mini_hyperide.png" width="16" height="16" align="top" alt="HyperIDE" /> <b>HyperIDE</b><br/>
 
 ### How it works
 
