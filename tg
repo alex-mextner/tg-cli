@@ -556,10 +556,10 @@ async function sendMessage(text: string, formatValue: Format, entities: EmojiEnt
     chat_id: CHAT_ID,
     text,
   }
-  if (parseMode) {
-    body.parse_mode = parseMode
-  } else if (entities.length > 0) {
+  if (entities.length > 0) {
     body.entities = entities
+  } else if (parseMode) {
+    body.parse_mode = parseMode
   }
   const resp = await fetch(`${API}/sendMessage`, {
     method: "POST",
@@ -575,10 +575,10 @@ async function sendPhoto(filePath: string, cap: string | undefined, formatValue:
   form.append("chat_id", CHAT_ID)
   form.append("photo", Bun.file(filePath))
   if (cap) form.append("caption", cap)
-  if (parseMode) {
-    form.append("parse_mode", parseMode)
-  } else if (entities.length > 0) {
+  if (entities.length > 0) {
     form.append("caption_entities", JSON.stringify(entities))
+  } else if (parseMode) {
+    form.append("parse_mode", parseMode)
   }
   const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
   await checkResponse(resp, "sendPhoto")
@@ -590,10 +590,10 @@ async function sendDocument(filePath: string, cap: string | undefined, formatVal
   form.append("chat_id", CHAT_ID)
   form.append("document", Bun.file(filePath))
   if (cap) form.append("caption", cap)
-  if (parseMode) {
-    form.append("parse_mode", parseMode)
-  } else if (entities.length > 0) {
+  if (entities.length > 0) {
     form.append("caption_entities", JSON.stringify(entities))
+  } else if (parseMode) {
+    form.append("parse_mode", parseMode)
   }
   const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
   await checkResponse(resp, "sendDocument")
@@ -607,8 +607,8 @@ async function sendMediaGroup(mediaItems: Item[], cap: string | undefined, forma
     type: item.type,
     media: `attach://file${idx}`,
     ...(idx === 0 && cap ? { caption: cap } : {}),
-    ...(idx === 0 && parseMode ? { parse_mode: parseMode } : {}),
-    ...(idx === 0 && !parseMode && entities.length > 0 ? { caption_entities: entities } : {}),
+    ...(idx === 0 && entities.length > 0 ? { caption_entities: entities } : {}),
+    ...(idx === 0 && entities.length === 0 && parseMode ? { parse_mode: parseMode } : {}),
   }))
   form.append("media", JSON.stringify(mediaArr))
   for (const [idx, item] of mediaItems.entries()) {
