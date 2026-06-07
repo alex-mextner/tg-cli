@@ -18,23 +18,31 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
-# AI model → emoji association mapping
-# The emoji is what users type to get the custom emoji in Telegram
+# AI model → emoji association mapping. The emoji is the Unicode char users
+# type to get the custom emoji in Telegram. MUST stay in sync with the builder
+# CONFIG in build-emoji-icons.py and MODEL_EMOJI_MAP in `tg` — every model here
+# must have a generated <model>.png from the builder.
 AI_MODELS = {
-    "claude": "🤖",
+    "claude": "✳️",
     "codex": "👐",
-    "gemini": "♊️",
+    "copilot": "🦾",
+    "cursor": "👆",
     "deepseek": "🐳",
-    "qwen": "🟣",
+    "gemini": "♊️",
+    "grok": "🤘",
+    "hyperide": "🚁",
     "kimi": "🌙",
-    "glm": "🗂",
-    "gpt": "⚡",
-    "openai": "⚡",
+    "meta": "🦙",
+    "mistral": "Ⓜ️",
+    "ollama": "🦙",
+    "perplexity": "🔮",
+    "qwen": "🟣",
+    "windsurf": "🏄",
 }
 
 # Set name must be unique and end with "_by_<bot_username>"
-SET_NAME = "ai_models_code"
-SET_TITLE = "AI Models for Code"
+SET_NAME = "agents"
+SET_TITLE = "AI Agents"
 
 
 def create_sticker_set(bot_token: str, image_dir: Path, dry_run: bool = False) -> None:
@@ -44,67 +52,88 @@ def create_sticker_set(bot_token: str, image_dir: Path, dry_run: bool = False) -
     bot_username = get_bot_username(bot_token)
     set_name = f"{SET_NAME}_by_{bot_username}"
 
+    # Preflight: every configured model MUST have an image. A partial upload
+    # would create a broken set that looks successful, so fail loudly first.
+    missing = [m for m in AI_MODELS if not (image_dir / f"{m}.png").exists()]
+
     if dry_run:
         print(f"[DRY RUN] Would create set: {set_name}")
         for model, emoji in AI_MODELS.items():
             img_path = image_dir / f"{model}.png"
-            if img_path.exists():
-                print(f"  - {model}: {emoji} ({img_path})")
-            else:
-                print(f"  - {model}: {emoji} (MISSING: {img_path})")
+            status = "" if img_path.exists() else " (MISSING)"
+            print(f"  - {model}: {emoji} ({img_path}){status}")
+        if missing:
+            print(f"[DRY RUN] {len(missing)} image(s) missing: "
+                  f"{', '.join(missing)}")
         return
 
-    # Create the first sticker (required)
-    first_model = list(AI_MODELS.keys())[0]
-    first_emoji = AI_MODELS[first_model]
-    first_img = image_dir / f"{first_model}.png"
-
-    if not first_img.exists():
-        print(f"Error: First image missing: {first_img}")
+    if missing:
+        print(f"Error: missing image(s) for: {', '.join(missing)}")
+        print(f"Generate them first: "
+              f"build-emoji-icons.py --prefix '' --out {image_dir}")
         sys.exit(1)
 
-    # Create the set
+    owner_id = get_owner_id(bot_token)
+    models = list(AI_MODELS.keys())
+
+    # Bot API 6.6+ createNewStickerSet: pass `stickers` as a JSON array of
+    # InputSticker objects, each referencing an attached file via attach://.
+    # Up to 50 stickers per call, so create the whole set in one request.
+    files = {}
+    input_stickers = []
+    open_handles = []
+    for i, model in enumerate(models):
+        attach = f"file{i}"
+        fh = open(image_dir / f"{model}.png", "rb")
+        open_handles.append(fh)
+        files[attach] = fh
+        input_stickers.append({
+            "sticker": f"attach://{attach}",
+            "format": "static",
+            "emoji_list": [AI_MODELS[model]],
+        })
+
     url = f"https://api.telegram.org/bot{bot_token}/createNewStickerSet"
-    with open(first_img, "rb") as f:
-        files = {"sticker": f}
-        data = {
-            "user_id": get_owner_id(bot_token),
-            "name": set_name,
-            "title": SET_TITLE,
-            "emojis": first_emoji,
-            "sticker_type": "custom_emoji",
-        }
+    data = {
+        "user_id": owner_id,
+        "name": set_name,
+        "title": SET_TITLE,
+        "sticker_type": "custom_emoji",
+        "stickers": json.dumps(input_stickers),
+    }
+    try:
         resp = requests.post(url, data=data, files=files)
+    finally:
+        for fh in open_handles:
+            fh.close()
 
     result = resp.json()
     if not result.get("ok"):
         print(f"Error creating set: {result}")
         sys.exit(1)
 
-    print(f"Created set: {set_name}")
+    print(f"Created set: {set_name} ({len(models)} stickers)")
 
-    # Add remaining stickers
-    for model, emoji in list(AI_MODELS.items())[1:]:
-        img_path = image_dir / f"{model}.png"
-        if not img_path.exists():
-            print(f"  Skipping {model} (missing image)")
-            continue
-
-        add_url = f"https://api.telegram.org/bot{bot_token}/addStickerToSet"
-        with open(img_path, "rb") as f:
-            files = {"sticker": f}
-            data = {
-                "user_id": get_owner_id(bot_token),
-                "name": set_name,
-                "emojis": emoji,
-            }
-            resp = requests.post(add_url, data=data, files=files)
-
-        result = resp.json()
-        if result.get("ok"):
-            print(f"  Added {model}: {emoji}")
-        else:
-            print(f"  Error adding {model}: {result}")
+    # Fetch the finished set and emit model -> custom_emoji_id mapping. Stickers
+    # come back in insertion order, which matches AI_MODELS, so zip by index
+    # (emoji is ambiguous — meta and ollama share 🦙).
+    info_url = f"https://api.telegram.org/bot{bot_token}/getStickerSet"
+    resp = requests.get(info_url, params={"name": set_name})
+    data = resp.json()
+    if not data.get("ok"):
+        print(f"Warning: could not fetch set for IDs: {data}")
+        return
+    stickers = data["result"]["stickers"]
+    models = list(AI_MODELS.keys())
+    print(f"\nSet URL: https://t.me/addemoji/{set_name}")
+    print("\nmodel -> custom_emoji_id:")
+    mapping = {}
+    for model, sticker in zip(models, stickers):
+        cid = sticker.get("custom_emoji_id", "")
+        mapping[model] = cid
+        print(f"  {model}: {cid}")
+    print("\nJSON:")
+    print(json.dumps(mapping, indent=2))
 
 
 def get_bot_username(token: str) -> str:

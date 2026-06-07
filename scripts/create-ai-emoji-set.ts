@@ -9,26 +9,34 @@
  *   - Run: bun scripts/create-ai-emoji-set.ts --image-dir ./assets
  *
  * The script auto-detects the bot username and creates a set named:
- *   ai_models_code_by_<bot_username>
+ *   agents_by_<bot_username>
  */
 
-import { readFileSync } from "fs"
+import { readFileSync, existsSync } from "fs"
 import { join } from "path"
 
+// MUST stay in sync with the builder CONFIG in build-emoji-icons.py and
+// MODEL_EMOJI_MAP in `tg` — every model here must have a generated <model>.png.
 const AI_MODELS: Record<string, string> = {
-  claude: "🤖",
+  claude: "✳️",
   codex: "👐",
-  gemini: "♊️",
+  copilot: "🦾",
+  cursor: "👆",
   deepseek: "🐳",
-  qwen: "🟣",
+  gemini: "♊️",
+  grok: "🤘",
+  hyperide: "🚁",
   kimi: "🌙",
-  glm: "🗂",
-  gpt: "⚡",
-  openai: "⚡",
+  meta: "🦙",
+  mistral: "Ⓜ️",
+  ollama: "🦙",
+  perplexity: "🔮",
+  qwen: "🟣",
+  windsurf: "🏄",
 }
 
-const SET_NAME = "ai_models_code"
-const SET_TITLE = "AI Models for Code"
+const SET_NAME = "agents"
+const SET_TITLE = "AI Agents"
 
 interface Args {
   imageDir: string
@@ -73,39 +81,46 @@ async function createSet(token: string, ownerId: number, imageDir: string, dryRu
   const setName = `${SET_NAME}_by_${botUsername}`
 
   const entries = Object.entries(AI_MODELS)
-  const [firstModel, firstEmoji] = entries[0]
-  const firstPath = join(imageDir, `${firstModel}.png`)
+
+  // Preflight: every configured model MUST have an image. A partial upload
+  // would create a broken set that still looks successful, so fail first.
+  const missing = entries
+    .map(([model]) => model)
+    .filter((model) => !existsSync(join(imageDir, `${model}.png`)))
 
   if (dryRun) {
     console.log(`[DRY RUN] Would create set: ${setName}`)
     for (const [model, emoji] of entries) {
       const p = join(imageDir, `${model}.png`)
-      try {
-        Bun.file(p)
-        console.log(`  - ${model}: ${emoji} (${p})`)
-      } catch {
-        console.log(`  - ${model}: ${emoji} (MISSING: ${p})`)
-      }
+      const status = existsSync(p) ? "" : " (MISSING)"
+      console.log(`  - ${model}: ${emoji} (${p})${status}`)
+    }
+    if (missing.length) {
+      console.log(`[DRY RUN] ${missing.length} image(s) missing: ${missing.join(", ")}`)
     }
     return
   }
 
-  // Check first image exists
-  try {
-    Bun.file(firstPath)
-  } catch {
-    console.error(`Error: First image missing: ${firstPath}`)
+  if (missing.length) {
+    console.error(`Error: missing image(s) for: ${missing.join(", ")}`)
+    console.error(`Generate them first: build-emoji-icons.py --prefix '' --out ${imageDir}`)
     process.exit(1)
   }
 
-  // Create set
+  // Bot API 6.6+ createNewStickerSet: pass `stickers` as a JSON array of
+  // InputSticker objects, each referencing an attached file via attach://.
+  // Up to 50 stickers per call, so create the whole set in one request.
   const form = new FormData()
   form.append("user_id", String(ownerId))
   form.append("name", setName)
   form.append("title", SET_TITLE)
-  form.append("emojis", firstEmoji)
   form.append("sticker_type", "custom_emoji")
-  form.append("sticker", Bun.file(firstPath))
+  const inputStickers = entries.map(([model, emoji], idx) => {
+    const attach = `file${idx}`
+    form.append(attach, Bun.file(join(imageDir, `${model}.png`)))
+    return { sticker: `attach://${attach}`, format: "static", emoji_list: [emoji] }
+  })
+  form.append("stickers", JSON.stringify(inputStickers))
 
   const resp = await fetch(`https://api.telegram.org/bot${token}/createNewStickerSet`, {
     method: "POST",
@@ -117,35 +132,29 @@ async function createSet(token: string, ownerId: number, imageDir: string, dryRu
     process.exit(1)
   }
 
-  console.log(`Created set: ${setName}`)
+  console.log(`Created set: ${setName} (${entries.length} stickers)`)
 
-  // Add remaining stickers
-  for (const [model, emoji] of entries.slice(1)) {
-    const path = join(imageDir, `${model}.png`)
-    try {
-      Bun.file(path)
-    } catch {
-      console.log(`  Skipping ${model} (missing image)`)
-      continue
-    }
-
-    const addForm = new FormData()
-    addForm.append("user_id", String(ownerId))
-    addForm.append("name", setName)
-    addForm.append("emojis", emoji)
-    addForm.append("sticker", Bun.file(path))
-
-    const addResp = await fetch(`https://api.telegram.org/bot${token}/addStickerToSet`, {
-      method: "POST",
-      body: addForm,
-    })
-    const addResult = await addResp.json() as { ok: boolean; description?: string }
-    if (addResult.ok) {
-      console.log(`  Added ${model}: ${emoji}`)
-    } else {
-      console.log(`  Error adding ${model}: ${addResult.description ?? "unknown"}`)
-    }
+  // Fetch the finished set and emit model -> custom_emoji_id mapping. Stickers
+  // come back in insertion order (matches AI_MODELS); zip by index since emoji
+  // is ambiguous (meta and ollama share 🦙).
+  const infoResp = await fetch(
+    `https://api.telegram.org/bot${token}/getStickerSet?name=${setName}`)
+  const info = await infoResp.json() as {
+    ok: boolean
+    result?: { stickers: Array<{ custom_emoji_id?: string }> }
   }
+  if (!info.ok || !info.result) {
+    console.warn(`Warning: could not fetch set for IDs`)
+    return
+  }
+  const mapping: Record<string, string> = {}
+  console.log(`\nSet URL: https://t.me/addemoji/${setName}\n\nmodel -> custom_emoji_id:`)
+  entries.forEach(([model], idx) => {
+    const cid = info.result!.stickers[idx]?.custom_emoji_id ?? ""
+    mapping[model] = cid
+    console.log(`  ${model}: ${cid}`)
+  })
+  console.log(`\nJSON:\n${JSON.stringify(mapping, null, 2)}`)
 }
 
 async function main() {

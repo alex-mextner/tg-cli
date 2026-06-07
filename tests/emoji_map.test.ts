@@ -1,7 +1,22 @@
 import { test, expect, beforeAll } from "bun:test"
+import { mkdtempSync, writeFileSync, chmodSync } from "fs"
+import { tmpdir } from "os"
+import { join } from "path"
 
 // Import the emoji map from the CLI
 const TG_PATH = new URL("../tg", import.meta.url).pathname
+
+// Create a temp dir with a fake `pgrep` that reports `ollama` as running.
+// Prepending it to PATH lets us prove the Claude env check wins over the
+// pgrep fallback even when an ollama daemon is genuinely up.
+function fakePgrepBinDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const script = '#!/bin/sh\nfor a in "$@"; do [ "$a" = "ollama" ] && exit 0; done\nexit 1\n'
+  const p = join(dir, "pgrep")
+  writeFileSync(p, script)
+  chmodSync(p, 0o755)
+  return dir
+}
 
 // Sanitize environment for subprocess tests
 // Whitelist only essential vars to prevent env leakage
@@ -114,7 +129,7 @@ test("gpt has Unicode fallback", async () => {
 })
 
 test("gpt shares OpenAI custom emoji ID", () => {
-  expect(EMBEDDABLE_EMOJI_MAP["gpt"]).toBe("5269267767965556041")
+  expect(EMBEDDABLE_EMOJI_MAP["gpt"]).toBe("5273797309195393626")
 })
 
 test("fireworks is Unicode-only (no custom emoji ID)", () => {
@@ -158,9 +173,9 @@ test("EMBEDDABLE_EMOJI_MAP structure is consistent", () => {
 test("set URL in comment matches help text", async () => {
   const content = await Bun.file(TG_PATH).text()
   // Find the comment URL (anchored to "// Default:")
-  const commentMatch = content.match(/\/\/ Default:.*?t\.me\/addemoji\/(agents_v\d+_by_[^\s)]+)/)
+  const commentMatch = content.match(/\/\/ Default:.*?t\.me\/addemoji\/(agents(?:_v\d+)?_by_[^\s)]+)/)
   // Find the help text URL (anchored to "Set:")
-  const helpMatch = content.match(/Set: https:\/\/t\.me\/addemoji\/(agents_v\d+_by_[^\s)]+)/)
+  const helpMatch = content.match(/Set: https:\/\/t\.me\/addemoji\/(agents(?:_v\d+)?_by_[^\s)]+)/)
   expect(commentMatch).toBeTruthy()
   expect(helpMatch).toBeTruthy()
   if (commentMatch && helpMatch) {
@@ -324,7 +339,7 @@ test("empty TG_EMOJI_IDS does not break defaults", async () => {
   const exitCode = await proc.exited
   expect(exitCode).toBe(0)
   // Should still show default IDs
-  expect(stdout.includes("5269756337675346446")).toBe(true) // hyperide
+  expect(stdout.includes("5274191514178723918")).toBe(true) // hyperide
 }, 10000)
 
 test("malformed TG_EMOJI_IDS does not break defaults", async () => {
@@ -344,7 +359,7 @@ test("malformed TG_EMOJI_IDS does not break defaults", async () => {
   const exitCode = await proc.exited
   expect(exitCode).toBe(0)
   // Should still show default IDs despite malformed JSON
-  expect(stdout.includes("5269756337675346446")).toBe(true) // hyperide
+  expect(stdout.includes("5274191514178723918")).toBe(true) // hyperide
   expect(stderr.includes("Warning: TG_EMOJI_IDS contains invalid JSON")).toBe(true)
 }, 10000)
 
@@ -388,7 +403,7 @@ test("TG_EMOJI_IDS with empty string value is rejected with warning", async () =
   // Empty string doesn't match ^\d{19}$, so it's rejected as invalid
   expect(stderr.includes("Warning: Ignoring invalid emoji ID")).toBe(true)
   // Should still show default Claude ID
-  expect(stdout.includes("5271533015321842500")).toBe(true)
+  expect(stdout.includes("5274170649227600531")).toBe(true)
 }, 10000)
 
 test("TG_EMOJI_IDS with non-string value is rejected with warning", async () => {
@@ -409,7 +424,7 @@ test("TG_EMOJI_IDS with non-string value is rejected with warning", async () => 
   expect(exitCode).toBe(0)
   // Non-string value should be rejected with warning
   expect(stderr.includes("Warning: Ignoring non-string emoji ID")).toBe(true)
-  expect(stdout.includes("5271533015321842500")).toBe(true)
+  expect(stdout.includes("5274170649227600531")).toBe(true)
 }, 10000)
 
 test("TG_EMOJI_IDS with null value is rejected gracefully", async () => {
@@ -726,9 +741,9 @@ test("gpt alias shares the same ID as gpt4 and gpt3", async () => {
   expect(gpt4Line).toBeTruthy()
   expect(gpt3Line).toBeTruthy()
   // All share the same custom emoji ID
-  expect(gptLine!.includes("5269267767965556041")).toBe(true)
-  expect(gpt4Line!.includes("5269267767965556041")).toBe(true)
-  expect(gpt3Line!.includes("5269267767965556041")).toBe(true)
+  expect(gptLine!.includes("5273797309195393626")).toBe(true)
+  expect(gpt4Line!.includes("5273797309195393626")).toBe(true)
+  expect(gpt3Line!.includes("5273797309195393626")).toBe(true)
 }, 10000)
 
 test("TG_EMOJI_ID_CLAUDE with non-numeric ID is rejected with warning", async () => {
@@ -770,7 +785,7 @@ test("empty TG_EMOJI_ID_CLAUDE is treated as missing", async () => {
   // Empty string is falsy, so Claude should still have its default ID
   const claudeLine = stdout.split("\n").find((line: string) => line.includes(":claude:"))
   expect(claudeLine).toBeTruthy()
-  expect(claudeLine!.includes("5271533015321842500")).toBe(true)
+  expect(claudeLine!.includes("5274170649227600531")).toBe(true)
 }, 10000)
 
 test("unsupported helper :glm: is documented as Unicode-only", async () => {
@@ -883,8 +898,8 @@ test("emoji helpers are resolved correctly in ls-emoji-helpers", async () => {
   expect(stdout.includes(":deepseek:")).toBe(true)
   expect(stdout.includes("🐳")).toBe(true)
   // Check that custom emoji IDs are shown for embeddable helpers
-  expect(stdout.includes("5269756337675346446")).toBe(true) // hyperide
-  expect(stdout.includes("5271533015321842500")).toBe(true) // claude
+  expect(stdout.includes("5274191514178723918")).toBe(true) // hyperide
+  expect(stdout.includes("5274170649227600531")).toBe(true) // claude
   // Check ollama (new in v10) — specific line to avoid ambiguity with llama/meta
   const ollamaLine = stdout.split("\n").find((line: string) => line.includes(":ollama:"))
   expect(ollamaLine).toBeTruthy()
@@ -898,4 +913,90 @@ test("emoji helpers are resolved correctly in ls-emoji-helpers", async () => {
   // Check fireworks (Unicode-only)
   expect(stdout.includes(":fireworks:")).toBe(true)
   expect(stdout.includes("🎆")).toBe(true)
+}, 10000)
+
+test("CLAUDECODE env detects claude (not a background ollama daemon)", async () => {
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: {
+      ...sanitizeEnv(),
+      CLAUDECODE: "1",
+      TG_BOT_TOKEN: "dummy",
+      TG_CHAT_ID: "123",
+    },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  const exitCode = await proc.exited
+  expect(exitCode).toBe(0)
+  // Regression: a running `ollama` daemon used to win the pgrep fallback and
+  // mislabel Claude Code sessions as ollama.
+  expect(stdout.startsWith("claude")).toBe(true)
+  expect(stdout.includes("✳️")).toBe(true)
+}, 10000)
+
+test("TG_AI_MODEL overrides CLAUDECODE detection", async () => {
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: {
+      ...sanitizeEnv(),
+      CLAUDECODE: "1",
+      TG_AI_MODEL: "gemini",
+      TG_BOT_TOKEN: "dummy",
+      TG_CHAT_ID: "123",
+    },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  const exitCode = await proc.exited
+  expect(exitCode).toBe(0)
+  expect(stdout.startsWith("gemini")).toBe(true)
+}, 10000)
+
+test("--detect-model works without Telegram credentials (info-only flag)", async () => {
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: {
+      // No TG_BOT_TOKEN / TG_CHAT_ID — info-only flags must not require them.
+      ...sanitizeEnv(),
+      CLAUDECODE: "1",
+    },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  const exitCode = await proc.exited
+  expect(exitCode).toBe(0)
+  expect(stdout.startsWith("claude")).toBe(true)
+}, 10000)
+
+test("CLAUDECODE beats a genuinely-running ollama (fake pgrep)", async () => {
+  const env = sanitizeEnv()
+  const binDir = fakePgrepBinDir()
+  const PATH = `${binDir}:${env.PATH}`
+
+  // Control: with a fake ollama 'running' and NO CLAUDECODE, detection falls
+  // through to the pgrep block and reports ollama — proving the fake works.
+  const control = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const controlOut = await new Response(control.stdout).text()
+  await control.exited
+  expect(controlOut.startsWith("ollama")).toBe(true)
+
+  // Regression: CLAUDECODE must win even though ollama is 'running'.
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH, CLAUDECODE: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect((await proc.exited)).toBe(0)
+  expect(stdout.startsWith("claude")).toBe(true)
 }, 10000)

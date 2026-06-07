@@ -6,7 +6,7 @@ The `tg` CLI supports custom emoji icons for AI model identification in Telegram
 
 ## How it works
 
-1. The bot `@UltraClaudeCodeBot` owns custom emoji sticker sets
+1. The bot `@HyperIDE_Bot` owns custom emoji sticker sets
 2. Each sticker has a `custom_emoji_id` (19-digit numeric string)
 3. The `tg` CLI maps model names to these IDs
 4. When sending a message, the CLI creates `custom_emoji` entities in the Telegram API payload
@@ -14,29 +14,29 @@ The `tg` CLI supports custom emoji icons for AI model identification in Telegram
 
 ## Current set
 
-- **Set name**: `agents_v10_by_UltraClaudeCodeBot`
-- **URL**: https://t.me/addemoji/agents_v10_by_UltraClaudeCodeBot
-- **Bot**: `@UltraClaudeCodeBot`
+- **Set name**: `agents_by_HyperIDE_Bot`
+- **URL**: https://t.me/addemoji/agents_by_HyperIDE_Bot
+- **Bot**: `@HyperIDE_Bot`
 
 ## Model to Emoji mapping
 
 | Model | Emoji | Custom Emoji ID | Notes |
 |-------|-------|-----------------|-------|
-| HyperIDE | 🚁 | `5269756337675346446` | |
-| Claude | ✳️ | `5271533015321842500` | Also anthropic, devin, cognition, aider, continue |
-| Codex / OpenAI | 👐 | `5269267767965556041` | Also o3, o1, gpt4, gpt3, gpt |
-| Gemini | ♊️ | `5271619099351358220` | Also google |
-| DeepSeek | 🐳 | `5271683223213087502` | |
-| Qwen | 🟣 | `5271783192871870913` | Also alibaba |
-| Kimi | 🌙 | `5269705184614850043` | Also moonshot. Any version (kimi-k2p6-turbo) matches |
-| Mistral | Ⓜ️ | `5271760476789841127` | |
-| Grok | 🤘 | `5271696550496611333` | Also xai |
-| Copilot | 🦾 | `5271673589601443183` | Also github |
-| Perplexity | 🔮 | `5269534987945814166` | |
-| Cursor | 👆 | `5271670853707276208` | |
-| Windsurf | 🏄 | `5269760727131924567` | |
-| Meta / Llama | 🦙 | `5271674856616794663` | |
-| Ollama | 🦙 | `5271946500413365403` | |
+| HyperIDE | 🚁 | `5274191514178723918` | |
+| Claude | ✳️ | `5274170649227600531` | Also anthropic, devin, cognition, aider, continue |
+| Codex / OpenAI | 👐 | `5273797309195393626` | Also o3, o1, gpt4, gpt3, gpt |
+| Gemini | ♊️ | `5274254027427716477` | Also google |
+| DeepSeek | 🐳 | `5274018976752511967` | |
+| Qwen | 🟣 | `5274109179655661197` | Also alibaba |
+| Kimi | 🌙 | `5273889053991805596` | Also moonshot. Any version (kimi-k2p6-turbo) matches |
+| Mistral | Ⓜ️ | `5273823740424134905` | |
+| Grok | 🤘 | `5273973737861981852` | Also xai |
+| Copilot | 🦾 | `5274136375388580049` | Also github |
+| Perplexity | 🔮 | `5273733846758631156` | |
+| Cursor | 👆 | `5273731871073672487` | |
+| Windsurf | 🏄 | `5273875761068025296` | |
+| Meta / Llama | 🦙 | `5274259902942977093` | |
+| Ollama | 🦙 | `5273886056104634966` | |
 
 ## Alias system
 
@@ -46,6 +46,22 @@ Multiple model names can share the same emoji ID. This is intentional — versio
 - `codex`, `openai`, `o3`, `o1`, `gpt4`, `gpt3`, `gpt` → OpenAI's 👐
 - `gemini`, `google` → Gemini's ♊️
 - `kimi`, `moonshot`, `kimi-k2p6-turbo`, `kimi-k1.5` → Kimi's 🌙
+
+## Agent / model detection
+
+`detectAiModel()` picks the icon for the agent sending the message. Resolution order
+(first match wins) — explicit signals MUST come before pgrep fallbacks:
+
+1. `TG_AI_MODEL` env — explicit override, always wins.
+2. **`CLAUDECODE` / `CLAUDE_CODE_ENTRYPOINT` env → `claude`.** Claude Code sets these in
+   the agent environment. This check is deliberately ahead of the pgrep block: a
+   background `ollama` daemon (common on macOS) matches `pgrep -x ollama` and otherwise
+   mislabels a Claude Code session as ollama. (Regression covered by tests.)
+3. `OPENCODE` env → read the model from `opencode debug config`.
+4. `CODEX` env → `codex`.
+5. pgrep fallbacks for `aider`, `cursor`, `windsurf`, `llama`, `ollama`, `opencode`.
+
+Debug the result without sending a message: `tg --detect-model` prints `<model>\t<emoji>`.
 
 ## Version-agnostic detection
 
@@ -87,10 +103,14 @@ All icons are sourced from [svgl](https://svgl.app/) or similar icon repositorie
 
 ### SVG sources
 
-| Model | SVG source | Notes |
-|-------|-----------|-------|
+**All SVG sources live in the repo under `emoji-icons/src/<model>.svg`.** Never re-download
+ad hoc — the committed SVG is the single source of truth. Original upstream URLs (for
+re-fetching if an icon needs updating):
+
+| Model | Upstream source | Notes |
+|-------|-----------------|-------|
 | Claude | https://svgl.app/library/anthropic | |
-| Codex | Custom gear design (mini PNG — do not replace) | mini_codex.png is the canonical version |
+| Codex | https://svgl.app/library/openai | OpenAI flower mark (= ChatGPT). Rendered on a white circle. |
 | Gemini | https://svgl.app/library/gemini | |
 | DeepSeek | https://svgl.app/library/deepseek | |
 | Kimi | https://svgl.app/library/kimi | |
@@ -103,40 +123,105 @@ All icons are sourced from [svgl](https://svgl.app/) or similar icon repositorie
 | Cursor | https://svgl.app/library/cursor | |
 | Qwen | https://svgl.app/library/qwen | |
 | Ollama | https://svgl.app/library/ollama | |
-| HyperIDE | https://github.com/hyperide/hyper-ext/blob/main/vscode-extension/hypercanvas-preview/media/preview.svg | Uses `currentColor` → render with `stroke="white"` |
+| HyperIDE | https://github.com/hyperide/hyper-ext/blob/main/vscode-extension/hypercanvas-preview/media/preview.svg | Uses `currentColor` → script substitutes `stroke="black"` (black H on a white disc) |
 
 ### Per-model rules
 
-| Model | Processing | Background | Stroke | Notes |
-|-------|-----------|------------|--------|-------|
-| Claude | Copy as-is | No | No | Already visible on dark |
-| Codex | Use mini PNG as-is | No | No | Custom gear design, do not replace with openai.svg |
-| Gemini | Copy as-is | No | No | Already visible on dark |
-| DeepSeek | Copy as-is | No | No | Already visible on dark |
-| Kimi | Copy as-is | No | No | Already visible on dark |
-| Mistral | Copy as-is | No | No | Already visible on dark |
-| Meta/Llama | Copy as-is | No | No | Already visible on dark |
-| Perplexity | Copy as-is | No | No | Already visible on dark |
-| Grok | White circle | Yes | No | Needs visibility on dark |
-| Copilot | White circle | Yes | No | Needs visibility on dark |
-| Windsurf | White ring stroke only | No | Yes | Dark icon, ring border only — no fill |
-| Cursor | White ring stroke only | No | Yes | Dark icon, ring border only — no fill |
-| Qwen | Purple fill `#7B3FF2` | No | No | Was black, changed to purple |
-| Ollama | White circle | Yes | No | Large paths, needs centering |
-| HyperIDE | Render with stroke="white" | No | No | currentColor SVG, preserve original H viewBox |
+Treatment is declared in `CONFIG` inside `scripts/build-emoji-icons.py` and applied
+programmatically — do NOT bake circles/strokes into the source SVGs.
+
+- **circle**: solid white disc behind the icon (for dark/low-contrast marks).
+- **contour**: white silhouette traced around the icon's shape — an outline that follows
+  the actual contour, NOT a surrounding circle. Used for dark icons that should keep their
+  shape readable on a dark background.
+- **none**: icon as-is on transparency (already visible on dark).
+
+| Model | Background | `scale` | Notes |
+|-------|-----------|---------|-------|
+| Claude | none | 0.82 | Already visible on dark |
+| Codex | circle | 0.60 | OpenAI flower on white disc |
+| Copilot | circle | 0.60 | |
+| Ollama | circle | 0.56 | Smaller — was clipping at larger scale |
+| Grok | circle | 0.60 | Dark mark on white disc |
+| Perplexity | circle | 0.60 | Dark teal mark on white disc |
+| Windsurf | circle | 0.60 | Line-art W on white disc |
+| HyperIDE | circle | 0.58 | Black H (`stroke="black"`) on white disc — stays legible on light AND dark Telegram themes |
+| Cursor | contour | 0.74 | Dark mark, white silhouette outline |
+| Qwen | contour | 0.74 | Purple fill `#7B3FF2` + white silhouette outline |
+| Gemini | none | 0.82 | |
+| DeepSeek | none | 0.82 | |
+| Kimi | none | 0.82 | |
+| Mistral | none | 0.82 | |
+| Meta/Llama | none | 0.82 | |
+
+`scale` = fraction of the cell the trimmed icon content occupies. Lower = more padding.
+circle/contour icons sit smaller so the treatment has room. Icons are auto-trimmed
+(transparent border removed) then scaled to fit, so nothing clips regardless of source
+viewBox.
+
+The white disc is drawn with anti-aliasing (4× supersample + LANCZOS downscale) — a 1×
+`ImageDraw.ellipse` produces a jagged staircase edge that looks pixelated in Telegram.
+
+**Verify on both themes:** `--preview` renders a dark-bg collage, `--preview-light` a
+light-bg one. Any icon relying on a white disc or white stroke MUST be checked on the
+light preview — white-on-white vanishes (this is why HyperIDE moved from `stroke="white"`
+to a black H on a white disc).
 
 ## Build pipeline
 
-1. **Copy untouched icons** from previous version (v9 → v10): claude, codex, gemini, deepseek, perplexity, kimi, mistral, meta
-2. **Fix specific icons**:
-   - Qwen: purple fill instead of black
-   - HyperIDE: restore original 512×512 viewBox
-   - Ollama: auto-center using bounding box calculation
-   - Grok/Copilot/Windsurf/Cursor: preserve original viewBox, add white stroke, shrink 4px, center
-3. **Generate PNG** via `rsvg-convert` (100×100)
-4. **Create preview collage** for visual verification
-5. **Upload to Telegram** via `createNewStickerSet` with `sticker_type=custom_emoji`
-6. **Update IDs** in `tg` CLI source
+The build is fully scripted — `scripts/build-emoji-icons.py`:
+
+```bash
+# Render all icons at 100×100 (Telegram custom emoji size)
+python3 scripts/build-emoji-icons.py --size 100
+
+# Preview only (no file writes) + dark-bg collage for review
+python3 scripts/build-emoji-icons.py --no-write --preview /tmp/preview.png
+
+# Rebuild a subset
+python3 scripts/build-emoji-icons.py --only codex,ollama
+```
+
+Per icon the script: renders `src/<model>.svg` via `rsvg-convert` at 512px → auto-trims
+transparent borders → scales to `scale*size` with centered padding → applies the `bg`
+treatment (circle / contour / none) → writes `<prefix><model>.png` at `--size`.
+
+Output filenames default to the `mini_` prefix (matching the committed repo assets). The
+upload scripts (`create-ai-emoji-set.py` / `.ts`) expect bare `<model>.png`, so generate
+upload assets into a temp dir with `--prefix ''`:
+
+```bash
+python3 scripts/build-emoji-icons.py --size 100 --prefix '' --out /tmp/upload
+python3 scripts/create-ai-emoji-set.py --image-dir /tmp/upload
+```
+
+A missing `src/<model>.svg` for any configured model is a fatal error (the script exits
+non-zero before rendering) — generated assets never go stale silently.
+
+### Mandatory review workflow (do this every time, no exceptions)
+
+1. **Render** both previews:
+   `build-emoji-icons.py --no-write --preview /tmp/dark.png --preview-light /tmp/light.png`
+   Check icons on BOTH — white discs/strokes can vanish on the light theme.
+2. **Run `review` CLI** on the working-tree diff (`review` in the repo root) BEFORE sending
+   anything. Fix every finding.
+3. **Fix** issues, re-render, re-review until clean.
+4. **Only then send the preview to Telegram** for human approval. Never send an unreviewed
+   preview.
+5. After approval: write `mini_*.png` (`build-emoji-icons.py --size 100`), generate upload
+   assets (`--prefix '' --out /tmp/upload`), upload via `create-ai-emoji-set.py`, update IDs
+   in `tg` from the printed mapping.
+
+### Bot API note (createNewStickerSet)
+
+Bot API 6.6+ takes `stickers` as a JSON array of InputSticker objects
+(`{sticker: "attach://fileN", format: "static", emoji_list: [emoji]}`) with files attached
+via multipart `attach://` — NOT the old single-`sticker`+`emojis` form (that returns
+"there is no sticker file in the request"). The owner `user_id` must have interacted with
+the bot at least once (send `/start`), else `createNewStickerSet` returns "user not found".
+
+Every new requirement the user states about icon treatment MUST be recorded in this spec
+(the `CONFIG` table above) — the spec is the contract, not chat history.
 
 ## Environment variable overrides
 
