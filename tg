@@ -64,7 +64,7 @@ Emoji helpers (custom emoji):
   Use :codex:, :gemini:, :claude:, :deepseek:, :qwen:, :kimi:
   :o3:, :o1:, :gpt4:, :gpt3:, :gpt:, :llama:, :ollama:, :mistral:, :grok:, :copilot:
   :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:
-  :hyperide:
+  :hyperide:, :k2p6:
   to embed custom emoji icons from the HyperIDE.ai set.
   Set: https://t.me/addemoji/agents_v10_by_UltraClaudeCodeBot
 
@@ -147,6 +147,7 @@ const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
   deepseek: "5271683223213087502", // 🐳 DeepSeek
   qwen: "5271783192871870913",    // 🟣 Qwen
   alibaba: "5271783192871870913", // 🟣 Qwen
+  k2p6: "5269705184614850043",    // 🌙 Kimi k2.6
   kimi: "5269705184614850043",    // 🌙 Kimi
   moonshot: "5269705184614850043", // 🌙 Kimi
   o3: "5269267767965556041",      // 👐 OpenAI
@@ -226,6 +227,7 @@ const UNICODE_EMOJI_MAP: Record<string, string> = {
   perplexity: "🔮",
   cursor: "👆",
   windsurf: "🏄",
+  k2p6: "🌙",
   devin: "🧑‍💻", cognition: "🧑‍💻",
   aider: "🤝",
   continue: "⏩",
@@ -319,11 +321,21 @@ function detectAiModel(): string {
           const prov = p as { models?: Record<string, unknown> }
           if (prov.models) {
             const ids = Object.keys(prov.models)
-            if (ids.length === 1) return ids[0]
+            if (ids.length === 1) {
+              const fullId = ids[0]
+              // Extract short name from full ID (e.g., accounts/fireworks/routers/kimi-k2p6-turbo -> kimi-k2p6-turbo)
+              const shortName = fullId.includes('/') ? (fullId.split('/').pop() || fullId) : fullId
+              return shortName
+            }
             // If multiple, prefer the one that looks like a router/default
             const router = ids.find((id) => id.includes("router"))
-            if (router) return router
-            return ids[0]
+            if (router) {
+              const shortName = router.includes('/') ? (router.split('/').pop() || router) : router
+              return shortName
+            }
+            const first = ids[0]
+            const shortName = first.includes('/') ? (first.split('/').pop() || first) : first
+            return shortName
           }
         }
       }
@@ -365,7 +377,7 @@ const MODEL_EMOJI_MAP: Record<string, string> = {
   gemini: "♊️", google: "♊️",
   deepseek: "🐳",
   qwen: "🟣", alibaba: "🟣",
-  kimi: "🌙", moonshot: "🌙",
+  k2p6: "🌙", kimi: "🌙", moonshot: "🌙",
   glm: "🗂", chatglm: "🗂",
   llama: "🦙", meta: "🦙", ollama: "🦙",
   mistral: "Ⓜ️",
@@ -389,6 +401,9 @@ function detectAiEmoji(): string {
   // 2. Derive from detected model name
   if (MODEL) {
     const lower = MODEL.toLowerCase()
+    // Try exact match first to avoid false positives (e.g., "kimi" inside "kimi-k2p6-turbo")
+    if (MODEL_EMOJI_MAP[lower]) return MODEL_EMOJI_MAP[lower]
+    // Fallback to substring matching for partial matches
     for (const [key, emoji] of Object.entries(MODEL_EMOJI_MAP)) {
       if (lower.includes(key)) return emoji
     }
