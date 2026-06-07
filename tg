@@ -533,8 +533,27 @@ const finalEntities: EmojiEntity[] = [
 ]
 
 // --- API calls ---
-function parseModeFor(formatValue: Format): "HTML" | undefined {
-  return formatValue === "html" ? "HTML" : undefined
+function detectHtmlTags(text: string): boolean {
+  const htmlPattern = /<(b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|tg-time|code|pre|blockquote)\b/i
+  return htmlPattern.test(text)
+}
+
+function parseModeFor(formatValue: Format, text?: string): "HTML" | undefined {
+  if (formatValue === "html") return "HTML"
+  if (text && detectHtmlTags(text)) return "HTML"
+  return undefined
+}
+
+function convertEntitiesToHtml(text: string, entities: EmojiEntity[]): string {
+  // Sort by offset descending to replace from end to start without invalidating offsets
+  const sorted = [...entities].sort((a, b) => b.offset - a.offset)
+  let result = text
+  for (const entity of sorted) {
+    const emoji = result.slice(entity.offset, entity.offset + entity.length)
+    const replacement = `<tg-emoji emoji-id="${entity.custom_emoji_id}">${emoji}</tg-emoji>`
+    result = result.slice(0, entity.offset) + replacement + result.slice(entity.offset + entity.length)
+  }
+  return result
 }
 
 async function checkResponse(resp: Response, method: string): Promise<void> {
@@ -551,15 +570,19 @@ async function checkResponse(resp: Response, method: string): Promise<void> {
 }
 
 async function sendMessage(text: string, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
-  const parseMode = parseModeFor(formatValue)
+  const parseMode = parseModeFor(formatValue, text)
+  let finalText = text
+  if (parseMode && entities.length > 0) {
+    finalText = convertEntitiesToHtml(text, entities)
+  }
   const body: Record<string, unknown> = {
     chat_id: CHAT_ID,
-    text,
+    text: finalText,
   }
-  if (entities.length > 0) {
-    body.entities = entities
-  } else if (parseMode) {
+  if (parseMode) {
     body.parse_mode = parseMode
+  } else if (entities.length > 0) {
+    body.entities = entities
   }
   const resp = await fetch(`${API}/sendMessage`, {
     method: "POST",
@@ -570,45 +593,57 @@ async function sendMessage(text: string, formatValue: Format, entities: EmojiEnt
 }
 
 async function sendPhoto(filePath: string, cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
-  const parseMode = parseModeFor(formatValue)
+  const parseMode = parseModeFor(formatValue, cap)
+  let finalCap = cap
+  if (parseMode && cap && entities.length > 0) {
+    finalCap = convertEntitiesToHtml(cap, entities)
+  }
   const form = new FormData()
   form.append("chat_id", CHAT_ID)
   form.append("photo", Bun.file(filePath))
-  if (cap) form.append("caption", cap)
-  if (entities.length > 0) {
-    form.append("caption_entities", JSON.stringify(entities))
-  } else if (parseMode) {
+  if (finalCap) form.append("caption", finalCap)
+  if (parseMode) {
     form.append("parse_mode", parseMode)
+  } else if (entities.length > 0) {
+    form.append("caption_entities", JSON.stringify(entities))
   }
   const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
   await checkResponse(resp, "sendPhoto")
 }
 
 async function sendDocument(filePath: string, cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
-  const parseMode = parseModeFor(formatValue)
+  const parseMode = parseModeFor(formatValue, cap)
+  let finalCap = cap
+  if (parseMode && cap && entities.length > 0) {
+    finalCap = convertEntitiesToHtml(cap, entities)
+  }
   const form = new FormData()
   form.append("chat_id", CHAT_ID)
   form.append("document", Bun.file(filePath))
-  if (cap) form.append("caption", cap)
-  if (entities.length > 0) {
-    form.append("caption_entities", JSON.stringify(entities))
-  } else if (parseMode) {
+  if (finalCap) form.append("caption", finalCap)
+  if (parseMode) {
     form.append("parse_mode", parseMode)
+  } else if (entities.length > 0) {
+    form.append("caption_entities", JSON.stringify(entities))
   }
   const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
   await checkResponse(resp, "sendDocument")
 }
 
 async function sendMediaGroup(mediaItems: Item[], cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
-  const parseMode = parseModeFor(formatValue)
+  const parseMode = parseModeFor(formatValue, cap)
+  let finalCap = cap
+  if (parseMode && cap && entities.length > 0) {
+    finalCap = convertEntitiesToHtml(cap, entities)
+  }
   const form = new FormData()
   form.append("chat_id", CHAT_ID)
   const mediaArr = mediaItems.map((item, idx) => ({
     type: item.type,
     media: `attach://file${idx}`,
-    ...(idx === 0 && cap ? { caption: cap } : {}),
-    ...(idx === 0 && entities.length > 0 ? { caption_entities: entities } : {}),
-    ...(idx === 0 && entities.length === 0 && parseMode ? { parse_mode: parseMode } : {}),
+    ...(idx === 0 && finalCap ? { caption: finalCap } : {}),
+    ...(idx === 0 && parseMode ? { parse_mode: parseMode } : {}),
+    ...(idx === 0 && !parseMode && entities.length > 0 ? { caption_entities: entities } : {}),
   }))
   form.append("media", JSON.stringify(mediaArr))
   for (const [idx, item] of mediaItems.entries()) {

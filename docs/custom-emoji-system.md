@@ -137,6 +137,21 @@ Validation:
 - Arrays and non-object JSON are rejected
 - Prototype pollution keys (`__proto__`, `constructor`, `toString`, `valueOf`) are blocked
 
+## HTML and Custom Emoji
+
+Telegram Bot API does not allow `entities` and `parse_mode` simultaneously. The `tg` CLI handles this automatically:
+
+- **Without `--format html`**: Uses `entities` (custom emoji works, HTML tags in text are sent as plain text)
+- **With `--format html`**: Uses `parse_mode=HTML` and converts custom emoji entities to `<tg-emoji>` tags in the text
+- **Auto-detection**: If `--format` is omitted but text contains HTML tags (`<b>`, `<i>`, etc.), `parse_mode=HTML` is used automatically
+
+Example with `--format html`:
+```
+tg --format html "<b>Hello</b> :kimi:"
+```
+
+The `:kimi:` helper is converted to `<tg-emoji emoji-id="5269705184614850043">🌙</tg-emoji>` in the text, and `parse_mode=HTML` is set. Telegram renders both the bold text and the custom emoji.
+
 ## Architecture
 
 ```
@@ -145,19 +160,19 @@ Validation:
 │  (kimi-k2p6)    │     │  (kimi-k2p6 → kimi)│     │  (kimi → 🌙)     │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
                                                           │
-                              ┌─────────────────────────┘
-                              ▼
-                     ┌─────────────────┐
-                     │  EMBEDDABLE_MAP │
-                     │ (kimi → ID)     │
-                     └─────────────────┘
-                              │
-                              ▼
-                     ┌─────────────────┐
-                     │ Telegram API    │
-                     │ custom_emoji    │
-                     │ entity          │
-                     └─────────────────┘
+                               ┌─────────────────────────┘
+                               ▼
+                      ┌─────────────────┐
+                      │  EMBEDDABLE_MAP │
+                      │ (kimi → ID)     │
+                      └─────────────────┘
+                               │
+                               ▼
+                      ┌─────────────────┐
+                      │ Telegram API    │
+                      │ custom_emoji    │
+                      │ entity          │
+                      └─────────────────┘
 ```
 
 ## Testing
@@ -199,6 +214,6 @@ When updating emoji sets (v10 → v11):
 ## Files
 
 - `tg` — Main CLI script with all emoji logic
-- `tests/emoji_map.test.ts` — 45 tests covering the system
+- `tests/emoji_map.test.ts` — 48 tests covering the system
 - `package.json` — Test script and module configuration
 - `docs/custom-emoji-system.md` — This document
