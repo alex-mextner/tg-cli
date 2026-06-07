@@ -119,14 +119,6 @@ tg "Testing :codex: and :gemini: side by side"
 tg --format html "<b>Models:</b> :claude: :deepseek: :qwen:"
 ```
 
-### HTML + custom emoji together
-
-With `--format html`, custom emoji are converted to `<tg-emoji>` tags so both work simultaneously:
-
-```bash
-tg --format html "<b>Report</b> :kimi: \n<i>Status: complete</i>"
-```
-
 ### Advanced: environment overrides
 
 Everything works automatically. Manual overrides are rarely needed:
@@ -183,8 +175,8 @@ Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 
 - **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
 - **[review-cli](https://github.com/alex-mextner/review-cli)** — multi-model read-only code review
-- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable 3D FDM lifecycle
-- **[hyperide.ai](https://hyperide.ai)** — AI-assisted IDE
+- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
 ## License
 
