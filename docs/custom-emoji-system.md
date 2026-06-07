@@ -85,25 +85,45 @@ All icons are sourced from [svgl](https://svgl.app/) or similar icon repositorie
 - Scale to fit within 80x80 (leaving 10px margin)
 - Center using `translate(tx, ty) scale(s)`
 
+### SVG sources
+
+| Model | SVG source | Notes |
+|-------|-----------|-------|
+| Claude | https://svgl.app/library/anthropic | |
+| Codex | Custom gear design (mini PNG — do not replace) | mini_codex.png is the canonical version |
+| Gemini | https://svgl.app/library/gemini | |
+| DeepSeek | https://svgl.app/library/deepseek | |
+| Kimi | https://svgl.app/library/kimi | |
+| Mistral | https://svgl.app/library/mistral | |
+| Meta/Llama | https://svgl.app/library/meta | |
+| Perplexity | https://svgl.app/library/perplexity | |
+| Grok | https://svgl.app/library/grok | |
+| Copilot | https://svgl.app/library/github-copilot | |
+| Windsurf | https://svgl.app/library/windsurf | |
+| Cursor | https://svgl.app/library/cursor | |
+| Qwen | https://svgl.app/library/qwen | |
+| Ollama | https://svgl.app/library/ollama | |
+| HyperIDE | https://github.com/hyperide/hyper-ext/blob/main/vscode-extension/hypercanvas-preview/media/preview.svg | Uses `currentColor` → render with `stroke="white"` |
+
 ### Per-model rules
 
 | Model | Processing | Background | Stroke | Notes |
 |-------|-----------|------------|--------|-------|
 | Claude | Copy as-is | No | No | Already visible on dark |
-| Codex | Copy as-is | No | No | Already visible on dark |
+| Codex | Use mini PNG as-is | No | No | Custom gear design, do not replace with openai.svg |
 | Gemini | Copy as-is | No | No | Already visible on dark |
 | DeepSeek | Copy as-is | No | No | Already visible on dark |
 | Kimi | Copy as-is | No | No | Already visible on dark |
 | Mistral | Copy as-is | No | No | Already visible on dark |
 | Meta/Llama | Copy as-is | No | No | Already visible on dark |
 | Perplexity | Copy as-is | No | No | Already visible on dark |
-| Grok | White circle + center | Yes | Yes | Needs visibility on dark |
-| Copilot | White circle + center | Yes | Yes | Needs visibility on dark |
-| Windsurf | White circle + center | Yes | Yes | Needs visibility on dark |
-| Cursor | White circle + center | Yes | Yes | Needs visibility on dark |
+| Grok | White circle | Yes | No | Needs visibility on dark |
+| Copilot | White circle | Yes | No | Needs visibility on dark |
+| Windsurf | White ring stroke only | No | Yes | Dark icon, ring border only — no fill |
+| Cursor | White ring stroke only | No | Yes | Dark icon, ring border only — no fill |
 | Qwen | Purple fill `#7B3FF2` | No | No | Was black, changed to purple |
-| Ollama | White circle, auto-center | Yes | No | Large paths, needs centering |
-| HyperIDE | Original 512×512 viewBox | No | No | Preserve original aspect ratio |
+| Ollama | White circle | Yes | No | Large paths, needs centering |
+| HyperIDE | Render with stroke="white" | No | No | currentColor SVG, preserve original H viewBox |
 
 ## Build pipeline
 
