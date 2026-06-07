@@ -1,6 +1,6 @@
 # tg-cli
 
-Simple Telegram CLI to send messages, photos, and files via a bot.
+> **Built for AI agents.** When you run `tg` inside a tmux session, it auto-detects which AI model is running (Kimi, Claude, Codex, Gemini, etc.) and prefixes every Telegram message with the corresponding custom emoji. No manual configuration — the icon just appears.
 
 ## Installation
 
@@ -38,7 +38,7 @@ TG_CHAT_ID=<your chat or user ID>
 ## Usage
 
 ```bash
-# Send a text message
+# Send a text message (auto-detects AI model, adds custom emoji prefix)
 tg "Hello from the terminal"
 
 # Send formatted HTML (auto-detected if tags present)
@@ -82,28 +82,37 @@ returns, tabs, and backslashes. File paths are not decoded.
 
 ## Custom Emoji System
 
-The CLI supports custom emoji icons for AI model identification. When running inside tmux, it auto-detects the current AI model (opencode, codex, aider, etc.) and prefixes messages with the corresponding custom emoji.
+The CLI auto-detects your AI model from the running process and sends custom emoji icons.
+Everything works automatically — no manual configuration needed.
 
 ### Auto-detected models
 
-- **Kimi** (🌙) — Moonshot AI
-- **Claude** (✳️) — Anthropic
-- **Codex** (👐) — OpenAI
-- **Gemini** (♊️) — Google
-- **DeepSeek** (🐳)
-- **Qwen** (🟣) — Alibaba
-- **Mistral** (Ⓜ️)
-- **Grok** (🤘) — xAI
-- **Copilot** (🦾) — GitHub
-- **Perplexity** (🔮)
-- **Cursor** (👆)
-- **Windsurf** (🏄)
-- **Ollama** (🦙)
-- **HyperIDE** (🚁)
+🌙 <b>Kimi</b> — Moonshot AI<br/>
+✳️ <b>Claude</b> — Anthropic<br/>
+👐 <b>Codex</b> — OpenAI<br/>
+♊️ <b>Gemini</b> — Google<br/>
+🐳 <b>DeepSeek</b><br/>
+🟣 <b>Qwen</b> — Alibaba<br/>
+Ⓜ️ <b>Mistral</b><br/>
+🤘 <b>Grok</b> — xAI<br/>
+🦾 <b>Copilot</b> — GitHub<br/>
+🔮 <b>Perplexity</b><br/>
+👆 <b>Cursor</b><br/>
+🏄 <b>Windsurf</b><br/>
+🦙 <b>Ollama</b><br/>
+🚁 <b>HyperIDE</b><br/>
+
+### How it works
+
+When you run `tg` inside a tmux pane, it:
+1. Detects the current AI model from process list (opencode, codex, aider, etc.)
+2. Looks up the custom emoji ID for that model
+3. Sends a `custom_emoji` entity alongside your message
+4. Telegram displays the model's branded icon instead of plain text
 
 ### Emoji helpers
 
-Use `:model:` syntax in any message:
+You can also manually insert any model's emoji:
 
 ```bash
 tg "Testing :codex: and :gemini: side by side"
@@ -112,26 +121,25 @@ tg --format html "<b>Models:</b> :claude: :deepseek: :qwen:"
 
 ### HTML + custom emoji together
 
-When using `--format html`, custom emoji are converted to `<tg-emoji>` tags so both work simultaneously:
+With `--format html`, custom emoji are converted to `<tg-emoji>` tags so both work simultaneously:
 
 ```bash
 tg --format html "<b>Report</b> :kimi: \n<i>Status: complete</i>"
 ```
 
-### Environment overrides
+### Advanced: environment overrides
+
+Everything works automatically. Manual overrides are rarely needed:
 
 ```bash
-# Override single model
-TG_EMOJI_ID_kimi=1234567890123456789 tg "message"
-
-# Override multiple models
-TG_EMOJI_IDS='{"kimi":"123","claude":"456"}' tg "message"
-
-# Force AI model detection
+# Override the detected model
 TG_AI_MODEL=kimi tg "message"
+
+# Override a specific emoji ID
+TG_EMOJI_ID_kimi=1234567890123456789 tg "message"
 ```
 
-See [docs/custom-emoji-system.md](docs/custom-emoji-system.md) for full specification.
+See [docs/custom-emoji-system.md](docs/custom-emoji-system.md) for the full specification.
 
 ## HTML Auto-detection
 
@@ -169,6 +177,15 @@ tg --format html "<b>Important</b>: deployment complete"
   </tr>
 </table>
 
+## Ecosystem
+
+Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
+
+- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
+- **[review-cli](https://github.com/alex-mextner/review-cli)** — multi-model read-only code review
+- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable 3D FDM lifecycle
+- **[hyperide.ai](https://hyperide.ai)** — AI-assisted IDE
+
 ## License
 
-MIT — Copyright Alex Ultra, 2026
+MIT
