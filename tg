@@ -305,42 +305,8 @@ function detectAiModel(): string {
   // 1. Explicit env var wins
   if (env.TG_AI_MODEL) return env.TG_AI_MODEL
 
-  // 2. Opencode (current agent) — higher priority than codex
-  if (process.env.OPENCODE) {
-    try {
-      const result = Bun.spawnSync(["opencode", "debug", "config"], {
-        stdout: "pipe",
-        stderr: "pipe",
-      })
-      if (result.exitCode === 0) {
-        const cfg = JSON.parse(new TextDecoder().decode(result.stdout))
-        const providers = cfg.provider || {}
-        for (const [_name, p] of Object.entries(providers)) {
-          const prov = p as { models?: Record<string, unknown> }
-          if (prov.models) {
-            const ids = Object.keys(prov.models)
-            if (ids.length === 1) {
-              const fullId = ids[0]
-              // Extract short name from full ID (e.g., accounts/fireworks/routers/kimi-k2p6-turbo -> kimi-k2p6-turbo)
-              const shortName = fullId.includes('/') ? (fullId.split('/').pop() || fullId) : fullId
-              return shortName
-            }
-            // If multiple, prefer the one that looks like a router/default
-            const router = ids.find((id) => id.includes("router"))
-            if (router) {
-              const shortName = router.includes('/') ? (router.split('/').pop() || router) : router
-              return shortName
-            }
-            const first = ids[0]
-            const shortName = first.includes('/') ? (first.split('/').pop() || first) : first
-            return shortName
-          }
-        }
-      }
-    } catch {
-      // ignore — opencode not available or config parse failed
-    }
-  }
+  // 2. Detect Opencode CLI process
+  if (isProcessRunning("opencode") || isProcessRunning("opencode.exe")) return "opencode"
 
   // 3. Detect Codex CLI (only via explicit env, not pgrep — codex is often background)
   if (process.env.CODEX) return "codex"
@@ -370,6 +336,7 @@ const MODEL = detectAiModel()
 
 // --- AI emoji mapping (plum11 convention + extended) ---
 const MODEL_EMOJI_MAP: Record<string, string> = {
+  opencode: "🗂",
   claude: "✳️", anthropic: "✳️",
   codex: "👐", openai: "👐", o3: "👐", o1: "👐", gpt4: "👐", gpt3: "👐",
   gemini: "♊️", google: "♊️",
