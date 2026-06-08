@@ -42,7 +42,7 @@ AI_MODELS = {
 
 # Set name must be unique and end with "_by_<bot_username>"
 SET_NAME = "agents"
-SET_TITLE = "AI Agents"
+SET_TITLE = "HyperIDE.ai · AI Agents"
 
 
 def create_sticker_set(bot_token: str, image_dir: Path, dry_run: bool = False) -> None:

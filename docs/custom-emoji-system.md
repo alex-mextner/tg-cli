@@ -15,6 +15,7 @@ The `tg` CLI supports custom emoji icons for AI model identification in Telegram
 ## Current set
 
 - **Set name**: `agents_by_HyperIDE_Bot`
+- **Title**: `HyperIDE.ai · AI Agents`
 - **URL**: https://t.me/addemoji/agents_by_HyperIDE_Bot
 - **Bot**: `@HyperIDE_Bot`
 

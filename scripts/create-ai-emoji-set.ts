@@ -36,7 +36,7 @@ const AI_MODELS: Record<string, string> = {
 }
 
 const SET_NAME = "agents"
-const SET_TITLE = "AI Agents"
+const SET_TITLE = "HyperIDE.ai · AI Agents"
 
 interface Args {
   imageDir: string
