@@ -2,15 +2,17 @@
 
 ## Overview
 
-The `tg` CLI supports custom emoji icons for AI model identification in Telegram messages. The system uses Telegram's custom emoji sticker sets (`custom_emoji` type) to display model-specific icons instead of generic Unicode emojis.
+The `tg` CLI shows a per-agent icon in Telegram messages using Telegram's custom emoji
+sticker sets (`custom_emoji` type) instead of generic Unicode emojis. Each AI model/agent
+maps to a `custom_emoji_id` in a set owned by a bot.
 
 ## How it works
 
-1. The bot `@HyperIDE_Bot` owns custom emoji sticker sets
-2. Each sticker has a `custom_emoji_id` (19-digit numeric string)
-3. The `tg` CLI maps model names to these IDs
-4. When sending a message, the CLI creates `custom_emoji` entities in the Telegram API payload
-5. The resulting message shows the custom icon instead of (or alongside) Unicode fallback
+1. The bot `@HyperIDE_Bot` owns the custom emoji sticker set.
+2. Each sticker has a `custom_emoji_id` (19-digit numeric string).
+3. The `tg` CLI maps model names to these IDs (`EMBEDDABLE_EMOJI_MAP` in `tg`).
+4. When sending, the CLI emits `custom_emoji` entities (or `<tg-emoji>` tags in HTML mode).
+5. Telegram renders the custom icon, falling back to a Unicode emoji where unsupported.
 
 ## Current set
 
@@ -41,7 +43,8 @@ The `tg` CLI supports custom emoji icons for AI model identification in Telegram
 
 ## Alias system
 
-Multiple model names can share the same emoji ID. This is intentional — versions of the same model family share the same icon:
+Multiple model names can share the same emoji ID. This is intentional — versions of the
+same model family share one icon:
 
 - `claude`, `anthropic`, `devin`, `cognition`, `aider`, `continue` → Claude's ✳️
 - `codex`, `openai`, `o3`, `o1`, `gpt4`, `gpt3`, `gpt` → OpenAI's 👐
@@ -63,10 +66,11 @@ Multiple model names can share the same emoji ID. This is intentional — versio
 5. pgrep fallbacks for `aider`, `cursor`, `windsurf`, `llama`, `ollama`, `opencode`.
 
 Debug the result without sending a message: `tg --detect-model` prints `<model>\t<emoji>`.
+This is an info-only flag and works without Telegram credentials configured.
 
 ## Version-agnostic detection
 
-The `extractBaseModel()` function extracts the base model name from versioned identifiers:
+`extractBaseModel()` extracts the base model name from versioned identifiers:
 
 - `kimi-k2p6-turbo` → `kimi`
 - `claude-3-opus` → `claude`
@@ -74,39 +78,18 @@ The `extractBaseModel()` function extracts the base model name from versioned id
 - `o1-preview` → `o1`
 - `accounts/fireworks/routers/kimi-k2p6-turbo` → `kimi-k2p6-turbo` → `kimi`
 
-This is done by:
-1. Checking exact match in `MODEL_EMOJI_MAP` or `EMBEDDABLE_EMOJI_MAP`
-2. If no exact match, split by `-` or `_` and try progressively shorter prefixes
-3. First matching prefix wins
+How:
+1. Check exact match in `MODEL_EMOJI_MAP` or `EMBEDDABLE_EMOJI_MAP`.
+2. If no exact match, split by `-` or `_` and try progressively shorter prefixes.
+3. First matching prefix wins.
 
-## Icon design requirements
-
-### SVG source files
-
-All icons are sourced from [svgl](https://svgl.app/) or similar icon repositories. The original SVGs are preserved in `/tmp/hi_v2/clean/`.
-
-### Processing rules
-
-**White circle background (for icons that need to be visible on dark backgrounds):**
-- Apply when the icon has no natural background or is hard to see on dark backgrounds
-- Circle: `cx="50" cy="50" r="48" fill="white"`
-- Centered in 100x100 canvas
-
-**White stroke (for icons that need outline definition):**
-- Apply when the icon is a simple shape or line art
-- Stroke: `stroke="white" stroke-width="2"`
-- Shrink content by 4px and center to make room for stroke
-
-**Auto-centering:**
-- Calculate bounding box of all paths in the SVG
-- Scale to fit within 80x80 (leaving 10px margin)
-- Center using `translate(tx, ty) scale(s)`
+## Icon assets
 
 ### SVG sources
 
-**All SVG sources live in the repo under `emoji-icons/src/<model>.svg`.** Never re-download
-ad hoc — the committed SVG is the single source of truth. Original upstream URLs (for
-re-fetching if an icon needs updating):
+**All SVG sources live in the repo under `emoji-icons/src/<model>.svg`** — the committed
+SVG is the single source of truth. Never re-download ad hoc. Upstream URLs below are only
+for re-fetching when an icon genuinely needs updating.
 
 | Model | Upstream source | Notes |
 |-------|-----------------|-------|
@@ -126,15 +109,17 @@ re-fetching if an icon needs updating):
 | Ollama | https://svgl.app/library/ollama | |
 | HyperIDE | https://github.com/hyperide/hyper-ext/blob/main/vscode-extension/hypercanvas-preview/media/preview.svg | Uses `currentColor` → script substitutes `stroke="black"` (black H on a white disc) |
 
-### Per-model rules
+### Per-model treatment
 
 Treatment is declared in `CONFIG` inside `scripts/build-emoji-icons.py` and applied
 programmatically — do NOT bake circles/strokes into the source SVGs.
 
-- **circle**: solid white disc behind the icon (for dark/low-contrast marks).
-- **contour**: white silhouette traced around the icon's shape — an outline that follows
-  the actual contour, NOT a surrounding circle. Used for dark icons that should keep their
-  shape readable on a dark background.
+- **circle**: solid white disc behind the icon (for dark/low-contrast marks). Drawn with
+  anti-aliasing (4× supersample + LANCZOS downscale) — a 1× `ImageDraw.ellipse` produces a
+  jagged staircase edge that looks pixelated in Telegram.
+- **contour**: white silhouette traced around the icon's shape — an outline following the
+  actual contour, NOT a surrounding circle. For dark icons that should keep their shape
+  readable on a dark background.
 - **none**: icon as-is on transparency (already visible on dark).
 
 | Model | Background | `scale` | Notes |
@@ -146,7 +131,7 @@ programmatically — do NOT bake circles/strokes into the source SVGs.
 | Grok | circle | 0.60 | Dark mark on white disc |
 | Perplexity | circle | 0.60 | Dark teal mark on white disc |
 | Windsurf | circle | 0.60 | Line-art W on white disc |
-| HyperIDE | circle | 0.58 | Black H (`stroke="black"`) on white disc — stays legible on light AND dark Telegram themes |
+| HyperIDE | circle | 0.58 | Black H (`stroke="black"`) on white disc — legible on light AND dark themes |
 | Cursor | contour | 0.74 | Dark mark, white silhouette outline |
 | Qwen | contour | 0.74 | Purple fill `#7B3FF2` + white silhouette outline |
 | Gemini | none | 0.82 | |
@@ -158,105 +143,122 @@ programmatically — do NOT bake circles/strokes into the source SVGs.
 `scale` = fraction of the cell the trimmed icon content occupies. Lower = more padding.
 circle/contour icons sit smaller so the treatment has room. Icons are auto-trimmed
 (transparent border removed) then scaled to fit, so nothing clips regardless of source
-viewBox.
-
-The white disc is drawn with anti-aliasing (4× supersample + LANCZOS downscale) — a 1×
-`ImageDraw.ellipse` produces a jagged staircase edge that looks pixelated in Telegram.
-
-**Verify on both themes:** `--preview` renders a dark-bg collage, `--preview-light` a
-light-bg one. Any icon relying on a white disc or white stroke MUST be checked on the
-light preview — white-on-white vanishes (this is why HyperIDE moved from `stroke="white"`
-to a black H on a white disc).
+viewBox. Optional per-model `stroke` / `fill` keys substitute `currentColor` in the SVG.
 
 ## Build pipeline
 
-The build is fully scripted — `scripts/build-emoji-icons.py`:
+Fully scripted — `scripts/build-emoji-icons.py`:
 
 ```bash
-# Render all icons at 100×100 (Telegram custom emoji size)
+# Render all icons at 100×100 (Telegram custom emoji size) into emoji-icons/mini_*.png
 python3 scripts/build-emoji-icons.py --size 100
 
-# Preview only (no file writes) + dark-bg collage for review
-python3 scripts/build-emoji-icons.py --no-write --preview /tmp/preview.png
+# Preview only (no writes): dark + light collages for review
+python3 scripts/build-emoji-icons.py --no-write --preview /tmp/dark.png --preview-light /tmp/light.png
 
 # Rebuild a subset
 python3 scripts/build-emoji-icons.py --only codex,ollama
 ```
 
-Per icon the script: renders `src/<model>.svg` via `rsvg-convert` at 512px → auto-trims
-transparent borders → scales to `scale*size` with centered padding → applies the `bg`
-treatment (circle / contour / none) → writes `<prefix><model>.png` at `--size`.
+Per icon: render `src/<model>.svg` via `rsvg-convert` at 512px → auto-trim transparent
+borders → scale to `scale*size` with centered padding → apply the `bg` treatment
+(circle / contour / none) → write `<prefix><model>.png` at `--size`.
 
 Output filenames default to the `mini_` prefix (matching the committed repo assets). The
-upload scripts (`create-ai-emoji-set.py` / `.ts`) expect bare `<model>.png`, so generate
-upload assets into a temp dir with `--prefix ''`:
+upload scripts expect bare `<model>.png`, so generate upload assets with `--prefix ''`:
 
 ```bash
 python3 scripts/build-emoji-icons.py --size 100 --prefix '' --out /tmp/upload
-python3 scripts/create-ai-emoji-set.py --image-dir /tmp/upload
 ```
 
 A missing `src/<model>.svg` for any configured model is a fatal error (the script exits
 non-zero before rendering) — generated assets never go stale silently.
 
-### Mandatory review workflow (do this every time, no exceptions)
+### Mandatory review workflow (every time, no exceptions)
 
 1. **Render** both previews:
    `build-emoji-icons.py --no-write --preview /tmp/dark.png --preview-light /tmp/light.png`
-   Check icons on BOTH — white discs/strokes can vanish on the light theme.
+   Check icons on BOTH — white discs/strokes can vanish on the light theme (this is why
+   HyperIDE moved from `stroke="white"` to a black H on a white disc).
 2. **Run `review` CLI** on the working-tree diff (`review` in the repo root) BEFORE sending
    anything. Fix every finding.
 3. **Fix** issues, re-render, re-review until clean.
 4. **Only then send the preview to Telegram** for human approval. Never send an unreviewed
    preview.
-5. After approval: write `mini_*.png` (`build-emoji-icons.py --size 100`), generate upload
-   assets (`--prefix '' --out /tmp/upload`), upload via `create-ai-emoji-set.py`, update IDs
-   in `tg` from the printed mapping.
-
-### Bot API note (createNewStickerSet)
-
-Bot API 6.6+ takes `stickers` as a JSON array of InputSticker objects
-(`{sticker: "attach://fileN", format: "static", emoji_list: [emoji]}`) with files attached
-via multipart `attach://` — NOT the old single-`sticker`+`emojis` form (that returns
-"there is no sticker file in the request"). The owner `user_id` must have interacted with
-the bot at least once (send `/start`), else `createNewStickerSet` returns "user not found".
+5. After approval: regenerate `mini_*.png`, upload (below), update IDs in `tg`.
 
 Every new requirement the user states about icon treatment MUST be recorded in this spec
 (the `CONFIG` table above) — the spec is the contract, not chat history.
 
-## Environment variable overrides
+## Uploading / replacing the set
 
-Users can override emoji IDs without modifying the source:
+The uploader (`scripts/create-ai-emoji-set.py`, or the `.ts` equivalent) reads
+`<model>.png` from `--image-dir`, creates the set, and prints the `model → custom_emoji_id`
+mapping. `AI_MODELS` (uploader) MUST stay in sync with `CONFIG` (builder) and
+`MODEL_EMOJI_MAP` (`tg`).
 
 ```bash
-# Override single model
+# 1. Generate upload assets
+python3 scripts/build-emoji-icons.py --size 100 --prefix '' --out /tmp/upload
+
+# 2. (Replacing an existing set) delete it first — frees the name so the URL is preserved
+curl -s "https://api.telegram.org/bot$TG_BOT_TOKEN/deleteStickerSet" -d "name=agents_by_HyperIDE_Bot"
+
+# 3. Create the set and capture the printed IDs
+TG_BOT_TOKEN=... TG_OWNER_ID=<your-user-id> \
+  python3 scripts/create-ai-emoji-set.py --image-dir /tmp/upload
+
+# 4. Paste the new IDs into EMBEDDABLE_EMOJI_MAP in tg, then `bun test`
+```
+
+### Telegram Bot API gotchas
+
+- **InputSticker format (6.6+):** `createNewStickerSet` takes `stickers` as a JSON array of
+  InputSticker objects (`{sticker: "attach://fileN", format: "static", emoji_list: [emoji]}`)
+  with files attached via multipart `attach://`. The old single-`sticker`+`emojis` form
+  returns `"there is no sticker file in the request"`.
+- **Owner must /start the bot:** `user_id` must have interacted with the bot at least once,
+  else `createNewStickerSet` returns `"user not found"`. In a private chat, `TG_CHAT_ID`
+  equals the owner's `user_id`.
+- **Title:** set via `setStickerSetTitle` (no recreate needed); `name`/URL are immutable.
+- **No list API:** Bot API cannot enumerate a bot's sets. To delete old ones you must know
+  each name and hold the owning bot's token (`deleteStickerSet` per name).
+
+## Environment variable overrides
+
+Override emoji IDs without touching source:
+
+```bash
+# Single model
 TG_EMOJI_ID_claude=1234567890123456789 tg "message"
 
-# Override multiple models
-TG_EMOJI_IDS='{"claude":"123","codex":"456"}' tg "message"
+# Multiple models
+TG_EMOJI_IDS='{"claude":"123...","codex":"456..."}' tg "message"
 ```
 
 Validation:
-- IDs must be exactly 19 digits (`/^\d{19}$/`)
-- Invalid IDs are rejected with a warning to stderr
-- Empty strings are rejected
-- Arrays and non-object JSON are rejected
-- Prototype pollution keys (`__proto__`, `constructor`, `toString`, `valueOf`) are blocked
+- IDs must be exactly 19 digits (`/^\d{19}$/`).
+- Invalid IDs / empty strings / arrays / non-object JSON are rejected with a stderr warning.
+- Prototype-pollution keys (`__proto__`, `constructor`, `toString`, `valueOf`) are blocked.
 
 ## HTML and Custom Emoji
 
-Telegram Bot API does not allow `entities` and `parse_mode` simultaneously. The `tg` CLI handles this automatically:
+Telegram Bot API does not allow `entities` and `parse_mode` simultaneously. `tg` handles
+this automatically:
 
-- **Without `--format html`**: Uses `entities` (custom emoji works, HTML tags in text are sent as plain text)
-- **With `--format html`**: Uses `parse_mode=HTML` and converts custom emoji entities to `<tg-emoji>` tags in the text
-- **Auto-detection**: If `--format` is omitted but text contains HTML tags (`<b>`, `<i>`, etc.), `parse_mode=HTML` is used automatically
+- **Without `--format html`**: uses `entities` (custom emoji works; HTML tags in text are
+  sent as plain text).
+- **With `--format html`**: uses `parse_mode=HTML` and converts custom emoji entities to
+  `<tg-emoji>` tags in the text.
+- **Auto-detection**: if `--format` is omitted but the text contains HTML tags, HTML mode
+  is used automatically.
 
-Example with `--format html`:
 ```
 tg --format html "<b>Hello</b> :kimi:"
 ```
 
-The `:kimi:` helper is converted to `<tg-emoji emoji-id="5269705184614850043">🌙</tg-emoji>` in the text, and `parse_mode=HTML` is set. Telegram renders both the bold text and the custom emoji.
+The `:kimi:` helper becomes `<tg-emoji emoji-id="5273889053991805596">🌙</tg-emoji>` and
+`parse_mode=HTML` is set.
 
 ## Architecture
 
@@ -283,43 +285,40 @@ The `:kimi:` helper is converted to `<tg-emoji emoji-id="5269705184614850043">�
 
 ## Testing
 
-Run tests:
 ```bash
 bun test
 ```
 
-Tests cover:
-- Map structure and format validation
-- Alias consistency (all aliases share same ID)
-- Golden mapping for v10 IDs
-- Unicode fallback coverage
-- Help text consistency
-- Environment variable overrides
-- Invalid input rejection
-- Security (prototype pollution prevention)
-- Boundary tests (19-digit ID validation)
-
-## Maintenance
-
-When updating emoji sets (v10 → v11):
-1. Update the `V10_GOLDEN_MAP` in tests (or remove it if using dynamic validation)
-2. Update all `custom_emoji_id` values in `EMBEDDABLE_EMOJI_MAP`
-3. Update the set URL comment
-4. Run `bun test` to verify
-5. Update `.files` submodule
+Covers: map structure & 19-digit ID format, alias consistency, Unicode fallback coverage,
+help-text consistency, env-var overrides, invalid-input rejection, prototype-pollution
+prevention, and agent detection (incl. a fake-`pgrep` regression proving `CLAUDECODE` beats
+a running ollama). Tests parse `EMBEDDABLE_EMOJI_MAP` dynamically from `tg`, so updating IDs
+does not require editing hardcoded golden values.
 
 ## Adding a new model
 
-1. Add entry to `EMBEDDABLE_EMOJI_MAP` with the custom emoji ID
-2. Add entry to `UNICODE_EMOJI_MAP` with the Unicode fallback
-3. Add entry to `MODEL_EMOJI_MAP` with the display emoji
-4. Add to help text if user-facing
-5. Add test in `tests/emoji_map.test.ts`
-6. If it's an alias, add to the appropriate alias group test
+1. Add `emoji-icons/src/<model>.svg`.
+2. Add a `CONFIG` entry in `scripts/build-emoji-icons.py` (bg / scale / optional stroke/fill).
+3. Add the model to `AI_MODELS` in both `create-ai-emoji-set.py` and `.ts`.
+4. Rebuild + re-upload the set, then add the new `custom_emoji_id` to `EMBEDDABLE_EMOJI_MAP`,
+   `UNICODE_EMOJI_MAP`, and `MODEL_EMOJI_MAP` in `tg`.
+5. Add to the help text if user-facing.
+6. Add/extend tests in `tests/emoji_map.test.ts` (and the alias group test if it's an alias).
+
+## Updating the set (e.g. icon redesign)
+
+1. Edit `CONFIG` / source SVGs.
+2. Run the mandatory review workflow above (dual-theme preview + `review` CLI).
+3. Delete + recreate the set (preserves the `agents_by_HyperIDE_Bot` name/URL).
+4. Replace all IDs in `EMBEDDABLE_EMOJI_MAP` and any hardcoded test IDs; `bun test`.
+5. Commit (the `.files` repo is consumed as a submodule elsewhere).
 
 ## Files
 
-- `tg` — Main CLI script with all emoji logic
-- `tests/emoji_map.test.ts` — 48 tests covering the system
-- `package.json` — Test script and module configuration
-- `docs/custom-emoji-system.md` — This document
+- `tg` — main CLI with all emoji + detection logic.
+- `emoji-icons/src/*.svg` — source SVGs (single source of truth).
+- `emoji-icons/mini_*.png` — generated 100×100 assets.
+- `scripts/build-emoji-icons.py` — SVG → PNG build pipeline.
+- `scripts/create-ai-emoji-set.py` / `.ts` — sticker-set uploader.
+- `tests/emoji_map.test.ts` — test suite.
+- `docs/custom-emoji-system.md` — this document.
