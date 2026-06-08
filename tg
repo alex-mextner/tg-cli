@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
-import { readFileSync } from "fs"
-import { join } from "path"
+import { readFileSync, statSync } from "fs"
+import { isAbsolute, join, resolve } from "path"
+
+export const VERSION = "1.0.0"
 
 // --- Config loader ---
 function loadEnv(filePath: string): Record<string, string> {
@@ -22,33 +24,65 @@ function loadEnv(filePath: string): Record<string, string> {
   return env
 }
 
-const configEnv = loadEnv(join(process.env.HOME ?? "~", ".config", "tg-cli", ".env"))
-const env = { ...configEnv, ...process.env }
-
-const BOT_TOKEN = env.TG_BOT_TOKEN
-const CHAT_ID = env.TG_CHAT_ID
-
-// Info-only flags inspect local state and send nothing, so they must work
-// without Telegram credentials configured.
-const INFO_ONLY_FLAGS = new Set(["--detect-model", "--ls-emoji-helpers"])
-if ((!BOT_TOKEN || !CHAT_ID) && !INFO_ONLY_FLAGS.has(process.argv[2])) {
-  console.error("Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ~/.config/tg-cli/.env")
-  process.exit(1)
+// --- Version output (runtime git hash + changelog) ---
+/**
+ * Resolve the short git commit hash of the repo containing the tg script.
+ * Read at RUNTIME (the tool is run directly via bun, not built), so the hash
+ * always reflects the checked-out commit. Never throws: returns "unknown" when
+ * git is unavailable or the script lives outside a git repo.
+ */
+export function gitShortHash(scriptDir: string): string {
+  try {
+    const proc = Bun.spawnSync(["git", "-C", scriptDir, "rev-parse", "--short", "HEAD"])
+    if (proc.exitCode === 0) {
+      const hash = proc.stdout.toString().trim()
+      if (hash) return hash
+    }
+  } catch {
+    // git missing / not a repo — fall through to "unknown"
+  }
+  return "unknown"
 }
 
-const API = `https://api.telegram.org/bot${BOT_TOKEN}`
-
-// --- Arg parsing ---
-interface Item {
-  type: "photo" | "document"
-  path: string
+/**
+ * Read the latest (top-most) version section of CHANGELOG.md, i.e. everything
+ * from the first `## ` heading up to the next `## ` heading. Keeps --version
+ * output readable as releases accumulate. Returns "" when the changelog is
+ * absent or has no version section. Never throws.
+ */
+export function latestChangelogSection(scriptDir: string): string {
+  try {
+    const raw = readFileSync(join(scriptDir, "CHANGELOG.md"), "utf8")
+    const lines = raw.split("\n")
+    const start = lines.findIndex((l) => l.startsWith("## "))
+    if (start === -1) return ""
+    let end = lines.length
+    for (let i = start + 1; i < lines.length; i++) {
+      if (lines[i].startsWith("## ")) {
+        end = i
+        break
+      }
+    }
+    return lines.slice(start, end).join("\n").replace(/\s+$/, "")
+  } catch {
+    // no changelog — degrade gracefully
+    return ""
+  }
 }
 
-type Format = "plain" | "html"
+/**
+ * Compose the full `--version` / `-v` output: a version+hash line, then the
+ * latest changelog section (when present). Pure aside from the I/O it delegates
+ * to the helpers above, and never throws.
+ */
+export function versionOutput(scriptDir: string): string {
+  const head = `tg ${VERSION} (${gitShortHash(scriptDir)})`
+  const changelog = latestChangelogSection(scriptDir)
+  return changelog ? `${head}\n\n${changelog}` : head
+}
 
-const args = process.argv.slice(2)
-
-const USAGE = `Usage:
+// --- Usage ---
+export const USAGE = `Usage:
   tg [--format plain|html] "text message"
   tg [--format plain|html] --photo screen.png
   tg [--format plain|html] --photo screen.png "caption"
@@ -57,7 +91,25 @@ const USAGE = `Usage:
   tg [--format plain|html] --photo a.png --photo b.png "caption"
   tg [--format plain|html] --file a.pdf --file b.pdf
   tg [--format plain|html] --photo a.png --file doc.pdf "caption"
+  tg "see /abs/path/shot.png"   # existing file paths in text are auto-attached
   tg --ls-emoji-helpers
+
+Options:
+  --format plain|html  message format (default: plain)
+  --photo <path>       attach an image (repeatable)
+  --file <path>        attach a document (repeatable)
+  -v, --version        print version and exit
+  -h, --help           print this help and exit
+
+Auto-attach:
+  File paths in the message text that resolve to an existing file (absolute,
+  ~-expanded, or relative to the current directory) are auto-attached: images
+  become photos, everything else becomes a document. The path token is removed
+  from the caption. Explicit --photo/--file take precedence.
+
+Unknown flags:
+  Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
+  stderr and the process exits non-zero. They are NOT sent as message text.
 
 Text escape handling:
   Message text and captions convert \\n, \\r, \\t, and \\\\ into real newlines,
@@ -91,47 +143,187 @@ Only those HTML tags are supported. Escape raw <, >, and & outside tags as
 &lt;, &gt;, and &amp;.
 `
 
-if (args.length === 0) {
-  console.error(USAGE)
-  process.exit(1)
+// --- Arg parsing (pure) ---
+export interface Item {
+  type: "photo" | "document"
+  path: string
 }
 
-if (args[0] === "--help" || args[0] === "-h") {
-  console.log(USAGE)
-  process.exit(0)
+export type Format = "plain" | "html"
+
+export type ParseResult =
+  | { action: "help" }
+  | { action: "version" }
+  | { action: "lsEmojiHelpers" }
+  | { action: "detectModel" }
+  | { action: "error"; message: string }
+  | { action: "send"; items: Item[]; caption: string; format: Format }
+
+// Extensions that Telegram's sendPhoto accepts. SVG is intentionally excluded:
+// Telegram rejects SVG as a photo, so an auto-detected .svg path falls back to
+// a document (explicit --photo still honors the user's choice).
+const IMAGE_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "heic",
+  "heif",
+])
+
+function isImagePath(path: string): boolean {
+  const dot = path.lastIndexOf(".")
+  if (dot === -1) return false
+  return IMAGE_EXTENSIONS.has(path.slice(dot + 1).toLowerCase())
 }
 
-const items: Item[] = []
-const textParts: string[] = []
-let format: Format = "plain"
+function expandHome(token: string, home: string): string {
+  if (token === "~") return home
+  if (token.startsWith("~/")) return join(home, token.slice(2))
+  return token
+}
 
-let i = 0
-while (i < args.length) {
-  const arg = args[i]
-  if (arg === "--format") {
-    const nextArg = args[i + 1]
-    if (!nextArg || nextArg.startsWith("--")) {
-      console.error("Error: --format requires plain or html")
-      process.exit(1)
-    }
-    if (nextArg !== "plain" && nextArg !== "html") {
-      console.error(`Error: unsupported format '${nextArg}'. Accepted values: plain, html`)
-      process.exit(1)
-    }
-    format = nextArg
-    i += 2
-  } else if (arg === "--photo" || arg === "--file") {
-    const nextArg = args[i + 1]
-    if (!nextArg || nextArg.startsWith("--")) {
-      console.error(`Error: ${arg} requires a file path argument`)
-      process.exit(1)
-    }
-    items.push({ type: arg === "--photo" ? "photo" : "document", path: nextArg })
-    i += 2
-  } else {
-    textParts.push(arg)
-    i++
+/**
+ * Resolve a text token to an existing file path, if it is one.
+ * Tries ~-expansion, absolute, and cwd-relative resolution.
+ * Returns the absolute path only when it resolves to a real file (not a dir).
+ */
+function resolveExistingFile(token: string, cwd: string, home: string): string | null {
+  if (!token) return null
+  const expanded = expandHome(token, home)
+  const candidate = isAbsolute(expanded) ? expanded : resolve(cwd, expanded)
+  try {
+    if (statSync(candidate).isFile()) return candidate
+  } catch {
+    // not a path / no access — treat as ordinary text
   }
+  return null
+}
+
+/**
+ * Parse argv (already sliced past node/script) into an action. Never throws and
+ * never calls process.exit: the caller decides what to do with the result.
+ *
+ * Precedence (the reconciliation point for "unknown dashed → error"):
+ *   1. -h/--help and -v/--version win anywhere, before everything else.
+ *   2. Info-only flags --ls-emoji-helpers / --detect-model win next.
+ *   3. Real flags are matched: --format (with value validation), --photo,
+ *      --file (each consuming a path value).
+ *   4. ONLY a dashed token that matched none of the above is "unknown" → error.
+ * This guarantees every flag main supports is recognized before the
+ * unknown-dashed guard can fire, so none of them regress to an error.
+ */
+export function parseArgs(args: string[], cwd: string, home: string): ParseResult {
+  // 1. Help / version win anywhere, before the empty check.
+  for (const a of args) {
+    if (a === "-h" || a === "--help") return { action: "help" }
+  }
+  for (const a of args) {
+    if (a === "-v" || a === "--version") return { action: "version" }
+  }
+
+  // 2. Info-only flags win next, anywhere on the line.
+  for (const a of args) {
+    if (a === "--ls-emoji-helpers") return { action: "lsEmojiHelpers" }
+  }
+  for (const a of args) {
+    if (a === "--detect-model") return { action: "detectModel" }
+  }
+
+  const explicit: Item[] = []
+  const textParts: string[] = []
+  let format: Format = "plain"
+
+  let i = 0
+  while (i < args.length) {
+    const arg = args[i]
+    if (arg === "--format") {
+      const nextArg = args[i + 1]
+      if (!nextArg || nextArg.startsWith("--")) {
+        return { action: "error", message: "--format requires plain or html" }
+      }
+      if (nextArg !== "plain" && nextArg !== "html") {
+        return {
+          action: "error",
+          message: `unsupported format '${nextArg}'. Accepted values: plain, html`,
+        }
+      }
+      format = nextArg
+      i += 2
+      continue
+    }
+    if (arg === "--photo" || arg === "--file") {
+      const nextArg = args[i + 1]
+      // A dashed next token is only consumed as a path when it actually
+      // resolves to an existing file (e.g. `--file -receipt.png`). Otherwise
+      // it is a missing/invalid path → error, matching main's behavior.
+      const dashedButNotAFile =
+        !!nextArg && nextArg.startsWith("-") && resolveExistingFile(nextArg, cwd, home) === null
+      if (!nextArg || dashedButNotAFile) {
+        return { action: "error", message: `${arg} requires a file path argument` }
+      }
+      explicit.push({ type: arg === "--photo" ? "photo" : "document", path: nextArg })
+      i += 2
+      continue
+    }
+    // A standalone dashed token that matched no known flag (and is not a flag
+    // value, since those are consumed above) is an unknown flag → error.
+    if (arg.startsWith("-")) {
+      return { action: "error", message: `unknown flag: ${arg}` }
+    }
+    // Anything else is plain text.
+    textParts.push(arg)
+    i += 1
+  }
+
+  // Auto-detect existing-file paths in the message text. Split the joined text
+  // on whitespace so both `tg /tmp/x.png` and `tg "look /tmp/x.png"` work.
+  const explicitResolved = new Set(
+    explicit
+      .map((it) => resolveExistingFile(it.path, cwd, home))
+      .filter((p): p is string => p !== null),
+  )
+  const autoItems: Item[] = []
+  // Tokenize the joined text but KEEP whitespace runs (incl. newlines) so the
+  // caption preserves the user's formatting — we only excise matched path
+  // tokens, never normalize spacing of plain text. Split with a capturing
+  // group: even indices are word tokens, odd indices are the whitespace gaps.
+  const segments = textParts.join(" ").split(/(\s+)/)
+  const kept: string[] = []
+  for (let s = 0; s < segments.length; s++) {
+    const seg = segments[s]
+    const isWhitespace = s % 2 === 1
+    if (isWhitespace) {
+      kept.push(seg)
+      continue
+    }
+    if (!seg) {
+      kept.push(seg)
+      continue
+    }
+    const resolved = resolveExistingFile(seg, cwd, home)
+    if (resolved) {
+      if (!explicitResolved.has(resolved)) {
+        explicitResolved.add(resolved) // dedup repeats within the text too
+        autoItems.push({ type: isImagePath(resolved) ? "photo" : "document", path: resolved })
+      }
+      // Excise the path token and the whitespace gap that followed it (if any)
+      // so we don't leave a doubled space behind.
+      if (s + 1 < segments.length) segments[s + 1] = ""
+      continue
+    }
+    kept.push(seg)
+  }
+
+  const items = [...explicit, ...autoItems]
+  // Trim only the outer edges; interior formatting (newlines, alignment) stays.
+  const caption = kept.join("").replace(/^\s+|\s+$/g, "")
+
+  // Empty invocation (or nothing left after path excision) → help, exit 0.
+  if (items.length === 0 && !caption) return { action: "help" }
+  return { action: "send", items, caption, format }
 }
 
 // --- Embeddable emoji helpers ---
@@ -173,45 +365,6 @@ const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
   continue: "5274170649227600531", // Custom ID: shares Claude's ✳️ ID. Unicode: ⏩
   gpt: "5273797309195393626",       // Custom ID: shares OpenAI's 👐 ID. Unicode: ⚡
 }
-// Override with env vars if provided
-if (env.TG_EMOJI_IDS) {
-  try {
-    const parsed = JSON.parse(env.TG_EMOJI_IDS)
-    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-      for (const [model, id] of Object.entries(parsed)) {
-        if (["__proto__", "constructor", "tostring", "valueof"].includes(model.toLowerCase())) {
-          console.error(`Warning: Rejecting reserved key in TG_EMOJI_IDS: ${model}`)
-          continue
-        }
-        if (typeof id === "string" && /^\d{19}$/.test(id)) {
-          EMBEDDABLE_EMOJI_MAP[model] = id
-        } else if (typeof id === "string") {
-          console.error(`Warning: Ignoring invalid emoji ID in TG_EMOJI_IDS for ${model}: ${id} (expected 19 digits)`)
-        } else {
-          console.error(`Warning: Ignoring non-string emoji ID in TG_EMOJI_IDS for ${model}: ${id} (expected string)`)
-        }
-      }
-    } else {
-      console.error("Warning: TG_EMOJI_IDS must be a JSON object, not an array or primitive")
-    }
-  } catch {
-    console.error("Warning: TG_EMOJI_IDS contains invalid JSON, using default emoji IDs")
-  }
-}
-for (const [key, val] of Object.entries(env)) {
-  if (key.startsWith("TG_EMOJI_ID_")) {
-    const model = key.slice("TG_EMOJI_ID_".length).toLowerCase()
-    if (model && !["__proto__", "constructor", "tostring", "valueof"].includes(model)) {
-      if (val && /^\d{19}$/.test(val)) {
-        EMBEDDABLE_EMOJI_MAP[model] = val
-      } else {
-        console.error(`Warning: Ignoring invalid emoji ID for ${model}: ${val} (expected 19 digits)`)
-      }
-    } else if (model && ["__proto__", "constructor", "tostring", "valueof"].includes(model)) {
-      console.error(`Warning: Rejecting reserved key in TG_EMOJI_ID_${model}: ${val}`)
-    }
-  }
-}
 
 // Unicode emoji fallback map
 const UNICODE_EMOJI_MAP: Record<string, string> = {
@@ -248,134 +401,6 @@ interface ParsedText {
   entities: EmojiEntity[]
 }
 
-function decodeTextEscapes(value: string): string {
-  return value.replace(/\\([nrt\\])/g, (_match: string, escaped: string) => {
-    if (escaped === "n") return "\n"
-    if (escaped === "r") return "\r"
-    if (escaped === "t") return "\t"
-    return "\\"
-  })
-}
-
-function parseEmojiHelpers(text: string): ParsedText {
-  const entities: EmojiEntity[] = []
-  let result = ""
-  let offset = 0
-
-  const regex = /:([a-zA-Z0-9_-]+):/g
-  let match
-  let lastIndex = 0
-
-  while ((match = regex.exec(text)) !== null) {
-    const [fullMatch, name] = match
-    const lower = name.toLowerCase()
-    const emojiId = EMBEDDABLE_EMOJI_MAP[lower]
-    const unicodeEmoji = UNICODE_EMOJI_MAP[lower]
-
-    // Append text before match
-    result += text.slice(lastIndex, match.index)
-
-    if (emojiId) {
-      // Use placeholder emoji for entity
-      const placeholder = unicodeEmoji || "🤖"
-      entities.push({
-        type: "custom_emoji",
-        offset: result.length,
-        length: placeholder.length,
-        custom_emoji_id: emojiId,
-      })
-      result += placeholder
-    } else if (unicodeEmoji) {
-      result += unicodeEmoji
-    } else {
-      result += fullMatch
-    }
-
-    lastIndex = regex.lastIndex
-  }
-
-  // Append remaining text
-  result += text.slice(lastIndex)
-
-  return { text: result, entities }
-}
-
-const rawCaption = decodeTextEscapes(textParts.join(" "))
-const caption = rawCaption
-
-// --- AI model detection ---
-function detectAiModel(): string {
-  // 1. Explicit env var wins
-  if (env.TG_AI_MODEL) return env.TG_AI_MODEL
-
-  // 1b. Claude Code sets CLAUDECODE=1 (and CLAUDE_CODE_* vars) in the agent's
-  // environment. Check this BEFORE the pgrep fallbacks below: a background
-  // `ollama` daemon (common on macOS) would otherwise be matched first and
-  // mislabel a Claude Code session as ollama.
-  if (env.CLAUDECODE || env.CLAUDE_CODE_ENTRYPOINT) return "claude"
-
-  // 2. Opencode (current agent) — read model from config
-  if (process.env.OPENCODE) {
-    try {
-      const result = Bun.spawnSync(["opencode", "debug", "config"], {
-        stdout: "pipe",
-        stderr: "pipe",
-      })
-      if (result.exitCode === 0) {
-        const cfg = JSON.parse(new TextDecoder().decode(result.stdout))
-        const providers = cfg.provider || {}
-        for (const [_name, p] of Object.entries(providers)) {
-          const prov = p as { models?: Record<string, unknown> }
-          if (prov.models) {
-            const ids = Object.keys(prov.models)
-            if (ids.length === 1) {
-              const fullId = ids[0]
-              const shortName = fullId.includes('/') ? (fullId.split('/').pop() || fullId) : fullId
-              return shortName
-            }
-            const router = ids.find((id) => id.includes("router"))
-            if (router) {
-              const shortName = router.includes('/') ? (router.split('/').pop() || router) : router
-              return shortName
-            }
-            const first = ids[0]
-            const shortName = first.includes('/') ? (first.split('/').pop() || first) : first
-            return shortName
-          }
-        }
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  // 3. Detect Codex CLI (only via explicit env, not pgrep — codex is often background)
-  if (process.env.CODEX) return "codex"
-  // 3b. Detect other known CLI tools
-  if (isProcessRunning("aider")) return "aider"
-  if (isProcessRunning("cursor")) return "cursor"
-  if (isProcessRunning("windsurf")) return "windsurf"
-  if (isProcessRunning("llama")) return "llama"
-  if (isProcessRunning("ollama")) return "ollama"
-  if (isProcessRunning("opencode") || isProcessRunning("opencode.exe")) return "opencode"
-
-  return ""
-}
-
-function isProcessRunning(name: string): boolean {
-  try {
-    const result = Bun.spawnSync(["pgrep", "-x", name], {
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    return result.exitCode === 0
-  } catch {
-    return false
-  }
-}
-
-const MODEL = detectAiModel()
-
 // --- AI emoji mapping (plum11 convention + extended) ---
 const MODEL_EMOJI_MAP: Record<string, string> = {
   claude: "✳️", anthropic: "✳️",
@@ -400,21 +425,25 @@ const MODEL_EMOJI_MAP: Record<string, string> = {
   gpt: "⚡",
 }
 
-function detectAiEmoji(): string {
-  // 1. Explicit env var wins
-  if (env.TG_AI_EMOJI) return env.TG_AI_EMOJI
+function decodeTextEscapes(value: string): string {
+  return value.replace(/\\([nrt\\])/g, (_match: string, escaped: string) => {
+    if (escaped === "n") return "\n"
+    if (escaped === "r") return "\r"
+    if (escaped === "t") return "\t"
+    return "\\"
+  })
+}
 
-  // 2. Derive from detected model name
-  if (MODEL) {
-    const base = extractBaseModel(MODEL)
-    if (MODEL_EMOJI_MAP[base]) return MODEL_EMOJI_MAP[base]
-    // Fallback to substring matching for partial matches
-    for (const [key, emoji] of Object.entries(MODEL_EMOJI_MAP)) {
-      if (base.includes(key)) return emoji
-    }
+function isProcessRunning(name: string): boolean {
+  try {
+    const result = Bun.spawnSync(["pgrep", "-x", name], {
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    return result.exitCode === 0
+  } catch {
+    return false
   }
-
-  return "🗂"
 }
 
 function extractBaseModel(modelName: string): string {
@@ -432,256 +461,459 @@ function extractBaseModel(modelName: string): string {
   return lower
 }
 
-const AI_EMOJI = detectAiEmoji()
+// --- CLI entrypoint (only runs when executed directly, not when imported) ---
+if (import.meta.main) {
+  const args = process.argv.slice(2)
+  const home = process.env.HOME ?? "~"
+  const parsed = parseArgs(args, process.cwd(), home)
 
-// --- Emoji helpers ---
-function listEmojiHelpers(): string {
-  const lines = [
-    "Available emoji helpers:",
-    "",
-  ]
-  for (const [key, emoji] of Object.entries(MODEL_EMOJI_MAP)) {
-    const id = EMBEDDABLE_EMOJI_MAP[key]
-    if (id) {
-      lines.push(`  :${key}: → ${emoji} <tg-emoji emoji-id="${id}">`)
-    } else {
-      lines.push(`  :${key}: → ${emoji} (no emoji-id set — add TG_EMOJI_ID_${key})`)
-    }
+  // No-send actions resolve BEFORE the credential gate so help/version/info
+  // flags work without Telegram credentials configured.
+  if (parsed.action === "help") {
+    console.log(USAGE)
+    process.exit(0)
   }
-  lines.push("")
-  lines.push("Set emoji IDs via env vars:")
-  lines.push("  TG_EMOJI_ID_claude=5274170649227600531")
-  lines.push("  TG_EMOJI_IDS='{\"claude\":\"5274170649227600531\",\"codex\":\"5273797309195393626\"}'")
-  return lines.join("\n")
-}
-
-// Handle --ls-emoji-helpers after all helpers are defined
-if (args[0] === "--ls-emoji-helpers") {
-  console.log(listEmojiHelpers())
-  process.exit(0)
-}
-
-// Debug: print the detected AI model + emoji and exit (no message sent).
-if (args[0] === "--detect-model") {
-  console.log(`${MODEL || "(none)"}\t${AI_EMOJI || "(none)"}`)
-  process.exit(0)
-}
-
-// --- Tmux context ---
-function getTmuxPrefix(): string {
-  if (!process.env.TMUX) return ""
-  try {
-    const pane = process.env.TMUX_PANE
-    const result = Bun.spawnSync(
-      ["tmux", "display-message", "-p", "-t", pane, "#{window_name}"], {
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    if (result.exitCode === 0) {
-      const name = new TextDecoder().decode(result.stdout).trim()
-      if (name) return `[${name}]`
-    }
-  } catch {
-    // ignore — tmux not available or not in a pane
+  if (parsed.action === "version") {
+    console.log(versionOutput(import.meta.dir))
+    process.exit(0)
   }
-  return ""
-}
+  if (parsed.action === "error") {
+    console.error(`Error: ${parsed.message}`)
+    console.error(USAGE)
+    process.exit(1)
+  }
 
-const tmuxPrefix = getTmuxPrefix()
+  const configEnv = loadEnv(join(home, ".config", "tg-cli", ".env"))
+  const env = { ...configEnv, ...process.env }
 
-// --- Build prefix with custom emoji ---
-function buildPrefix(): ParsedText {
-  const parts: string[] = []
-  const entities: EmojiEntity[] = []
-  let offset = 0
-
-  if (AI_EMOJI) {
-    // Convert AI_EMOJI (Unicode) to custom emoji if available
-    const base = extractBaseModel(MODEL)
-    let emojiId = EMBEDDABLE_EMOJI_MAP[base]
-    // If not found by exact key, try substring matching
-    if (!emojiId) {
-      for (const [key, id] of Object.entries(EMBEDDABLE_EMOJI_MAP)) {
-        if (base.includes(key)) {
-          emojiId = id
-          break
+  // Override embeddable emoji IDs with env vars if provided. Runs before any
+  // info-flag handler so --ls-emoji-helpers reflects overrides + emits warnings.
+  if (env.TG_EMOJI_IDS) {
+    try {
+      const parsedIds = JSON.parse(env.TG_EMOJI_IDS)
+      if (parsedIds !== null && typeof parsedIds === "object" && !Array.isArray(parsedIds)) {
+        for (const [model, id] of Object.entries(parsedIds)) {
+          if (["__proto__", "constructor", "tostring", "valueof"].includes(model.toLowerCase())) {
+            console.error(`Warning: Rejecting reserved key in TG_EMOJI_IDS: ${model}`)
+            continue
+          }
+          if (typeof id === "string" && /^\d{19}$/.test(id)) {
+            EMBEDDABLE_EMOJI_MAP[model] = id
+          } else if (typeof id === "string") {
+            console.error(`Warning: Ignoring invalid emoji ID in TG_EMOJI_IDS for ${model}: ${id} (expected 19 digits)`)
+          } else {
+            console.error(`Warning: Ignoring non-string emoji ID in TG_EMOJI_IDS for ${model}: ${id} (expected string)`)
+          }
         }
+      } else {
+        console.error("Warning: TG_EMOJI_IDS must be a JSON object, not an array or primitive")
+      }
+    } catch {
+      console.error("Warning: TG_EMOJI_IDS contains invalid JSON, using default emoji IDs")
+    }
+  }
+  for (const [key, val] of Object.entries(env)) {
+    if (key.startsWith("TG_EMOJI_ID_")) {
+      const model = key.slice("TG_EMOJI_ID_".length).toLowerCase()
+      if (model && !["__proto__", "constructor", "tostring", "valueof"].includes(model)) {
+        if (val && /^\d{19}$/.test(val)) {
+          EMBEDDABLE_EMOJI_MAP[model] = val
+        } else {
+          console.error(`Warning: Ignoring invalid emoji ID for ${model}: ${val} (expected 19 digits)`)
+        }
+      } else if (model && ["__proto__", "constructor", "tostring", "valueof"].includes(model)) {
+        console.error(`Warning: Rejecting reserved key in TG_EMOJI_ID_${model}: ${val}`)
       }
     }
-    if (emojiId) {
-      entities.push({
-        type: "custom_emoji",
-        offset: offset,
-        length: AI_EMOJI.length,
-        custom_emoji_id: emojiId,
+  }
+
+  // --- AI model detection ---
+  const detectAiModel = (): string => {
+    // 1. Explicit env var wins
+    if (env.TG_AI_MODEL) return env.TG_AI_MODEL
+
+    // 1b. Claude Code sets CLAUDECODE=1 (and CLAUDE_CODE_* vars) in the agent's
+    // environment. Check this BEFORE the pgrep fallbacks below: a background
+    // `ollama` daemon (common on macOS) would otherwise be matched first and
+    // mislabel a Claude Code session as ollama.
+    if (env.CLAUDECODE || env.CLAUDE_CODE_ENTRYPOINT) return "claude"
+
+    // 2. Opencode (current agent) — read model from config
+    if (process.env.OPENCODE) {
+      try {
+        const result = Bun.spawnSync(["opencode", "debug", "config"], {
+          stdout: "pipe",
+          stderr: "pipe",
+        })
+        if (result.exitCode === 0) {
+          const cfg = JSON.parse(new TextDecoder().decode(result.stdout))
+          const providers = cfg.provider || {}
+          for (const [_name, p] of Object.entries(providers)) {
+            const prov = p as { models?: Record<string, unknown> }
+            if (prov.models) {
+              const ids = Object.keys(prov.models)
+              if (ids.length === 1) {
+                const fullId = ids[0]
+                const shortName = fullId.includes('/') ? (fullId.split('/').pop() || fullId) : fullId
+                return shortName
+              }
+              const router = ids.find((id) => id.includes("router"))
+              if (router) {
+                const shortName = router.includes('/') ? (router.split('/').pop() || router) : router
+                return shortName
+              }
+              const first = ids[0]
+              const shortName = first.includes('/') ? (first.split('/').pop() || first) : first
+              return shortName
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // 3. Detect Codex CLI (only via explicit env, not pgrep — codex is often background)
+    if (process.env.CODEX) return "codex"
+    // 3b. Detect other known CLI tools
+    if (isProcessRunning("aider")) return "aider"
+    if (isProcessRunning("cursor")) return "cursor"
+    if (isProcessRunning("windsurf")) return "windsurf"
+    if (isProcessRunning("llama")) return "llama"
+    if (isProcessRunning("ollama")) return "ollama"
+    if (isProcessRunning("opencode") || isProcessRunning("opencode.exe")) return "opencode"
+
+    return ""
+  }
+
+  const MODEL = detectAiModel()
+
+  const detectAiEmoji = (): string => {
+    // 1. Explicit env var wins
+    if (env.TG_AI_EMOJI) return env.TG_AI_EMOJI
+
+    // 2. Derive from detected model name
+    if (MODEL) {
+      const base = extractBaseModel(MODEL)
+      if (MODEL_EMOJI_MAP[base]) return MODEL_EMOJI_MAP[base]
+      // Fallback to substring matching for partial matches
+      for (const [key, emoji] of Object.entries(MODEL_EMOJI_MAP)) {
+        if (base.includes(key)) return emoji
+      }
+    }
+
+    return "🗂"
+  }
+
+  const AI_EMOJI = detectAiEmoji()
+
+  // --- Emoji helpers listing ---
+  const listEmojiHelpers = (): string => {
+    const lines = [
+      "Available emoji helpers:",
+      "",
+    ]
+    for (const [key, emoji] of Object.entries(MODEL_EMOJI_MAP)) {
+      const id = EMBEDDABLE_EMOJI_MAP[key]
+      if (id) {
+        lines.push(`  :${key}: → ${emoji} <tg-emoji emoji-id="${id}">`)
+      } else {
+        lines.push(`  :${key}: → ${emoji} (no emoji-id set — add TG_EMOJI_ID_${key})`)
+      }
+    }
+    lines.push("")
+    lines.push("Set emoji IDs via env vars:")
+    lines.push("  TG_EMOJI_ID_claude=5274170649227600531")
+    lines.push("  TG_EMOJI_IDS='{\"claude\":\"5274170649227600531\",\"codex\":\"5273797309195393626\"}'")
+    return lines.join("\n")
+  }
+
+  // Info-only flags inspect local state and send nothing, so they must work
+  // without Telegram credentials configured. Resolve them before the gate.
+  if (parsed.action === "lsEmojiHelpers") {
+    console.log(listEmojiHelpers())
+    process.exit(0)
+  }
+  if (parsed.action === "detectModel") {
+    console.log(`${MODEL || "(none)"}\t${AI_EMOJI || "(none)"}`)
+    process.exit(0)
+  }
+
+  const BOT_TOKEN = env.TG_BOT_TOKEN
+  const CHAT_ID = env.TG_CHAT_ID
+
+  if (!BOT_TOKEN || !CHAT_ID) {
+    console.error("Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ~/.config/tg-cli/.env")
+    process.exit(1)
+  }
+
+  const API = `https://api.telegram.org/bot${BOT_TOKEN}`
+
+  const parseEmojiHelpers = (text: string): ParsedText => {
+    const entities: EmojiEntity[] = []
+    let result = ""
+
+    const regex = /:([a-zA-Z0-9_-]+):/g
+    let match
+    let lastIndex = 0
+
+    while ((match = regex.exec(text)) !== null) {
+      const [fullMatch, name] = match
+      const lower = name.toLowerCase()
+      const emojiId = EMBEDDABLE_EMOJI_MAP[lower]
+      const unicodeEmoji = UNICODE_EMOJI_MAP[lower]
+
+      // Append text before match
+      result += text.slice(lastIndex, match.index)
+
+      if (emojiId) {
+        // Use placeholder emoji for entity
+        const placeholder = unicodeEmoji || "🤖"
+        entities.push({
+          type: "custom_emoji",
+          offset: result.length,
+          length: placeholder.length,
+          custom_emoji_id: emojiId,
+        })
+        result += placeholder
+      } else if (unicodeEmoji) {
+        result += unicodeEmoji
+      } else {
+        result += fullMatch
+      }
+
+      lastIndex = regex.lastIndex
+    }
+
+    // Append remaining text
+    result += text.slice(lastIndex)
+
+    return { text: result, entities }
+  }
+
+  // --- Tmux context ---
+  const getTmuxPrefix = (): string => {
+    if (!process.env.TMUX) return ""
+    try {
+      const pane = process.env.TMUX_PANE
+      const result = Bun.spawnSync(
+        ["tmux", "display-message", "-p", "-t", pane, "#{window_name}"], {
+        stdout: "pipe",
+        stderr: "pipe",
       })
+      if (result.exitCode === 0) {
+        const name = new TextDecoder().decode(result.stdout).trim()
+        if (name) return `[${name}]`
+      }
+    } catch {
+      // ignore — tmux not available or not in a pane
     }
-    parts.push(AI_EMOJI)
-    offset += AI_EMOJI.length
+    return ""
   }
 
-  if (tmuxPrefix) {
-    if (parts.length > 0) {
-      parts.push(" ")
-      offset += 1
+  const tmuxPrefix = getTmuxPrefix()
+
+  // --- Build prefix with custom emoji ---
+  const buildPrefix = (): ParsedText => {
+    const parts: string[] = []
+    const entities: EmojiEntity[] = []
+    let offset = 0
+
+    if (AI_EMOJI) {
+      // Convert AI_EMOJI (Unicode) to custom emoji if available
+      const base = extractBaseModel(MODEL)
+      let emojiId = EMBEDDABLE_EMOJI_MAP[base]
+      // If not found by exact key, try substring matching
+      if (!emojiId) {
+        for (const [key, id] of Object.entries(EMBEDDABLE_EMOJI_MAP)) {
+          if (base.includes(key)) {
+            emojiId = id
+            break
+          }
+        }
+      }
+      if (emojiId) {
+        entities.push({
+          type: "custom_emoji",
+          offset: offset,
+          length: AI_EMOJI.length,
+          custom_emoji_id: emojiId,
+        })
+      }
+      parts.push(AI_EMOJI)
+      offset += AI_EMOJI.length
     }
-    parts.push(tmuxPrefix)
-    offset += tmuxPrefix.length
+
+    if (tmuxPrefix) {
+      if (parts.length > 0) {
+        parts.push(" ")
+        offset += 1
+      }
+      parts.push(tmuxPrefix)
+      offset += tmuxPrefix.length
+    }
+
+    if (parts.length === 0) return { text: "", entities: [] }
+    parts.push("\n")
+    return { text: parts.join(""), entities }
   }
 
-  if (parts.length === 0) return { text: "", entities: [] }
-  parts.push("\n")
-  return { text: parts.join(""), entities }
-}
+  const { items, caption: rawCaption, format } = parsed
+  const caption = decodeTextEscapes(rawCaption)
 
-const prefix = buildPrefix()
+  const prefix = buildPrefix()
 
-// Combine prefix + caption with correct offsets
-const parsedCaption = parseEmojiHelpers(caption)
-const finalText = prefix.text + parsedCaption.text
-const finalEntities: EmojiEntity[] = [
-  ...prefix.entities,
-  ...parsedCaption.entities.map((e) => ({
-    ...e,
-    offset: e.offset + prefix.text.length,
-  })),
-]
+  // Combine prefix + caption with correct offsets
+  const parsedCaption = parseEmojiHelpers(caption)
+  const finalText = prefix.text + parsedCaption.text
+  const finalEntities: EmojiEntity[] = [
+    ...prefix.entities,
+    ...parsedCaption.entities.map((e) => ({
+      ...e,
+      offset: e.offset + prefix.text.length,
+    })),
+  ]
 
-// --- API calls ---
-function detectHtmlTags(text: string): boolean {
-  const htmlPattern = /<(b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|tg-time|code|pre|blockquote)\b/i
-  return htmlPattern.test(text)
-}
+  // --- API calls ---
+  const detectHtmlTags = (text: string): boolean => {
+    const htmlPattern = /<(b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|tg-time|code|pre|blockquote)\b/i
+    return htmlPattern.test(text)
+  }
 
-function parseModeFor(formatValue: Format, text?: string): "HTML" | undefined {
-  if (formatValue === "html") return "HTML"
-  if (text && detectHtmlTags(text)) return "HTML"
-  return undefined
-}
+  const parseModeFor = (formatValue: Format, text?: string): "HTML" | undefined => {
+    if (formatValue === "html") return "HTML"
+    if (text && detectHtmlTags(text)) return "HTML"
+    return undefined
+  }
 
-function convertEntitiesToHtml(text: string, entities: EmojiEntity[]): string {
-  // Sort by offset descending to replace from end to start without invalidating offsets
-  const sorted = [...entities].sort((a, b) => b.offset - a.offset)
-  let result = text
-  for (const entity of sorted) {
-    const emoji = result.slice(entity.offset, entity.offset + entity.length)
-    const replacement = `<tg-emoji emoji-id="${entity.custom_emoji_id}">${emoji}</tg-emoji>`
-    result = result.slice(0, entity.offset) + replacement + result.slice(entity.offset + entity.length)
+  const convertEntitiesToHtml = (text: string, entities: EmojiEntity[]): string => {
+    // Sort by offset descending to replace from end to start without invalidating offsets
+    const sorted = [...entities].sort((a, b) => b.offset - a.offset)
+    let result = text
+    for (const entity of sorted) {
+      const emoji = result.slice(entity.offset, entity.offset + entity.length)
+      const replacement = `<tg-emoji emoji-id="${entity.custom_emoji_id}">${emoji}</tg-emoji>`
+      result = result.slice(0, entity.offset) + replacement + result.slice(entity.offset + entity.length)
+    }
+    return result
   }
-  return result
-}
 
-async function checkResponse(resp: Response, method: string): Promise<void> {
-  if (!resp.ok) {
-    const body = await resp.text()
-    console.error(`Telegram API error (${method}): ${resp.status} ${body}`)
-    process.exit(1)
+  const checkResponse = async (resp: Response, method: string): Promise<void> => {
+    if (!resp.ok) {
+      const body = await resp.text()
+      console.error(`Telegram API error (${method}): ${resp.status} ${body}`)
+      process.exit(1)
+    }
+    const json = await resp.json() as { ok: boolean; description?: string }
+    if (!json.ok) {
+      console.error(`Telegram API error (${method}): ${json.description ?? "unknown error"}`)
+      process.exit(1)
+    }
   }
-  const json = await resp.json() as { ok: boolean; description?: string }
-  if (!json.ok) {
-    console.error(`Telegram API error (${method}): ${json.description ?? "unknown error"}`)
-    process.exit(1)
-  }
-}
 
-async function sendMessage(text: string, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
-  const parseMode = parseModeFor(formatValue, text)
-  let finalText = text
-  if (parseMode && entities.length > 0) {
-    finalText = convertEntitiesToHtml(text, entities)
+  const sendMessage = async (text: string, formatValue: Format, entities: EmojiEntity[]): Promise<void> => {
+    const parseMode = parseModeFor(formatValue, text)
+    let outText = text
+    if (parseMode && entities.length > 0) {
+      outText = convertEntitiesToHtml(text, entities)
+    }
+    const body: Record<string, unknown> = {
+      chat_id: CHAT_ID,
+      text: outText,
+    }
+    if (parseMode) {
+      body.parse_mode = parseMode
+    } else if (entities.length > 0) {
+      body.entities = entities
+    }
+    const resp = await fetch(`${API}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+    await checkResponse(resp, "sendMessage")
   }
-  const body: Record<string, unknown> = {
-    chat_id: CHAT_ID,
-    text: finalText,
-  }
-  if (parseMode) {
-    body.parse_mode = parseMode
-  } else if (entities.length > 0) {
-    body.entities = entities
-  }
-  const resp = await fetch(`${API}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  })
-  await checkResponse(resp, "sendMessage")
-}
 
-async function sendPhoto(filePath: string, cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
-  const parseMode = parseModeFor(formatValue, cap)
-  let finalCap = cap
-  if (parseMode && cap && entities.length > 0) {
-    finalCap = convertEntitiesToHtml(cap, entities)
+  const sendPhoto = async (filePath: string, cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> => {
+    const parseMode = parseModeFor(formatValue, cap)
+    let finalCap = cap
+    if (parseMode && cap && entities.length > 0) {
+      finalCap = convertEntitiesToHtml(cap, entities)
+    }
+    const form = new FormData()
+    form.append("chat_id", CHAT_ID)
+    form.append("photo", Bun.file(filePath))
+    if (finalCap) form.append("caption", finalCap)
+    if (parseMode) {
+      form.append("parse_mode", parseMode)
+    } else if (entities.length > 0) {
+      form.append("caption_entities", JSON.stringify(entities))
+    }
+    const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
+    await checkResponse(resp, "sendPhoto")
   }
-  const form = new FormData()
-  form.append("chat_id", CHAT_ID)
-  form.append("photo", Bun.file(filePath))
-  if (finalCap) form.append("caption", finalCap)
-  if (parseMode) {
-    form.append("parse_mode", parseMode)
-  } else if (entities.length > 0) {
-    form.append("caption_entities", JSON.stringify(entities))
-  }
-  const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
-  await checkResponse(resp, "sendPhoto")
-}
 
-async function sendDocument(filePath: string, cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
-  const parseMode = parseModeFor(formatValue, cap)
-  let finalCap = cap
-  if (parseMode && cap && entities.length > 0) {
-    finalCap = convertEntitiesToHtml(cap, entities)
+  const sendDocument = async (filePath: string, cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> => {
+    const parseMode = parseModeFor(formatValue, cap)
+    let finalCap = cap
+    if (parseMode && cap && entities.length > 0) {
+      finalCap = convertEntitiesToHtml(cap, entities)
+    }
+    const form = new FormData()
+    form.append("chat_id", CHAT_ID)
+    form.append("document", Bun.file(filePath))
+    if (finalCap) form.append("caption", finalCap)
+    if (parseMode) {
+      form.append("parse_mode", parseMode)
+    } else if (entities.length > 0) {
+      form.append("caption_entities", JSON.stringify(entities))
+    }
+    const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
+    await checkResponse(resp, "sendDocument")
   }
-  const form = new FormData()
-  form.append("chat_id", CHAT_ID)
-  form.append("document", Bun.file(filePath))
-  if (finalCap) form.append("caption", finalCap)
-  if (parseMode) {
-    form.append("parse_mode", parseMode)
-  } else if (entities.length > 0) {
-    form.append("caption_entities", JSON.stringify(entities))
-  }
-  const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
-  await checkResponse(resp, "sendDocument")
-}
 
-async function sendMediaGroup(mediaItems: Item[], cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> {
-  const parseMode = parseModeFor(formatValue, cap)
-  let finalCap = cap
-  if (parseMode && cap && entities.length > 0) {
-    finalCap = convertEntitiesToHtml(cap, entities)
+  const sendMediaGroup = async (mediaItems: Item[], cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> => {
+    const parseMode = parseModeFor(formatValue, cap)
+    let finalCap = cap
+    if (parseMode && cap && entities.length > 0) {
+      finalCap = convertEntitiesToHtml(cap, entities)
+    }
+    const form = new FormData()
+    form.append("chat_id", CHAT_ID)
+    const mediaArr = mediaItems.map((item, idx) => ({
+      type: item.type,
+      media: `attach://file${idx}`,
+      ...(idx === 0 && finalCap ? { caption: finalCap } : {}),
+      ...(idx === 0 && parseMode ? { parse_mode: parseMode } : {}),
+      ...(idx === 0 && !parseMode && entities.length > 0 ? { caption_entities: entities } : {}),
+    }))
+    form.append("media", JSON.stringify(mediaArr))
+    for (const [idx, item] of mediaItems.entries()) {
+      form.append(`file${idx}`, Bun.file(item.path))
+    }
+    const resp = await fetch(`${API}/sendMediaGroup`, { method: "POST", body: form })
+    await checkResponse(resp, "sendMediaGroup")
   }
-  const form = new FormData()
-  form.append("chat_id", CHAT_ID)
-  const mediaArr = mediaItems.map((item, idx) => ({
-    type: item.type,
-    media: `attach://file${idx}`,
-    ...(idx === 0 && finalCap ? { caption: finalCap } : {}),
-    ...(idx === 0 && parseMode ? { parse_mode: parseMode } : {}),
-    ...(idx === 0 && !parseMode && entities.length > 0 ? { caption_entities: entities } : {}),
-  }))
-  form.append("media", JSON.stringify(mediaArr))
-  for (const [idx, item] of mediaItems.entries()) {
-    form.append(`file${idx}`, Bun.file(item.path))
-  }
-  const resp = await fetch(`${API}/sendMediaGroup`, { method: "POST", body: form })
-  await checkResponse(resp, "sendMediaGroup")
-}
 
-// --- Dispatch ---
-if (items.length === 0) {
-  if (!finalText) {
-    console.error("Error: no message text provided")
-    process.exit(1)
-  }
-  await sendMessage(finalText, format, finalEntities)
-} else if (items.length === 1) {
-  const item = items[0]
-  if (item.type === "photo") {
-    await sendPhoto(item.path, finalText || undefined, format, finalEntities)
+  // --- Dispatch ---
+  if (items.length === 0) {
+    if (!finalText) {
+      console.error("Error: no message text provided")
+      process.exit(1)
+    }
+    await sendMessage(finalText, format, finalEntities)
+  } else if (items.length === 1) {
+    const item = items[0]
+    if (item.type === "photo") {
+      await sendPhoto(item.path, finalText || undefined, format, finalEntities)
+    } else {
+      await sendDocument(item.path, finalText || undefined, format, finalEntities)
+    }
   } else {
-    await sendDocument(item.path, finalText || undefined, format, finalEntities)
+    await sendMediaGroup(items, finalText || undefined, format, finalEntities)
   }
-} else {
-  await sendMediaGroup(items, finalText || undefined, format, finalEntities)
+
+  // Every send path above either succeeded or already exited(1) via
+  // checkResponse, so reaching here means the send actually went through.
+  console.log("OK")
 }
