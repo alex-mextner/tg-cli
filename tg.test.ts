@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { parseArgs } from './tg';
+import { parseArgs, VERSION } from './tg';
 
 // Real temp files for existence checks — no Telegram API is ever touched.
 let dir: string;
@@ -29,6 +29,27 @@ test('help/version flags win anywhere', () => {
   expect(parseArgs(['-v'], dir, HOME)).toEqual({ action: 'version' });
   expect(parseArgs(['hi', '--version'], dir, HOME)).toEqual({ action: 'version' });
 });
+
+// --version / -v print the version, the runtime git short hash, and the latest
+// CHANGELOG section. The hash is dynamic, so we assert on robust tokens — the
+// version string, a hex hash-like token, and a stable changelog marker — rather
+// than an exact byte match. Runs the real script as a subprocess; no Telegram
+// API is touched (the version branch exits before any network call).
+const TG_SCRIPT = join(import.meta.dir, 'tg');
+
+for (const flag of ['--version', '-v']) {
+  test(`${flag} prints version + git hash + changelog, exit 0`, () => {
+    const proc = Bun.spawnSync(['bun', TG_SCRIPT, flag]);
+    const out = proc.stdout.toString();
+    expect(proc.exitCode).toBe(0);
+    // Version string present.
+    expect(out).toContain(VERSION);
+    // A real short-or-long git hash (hex, 7-40 chars) or the graceful fallback.
+    expect(out).toMatch(/\b([0-9a-f]{7,40}|unknown)\b/);
+    // Stable changelog marker — the version heading, not prose we might reword.
+    expect(out).toContain(`## ${VERSION}`);
+  });
+}
 
 test('unknown dashed token is an error, not plain text', () => {
   expect(parseArgs(['--foo'], dir, HOME)).toEqual({
