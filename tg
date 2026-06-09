@@ -796,19 +796,6 @@ if (import.meta.main) {
   const { items, caption: rawCaption, format } = parsed
   const caption = decodeTextEscapes(rawCaption)
 
-  const prefix = buildPrefix()
-
-  // Combine prefix + caption with correct offsets
-  const parsedCaption = parseEmojiHelpers(caption)
-  const finalText = prefix.text + parsedCaption.text
-  const finalEntities: EmojiEntity[] = [
-    ...prefix.entities,
-    ...parsedCaption.entities.map((e) => ({
-      ...e,
-      offset: e.offset + prefix.text.length,
-    })),
-  ]
-
   // --- API calls ---
   const detectHtmlTags = (text: string): boolean => {
     const htmlPattern = /<(b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|tg-time|code|pre|blockquote)\b/i
@@ -893,26 +880,53 @@ if (import.meta.main) {
   // to inline HTML before reaching the transmitter, so the send primitives deal
   // only in (string, format) — no entity arrays at this layer.
 
-  // --- Render emoji to inline HTML up front ---
-  // The transmitter only deals in (string, format). Custom-emoji entities are
-  // offset-based and would be invalidated by the >4096 splitter, so we RENDER
-  // them to inline <tg-emoji> HTML here and feed the transmitter a plain string
-  // in HTML mode. Emoji always live in the prefix (message start), so they
-  // never straddle a split boundary. With no entities and no HTML requested or
-  // detected, we stay in plain mode (no forced escaping of plain text).
-  // "User HTML" = the user asked for it or wrote real tags. "Forced HTML" =
-  // there are emoji entities but no user HTML, so we switch to HTML solely to
-  // carry the <tg-emoji> tags — in that case the surrounding text is plain and
-  // MUST be escaped, or literal &<> would break parsing (regression guard).
-  const userHtml = format === "html" || detectHtmlTags(finalText)
-  const renderToHtml = userHtml || finalEntities.length > 0
-  const renderedText = renderToHtml
-    ? convertEntitiesToHtml(finalText, finalEntities, !userHtml)
-    : finalText
-  const effectiveFormat: Format = renderToHtml ? "html" : "plain"
+  // --- renderText hook: prefix + emoji → inline <tg-emoji> HTML ---
+  // Pipeline order (forced, see normalize.ts): decode → extract(R2/R4) → THIS
+  // hook on the surviving prose → assemble. Rendering AFTER extraction keeps
+  // emoji-entity offsets valid (a strip would otherwise shift them) and avoids
+  // substituting :helper: markers inside text we're about to remove.
+  const prefix = buildPrefix()
+  const renderText = (stripped: string, fmt: Format): { text: string; format: Format } => {
+    const parsedCaption = parseEmojiHelpers(stripped)
+    const finalText = prefix.text + parsedCaption.text
+    const finalEntities: EmojiEntity[] = [
+      ...prefix.entities,
+      ...parsedCaption.entities.map((e) => ({ ...e, offset: e.offset + prefix.text.length })),
+    ]
+    // The transmitter only deals in (string, format). Custom-emoji entities are
+    // offset-based and would be invalidated by the >4096 splitter, so we render
+    // them to inline <tg-emoji> HTML now. Emoji always live in the prefix
+    // (message start), so they never straddle a split boundary.
+    // "User HTML" = user asked for it or wrote real tags → leave verbatim.
+    // "Forced HTML" = emoji present but no user HTML → escape the surrounding
+    // plain text (&<>), or literal characters would break parsing.
+    const userHtml = fmt === "html" || detectHtmlTags(finalText)
+    const renderToHtml = userHtml || finalEntities.length > 0
+    if (!renderToHtml) return { text: finalText, format: "plain" }
+    return {
+      text: convertEntitiesToHtml(finalText, finalEntities, !userHtml),
+      format: "html",
+    }
+  }
 
-  // --- Build the SendPlan (normalization layer) ---
-  const plan = buildSendPlan(items, renderedText, effectiveFormat)
+  // --- File contents for R2 (duplicated-paste detection) ---
+  // Only DOCUMENT items, read from disk, size-capped — string-matching a binary
+  // photo against pasted text is pointless and potentially huge.
+  const R2_MAX_BYTES = 256 * 1024
+  const fileContents = items
+    .filter((it) => it.type === "document")
+    .map((it) => {
+      try {
+        if (statSync(it.path).size > R2_MAX_BYTES) return null
+        return { path: it.path, content: readFileSync(it.path, "utf8") }
+      } catch {
+        return null
+      }
+    })
+    .filter((f): f is { path: string; content: string } => f !== null)
+
+  // --- Build the SendPlan (normalization layer: R2/R3/R4 + render) ---
+  const plan = buildSendPlan(items, caption, format, { fileContents, renderText })
 
   if (
     plan.photos.length === 0 &&
