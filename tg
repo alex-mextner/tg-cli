@@ -6,15 +6,11 @@ import {
   parseFeatureConfig,
   resolveFeatures,
 } from "./features/auto-attach/feature-flags"
+import { planLineSpecs } from "./features/auto-attach/line-spec"
 import { buildSendPlan } from "./features/auto-attach/normalize"
-import {
-  extractContextRange,
-  injectMarkers,
-  parseLineSpec,
-  renderQuote,
-} from "./features/auto-attach/snippet"
+import { parseLineSpec } from "./features/auto-attach/snippet"
 import { transmit, type Transport } from "./features/auto-attach/transmitter"
-import { type SendItem } from "./features/auto-attach/types"
+import { CAPTION_LIMIT, type SendItem } from "./features/auto-attach/types"
 import {
   enumerateWorktreeRoots,
   looksPathLike,
@@ -182,6 +178,12 @@ export interface Item {
   // (file.ts:42 / :42-50 / :42:5). Absent otherwise so no-spec parse results
   // are byte-identical to before (keeps existing toEqual assertions green).
   lineSpec?: ItemLineSpec
+  // True ONLY for items DETECTED by the auto-attach path scanner (not for
+  // explicit --photo/--file). FIX 1: the size gate (≤1024 → don't attach)
+  // applies to auto-detected DOCUMENTS only — an explicit flag is a direct
+  // instruction and always attaches. Absent on explicit items so their
+  // existing toEqual assertions stay byte-identical.
+  auto?: true
 }
 
 export type Format = "plain" | "html"
@@ -408,7 +410,7 @@ export function parseArgs(
         continue
       }
       explicitResolved.add(resolved) // dedup repeats within the text too
-      const item: Item = { type: isImagePath(resolved) ? "photo" : "document", path: resolved }
+      const item: Item = { type: isImagePath(resolved) ? "photo" : "document", path: resolved, auto: true }
       if (spec) item.lineSpec = spec
       autoItems.push(item)
     }
@@ -992,51 +994,23 @@ if (import.meta.main) {
   //   - an in-memory copy of the whole file with marker comments around the
   //     range, which REPLACES the disk source (never touches the original).
   // Images with a line-spec are attached as-is (no snippet/markers).
-  const extOf = (p: string): string => {
-    const dot = p.lastIndexOf(".")
-    return dot === -1 ? "txt" : p.slice(dot + 1).toLowerCase()
-  }
-  const baseName = (p: string): string => p.slice(p.lastIndexOf("/") + 1)
-  interface LineSpecRender {
-    token: string
-    quote: string
-    injectedFor: string // disk path whose source should become the marked copy
-    markedContent: string
-    filename: string
-  }
-  const lineSpecRenders: LineSpecRender[] = []
-  // Only treat KNOWN text extensions as snippet-able. A binary document with a
-  // line-spec (e.g. report.pdf:12) would otherwise be read as UTF-8 — which
-  // usually doesn't throw — and uploaded as a corrupted in-memory copy. For an
-  // unlisted ext we skip the quote+marker entirely; the file still attaches
-  // normally as its disk source and the token stays in the caption.
-  const TEXT_EXTS = new Set([
-    "ts", "tsx", "js", "jsx", "mjs", "cjs",
-    "py", "json", "jsonc", "md", "markdown",
-    "sh", "bash", "zsh", "html", "css", "scss",
-    "yaml", "yml", "go", "rs", "txt", "csv",
-    "log", "toml", "ini", "xml", "sql", "rb",
-    "java", "c", "h", "cpp", "hpp", "swift", "kt",
-  ])
-  for (const it of items) {
-    if (!it.lineSpec || it.type !== "document") continue
-    const ext = extOf(it.path)
-    if (!TEXT_EXTS.has(ext)) continue // binary/unknown → attach as-is, no snippet
-    let source: string
+  //
+  // The line-spec snippet/marker work AND the FIX 1 size gate live in the pure
+  // `planLineSpecs` (features/auto-attach/line-spec.ts), tested in isolation
+  // with an in-memory reader. Here we inject a real disk reader that converts a
+  // throwing read into null. The planner's own TEXT_EXTS gate decides ext
+  // eligibility, so this reader only ever runs on a text-ext path; a null result
+  // (missing/unreadable) makes the planner fall through to attach-as-is and
+  // never silently drop a file.
+  const readText = (p: string): string | null => {
     try {
-      source = readFileSync(it.path, "utf8")
+      return readFileSync(p, "utf8")
     } catch {
-      continue // unreadable → skip the snippet, the file still attaches as-is
+      return null
     }
-    const ctx = extractContextRange(source, it.lineSpec.startLine, it.lineSpec.endLine, ext)
-    lineSpecRenders.push({
-      token: it.lineSpec.token,
-      quote: renderQuote(ctx.text, ext),
-      injectedFor: it.path,
-      markedContent: injectMarkers(source, it.lineSpec.startLine, it.lineSpec.endLine, ext),
-      filename: baseName(it.path),
-    })
   }
+  const lsPlan = planLineSpecs(items, readText, CAPTION_LIMIT)
+  const lineSpecRenders = lsPlan.quotes
   const hasQuotes = lineSpecRenders.length > 0
 
   // --- renderText hook: prefix + emoji → inline <tg-emoji> HTML ---
@@ -1074,9 +1048,13 @@ if (import.meta.main) {
   // --- File contents for R2 (duplicated-paste detection) ---
   // Only DOCUMENT items, read from disk, size-capped — string-matching a binary
   // photo against pasted text is pointless and potentially huge.
+  // FIX 1 interaction: a doc the size gate is about to DROP must NOT participate
+  // in R2 dup-stripping — otherwise its pasted content would be removed from the
+  // text AND the attachment dropped, losing the content entirely. Exclude
+  // gated-out docs from R2 so a small auto doc the user pasted keeps the paste.
   const R2_MAX_BYTES = 256 * 1024
   const fileContents = items
-    .filter((it) => it.type === "document")
+    .filter((it) => it.type === "document" && !lsPlan.dropped.has(it.path))
     .map((it) => {
       try {
         if (statSync(it.path).size > R2_MAX_BYTES) return null
@@ -1089,6 +1067,17 @@ if (import.meta.main) {
 
   // --- Build the SendPlan (normalization layer: R2/R3/R4 + render) ---
   const plan = buildSendPlan(items, caption, format, { fileContents, renderText })
+
+  // --- FIX 1 size gate: drop the attachments the planner gated out. ---
+  // A small (≤1024) line-spec file is fully shown by its inline snippet, and a
+  // small bare auto-detected document is not attached at all (its path token
+  // stays in the caption). Photos are never in `dropped`. The path token is NOT
+  // removed from the text either way (core correction: never excise a path).
+  if (lsPlan.dropped.size > 0) {
+    plan.documents = plan.documents.filter(
+      (d) => !(d.source.kind === "disk" && lsPlan.dropped.has(d.source.path)),
+    )
+  }
 
   // --- Insert line-spec quotes (post-render) + swap in marker-injected copies.
   if (hasQuotes) {
@@ -1121,13 +1110,15 @@ if (import.meta.main) {
         format: "html",
       })
     }
-    // Replace each line-spec document's disk source with the in-memory
-    // marker-injected copy (never modifies the original file on disk).
-    for (const r of lineSpecRenders) {
+    // Replace each STILL-ATTACHED line-spec document's disk source with the
+    // in-memory marker-injected copy (never modifies the original file on disk).
+    // A small line-spec file was already dropped above (snippet-only) and has no
+    // entry in `lsPlan.marked`, so `.find` returns undefined and the swap no-ops.
+    for (const m of lsPlan.marked) {
       const doc = plan.documents.find(
-        (d) => d.source.kind === "disk" && d.source.path === r.injectedFor,
+        (d) => d.source.kind === "disk" && d.source.path === m.path,
       )
-      if (doc) doc.source = { kind: "memory", filename: r.filename, content: r.markedContent }
+      if (doc) doc.source = { kind: "memory", filename: m.filename, content: m.content }
     }
   }
 

@@ -39,6 +39,38 @@ If a path carries a trailing location spec — `file.ts:42`, `file.ts:42-50`,
   the attachment. ONLY in the copy sent to TG — NEVER modify the original file. Prefer an
   **in-memory FS simulation** over real disk copies; if a real copy is ever made, delete it.
 
+## Size gate on PATH → attach (FIX 1, CTO-confirmed)
+
+R1 ("path present → attach F") is reconciled with the 1024 size principle (R3/R4):
+the attach decision for an AUTO-detected path is size-gated on the same 1024 constant.
+The gate lives in the pure `features/auto-attach/line-spec.ts` (`planLineSpecs`,
+injected content-reader, unit-tested) and is consumed by the `tg` send path.
+
+- **Line-spec path** (`file.ts:N` / `:N-M` / `:N:C`): ALWAYS show the AST-aware ±2
+  snippet inline (below the mention). Attach the FULL marker-injected file ONLY if its
+  content **> 1024** chars. If the whole file **≤ 1024** → snippet inline ONLY, no
+  attachment (the snippet is taken to show everything).
+- **Bare path** (no line-spec), AUTO-detected: attach ONLY if content **> 1024** chars.
+  If **≤ 1024** → keep the path mention in the text, do NOT attach and do NOT auto-inline
+  the content (decision A: don't dump content the user didn't paste).
+- **EXPLICIT `--photo`/`--file`** items are NEVER gated — a flag is a direct instruction;
+  they always attach. An explicit `--file x.ts` that ADOPTS a text line-spec
+  (`--file x.ts "see x.ts:3"`) still attaches with markers regardless of size.
+- **PHOTOS** are never gated (a char count on binary image bytes is meaningless, and
+  reading them as UTF-8 would corrupt the upload). **Binary / unknown-ext documents** and
+  **unreadable** files fall through to ATTACH — when size can't be measured, err toward
+  attaching, never silently drop a file.
+- Interaction with R2: a doc the gate will DROP is excluded from R2 dup-stripping, so a
+  small auto doc whose content was pasted keeps the paste (the attachment goes, the text
+  stays). R2/R3/R4 are otherwise unchanged; the gate only adds the PATH→attach size check.
+
+KNOWN LIMITATION (deferred — raised by codex, kept per the explicit ≤1024 rule): a small
+but many-line line-spec file (≤1024 chars total but spanning more than the ±2 context
+window) shows only the snippet, not the whole file — the other lines are omitted. This is
+a deliberate consequence of the char-threshold rule as the CTO specified it. A span-aware
+gate ("attach when ±2 doesn't cover the whole file even if ≤1024") would be a refinement if
+the CTO wants it; not implemented here.
+
 ## Caption overflow (answer 2)
 Telegram caption limit = 1024. If the accompanying text for a photo/document > 1024 → send
 the media with NO long caption (short/none) and send the full text as a SEPARATE text

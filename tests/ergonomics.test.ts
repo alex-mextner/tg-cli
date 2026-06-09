@@ -178,7 +178,7 @@ test('--photo with a real RELATIVE dashed filename still attaches (flag value, n
 test('absolute image path in text → photo item, path KEPT in caption', () => {
   expect(parseArgs(['look', imgAbs, 'here'], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'photo', path: imgAbs }],
+    items: [{ type: 'photo', path: imgAbs, auto: true }],
     caption: `look ${imgAbs} here`,
     format: 'plain',
   });
@@ -187,7 +187,7 @@ test('absolute image path in text → photo item, path KEPT in caption', () => {
 test('absolute non-image path in text → document item, path KEPT', () => {
   expect(parseArgs([pdfAbs], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'document', path: pdfAbs }],
+    items: [{ type: 'document', path: pdfAbs, auto: true }],
     caption: pdfAbs,
     format: 'plain',
   });
@@ -198,7 +198,7 @@ test('auto-detected SVG in text → document (Telegram rejects SVG as photo), pa
   writeFileSync(svgAbs, '<svg/>');
   expect(parseArgs([svgAbs], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'document', path: svgAbs }],
+    items: [{ type: 'document', path: svgAbs, auto: true }],
     caption: svgAbs,
     format: 'plain',
   });
@@ -208,7 +208,7 @@ test('auto-detected SVG in text → document (Telegram rejects SVG as photo), pa
 test('relative existing file resolves against cwd, token KEPT in caption', () => {
   expect(parseArgs(['shot.PNG'], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'photo', path: imgAbs }],
+    items: [{ type: 'photo', path: imgAbs, auto: true }],
     caption: 'shot.PNG',
     format: 'plain',
   });
@@ -217,7 +217,7 @@ test('relative existing file resolves against cwd, token KEPT in caption', () =>
 test('path inside a quoted single argv token is detected, KEPT in caption', () => {
   expect(parseArgs([`look at ${imgAbs} please`], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'photo', path: imgAbs }],
+    items: [{ type: 'photo', path: imgAbs, auto: true }],
     caption: `look at ${imgAbs} please`,
     format: 'plain',
   });
@@ -254,7 +254,7 @@ test('~ home expansion resolves to a real file, token KEPT in caption', () => {
   // home = dir for this case so ~/shot.PNG resolves to imgAbs.
   expect(parseArgs(['~/shot.PNG'], '/some/other/cwd', dir)).toEqual({
     action: 'send',
-    items: [{ type: 'photo', path: imgAbs }],
+    items: [{ type: 'photo', path: imgAbs, auto: true }],
     caption: '~/shot.PNG',
     format: 'plain',
   });
@@ -273,8 +273,9 @@ test('explicit --file plus auto-detected photo → media group, text path KEPT',
   expect(parseArgs(['--file', pdfAbs, imgAbs, 'both'], dir, HOME)).toEqual({
     action: 'send',
     items: [
+      // Explicit --file → no `auto`; auto-detected photo → `auto: true`.
       { type: 'document', path: pdfAbs },
-      { type: 'photo', path: imgAbs },
+      { type: 'photo', path: imgAbs, auto: true },
     ],
     caption: `${imgAbs} both`,
     format: 'plain',
@@ -301,7 +302,7 @@ test('plain multi-line / multi-space text preserves whitespace exactly', () => {
 test('caption around a detected path keeps the path AND surrounding formatting', () => {
   expect(parseArgs([`top\n${imgAbs}\nbottom`], dir, HOME)).toEqual({
     action: 'send',
-    items: [{ type: 'photo', path: imgAbs }],
+    items: [{ type: 'photo', path: imgAbs, auto: true }],
     caption: `top\n${imgAbs}\nbottom`,
     format: 'plain',
   });
@@ -337,6 +338,9 @@ test('line-spec :N on an existing file → attached with lineSpec, token KEPT', 
       {
         type: 'document',
         path: tsAbs,
+        // Auto-detected from the text → carries `auto: true` (FIX 1 size gate
+        // applies to auto items only; explicit --file does not).
+        auto: true,
         lineSpec: { token: `${tsAbs}:3`, startLine: 3, endLine: 3, col: undefined },
       },
     ],
@@ -404,10 +408,10 @@ test('plain existing path with no spec has NO lineSpec field', () => {
   const r = parseArgs([pdfAbs], dir, HOME);
   expect(r).toEqual({
     action: 'send',
-    items: [{ type: 'document', path: pdfAbs }],
+    items: [{ type: 'document', path: pdfAbs, auto: true }],
     caption: pdfAbs,
     format: 'plain',
   });
-  // Explicit: the field is absent, not undefined.
+  // No spec: the lineSpec field is absent, not undefined.
   if (r.action === 'send') expect('lineSpec' in r.items[0]).toBe(false);
 });
