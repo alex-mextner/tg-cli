@@ -89,3 +89,52 @@ filename base; auto-detect the extension from content (language detection → .t
 - Full AST parsing for every language is not feasible in a single Bun script; use a light
   approach (brace/indent-aware ±2, or a small parser only for the common langs) and degrade
   to line-based ±2 otherwise — but say so in code comments + the spec, don't pretend.
+
+## Implementation notes (what actually shipped — read this)
+
+Module layout (`features/auto-attach/`):
+- `feature-flags.ts` — pure config.yaml parse (tiny hand-rolled reader, no yaml dep) +
+  3-layer resolution (default → config → `--feature`/`--no-feature`). `auto-attach` ON by
+  default.
+- `types.ts` — `SendItem` (source = disk path OR in-memory `{filename, content}`),
+  `SendPlan {photos, textMessages, documents}`, limits (`CAPTION_LIMIT=1024`, `MESSAGE_LIMIT=4096`).
+- `extract.ts` — R2 (`stripDuplicatedFileContent`, line-based & whitespace-tolerant), R4
+  (`extractLargeCodeBlocks`, >1024 fenced; ≤1024 left inline = R3), `detectLanguage`,
+  `inferFragmentName`.
+- `snippet.ts` — line-spec parse + AST-aware ±2 extraction + shift-tab + quote render +
+  marker injection.
+- `normalize.ts` — `extractFromText` (R4 spliced last-to-first, THEN R2) + `buildSendPlan`
+  with a `renderText` hook (emoji rendering injected by tg so entity offsets are computed
+  on post-extraction text).
+- `transmitter.ts` — the ONLY layer with Telegram length-limit logic + ordering. Injectable
+  `Transport` (mockable). Caption-overflow + the >4096 split are safety nets that run even
+  when `auto-attach` is OFF.
+
+AST-awareness is **honestly light** (not a real parser):
+- ts/tsx/js/jsx/json/go/rs/css: brace-balance — after ±2 lines, extend outward (capped at
+  40 lines) until `{`/`}` balance. Ignores braces inside strings/comments — acceptable for a
+  preview snippet, NOT a correctness guarantee.
+- py: indent-aware — extend to the contiguous block at/above the target line's indent.
+- everything else: plain line-based ±2.
+The column in `file.ts:N:C` is parsed and surfaced but not used to narrow the extraction.
+
+Pipeline order (forced): `decode → extractFromText(R4 then R2) → renderText(prefix + emoji →
+inline <tg-emoji> HTML) → insert line-spec quotes (post-render, token-anchored) → SendPlan →
+transmit (caption-overflow → 4096 split → photos→text→documents)`.
+
+HTML / escaping rule: custom-emoji entities are rendered to inline `<tg-emoji>` HTML up
+front (so the splitter can't invalidate offset arrays). When HTML is forced ONLY to carry
+emoji/quotes (no user-intended HTML), the surrounding plain prose is HTML-escaped (`&<>`);
+when the user asked for `--format html` or wrote real tags, prose is left verbatim.
+
+Resolved edge: when extraction empties the prose but attachments remain, the AI-emoji/tmux
+prefix still rides as the caption (consistent with `tg --photo x.png`); a truly empty render
+(no prefix, no prose) produces no text message.
+
+In-memory FS: line-spec marker copies and R4 fragments are `Blob`s built from in-memory
+content — the original files are never modified and nothing is written to disk (verified:
+a real smoke send left the source hash unchanged with no stray files).
+
+Behavior change vs the old send path: multiple attachments are now sent as individual
+photo/document messages (transmitter model) rather than a single `sendMediaGroup` album, so
+the photos→text→documents ordering and per-item caption-overflow rules apply uniformly.
