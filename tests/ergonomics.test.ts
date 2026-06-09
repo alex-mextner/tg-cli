@@ -172,50 +172,53 @@ test('--photo with a real RELATIVE dashed filename still attaches (flag value, n
 });
 
 // --- Ergonomic #3: auto-attach paths in message text ---
-test('absolute image path in text → photo item, stripped from caption', () => {
+// CORE CORRECTION (spec §"never excise a path"): detected paths are KEPT in the
+// caption verbatim — only the file is additionally attached. These cases used
+// to assert excision; the CTO reversed that, so they now assert path-kept.
+test('absolute image path in text → photo item, path KEPT in caption', () => {
   expect(parseArgs(['look', imgAbs, 'here'], dir, HOME)).toEqual({
     action: 'send',
     items: [{ type: 'photo', path: imgAbs }],
-    caption: 'look here',
+    caption: `look ${imgAbs} here`,
     format: 'plain',
   });
 });
 
-test('absolute non-image path in text → document item', () => {
+test('absolute non-image path in text → document item, path KEPT', () => {
   expect(parseArgs([pdfAbs], dir, HOME)).toEqual({
     action: 'send',
     items: [{ type: 'document', path: pdfAbs }],
-    caption: '',
+    caption: pdfAbs,
     format: 'plain',
   });
 });
 
-test('auto-detected SVG in text → document (Telegram rejects SVG as photo)', () => {
+test('auto-detected SVG in text → document (Telegram rejects SVG as photo), path KEPT', () => {
   const svgAbs = join(dir, 'diagram.svg');
   writeFileSync(svgAbs, '<svg/>');
   expect(parseArgs([svgAbs], dir, HOME)).toEqual({
     action: 'send',
     items: [{ type: 'document', path: svgAbs }],
-    caption: '',
+    caption: svgAbs,
     format: 'plain',
   });
   rmSync(svgAbs, { force: true });
 });
 
-test('relative existing file resolves against cwd', () => {
+test('relative existing file resolves against cwd, token KEPT in caption', () => {
   expect(parseArgs(['shot.PNG'], dir, HOME)).toEqual({
     action: 'send',
     items: [{ type: 'photo', path: imgAbs }],
-    caption: '',
+    caption: 'shot.PNG',
     format: 'plain',
   });
 });
 
-test('path inside a quoted single argv token is detected', () => {
+test('path inside a quoted single argv token is detected, KEPT in caption', () => {
   expect(parseArgs([`look at ${imgAbs} please`], dir, HOME)).toEqual({
     action: 'send',
     items: [{ type: 'photo', path: imgAbs }],
-    caption: 'look at please',
+    caption: `look at ${imgAbs} please`,
     format: 'plain',
   });
 });
@@ -247,33 +250,33 @@ test('directory token is NOT treated as a file', () => {
   });
 });
 
-test('~ home expansion resolves to a real file', () => {
+test('~ home expansion resolves to a real file, token KEPT in caption', () => {
   // home = dir for this case so ~/shot.PNG resolves to imgAbs.
   expect(parseArgs(['~/shot.PNG'], '/some/other/cwd', dir)).toEqual({
     action: 'send',
     items: [{ type: 'photo', path: imgAbs }],
-    caption: '',
+    caption: '~/shot.PNG',
     format: 'plain',
   });
 });
 
-test('explicit --photo takes precedence: same file not attached twice', () => {
+test('explicit --photo takes precedence: same file not attached twice, text path KEPT', () => {
   expect(parseArgs(['--photo', imgAbs, imgAbs, 'cap'], dir, HOME)).toEqual({
     action: 'send',
     items: [{ type: 'photo', path: imgAbs }],
-    caption: 'cap',
+    caption: `${imgAbs} cap`,
     format: 'plain',
   });
 });
 
-test('explicit --file plus auto-detected photo → media group', () => {
+test('explicit --file plus auto-detected photo → media group, text path KEPT', () => {
   expect(parseArgs(['--file', pdfAbs, imgAbs, 'both'], dir, HOME)).toEqual({
     action: 'send',
     items: [
       { type: 'document', path: pdfAbs },
       { type: 'photo', path: imgAbs },
     ],
-    caption: 'both',
+    caption: `${imgAbs} both`,
     format: 'plain',
   });
 });
@@ -295,11 +298,11 @@ test('plain multi-line / multi-space text preserves whitespace exactly', () => {
   });
 });
 
-test('caption around an excised path keeps surrounding formatting', () => {
+test('caption around a detected path keeps the path AND surrounding formatting', () => {
   expect(parseArgs([`top\n${imgAbs}\nbottom`], dir, HOME)).toEqual({
     action: 'send',
     items: [{ type: 'photo', path: imgAbs }],
-    caption: 'top\nbottom',
+    caption: `top\n${imgAbs}\nbottom`,
     format: 'plain',
   });
 });

@@ -101,11 +101,13 @@ Options:
   -v, --version        print version and exit
   -h, --help           print this help and exit
 
-Auto-attach:
+Auto-attach (feature, ON by default — toggle with --feature/--no-feature):
   File paths in the message text that resolve to an existing file (absolute,
   ~-expanded, or relative to the current directory) are auto-attached: images
-  become photos, everything else becomes a document. The path token is removed
-  from the caption. Explicit --photo/--file take precedence.
+  become photos, everything else becomes a document. The path token is KEPT in
+  the caption (it is NOT removed). Explicit --photo/--file take precedence.
+  Disable with --no-feature auto-attach or features.auto-attach: false in
+  ~/.config/tg-cli/config.yaml.
 
 Unknown flags:
   Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
@@ -286,40 +288,27 @@ export function parseArgs(args: string[], cwd: string, home: string): ParseResul
       .filter((p): p is string => p !== null),
   )
   const autoItems: Item[] = []
-  // Tokenize the joined text but KEEP whitespace runs (incl. newlines) so the
-  // caption preserves the user's formatting — we only excise matched path
-  // tokens, never normalize spacing of plain text. Split with a capturing
-  // group: even indices are word tokens, odd indices are the whitespace gaps.
+  // CORE CORRECTION (spec §"never excise a path"): a path mentioned in the text
+  // STAYS in the text verbatim. We only DETECT it and attach the file — we never
+  // strip the token from the caption. (The old behavior excised it; that is now
+  // reversed.) Tokenize purely to find file references; the caption is the
+  // original joined text, untouched except for outer-edge trimming.
   const segments = textParts.join(" ").split(/(\s+)/)
-  const kept: string[] = []
   for (let s = 0; s < segments.length; s++) {
-    const seg = segments[s]
     const isWhitespace = s % 2 === 1
-    if (isWhitespace) {
-      kept.push(seg)
-      continue
-    }
-    if (!seg) {
-      kept.push(seg)
-      continue
-    }
+    const seg = segments[s]
+    if (isWhitespace || !seg) continue
     const resolved = resolveExistingFile(seg, cwd, home)
-    if (resolved) {
-      if (!explicitResolved.has(resolved)) {
-        explicitResolved.add(resolved) // dedup repeats within the text too
-        autoItems.push({ type: isImagePath(resolved) ? "photo" : "document", path: resolved })
-      }
-      // Excise the path token and the whitespace gap that followed it (if any)
-      // so we don't leave a doubled space behind.
-      if (s + 1 < segments.length) segments[s + 1] = ""
-      continue
+    if (resolved && !explicitResolved.has(resolved)) {
+      explicitResolved.add(resolved) // dedup repeats within the text too
+      autoItems.push({ type: isImagePath(resolved) ? "photo" : "document", path: resolved })
     }
-    kept.push(seg)
   }
 
   const items = [...explicit, ...autoItems]
   // Trim only the outer edges; interior formatting (newlines, alignment) stays.
-  const caption = kept.join("").replace(/^\s+|\s+$/g, "")
+  // The path token is intentionally KEPT in the caption (core correction).
+  const caption = textParts.join(" ").replace(/^\s+|\s+$/g, "")
 
   // Empty invocation (or nothing left after path excision) → help, exit 0.
   if (items.length === 0 && !caption) return { action: "help" }
