@@ -7,6 +7,12 @@ import {
   resolveFeatures,
 } from "./features/auto-attach/feature-flags"
 import { buildSendPlan } from "./features/auto-attach/normalize"
+import {
+  extractContextRange,
+  injectMarkers,
+  parseLineSpec,
+  renderQuote,
+} from "./features/auto-attach/snippet"
 import { transmit, type Transport } from "./features/auto-attach/transmitter"
 import { CAPTION_LIMIT, type SendItem } from "./features/auto-attach/types"
 
@@ -154,9 +160,22 @@ Only those HTML tags are supported. Escape raw <, >, and & outside tags as
 `
 
 // --- Arg parsing (pure) ---
+export interface ItemLineSpec {
+  // The full original token as written (e.g. "src/a.ts:42-50"), kept so the
+  // quote can be anchored on it in the caption.
+  token: string
+  startLine: number
+  endLine: number
+  col: number | undefined
+}
+
 export interface Item {
   type: "photo" | "document"
   path: string
+  // Present only when the path was written with a trailing line-spec
+  // (file.ts:42 / :42-50 / :42:5). Absent otherwise so no-spec parse results
+  // are byte-identical to before (keeps existing toEqual assertions green).
+  lineSpec?: ItemLineSpec
 }
 
 export type Format = "plain" | "html"
@@ -316,10 +335,31 @@ export function parseArgs(
       const isWhitespace = s % 2 === 1
       const seg = segments[s]
       if (isWhitespace || !seg) continue
-      const resolved = resolveExistingFile(seg, cwd, home)
+      // First try a plain existing-file resolve. If that fails, the token may
+      // carry a trailing line-spec (file.ts:42 / :42-50 / :42:5) — strip it and
+      // resolve the base path. The full token stays in the caption either way.
+      let resolved = resolveExistingFile(seg, cwd, home)
+      let spec: ItemLineSpec | undefined
+      if (!resolved) {
+        const ls = parseLineSpec(seg)
+        if (ls) {
+          const baseResolved = resolveExistingFile(ls.path, cwd, home)
+          if (baseResolved) {
+            resolved = baseResolved
+            spec = {
+              token: seg,
+              startLine: ls.startLine,
+              endLine: ls.endLine,
+              col: ls.col,
+            }
+          }
+        }
+      }
       if (resolved && !explicitResolved.has(resolved)) {
         explicitResolved.add(resolved) // dedup repeats within the text too
-        autoItems.push({ type: isImagePath(resolved) ? "photo" : "document", path: resolved })
+        const item: Item = { type: isImagePath(resolved) ? "photo" : "document", path: resolved }
+        if (spec) item.lineSpec = spec
+        autoItems.push(item)
       }
     }
   }
@@ -885,6 +925,53 @@ if (import.meta.main) {
   // hook on the surviving prose → assemble. Rendering AFTER extraction keeps
   // emoji-entity offsets valid (a strip would otherwise shift them) and avoids
   // substituting :helper: markers inside text we're about to remove.
+  // --- Line-spec quotes + marker-injected copies (in-memory) ---
+  // For each text-readable item that carried a trailing line-spec, build:
+  //   - a TG quote of the referenced range ±2 (AST-aware) to insert directly
+  //     below the path mention in the caption, and
+  //   - an in-memory copy of the whole file with marker comments around the
+  //     range, which REPLACES the disk source (never touches the original).
+  // Images with a line-spec are attached as-is (no snippet/markers).
+  const extOf = (p: string): string => {
+    const dot = p.lastIndexOf(".")
+    return dot === -1 ? "txt" : p.slice(dot + 1).toLowerCase()
+  }
+  const baseName = (p: string): string => p.slice(p.lastIndexOf("/") + 1)
+  interface LineSpecRender {
+    token: string
+    quote: string
+    injectedFor: string // disk path whose source should become the marked copy
+    markedContent: string
+    filename: string
+  }
+  const lineSpecRenders: LineSpecRender[] = []
+  for (const it of items) {
+    if (!it.lineSpec || it.type !== "document") continue
+    let source: string
+    try {
+      source = readFileSync(it.path, "utf8")
+    } catch {
+      continue // unreadable → skip the snippet, the file still attaches as-is
+    }
+    const ext = extOf(it.path)
+    const ctx = extractContextRange(source, it.lineSpec.startLine, it.lineSpec.endLine, ext)
+    lineSpecRenders.push({
+      token: it.lineSpec.token,
+      quote: renderQuote(ctx.text, ext),
+      injectedFor: it.path,
+      markedContent: injectMarkers(source, it.lineSpec.startLine, it.lineSpec.endLine, ext),
+      filename: baseName(it.path),
+    })
+  }
+  const hasQuotes = lineSpecRenders.length > 0
+
+  // --- renderText hook: prefix + emoji → inline <tg-emoji> HTML ---
+  // Pipeline order (forced, see normalize.ts): decode → extract(R2/R4) → THIS
+  // hook on the surviving prose → assemble. Rendering AFTER extraction keeps
+  // emoji-entity offsets valid (a strip would otherwise shift them) and avoids
+  // substituting :helper: markers inside text we're about to remove. Line-spec
+  // quotes are inserted AFTER this hook (anchored on the token) so the injected
+  // <pre> can't flip the userHtml/escape decision below.
   const prefix = buildPrefix()
   const renderText = (stripped: string, fmt: Format): { text: string; format: Format } => {
     const parsedCaption = parseEmojiHelpers(stripped)
@@ -898,10 +985,11 @@ if (import.meta.main) {
     // them to inline <tg-emoji> HTML now. Emoji always live in the prefix
     // (message start), so they never straddle a split boundary.
     // "User HTML" = user asked for it or wrote real tags → leave verbatim.
-    // "Forced HTML" = emoji present but no user HTML → escape the surrounding
-    // plain text (&<>), or literal characters would break parsing.
+    // "Forced HTML" = emoji present, OR we will inject line-spec quotes, but no
+    // user HTML → escape the surrounding plain text (&<>) so literal characters
+    // can't break parsing.
     const userHtml = fmt === "html" || detectHtmlTags(finalText)
-    const renderToHtml = userHtml || finalEntities.length > 0
+    const renderToHtml = userHtml || finalEntities.length > 0 || hasQuotes
     if (!renderToHtml) return { text: finalText, format: "plain" }
     return {
       text: convertEntitiesToHtml(finalText, finalEntities, !userHtml),
@@ -927,6 +1015,43 @@ if (import.meta.main) {
 
   // --- Build the SendPlan (normalization layer: R2/R3/R4 + render) ---
   const plan = buildSendPlan(items, caption, format, { fileContents, renderText })
+
+  // --- Insert line-spec quotes (post-render) + swap in marker-injected copies.
+  if (hasQuotes) {
+    // Anchor each quote on the line that contains its (kept) path token, then
+    // splice the quote in on the line directly below. Token-anchored, so it is
+    // robust to length changes from emoji/HTML rendering above.
+    if (plan.textMessages.length > 0) {
+      let body = plan.textMessages[0].text
+      for (const r of lineSpecRenders) {
+        const lines = body.split("\n")
+        const idx = lines.findIndex((l) => l.includes(r.token))
+        if (idx === -1) {
+          // Token not found in the rendered text (shouldn't happen) → append.
+          lines.push(r.quote)
+        } else {
+          lines.splice(idx + 1, 0, r.quote)
+        }
+        body = lines.join("\n")
+      }
+      // A quote is HTML, so the message must be sent as HTML.
+      plan.textMessages[0] = { text: body, format: "html" }
+    } else {
+      // No prose survived but quotes exist → send the quotes as the message.
+      plan.textMessages.push({
+        text: lineSpecRenders.map((r) => r.quote).join("\n"),
+        format: "html",
+      })
+    }
+    // Replace each line-spec document's disk source with the in-memory
+    // marker-injected copy (never modifies the original file on disk).
+    for (const r of lineSpecRenders) {
+      const doc = plan.documents.find(
+        (d) => d.source.kind === "disk" && d.source.path === r.injectedFor,
+      )
+      if (doc) doc.source = { kind: "memory", filename: r.filename, content: r.markedContent }
+    }
+  }
 
   if (
     plan.photos.length === 0 &&

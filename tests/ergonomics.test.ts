@@ -325,3 +325,69 @@ test('auto-attach OFF: explicit --photo/--file still attach', () => {
     format: 'plain',
   });
 });
+
+// --- Line-spec: file.ts:N / :N-M / :N:C detected, token KEPT in caption ---
+test('line-spec :N on an existing file → attached with lineSpec, token KEPT', () => {
+  const tsAbs = join(dir, 'mod.ts');
+  writeFileSync(tsAbs, 'a\nb\nc\nd\ne');
+  const r = parseArgs([`see ${tsAbs}:3`], dir, HOME);
+  expect(r).toEqual({
+    action: 'send',
+    items: [
+      {
+        type: 'document',
+        path: tsAbs,
+        lineSpec: { token: `${tsAbs}:3`, startLine: 3, endLine: 3, col: undefined },
+      },
+    ],
+    caption: `see ${tsAbs}:3`,
+    format: 'plain',
+  });
+  rmSync(tsAbs, { force: true });
+});
+
+test('line-spec :N-M range and :N:C column parse onto the item', () => {
+  const tsAbs = join(dir, 'mod2.ts');
+  writeFileSync(tsAbs, 'a\nb\nc\nd\ne\nf');
+  const range = parseArgs([`${tsAbs}:2-4`], dir, HOME);
+  expect(range.action).toBe('send');
+  if (range.action === 'send') {
+    expect(range.items[0].lineSpec).toEqual({
+      token: `${tsAbs}:2-4`,
+      startLine: 2,
+      endLine: 4,
+      col: undefined,
+    });
+  }
+  const col = parseArgs([`${tsAbs}:2:5`], dir, HOME);
+  if (col.action === 'send') {
+    expect(col.items[0].lineSpec).toEqual({
+      token: `${tsAbs}:2:5`,
+      startLine: 2,
+      endLine: 2,
+      col: 5,
+    });
+  }
+  rmSync(tsAbs, { force: true });
+});
+
+test('line-spec on a NON-existent file → plain text, no attach', () => {
+  expect(parseArgs(['/nope/x.ts:42', 'hi'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: '/nope/x.ts:42 hi',
+    format: 'plain',
+  });
+});
+
+test('plain existing path with no spec has NO lineSpec field', () => {
+  const r = parseArgs([pdfAbs], dir, HOME);
+  expect(r).toEqual({
+    action: 'send',
+    items: [{ type: 'document', path: pdfAbs }],
+    caption: pdfAbs,
+    format: 'plain',
+  });
+  // Explicit: the field is absent, not undefined.
+  if (r.action === 'send') expect('lineSpec' in r.items[0]).toBe(false);
+});
