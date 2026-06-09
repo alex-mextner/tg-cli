@@ -32,7 +32,9 @@ function captionCandidate(plan: SendPlan): { text: string; format: Format } | nu
 }
 
 async function sendText(text: string, format: Format, t: Transport): Promise<void> {
-  for (const chunk of splitMessage(text, MESSAGE_LIMIT)) {
+  // Pass the format so plain messages skip HTML tag-balancing (otherwise a long
+  // plain message containing pseudo-tags like `a<b>c` would be corrupted).
+  for (const chunk of splitMessage(text, MESSAGE_LIMIT, format)) {
     await t.sendMessage(chunk, format);
   }
 }

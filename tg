@@ -821,16 +821,35 @@ if (import.meta.main) {
     return undefined
   }
 
-  const convertEntitiesToHtml = (text: string, entities: EmojiEntity[]): string => {
-    // Sort by offset descending to replace from end to start without invalidating offsets
-    const sorted = [...entities].sort((a, b) => b.offset - a.offset)
-    let result = text
-    for (const entity of sorted) {
-      const emoji = result.slice(entity.offset, entity.offset + entity.length)
-      const replacement = `<tg-emoji emoji-id="${entity.custom_emoji_id}">${emoji}</tg-emoji>`
-      result = result.slice(0, entity.offset) + replacement + result.slice(entity.offset + entity.length)
+  const escapeHtml = (s: string): string =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+
+  // Render custom-emoji entities to inline <tg-emoji> tags.
+  //   escape=false → the surrounding text is intentional HTML (user asked for
+  //     --format html or wrote real tags); leave it verbatim.
+  //   escape=true  → we are forcing HTML ONLY to carry the emoji; the
+  //     surrounding text is plain, so escape &<> in the non-entity segments so
+  //     literal characters can't break HTML parsing (regression guard).
+  const convertEntitiesToHtml = (
+    text: string,
+    entities: EmojiEntity[],
+    escape = false,
+  ): string => {
+    // Walk entities left-to-right, copying the gaps between them verbatim (or
+    // HTML-escaped when `escape`) and inserting a <tg-emoji> tag for each.
+    const asc = [...entities].sort((a, b) => a.offset - b.offset)
+    let out = ""
+    let cursor = 0
+    for (const e of asc) {
+      const gap = text.slice(cursor, e.offset)
+      out += escape ? escapeHtml(gap) : gap
+      const emoji = text.slice(e.offset, e.offset + e.length)
+      out += `<tg-emoji emoji-id="${e.custom_emoji_id}">${emoji}</tg-emoji>`
+      cursor = e.offset + e.length
     }
-    return result
+    const tail = text.slice(cursor)
+    out += escape ? escapeHtml(tail) : tail
+    return out
   }
 
   const checkResponse = async (resp: Response, method: string): Promise<void> => {
@@ -881,8 +900,15 @@ if (import.meta.main) {
   // in HTML mode. Emoji always live in the prefix (message start), so they
   // never straddle a split boundary. With no entities and no HTML requested or
   // detected, we stay in plain mode (no forced escaping of plain text).
-  const renderToHtml = format === "html" || finalEntities.length > 0 || detectHtmlTags(finalText)
-  const renderedText = renderToHtml ? convertEntitiesToHtml(finalText, finalEntities) : finalText
+  // "User HTML" = the user asked for it or wrote real tags. "Forced HTML" =
+  // there are emoji entities but no user HTML, so we switch to HTML solely to
+  // carry the <tg-emoji> tags — in that case the surrounding text is plain and
+  // MUST be escaped, or literal &<> would break parsing (regression guard).
+  const userHtml = format === "html" || detectHtmlTags(finalText)
+  const renderToHtml = userHtml || finalEntities.length > 0
+  const renderedText = renderToHtml
+    ? convertEntitiesToHtml(finalText, finalEntities, !userHtml)
+    : finalText
   const effectiveFormat: Format = renderToHtml ? "html" : "plain"
 
   // --- Build the SendPlan (normalization layer) ---

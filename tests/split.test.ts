@@ -56,6 +56,21 @@ test('HTML: open tag spanning a boundary is closed and reopened per chunk', () =
   }
 });
 
+test('HTML: a tag spanning 3+ chunks stays balanced in every chunk', () => {
+  // Inner long enough to need at least 3 chunks at this limit.
+  const inner = 'y'.repeat(LIMIT * 3);
+  const text = `<b>${inner}</b>`;
+  const chunks = splitMessage(text, LIMIT, 'html');
+  expect(chunks.length).toBeGreaterThanOrEqual(3);
+  for (const c of chunks) {
+    expect(c.length).toBeLessThanOrEqual(LIMIT);
+    const opens = (c.match(/<b>/g) || []).length;
+    const closes = (c.match(/<\/b>/g) || []).length;
+    expect(opens).toBe(closes); // each middle chunk reopens AND closes <b>
+    expect(opens).toBeGreaterThanOrEqual(1);
+  }
+});
+
 test('plain mode does not treat <...> as tags (no balancing)', () => {
   const text = 'a<b>c'.repeat(2000); // > 4096, contains pseudo-tags
   const chunks = splitMessage(text, LIMIT, 'plain');

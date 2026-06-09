@@ -119,7 +119,13 @@ export function splitMessage(text: string, limit: number, format: 'plain' | 'htm
       if (cut <= 0) cut = Math.max(1, safeCut(rest, 0, budget));
 
       const piece = rest.slice(0, cut);
-      stillOpen = htmlAware ? openTagsAt(piece, piece.length) : [];
+      // The open-tag stack must be computed over reopen+piece, NOT piece alone:
+      // a tag carried in from the previous chunk (present in `reopen`) is still
+      // open across this chunk and must be re-carried forward + closed here.
+      // (Bug fix: computing from `piece` only dropped carried tags on 3+-chunk
+      // spans, leaving an unclosed opener.)
+      const assembledPiece = reopen + piece;
+      stillOpen = htmlAware ? openTagsAt(assembledPiece, assembledPiece.length) : [];
       const closing = stillOpen
         .slice()
         .reverse()
