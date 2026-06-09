@@ -15,6 +15,12 @@ import {
 } from "./features/auto-attach/snippet"
 import { transmit, type Transport } from "./features/auto-attach/transmitter"
 import { type SendItem } from "./features/auto-attach/types"
+import {
+  enumerateWorktreeRoots,
+  looksPathLike,
+  resolveAcrossWorktrees,
+  runGitReal,
+} from "./features/auto-attach/worktree"
 
 export const VERSION = "1.0.0"
 
@@ -249,6 +255,12 @@ export function parseArgs(
   cwd: string,
   home: string,
   autoAttach = true,
+  // Worktree-aware fallback: a memoized thunk returning the priority-ordered
+  // list of git worktree roots to probe when a path-like token fails plain
+  // cwd/~/absolute resolution. Injected so tests stub it (and `main` memoizes
+  // the real `enumerateWorktreeRoots`). Defaults to "no extra roots" — with the
+  // thunk absent, resolution is exactly the old cwd-only behavior.
+  getWorktreeRoots: () => string[] = () => [],
 ): ParseResult {
   // 1. Help / version win anywhere, before the empty check.
   for (const a of args) {
@@ -330,6 +342,27 @@ export function parseArgs(
   // scan entirely — only explicit --photo/--file are attached, and any path in
   // the text stays as plain words (it is never attached).
   if (autoAttach) {
+    // Worktree-aware resolution (CTO request): when a token fails the plain
+    // cwd/~/absolute resolve, AND it looks path-like, fall back to probing the
+    // git worktree roots in priority order (current → main → branch-matched →
+    // rest). `getWorktreeRoots` is the injected, memoized thunk; the path-like
+    // gate keeps git OUT of the hot path for ordinary prose. This only changes
+    // WHERE a relative path resolves — never the R1–R4 attach rules.
+    const fileExistsAbs = (p: string): boolean => {
+      try {
+        return statSync(p).isFile()
+      } catch {
+        return false
+      }
+    }
+    const resolveWithWorktrees = (token: string): string | null => {
+      const plain = resolveExistingFile(token, cwd, home)
+      if (plain) return plain
+      if (!looksPathLike(token)) return null
+      const roots = getWorktreeRoots()
+      if (roots.length === 0) return null
+      return resolveAcrossWorktrees(token, roots, fileExistsAbs)
+    }
     const segments = textParts.join(" ").split(/(\s+)/)
     for (let s = 0; s < segments.length; s++) {
       const isWhitespace = s % 2 === 1
@@ -338,12 +371,13 @@ export function parseArgs(
       // First try a plain existing-file resolve. If that fails, the token may
       // carry a trailing line-spec (file.ts:42 / :42-50 / :42:5) — strip it and
       // resolve the base path. The full token stays in the caption either way.
-      let resolved = resolveExistingFile(seg, cwd, home)
+      // Both resolves go through the worktree-aware fallback.
+      let resolved = resolveWithWorktrees(seg)
       let spec: ItemLineSpec | undefined
       if (!resolved) {
         const ls = parseLineSpec(seg)
         if (ls) {
-          const baseResolved = resolveExistingFile(ls.path, cwd, home)
+          const baseResolved = resolveWithWorktrees(ls.path)
           if (baseResolved) {
             resolved = baseResolved
             spec = {
@@ -364,8 +398,10 @@ export function parseArgs(
         // documented in docs/specs/auto-attach.md; the marker copy can only mark
         // one range). Match on the resolved path, not the raw arg string.
         if (spec) {
+          // Re-resolve via the SAME worktree-aware path so a cross-worktree
+          // file (whose plain resolve is null) still matches its existing item.
           const existing = [...explicit, ...autoItems].find(
-            (it) => resolveExistingFile(it.path, cwd, home) === resolved && !it.lineSpec,
+            (it) => resolveWithWorktrees(it.path) === resolved && !it.lineSpec,
           )
           if (existing) existing.lineSpec = spec
         }
@@ -554,7 +590,17 @@ if (import.meta.main) {
   const autoAttachOn = features["auto-attach"] !== false
 
   const args = flagResult.rest
-  const parsed = parseArgs(args, process.cwd(), home, autoAttachOn)
+  // Memoize the worktree-root enumeration: git is spawned at most once per
+  // process, and only when a path-like token actually misses plain resolution
+  // (parseArgs calls this thunk lazily inside the auto-attach scan).
+  let worktreeRootsCache: string[] | null = null
+  const getWorktreeRoots = (): string[] => {
+    if (worktreeRootsCache === null) {
+      worktreeRootsCache = enumerateWorktreeRoots(process.cwd(), runGitReal)
+    }
+    return worktreeRootsCache
+  }
+  const parsed = parseArgs(args, process.cwd(), home, autoAttachOn, getWorktreeRoots)
 
   // No-send actions resolve BEFORE the credential gate so help/version/info
   // flags work without Telegram credentials configured.
