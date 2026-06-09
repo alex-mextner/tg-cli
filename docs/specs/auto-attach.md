@@ -150,3 +150,9 @@ Line-spec limitations (deliberate, post-review):
   `tg --file x.ts "see x.ts:42"`) adopts the spec onto that existing attachment.
 - CSS markers use a full `/* line: … */` block comment (a bare `/*` would comment out the
   rest of the attached copy).
+
+Length measurement: the caption-overflow decision (1024) uses an approximate VISIBLE length
+(`visibleLength` strips HTML tags + unescapes entities), so an emoji prefix + ~1000 visible
+chars rides as a caption instead of being wrongly split off. The >4096 splitter still
+measures raw `.length` (it splits a hair earlier under HTML — benign conservatism, every
+chunk stays valid).

@@ -16,6 +16,22 @@ test('empty caption → no text message', () => {
   expect(plan.textMessages).toEqual([]);
 });
 
+test('empty prose but a non-empty prefix (renderText) → prefix rides as caption', () => {
+  // Mirrors tg: even when the user's prose is empty, the AI-emoji/tmux prefix
+  // produced by renderText survives as the (caption) text message.
+  const plan = buildSendPlan([photo('/a.png')], '', 'plain', {
+    renderText: (t) => ({ text: '\u{1F681}\n' + t, format: 'plain' }),
+  });
+  expect(plan.textMessages).toEqual([{ text: '\u{1F681}\n', format: 'plain' }]);
+});
+
+test('truly empty render (no prefix, no prose) → no text message', () => {
+  const plan = buildSendPlan([photo('/a.png')], '', 'plain', {
+    renderText: (t, f) => ({ text: t, format: f }),
+  });
+  expect(plan.textMessages).toEqual([]);
+});
+
 // --- R2: duplicated file content stripped from the caption text ---
 test('R2: pasted full file content is stripped from the message text', () => {
   const content = 'export const x = 1\nexport const y = 2\nexport const z = 3';

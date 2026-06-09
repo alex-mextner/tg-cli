@@ -22,12 +22,30 @@ export interface Transport {
   sendDocument(item: SendItem, caption: string | undefined, format: Format): Promise<void>;
 }
 
+// Telegram counts caption/message length by VISIBLE characters, not raw HTML.
+// Under HTML mode the text carries <tg-emoji>/<pre>/… tags + escaped &lt; etc.
+// that don't count. Approximate the visible length so a caption with an emoji
+// prefix isn't wrongly classified as overflow (and sent as a separate message)
+// purely because of tag bytes. Approximate (good enough for the 1024 boundary),
+// not a full HTML length per Telegram's exact rules.
+export function visibleLength(text: string, format: Format): number {
+  if (format !== 'html') return text.length;
+  const noTags = text.replace(/<[^>]+>/g, '');
+  const unescaped = noTags
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+  return unescaped.length;
+}
+
 // Can the single text message ride as a media caption? Only when there is
-// exactly one text message and it fits within the caption limit.
+// exactly one text message and its VISIBLE length fits within the caption limit.
 function captionCandidate(plan: SendPlan): { text: string; format: Format } | null {
   if (plan.textMessages.length !== 1) return null;
   const m = plan.textMessages[0];
-  if (m.text.length > CAPTION_LIMIT) return null;
+  if (visibleLength(m.text, m.format) > CAPTION_LIMIT) return null;
   return m;
 }
 

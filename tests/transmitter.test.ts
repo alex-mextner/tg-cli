@@ -1,6 +1,38 @@
 import { expect, test } from 'bun:test';
-import { transmit, type Transport } from '../features/auto-attach/transmitter';
+import { transmit, visibleLength, type Transport } from '../features/auto-attach/transmitter';
 import type { SendPlan, SendItem } from '../features/auto-attach/types';
+
+test('visibleLength ignores HTML tags + counts unescaped entities', () => {
+  expect(visibleLength('plain', 'plain')).toBe(5);
+  expect(visibleLength('<b>hi</b>', 'html')).toBe(2);
+  expect(visibleLength('a &lt; b &amp; c', 'html')).toBe('a < b & c'.length);
+});
+
+test('HTML caption: raw length > 1024 but VISIBLE <= 1024 still rides as caption', () => {
+  const calls: Array<{ method: string }> = [];
+  const t: Transport = {
+    sendMessage: async () => {
+      calls.push({ method: 'sendMessage' });
+    },
+    sendPhoto: async () => {
+      calls.push({ method: 'sendPhoto' });
+    },
+    sendDocument: async () => {
+      calls.push({ method: 'sendDocument' });
+    },
+  };
+  // 1000 visible chars wrapped in a tag → raw length > 1024 but visible 1000.
+  const text = '<b>' + 'x'.repeat(1000) + '</b>';
+  const plan: SendPlan = {
+    photos: [{ type: 'photo', source: { kind: 'disk', path: '/a.png' } }],
+    textMessages: [{ text, format: 'html' }],
+    documents: [],
+  };
+  return transmit(plan, t).then(() => {
+    // Rode as the photo caption → no separate sendMessage.
+    expect(calls.map((c) => c.method)).toEqual(['sendPhoto']);
+  });
+});
 
 // A fake transport records every call instead of hitting the network.
 function fakeTransport() {
