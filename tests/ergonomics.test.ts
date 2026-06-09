@@ -306,3 +306,22 @@ test('caption around a detected path keeps the path AND surrounding formatting',
     format: 'plain',
   });
 });
+
+// --- Feature OFF path: auto-attach disabled → no text-path scanning ---
+test('auto-attach OFF: path in text is NOT attached, stays as plain text', () => {
+  expect(parseArgs(['look', imgAbs, 'here'], dir, HOME, false)).toEqual({
+    action: 'send',
+    items: [],
+    caption: `look ${imgAbs} here`,
+    format: 'plain',
+  });
+});
+
+test('auto-attach OFF: explicit --photo/--file still attach', () => {
+  expect(parseArgs(['--photo', imgAbs, 'cap'], dir, HOME, false)).toEqual({
+    action: 'send',
+    items: [{ type: 'photo', path: imgAbs }],
+    caption: 'cap',
+    format: 'plain',
+  });
+});

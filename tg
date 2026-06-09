@@ -1,6 +1,14 @@
 #!/usr/bin/env bun
 import { readFileSync, statSync } from "fs"
 import { isAbsolute, join, resolve } from "path"
+import {
+  applyFeatureFlags,
+  parseFeatureConfig,
+  resolveFeatures,
+} from "./features/auto-attach/feature-flags"
+import { buildSendPlan } from "./features/auto-attach/normalize"
+import { transmit, type Transport } from "./features/auto-attach/transmitter"
+import { CAPTION_LIMIT, type SendItem } from "./features/auto-attach/types"
 
 export const VERSION = "1.0.0"
 
@@ -217,7 +225,12 @@ function resolveExistingFile(token: string, cwd: string, home: string): string |
  * This guarantees every flag main supports is recognized before the
  * unknown-dashed guard can fire, so none of them regress to an error.
  */
-export function parseArgs(args: string[], cwd: string, home: string): ParseResult {
+export function parseArgs(
+  args: string[],
+  cwd: string,
+  home: string,
+  autoAttach = true,
+): ParseResult {
   // 1. Help / version win anywhere, before the empty check.
   for (const a of args) {
     if (a === "-h" || a === "--help") return { action: "help" }
@@ -293,15 +306,21 @@ export function parseArgs(args: string[], cwd: string, home: string): ParseResul
   // strip the token from the caption. (The old behavior excised it; that is now
   // reversed.) Tokenize purely to find file references; the caption is the
   // original joined text, untouched except for outer-edge trimming.
-  const segments = textParts.join(" ").split(/(\s+)/)
-  for (let s = 0; s < segments.length; s++) {
-    const isWhitespace = s % 2 === 1
-    const seg = segments[s]
-    if (isWhitespace || !seg) continue
-    const resolved = resolveExistingFile(seg, cwd, home)
-    if (resolved && !explicitResolved.has(resolved)) {
-      explicitResolved.add(resolved) // dedup repeats within the text too
-      autoItems.push({ type: isImagePath(resolved) ? "photo" : "document", path: resolved })
+  //
+  // Auto-detection is the `auto-attach` FEATURE. When it is OFF, we skip the
+  // scan entirely — only explicit --photo/--file are attached, and any path in
+  // the text stays as plain words (it is never attached).
+  if (autoAttach) {
+    const segments = textParts.join(" ").split(/(\s+)/)
+    for (let s = 0; s < segments.length; s++) {
+      const isWhitespace = s % 2 === 1
+      const seg = segments[s]
+      if (isWhitespace || !seg) continue
+      const resolved = resolveExistingFile(seg, cwd, home)
+      if (resolved && !explicitResolved.has(resolved)) {
+        explicitResolved.add(resolved) // dedup repeats within the text too
+        autoItems.push({ type: isImagePath(resolved) ? "photo" : "document", path: resolved })
+      }
     }
   }
 
@@ -452,9 +471,36 @@ function extractBaseModel(modelName: string): string {
 
 // --- CLI entrypoint (only runs when executed directly, not when imported) ---
 if (import.meta.main) {
-  const args = process.argv.slice(2)
+  const rawArgs = process.argv.slice(2)
   const home = process.env.HOME ?? "~"
-  const parsed = parseArgs(args, process.cwd(), home)
+
+  // Resolve feature flags FIRST: pull --feature/--no-feature out of argv, load
+  // ~/.config/tg-cli/config.yaml, and merge (default → config → CLI). The
+  // result gates auto-attach. The transmitter safety nets (caption overflow +
+  // 4096 split) are NOT a feature and always run.
+  const flagResult = applyFeatureFlags(rawArgs)
+  if (flagResult.error) {
+    console.error(`Error: ${flagResult.error}`)
+    console.error(USAGE)
+    process.exit(1)
+  }
+  const featureConfig = (() => {
+    try {
+      return parseFeatureConfig(
+        readFileSync(join(home, ".config", "tg-cli", "config.yaml"), "utf8"),
+      )
+    } catch {
+      return {}
+    }
+  })()
+  const features = resolveFeatures(featureConfig, {
+    enable: flagResult.enable,
+    disable: flagResult.disable,
+  })
+  const autoAttachOn = features["auto-attach"] !== false
+
+  const args = flagResult.rest
+  const parsed = parseArgs(args, process.cwd(), home, autoAttachOn)
 
   // No-send actions resolve BEFORE the credential gate so help/version/info
   // flags work without Telegram credentials configured.
@@ -823,86 +869,76 @@ if (import.meta.main) {
     await checkResponse(resp, "sendMessage")
   }
 
-  const sendPhoto = async (filePath: string, cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> => {
-    const parseMode = parseModeFor(formatValue, cap)
-    let finalCap = cap
-    if (parseMode && cap && entities.length > 0) {
-      finalCap = convertEntitiesToHtml(cap, entities)
-    }
-    const form = new FormData()
-    form.append("chat_id", CHAT_ID)
-    form.append("photo", Bun.file(filePath))
-    if (finalCap) form.append("caption", finalCap)
-    if (parseMode) {
-      form.append("parse_mode", parseMode)
-    } else if (entities.length > 0) {
-      form.append("caption_entities", JSON.stringify(entities))
-    }
-    const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
-    await checkResponse(resp, "sendPhoto")
+  // Per-item photo/document sending now lives in the Transport below (the
+  // transmitter calls those primitives). Custom-emoji entities are pre-rendered
+  // to inline HTML before reaching the transmitter, so the send primitives deal
+  // only in (string, format) — no entity arrays at this layer.
+
+  // --- Render emoji to inline HTML up front ---
+  // The transmitter only deals in (string, format). Custom-emoji entities are
+  // offset-based and would be invalidated by the >4096 splitter, so we RENDER
+  // them to inline <tg-emoji> HTML here and feed the transmitter a plain string
+  // in HTML mode. Emoji always live in the prefix (message start), so they
+  // never straddle a split boundary. With no entities and no HTML requested or
+  // detected, we stay in plain mode (no forced escaping of plain text).
+  const renderToHtml = format === "html" || finalEntities.length > 0 || detectHtmlTags(finalText)
+  const renderedText = renderToHtml ? convertEntitiesToHtml(finalText, finalEntities) : finalText
+  const effectiveFormat: Format = renderToHtml ? "html" : "plain"
+
+  // --- Build the SendPlan (normalization layer) ---
+  const plan = buildSendPlan(items, renderedText, effectiveFormat)
+
+  if (
+    plan.photos.length === 0 &&
+    plan.documents.length === 0 &&
+    plan.textMessages.length === 0
+  ) {
+    console.error("Error: no message text provided")
+    process.exit(1)
   }
 
-  const sendDocument = async (filePath: string, cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> => {
-    const parseMode = parseModeFor(formatValue, cap)
-    let finalCap = cap
-    if (parseMode && cap && entities.length > 0) {
-      finalCap = convertEntitiesToHtml(cap, entities)
+  // --- Transport: the only place that talks to the Telegram API. ---
+  // A SendItem source is either a real path (Bun.file) or in-memory content
+  // (Blob), so R4 fragment files and marker-injected copies never touch disk.
+  const blobFor = (item: SendItem): { body: Blob | ReturnType<typeof Bun.file>; name?: string } => {
+    if (item.source.kind === "memory") {
+      return { body: new Blob([item.source.content]), name: item.source.filename }
     }
-    const form = new FormData()
-    form.append("chat_id", CHAT_ID)
-    form.append("document", Bun.file(filePath))
-    if (finalCap) form.append("caption", finalCap)
-    if (parseMode) {
-      form.append("parse_mode", parseMode)
-    } else if (entities.length > 0) {
-      form.append("caption_entities", JSON.stringify(entities))
-    }
-    const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
-    await checkResponse(resp, "sendDocument")
+    return { body: Bun.file(item.source.path) }
+  }
+  const transport: Transport = {
+    sendMessage: (text, fmt) => sendMessage(text, fmt, []),
+    sendPhoto: async (item, cap, fmt) => {
+      const { body, name } = blobFor(item)
+      const form = new FormData()
+      form.append("chat_id", CHAT_ID)
+      if (name) form.append("photo", body, name)
+      else form.append("photo", body)
+      const parseMode = parseModeFor(fmt, cap)
+      if (cap) form.append("caption", cap)
+      if (parseMode) form.append("parse_mode", parseMode)
+      const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
+      await checkResponse(resp, "sendPhoto")
+    },
+    sendDocument: async (item, cap, fmt) => {
+      const { body, name } = blobFor(item)
+      const form = new FormData()
+      form.append("chat_id", CHAT_ID)
+      if (name) form.append("document", body, name)
+      else form.append("document", body)
+      const parseMode = parseModeFor(fmt, cap)
+      if (cap) form.append("caption", cap)
+      if (parseMode) form.append("parse_mode", parseMode)
+      const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
+      await checkResponse(resp, "sendDocument")
+    },
   }
 
-  const sendMediaGroup = async (mediaItems: Item[], cap: string | undefined, formatValue: Format, entities: EmojiEntity[]): Promise<void> => {
-    const parseMode = parseModeFor(formatValue, cap)
-    let finalCap = cap
-    if (parseMode && cap && entities.length > 0) {
-      finalCap = convertEntitiesToHtml(cap, entities)
-    }
-    const form = new FormData()
-    form.append("chat_id", CHAT_ID)
-    const mediaArr = mediaItems.map((item, idx) => ({
-      type: item.type,
-      media: `attach://file${idx}`,
-      ...(idx === 0 && finalCap ? { caption: finalCap } : {}),
-      ...(idx === 0 && parseMode ? { parse_mode: parseMode } : {}),
-      ...(idx === 0 && !parseMode && entities.length > 0 ? { caption_entities: entities } : {}),
-    }))
-    form.append("media", JSON.stringify(mediaArr))
-    for (const [idx, item] of mediaItems.entries()) {
-      form.append(`file${idx}`, Bun.file(item.path))
-    }
-    const resp = await fetch(`${API}/sendMediaGroup`, { method: "POST", body: form })
-    await checkResponse(resp, "sendMediaGroup")
-  }
+  // The transmitter applies caption-overflow + the >4096 split + the
+  // photos→text→documents ordering, then calls the transport primitives.
+  await transmit(plan, transport)
 
-  // --- Dispatch ---
-  if (items.length === 0) {
-    if (!finalText) {
-      console.error("Error: no message text provided")
-      process.exit(1)
-    }
-    await sendMessage(finalText, format, finalEntities)
-  } else if (items.length === 1) {
-    const item = items[0]
-    if (item.type === "photo") {
-      await sendPhoto(item.path, finalText || undefined, format, finalEntities)
-    } else {
-      await sendDocument(item.path, finalText || undefined, format, finalEntities)
-    }
-  } else {
-    await sendMediaGroup(items, finalText || undefined, format, finalEntities)
-  }
-
-  // Every send path above either succeeded or already exited(1) via
-  // checkResponse, so reaching here means the send actually went through.
+  // Reaching here means every send actually went through (checkResponse exits
+  // the process on any API failure).
   console.log("OK")
 }
