@@ -20,6 +20,9 @@ test('HTML caption: raw length > 1024 but VISIBLE <= 1024 still rides as caption
     sendDocument: async () => {
       calls.push({ method: 'sendDocument' });
     },
+    sendMediaGroup: async () => {
+      calls.push({ method: 'sendMediaGroup' });
+    },
   };
   // 1000 visible chars wrapped in a tag → raw length > 1024 but visible 1000.
   const text = '<b>' + 'x'.repeat(1000) + '</b>';
@@ -46,6 +49,9 @@ function fakeTransport() {
     },
     sendDocument: async (item, caption, format) => {
       calls.push({ method: 'sendDocument', args: { item, caption, format } });
+    },
+    sendMediaGroup: async (kind, items, caption, format) => {
+      calls.push({ method: 'sendMediaGroup', args: { kind, items, caption, format } });
     },
   };
   return { t, calls };
@@ -103,7 +109,9 @@ test('text > 4096 is split into multiple sendMessage calls', async () => {
   for (const m of msgs) expect((m.args.text as string).length).toBeLessThanOrEqual(4096);
 });
 
-test('multiple photos with short caption: caption goes on the first photo only', async () => {
+// FIX 2 (album restore): >=2 photos go out as ONE sendMediaGroup, not N
+// individual sendPhoto messages. The short caption rides the album (first item).
+test('multiple photos with short caption: ONE sendMediaGroup album, caption on the album', async () => {
   const { t, calls } = fakeTransport();
   await transmit(
     plan({
@@ -112,10 +120,106 @@ test('multiple photos with short caption: caption goes on the first photo only',
     }),
     t,
   );
-  const photoCalls = calls.filter((c) => c.method === 'sendPhoto');
-  expect(photoCalls.length).toBe(2);
-  expect(photoCalls[0].args.caption).toBe('cap');
-  expect(photoCalls[1].args.caption).toBeUndefined();
+  // Exactly one album call carrying both photos — no separate sendPhoto calls.
+  expect(calls.map((c) => c.method)).toEqual(['sendMediaGroup']);
+  const album = calls[0];
+  expect(album.args.kind).toBe('photo');
+  expect((album.args.items as SendItem[]).length).toBe(2);
+  expect(album.args.caption).toBe('cap');
+});
+
+test('FIX 2: exactly ONE photo still uses sendPhoto (a 1-item album is invalid)', async () => {
+  const { t, calls } = fakeTransport();
+  await transmit(plan({ photos: [photo('/a.png')], textMessages: [{ text: 'cap', format: 'plain' }] }), t);
+  expect(calls.map((c) => c.method)).toEqual(['sendPhoto']);
+  expect(calls[0].args.caption).toBe('cap');
+});
+
+test('FIX 2: >=2 documents go out as ONE sendMediaGroup document album', async () => {
+  const { t, calls } = fakeTransport();
+  await transmit(
+    plan({ documents: [doc('/a.pdf'), doc('/b.pdf')], textMessages: [{ text: 'note', format: 'plain' }] }),
+    t,
+  );
+  expect(calls.map((c) => c.method)).toEqual(['sendMediaGroup']);
+  expect(calls[0].args.kind).toBe('document');
+  expect((calls[0].args.items as SendItem[]).length).toBe(2);
+  expect(calls[0].args.caption).toBe('note');
+});
+
+test('FIX 2: photo album + >1024 caption → album caption-less + SEPARATE text message', async () => {
+  const { t, calls } = fakeTransport();
+  const big = 'x'.repeat(2000);
+  await transmit(
+    plan({ photos: [photo('/a.png'), photo('/b.png')], textMessages: [{ text: big, format: 'plain' }] }),
+    t,
+  );
+  const album = calls.find((c) => c.method === 'sendMediaGroup')!;
+  expect(album.args.caption).toBeUndefined();
+  const msg = calls.find((c) => c.method === 'sendMessage')!;
+  expect(msg.args.text).toBe(big);
+  // Album (photos) still precedes the separate text message.
+  expect(calls.indexOf(album)).toBeLessThan(calls.indexOf(msg));
+});
+
+test('FIX 2: ordering with albums — photo album → text → document album', async () => {
+  const { t, calls } = fakeTransport();
+  const big = 'x'.repeat(2000); // >1024 so text does NOT ride a caption
+  await transmit(
+    plan({
+      photos: [photo('/a.png'), photo('/b.png')],
+      textMessages: [{ text: big, format: 'plain' }],
+      documents: [doc('/c.pdf'), doc('/d.pdf')],
+    }),
+    t,
+  );
+  expect(calls.map((c) => c.method)).toEqual(['sendMediaGroup', 'sendMessage', 'sendMediaGroup']);
+  expect((calls[0].args.items as SendItem[]).length).toBe(2);
+  expect(calls[0].args.kind).toBe('photo');
+  expect((calls[2].args.items as SendItem[]).length).toBe(2);
+  expect(calls[2].args.kind).toBe('document');
+});
+
+test('FIX 2: >10 photos are chunked into 10-item albums (Telegram cap), caption on the very first', async () => {
+  const { t, calls } = fakeTransport();
+  const photos = Array.from({ length: 23 }, (_, i) => photo(`/p${i}.png`));
+  await transmit(plan({ photos, textMessages: [{ text: 'cap', format: 'plain' }] }), t);
+  // 23 → albums of 10 + 10 + 3.
+  expect(calls.map((c) => c.method)).toEqual(['sendMediaGroup', 'sendMediaGroup', 'sendMediaGroup']);
+  expect((calls[0].args.items as SendItem[]).length).toBe(10);
+  expect((calls[1].args.items as SendItem[]).length).toBe(10);
+  expect((calls[2].args.items as SendItem[]).length).toBe(3);
+  // Caption only on the first album.
+  expect(calls[0].args.caption).toBe('cap');
+  expect(calls[1].args.caption).toBeUndefined();
+  expect(calls[2].args.caption).toBeUndefined();
+});
+
+test('FIX 2: a trailing single item after a full album falls back to sendPhoto (1-item group is invalid)', async () => {
+  const { t, calls } = fakeTransport();
+  const photos = Array.from({ length: 11 }, (_, i) => photo(`/p${i}.png`));
+  await transmit(plan({ photos }), t);
+  // 11 → album of 10 + a lone sendPhoto (a 1-item group would be rejected).
+  expect(calls.map((c) => c.method)).toEqual(['sendMediaGroup', 'sendPhoto']);
+  expect((calls[0].args.items as SendItem[]).length).toBe(10);
+});
+
+test('FIX 2: short caption rides the PHOTO album when both albums present', async () => {
+  const { t, calls } = fakeTransport();
+  await transmit(
+    plan({
+      photos: [photo('/a.png'), photo('/b.png')],
+      textMessages: [{ text: 'cap', format: 'plain' }],
+      documents: [doc('/c.pdf'), doc('/d.pdf')],
+    }),
+    t,
+  );
+  expect(calls.map((c) => c.method)).toEqual(['sendMediaGroup', 'sendMediaGroup']);
+  // Photo album carries the caption; document album does not.
+  expect(calls[0].args.kind).toBe('photo');
+  expect(calls[0].args.caption).toBe('cap');
+  expect(calls[1].args.kind).toBe('document');
+  expect(calls[1].args.caption).toBeUndefined();
 });
 
 test('text-only with documents: caption rides the first document when short', async () => {

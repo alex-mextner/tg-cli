@@ -1175,6 +1175,33 @@ if (import.meta.main) {
       const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
       await checkResponse(resp, "sendDocument")
     },
+    // Album send (FIX 2): 2..10 same-type items as a single Telegram media
+    // group. Each item is uploaded as a multipart field and referenced from the
+    // `media` JSON via `attach://<field>`. The caption (if any) rides the FIRST
+    // InputMedia item — Telegram shows it as the album caption.
+    sendMediaGroup: async (kind, mediaItems, cap, fmt) => {
+      const form = new FormData()
+      form.append("chat_id", CHAT_ID)
+      const parseMode = parseModeFor(fmt, cap)
+      const media = mediaItems.map((item, i) => {
+        const { body, name } = blobFor(item)
+        const field = `file${i}`
+        // A memory item needs an explicit filename so Telegram keeps the ext;
+        // a disk item is uploaded under a stable field name (its own name is
+        // carried by Bun.file). attach:// binds the JSON entry to the field.
+        if (name) form.append(field, body, name)
+        else form.append(field, body)
+        const entry: Record<string, string> = { type: kind, media: `attach://${field}` }
+        if (i === 0 && cap) {
+          entry.caption = cap
+          if (parseMode) entry.parse_mode = parseMode
+        }
+        return entry
+      })
+      form.append("media", JSON.stringify(media))
+      const resp = await fetch(`${API}/sendMediaGroup`, { method: "POST", body: form })
+      await checkResponse(resp, "sendMediaGroup")
+    },
   }
 
   // The transmitter applies caption-overflow + the >4096 split + the

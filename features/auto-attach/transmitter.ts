@@ -20,6 +20,17 @@ export interface Transport {
   sendMessage(text: string, format: Format): Promise<void>;
   sendPhoto(item: SendItem, caption: string | undefined, format: Format): Promise<void>;
   sendDocument(item: SendItem, caption: string | undefined, format: Format): Promise<void>;
+  // Album send (spec §Ordering / FIX 2): 2..10 same-type items as a single
+  // Telegram media group. `kind` is 'photo' or 'document' — Telegram does NOT
+  // allow photos and documents in the SAME group, so photo-albums and
+  // document-albums are always separate calls (the photos→docs ordering already
+  // separates them). The caption, if any, rides the FIRST item of the group.
+  sendMediaGroup(
+    kind: 'photo' | 'document',
+    items: SendItem[],
+    caption: string | undefined,
+    format: Format,
+  ): Promise<void>;
 }
 
 // Telegram counts caption/message length by VISIBLE characters, not raw HTML.
@@ -57,6 +68,40 @@ async function sendText(text: string, format: Format, t: Transport): Promise<voi
   }
 }
 
+// Send one media section (all photos OR all documents) in the order-preserving
+// shape Telegram supports: a single sendMediaGroup album for 2..10 items, a lone
+// sendPhoto/sendDocument for exactly 1 (a 1-item group is rejected by Telegram),
+// and nothing for 0. The caption (when this section is the host) rides the first
+// item: as the single item's caption, or as the album's first-item caption.
+// Telegram caps a media group at 10 items; >10 same-type attachments are chunked
+// into consecutive albums. The caption rides only the FIRST item of the FIRST
+// chunk. A trailing chunk of exactly 1 falls back to sendPhoto/sendDocument
+// because a 1-item media group is rejected by the API.
+const MEDIA_GROUP_MAX = 10;
+
+async function sendMediaSection(
+  kind: 'photo' | 'document',
+  items: SendItem[],
+  caption: string | undefined,
+  captionFormat: Format,
+  t: Transport,
+): Promise<void> {
+  if (items.length === 0) return;
+  const send1 = kind === 'photo' ? t.sendPhoto.bind(t) : t.sendDocument.bind(t);
+  const fmtFor = (cap: string | undefined): Format => (cap !== undefined ? captionFormat : 'plain');
+
+  for (let offset = 0; offset < items.length; offset += MEDIA_GROUP_MAX) {
+    const chunk = items.slice(offset, offset + MEDIA_GROUP_MAX);
+    // Caption only on the very first item of the whole section.
+    const cap = offset === 0 ? caption : undefined;
+    if (chunk.length === 1) {
+      await send1(chunk[0], cap, fmtFor(cap));
+    } else {
+      await t.sendMediaGroup(kind, chunk, cap, fmtFor(cap));
+    }
+  }
+}
+
 export async function transmit(plan: SendPlan, t: Transport): Promise<void> {
   const hasMedia = plan.photos.length > 0 || plan.documents.length > 0;
   const riding = hasMedia ? captionCandidate(plan) : null;
@@ -65,15 +110,14 @@ export async function transmit(plan: SendPlan, t: Transport): Promise<void> {
   const captionText = riding ? riding.text : undefined;
   const captionFormat = riding ? riding.format : 'plain';
 
-  // The first media item carries the caption (photos take priority over docs).
-  const captionHost: SendItem | null = riding ? (plan.photos[0] ?? plan.documents[0] ?? null) : null;
+  // Caption host SECTION: photos take priority over documents (matches the
+  // pre-album behavior). The caption rides the first item of that section —
+  // sendMediaSection puts it on the album's first item (or the lone item).
+  const captionOnPhotos = riding && plan.photos.length > 0;
+  const captionOnDocs = riding && plan.photos.length === 0 && plan.documents.length > 0;
 
-  // 1. Photos.
-  for (const photo of plan.photos) {
-    const cap = photo === captionHost ? captionText : undefined;
-    const fmt = photo === captionHost ? captionFormat : 'plain';
-    await t.sendPhoto(photo, cap, fmt);
-  }
+  // 1. Photos (album when >=2, single send when 1).
+  await sendMediaSection('photo', plan.photos, captionOnPhotos ? captionText : undefined, captionFormat, t);
 
   // 2. Text — only as separate message(s) when it did NOT ride as a caption.
   if (!riding) {
@@ -82,10 +126,6 @@ export async function transmit(plan: SendPlan, t: Transport): Promise<void> {
     }
   }
 
-  // 3. Documents.
-  for (const document of plan.documents) {
-    const cap = document === captionHost ? captionText : undefined;
-    const fmt = document === captionHost ? captionFormat : 'plain';
-    await t.sendDocument(document, cap, fmt);
-  }
+  // 3. Documents (album when >=2, single send when 1).
+  await sendMediaSection('document', plan.documents, captionOnDocs ? captionText : undefined, captionFormat, t);
 }

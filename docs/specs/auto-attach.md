@@ -135,9 +135,21 @@ In-memory FS: line-spec marker copies and R4 fragments are `Blob`s built from in
 content — the original files are never modified and nothing is written to disk (verified:
 a real smoke send left the source hash unchanged with no stray files).
 
-Behavior change vs the old send path: multiple attachments are now sent as individual
-photo/document messages (transmitter model) rather than a single `sendMediaGroup` album, so
-the photos→text→documents ordering and per-item caption-overflow rules apply uniformly.
+Multi-attachment albums (FIX 2, restored): multiple same-type attachments are sent as a
+single `sendMediaGroup` album, NOT individual messages. The transmitter `sendMediaSection`
+helper applies, per section:
+- **≥2 items** → one `sendMediaGroup` call. Telegram caps a group at 10, so >10 same-type
+  items are chunked into consecutive 10-item albums; a trailing chunk of exactly 1 falls
+  back to `sendPhoto`/`sendDocument` (a 1-item group is rejected by the API).
+- **exactly 1 item** → `sendPhoto`/`sendDocument` (you cannot build a 1-item album).
+- **Photos and documents never share a group** (Telegram rejects mixed groups). The
+  photo-album and the document-album are always separate calls — which the
+  photos→text→documents ordering already separates.
+- **Caption** rides only the FIRST item of the FIRST chunk of the host section (photos take
+  caption priority over documents, matching single-item behavior). If the accompanying text
+  > 1024 (visible length), the album is sent caption-less and the full text goes out as a
+  SEPARATE text message in the sandwich middle (the existing caption-overflow path).
+- The >4096 text splitter is unchanged and still runs only on text messages.
 
 Line-spec limitations (deliberate, post-review):
 - Snippet + marker injection apply only to a known-text extension allowlist (ts/tsx/js/py/
