@@ -138,3 +138,15 @@ a real smoke send left the source hash unchanged with no stray files).
 Behavior change vs the old send path: multiple attachments are now sent as individual
 photo/document messages (transmitter model) rather than a single `sendMediaGroup` album, so
 the photos→text→documents ordering and per-item caption-overflow rules apply uniformly.
+
+Line-spec limitations (deliberate, post-review):
+- Snippet + marker injection apply only to a known-text extension allowlist (ts/tsx/js/py/
+  json/md/sh/css/yaml/go/rs/txt/csv/log/toml/ini/xml/sql/etc.). A binary document with a
+  trailing `:N` (e.g. `report.pdf:12`) still attaches as-is — no snippet, no marker copy —
+  because reading it as UTF-8 would corrupt the upload.
+- First line-spec per file wins. If the same file is referenced with two different specs
+  (`x.ts:10 x.ts:20`), only the first drives the marker-injected attachment (a single copy
+  can only mark one range). A spec mention of an already-attached file (e.g.
+  `tg --file x.ts "see x.ts:42"`) adopts the spec onto that existing attachment.
+- CSS markers use a full `/* line: … */` block comment (a bare `/*` would comment out the
+  rest of the attached copy).

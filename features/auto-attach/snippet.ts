@@ -139,26 +139,28 @@ export function renderQuote(code: string, lang: string): string {
   return `<pre><code class="language-${langClass}">\n${body}\n</code></pre>`;
 }
 
-const LINE_COMMENT: Record<string, string> = {
-  ts: '//',
-  tsx: '//',
-  js: '//',
-  jsx: '//',
-  go: '//',
-  rs: '//',
-  css: '/*',
-  py: '#',
-  sh: '#',
-  yaml: '#',
-  yml: '#',
+// Comment delimiters per ext. CSS (and other block-only langs) need a closing
+// delimiter or the marker would comment out the rest of the file.
+const COMMENT_STYLE: Record<string, { open: string; close: string }> = {
+  ts: { open: '//', close: '' },
+  tsx: { open: '//', close: '' },
+  js: { open: '//', close: '' },
+  jsx: { open: '//', close: '' },
+  go: { open: '//', close: '' },
+  rs: { open: '//', close: '' },
+  css: { open: '/*', close: ' */' },
+  py: { open: '#', close: '' },
+  sh: { open: '#', close: '' },
+  yaml: { open: '#', close: '' },
+  yml: { open: '#', close: '' },
 };
 
 // A visible marker band so the referenced range is easy to spot in the attached
 // copy. ONLY applied to the in-memory copy sent to TG — never the original file.
 export function injectMarkers(source: string, start: number, end: number, ext: string): string {
-  const comment = LINE_COMMENT[ext] ?? '//';
+  const style = COMMENT_STYLE[ext] ?? { open: '//', close: '' };
   const dashes = '-'.repeat(40);
-  const marker = `${comment} line: ${dashes}`;
+  const marker = `${style.open} line: ${dashes}${style.close}`;
   const lines = source.split('\n');
   const out: string[] = [];
   for (let i = 0; i < lines.length; i++) {

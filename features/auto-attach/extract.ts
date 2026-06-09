@@ -63,8 +63,9 @@ export function stripDuplicatedFileContent(text: string, files: FileContent[]): 
       }
     }
   }
-  // Collapse the blank gap left behind (3+ newlines → 2).
-  return out.replace(/\n{3,}/g, '\n\n').replace(/^\n+|\n+$/g, (m) => (m.includes('\n\n') ? '\n' : ''));
+  // Collapse the blank gap left behind (3+ newlines → 2). Edge-trimming is the
+  // caller's job (extractFromText), so we don't fight over leading/trailing \n.
+  return out.replace(/\n{3,}/g, '\n\n');
 }
 
 export interface CodeBlock {

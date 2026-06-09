@@ -14,7 +14,7 @@ import {
   renderQuote,
 } from "./features/auto-attach/snippet"
 import { transmit, type Transport } from "./features/auto-attach/transmitter"
-import { CAPTION_LIMIT, type SendItem } from "./features/auto-attach/types"
+import { type SendItem } from "./features/auto-attach/types"
 
 export const VERSION = "1.0.0"
 
@@ -355,12 +355,26 @@ export function parseArgs(
           }
         }
       }
-      if (resolved && !explicitResolved.has(resolved)) {
-        explicitResolved.add(resolved) // dedup repeats within the text too
-        const item: Item = { type: isImagePath(resolved) ? "photo" : "document", path: resolved }
-        if (spec) item.lineSpec = spec
-        autoItems.push(item)
+      if (!resolved) continue
+      if (explicitResolved.has(resolved)) {
+        // Already attached (explicit --file/--photo or an earlier mention). Don't
+        // attach twice, but if THIS mention carried a line-spec and the existing
+        // item has none, adopt it so `--file x.ts "see x.ts:42"` still renders a
+        // quote. First spec per file wins (a second, different spec is ignored —
+        // documented in docs/specs/auto-attach.md; the marker copy can only mark
+        // one range). Match on the resolved path, not the raw arg string.
+        if (spec) {
+          const existing = [...explicit, ...autoItems].find(
+            (it) => resolveExistingFile(it.path, cwd, home) === resolved && !it.lineSpec,
+          )
+          if (existing) existing.lineSpec = spec
+        }
+        continue
       }
+      explicitResolved.add(resolved) // dedup repeats within the text too
+      const item: Item = { type: isImagePath(resolved) ? "photo" : "document", path: resolved }
+      if (spec) item.lineSpec = spec
+      autoItems.push(item)
     }
   }
 
@@ -945,15 +959,29 @@ if (import.meta.main) {
     filename: string
   }
   const lineSpecRenders: LineSpecRender[] = []
+  // Only treat KNOWN text extensions as snippet-able. A binary document with a
+  // line-spec (e.g. report.pdf:12) would otherwise be read as UTF-8 — which
+  // usually doesn't throw — and uploaded as a corrupted in-memory copy. For an
+  // unlisted ext we skip the quote+marker entirely; the file still attaches
+  // normally as its disk source and the token stays in the caption.
+  const TEXT_EXTS = new Set([
+    "ts", "tsx", "js", "jsx", "mjs", "cjs",
+    "py", "json", "jsonc", "md", "markdown",
+    "sh", "bash", "zsh", "html", "css", "scss",
+    "yaml", "yml", "go", "rs", "txt", "csv",
+    "log", "toml", "ini", "xml", "sql", "rb",
+    "java", "c", "h", "cpp", "hpp", "swift", "kt",
+  ])
   for (const it of items) {
     if (!it.lineSpec || it.type !== "document") continue
+    const ext = extOf(it.path)
+    if (!TEXT_EXTS.has(ext)) continue // binary/unknown → attach as-is, no snippet
     let source: string
     try {
       source = readFileSync(it.path, "utf8")
     } catch {
       continue // unreadable → skip the snippet, the file still attaches as-is
     }
-    const ext = extOf(it.path)
     const ctx = extractContextRange(source, it.lineSpec.startLine, it.lineSpec.endLine, ext)
     lineSpecRenders.push({
       token: it.lineSpec.token,
@@ -1025,7 +1053,11 @@ if (import.meta.main) {
       let body = plan.textMessages[0].text
       for (const r of lineSpecRenders) {
         const lines = body.split("\n")
-        const idx = lines.findIndex((l) => l.includes(r.token))
+        // The render may have HTML-escaped the prose (forced HTML for the
+        // quote), which also escapes &<> inside the token — so match both the
+        // raw token and its escaped form.
+        const escapedToken = escapeHtml(r.token)
+        const idx = lines.findIndex((l) => l.includes(r.token) || l.includes(escapedToken))
         if (idx === -1) {
           // Token not found in the rendered text (shouldn't happen) → append.
           lines.push(r.quote)

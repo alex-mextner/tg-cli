@@ -125,3 +125,14 @@ test('injectMarkers: uses # comment for python', () => {
   const out = injectMarkers(py, 2, 2, 'py');
   expect(out).toMatch(/# line:/);
 });
+
+test('injectMarkers: CSS marker is a CLOSED block comment (no run-on)', () => {
+  const css = '.a { color: red }\n.b { color: blue }\n.c { color: green }';
+  const out = injectMarkers(css, 2, 2, 'css');
+  // Every "/* line:" must close with "*/" on the same line, or the rest of the
+  // file gets commented out.
+  for (const line of out.split('\n')) {
+    if (line.includes('/* line:')) expect(line.trimEnd()).toMatch(/\*\/$/);
+  }
+  expect(out).toContain('.c { color: green }');
+});

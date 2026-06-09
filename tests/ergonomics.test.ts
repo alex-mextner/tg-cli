@@ -380,6 +380,26 @@ test('line-spec on a NON-existent file → plain text, no attach', () => {
   });
 });
 
+test('line-spec mention of an already --file-attached file adopts the spec', () => {
+  const tsAbs = join(dir, 'adopt.ts');
+  writeFileSync(tsAbs, 'a\nb\nc\nd\ne');
+  // --file attaches with no spec; the text mention carries :3 → adopted.
+  const r = parseArgs(['--file', tsAbs, `see ${tsAbs}:3`], dir, HOME);
+  expect(r).toEqual({
+    action: 'send',
+    items: [
+      {
+        type: 'document',
+        path: tsAbs,
+        lineSpec: { token: `${tsAbs}:3`, startLine: 3, endLine: 3, col: undefined },
+      },
+    ],
+    caption: `see ${tsAbs}:3`,
+    format: 'plain',
+  });
+  rmSync(tsAbs, { force: true });
+});
+
 test('plain existing path with no spec has NO lineSpec field', () => {
   const r = parseArgs([pdfAbs], dir, HOME);
   expect(r).toEqual({
