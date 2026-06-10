@@ -216,8 +216,77 @@ delayed, or hung waiting for a button tap.
 - **D3 — Fleet.** One machine per bot token (Telegram `getUpdates` limit). For
   mbp + home on one bot, choose: bot-per-machine, or a central router that owns the
   single poll and fans out. Decide before multi-machine use.
+- **D4 — v1 harness set.** Ship `cc` (channel+hooks+tmux) + `opencode` (native) as
+  first-class; `codex`/`pi`/`aider`/`gemini` as the tmux-floor long tail. Confirm the cut.
 
-## 13. Out of scope / future
+## 13. Command layer
+
+Telegram messages starting with `/` are commands; everything else is a prompt (§4).
+Two commands are harness-aware; the rest pass through.
+
+- **`/rename <name>`** — rename the harness session **and** the tmux window together:
+  - tmux window: `tmux rename-window -t <pane> <name>` (universal).
+  - harness session: via the adapter (§14) — CC `/rename <name>`; opencode
+    `PATCH /session/{id}` `{title}`; harnesses without a rename → tmux window only, and
+    the bot replies "session rename not supported for `<harness>` — renamed the tmux
+    window only."
+- **`/new [<name>]`** — reset the session and (re)name it:
+  - reset via the adapter — CC `/clear`; opencode `POST /session` (fresh) / `session_new`;
+    codex `/new`; aider `/reset`. Where reset is weak (gemini `/clear` clears only the
+    screen), the bot says so.
+  - if `<name>` is omitted **and** the harness supports naming → ask for a name in TG
+    (free-text or buttons), then apply rename. If naming is unsupported → reset only.
+- **Any other `/cmd …`** — passthrough verbatim into the harness:
+  - TUI harnesses: inject `/cmd …` via `send-keys -l` + `Enter` (the harness interprets
+    its own slash command).
+  - opencode: `POST /session/{id}/command` (native), no keystrokes.
+
+## 14. Multi-harness support
+
+Inbound injection via tmux `send-keys` works for **any** terminal TUI; outbound stays
+`tg` for any harness whose agent can run shell (it calls `tg` itself). On that universal
+floor, each harness gets an **adapter** exposing native capabilities; where a capability
+is missing, the bot states it plainly rather than faking it.
+
+**`HarnessAdapter` interface:** `inject(text)`, `rename(name)`, `reset(name?)`,
+`forwardQuestions()` (native | tmux-scrape | none), `detect()` (claim a running
+process/pane). The CC adapter is the channel+hooks+tmux design of §5/§8; other adapters
+plug into the same `tg-ctl` lifecycle.
+
+**Capability matrix (verified June 2026):**
+
+| Harness | Native inject | Native question/perm forward | Rename | Reset | Feedback strategy |
+|---|---|---|---|---|---|
+| **opencode** (`oc`) | `POST /session/{id}/prompt_async` | **YES** — SSE `question.asked`/`permission.asked` + reply endpoints | `PATCH /session {title}` | `POST /session` | **Native HTTP+SSE — best, no tmux** |
+| **Claude Code** (`cc`) | tmux (no public inject API) | YES — hooks `PreToolUse`/`PermissionRequest`/`Notification` | `/rename` | `/clear` | hooks + channel + tmux |
+| **Codex** | `codex exec` / app-server | YES — `PermissionRequest` hook | — | `/new` | hooks + tmux |
+| **pi** | tmux | unknown (TS extensions could) — treat as none for v1 | — | — | tmux + agent-calls-`tg` |
+| **Aider** | `--message` (one-shot) | **NO** | — | `/reset` | tmux-only; bot says "limited" |
+| **Gemini CLI** | `-p` | **NO** (retiring 2026-06-18 → Antigravity `agy`) | — | `/clear` (screen only) | tmux-only; bot says "limited" |
+
+**opencode is the standout** — server-first (the TUI is one client of a local HTTP
+server). The bot owns `opencode serve` on a fixed port; the user's TUI/web attaches to
+it. The bot subscribes to `GET /event` (SSE), forwards `question.asked` /
+`permission.asked` to Telegram as inline buttons, answers via `/question/{id}/reply` /
+`/permission/{id}/reply`. No tmux, no scraping, no core patch (it's MIT and accepts PRs,
+but none is needed). `QuestionInfo` (`question`, `header`, `options[]`, `multiple`,
+`custom`) maps 1:1 to Telegram buttons. Caveat: a user-launched TUI binds a random port
+unless started with a fixed `--port` (or discovered via `--mdns`) — so the clean path is
+"bot owns the server, clients attach", not "inject into an arbitrary TUI".
+
+**The "not supported" rule:** when a harness lacks native question-forwarding (aider,
+gemini, pi-for-now), the bot does NOT silently scrape-and-hope; it forwards what tmux can
+see and replies once: "native question forwarding isn't available for `<harness>` —
+inbound works, but I can't reliably forward its prompts; answer in the terminal."
+
+**Detection:** reuse `tg`'s existing process/pane detection (it already brands by model)
+to pick the adapter; `pgrep` / pane-command disambiguates cc vs opencode vs codex vs pi.
+
+**Scope for v1:** ship `cc` (channel+hooks+tmux) and `opencode` (native) first-class;
+`codex` (hooks+tmux) and `pi`/`aider`/`gemini` (tmux floor + honest "limited" replies) as
+the long tail. See D4 (§12).
+
+## 15. Out of scope / future
 
 - Voice inbound, file-preview tunnels, multi-machine fleet routing, web dashboard
   (the monetization-hypothesis layer) — separate specs.
