@@ -66,7 +66,10 @@ test('unsupported message kind (no text/photo/document) is silent', () => {
 
 test('sender matching chatId is allowed', () => {
   const r = stepUpdates([upd(1, { text: 'hi' })], makeOpts());
-  expect(r.actions).toEqual([{ kind: 'inject-text', text: '[TG from Alex] hi' }]);
+  expect(r.actions).toEqual([
+    { kind: 'inject-text', text: '[TG from Alex] hi' },
+    { kind: 'ack', messageId: 1 },
+  ]);
 });
 
 test('unknown sender is rejected — no action, offset still advances', () => {
@@ -79,7 +82,10 @@ test('unknown sender is rejected — no action, offset still advances', () => {
 test('extra sender in allowedSenders is allowed', () => {
   const opts = makeOpts({ cfg: { ...DEFAULT_CONTROL, allowedSenders: [666] } });
   const r = stepUpdates([upd(1, { text: 'hi', from: { id: 666, username: 'eve' } })], opts);
-  expect(r.actions).toEqual([{ kind: 'inject-text', text: '[TG from eve] hi' }]);
+  expect(r.actions).toEqual([
+    { kind: 'inject-text', text: '[TG from eve] hi' },
+    { kind: 'ack', messageId: 1 },
+  ]);
 });
 
 test('message with no from is rejected', () => {
@@ -106,7 +112,7 @@ test('stale message is dropped and counted', () => {
 
 test('message exactly stalenessSec old is NOT stale (strict >)', () => {
   const r = stepUpdates([upd(1, { text: 'edge', date: NOW - 300 })], makeOpts());
-  expect(r.actions).toHaveLength(1);
+  expect(r.actions).toHaveLength(2); // delivery action + its ack
   expect(r.skippedStale).toBe(0);
 });
 
@@ -126,34 +132,46 @@ test("stale message from a disallowed sender does not inflate the stale count", 
 
 test('/stop → inject-key Escape', () => {
   const r = stepUpdates([upd(1, { text: '/stop' })], makeOpts());
-  expect(r.actions).toEqual([{ kind: 'inject-key', key: 'Escape' }]);
+  expect(r.actions).toEqual([
+    { kind: 'inject-key', key: 'Escape' },
+    { kind: 'ack', messageId: 1 },
+  ]);
 });
 
 test('/stop with trailing args still maps to Escape (first-token match)', () => {
   const r = stepUpdates([upd(1, { text: '/stop now' })], makeOpts());
-  expect(r.actions).toEqual([{ kind: 'inject-key', key: 'Escape' }]);
+  expect(r.actions).toEqual([
+    { kind: 'inject-key', key: 'Escape' },
+    { kind: 'ack', messageId: 1 },
+  ]);
 });
 
 test('/kill → kill-agent', () => {
   const r = stepUpdates([upd(1, { text: '/kill' })], makeOpts());
-  expect(r.actions).toEqual([{ kind: 'kill-agent' }]);
+  expect(r.actions).toEqual([{ kind: 'kill-agent' }, { kind: 'ack', messageId: 1 }]);
 });
 
 test('/status → status', () => {
   const r = stepUpdates([upd(1, { text: '/status' })], makeOpts());
-  expect(r.actions).toEqual([{ kind: 'status' }]);
+  expect(r.actions).toEqual([{ kind: 'status' }, { kind: 'ack', messageId: 1 }]);
 });
 
 test('unknown /cmd passes through VERBATIM — full text, no wrap', () => {
   const r = stepUpdates([upd(1, { text: '/compact keep the notes' })], makeOpts());
-  expect(r.actions).toEqual([{ kind: 'inject-text', text: '/compact keep the notes' }]);
+  expect(r.actions).toEqual([
+    { kind: 'inject-text', text: '/compact keep the notes' },
+    { kind: 'ack', messageId: 1 },
+  ]);
 });
 
 // --- plain text → wrapped inject (wrap fn injected via opts) ---
 
 test('plain text is wrapped with first_name', () => {
   const r = stepUpdates([upd(1, { text: 'do the thing' })], makeOpts());
-  expect(r.actions).toEqual([{ kind: 'inject-text', text: '[TG from Alex] do the thing' }]);
+  expect(r.actions).toEqual([
+    { kind: 'inject-text', text: '[TG from Alex] do the thing' },
+    { kind: 'ack', messageId: 1 },
+  ]);
 });
 
 test('name falls back to username, then "tg"', () => {
@@ -190,6 +208,7 @@ test('photo picks the LARGEST file_size, names it <update_id>.jpg', () => {
       caption: 'look at this',
       from: 'Alex',
     },
+    { kind: 'ack', messageId: 77 },
   ]);
 });
 
@@ -225,6 +244,7 @@ test('document name = <update_id>.<sanitized ext>, NEVER the Telegram basename',
       caption: 'q2',
       from: 'Alex',
     },
+    { kind: 'ack', messageId: 88 },
   ]);
 });
 
@@ -274,9 +294,22 @@ test('batch: ordered actions, stale counted, intruder dropped, offset correct', 
   const r = stepUpdates(updates, makeOpts());
   expect(r.actions).toEqual([
     { kind: 'inject-text', text: '[TG from Alex] hello' },
+    { kind: 'ack', messageId: 10 },
     { kind: 'status' },
+    { kind: 'ack', messageId: 11 },
     { kind: 'inject-text', text: '[TG from Alex] world' },
+    { kind: 'ack', messageId: 15 },
   ]);
   expect(r.skippedStale).toBe(1);
   expect(r.newOffset).toBe(16);
+});
+
+// --- delivery receipts (👀 reaction, spec §10) ---
+
+test('a pure error reply (too-large) earns NO ack — the reply IS the failure signal', () => {
+  const r = stepUpdates(
+    [upd(5, { photo: [{ file_id: 'huge', file_size: 21 * 1024 * 1024 }] })],
+    makeOpts()
+  );
+  expect(r.actions).toEqual([{ kind: 'reply', text: 'file too large for Bot API (>20 MB)' }]);
 });

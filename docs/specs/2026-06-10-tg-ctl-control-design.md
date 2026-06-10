@@ -307,6 +307,13 @@ delayed, or hung waiting for a button tap.
 - **Idle TTL (review F12):** if no agent pane has existed for
   `control.idle_exit_min` (default 30 min), exit cleanly — lazy auto-start
   resurrects the daemon on the next `tg` call. No stray processes.
+- **Delivery receipts (user request 2026-06-10):** every inbound message whose
+  handling fully succeeded gets a **👀 reaction** (`setMessageReaction`,
+  best-effort) — the human sees at a glance that the message landed in the
+  session. Every failure path replies with an error instead (no-agent,
+  ambiguous target, inject abort, kill/download failures, too-large media);
+  a failed message NEVER gets the reaction. Stale-dropped and
+  disallowed-sender messages get neither.
 - `claude` not running → inbound reply: "no active session".
 - Multiple tmux sessions with `claude` → pick the one matching the registration
   snapshot (pane id), else `control.session`, else most recently active agent

@@ -401,21 +401,25 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
 
   // Pick a target, run the plan; every failure mode turns into a TG reply so
-  // the human is never left wondering whether the message landed.
-  const injectViaTarget = async (buildPlan: (paneId: string) => InjectStep[]): Promise<void> => {
+  // the human is never left wondering whether the message landed. Returns
+  // true only when the plan actually executed — the caller uses it to decide
+  // whether the source message earns its 👀 delivery receipt.
+  const injectViaTarget = async (buildPlan: (paneId: string) => InjectStep[]): Promise<boolean> => {
     const found = discover()
     if (!found.ok) {
       await replyNotFound(found)
-      return
+      return false
     }
     const result = await executeInjectSteps(buildPlan(found.target.pane.paneId))
     if (!result.ok) {
       log(`inject aborted: ${result.error}`)
       await sendMessage(ctx, result.error)
+      return false
     }
+    return true
   }
 
-  const downloadMedia = async (action: Extract<Action, { kind: "download-media" }>): Promise<void> => {
+  const downloadMedia = async (action: Extract<Action, { kind: "download-media" }>): Promise<boolean> => {
     // getFile resolves the file_id to a server path; the bytes come from the
     // /file/ endpoint. The local name is ALWAYS the daemon-chosen
     // suggestedName — never the Telegram-supplied basename (spec §5.2).
@@ -427,7 +431,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (!remotePath) {
       log(`getFile failed for ${action.fileId}`)
       await sendMessage(ctx, "media download failed")
-      return
+      return false
     }
     const dataResp = await fetch(`${ctx.apiBase}/file/bot${ctx.token}/${remotePath}`, {
       signal: AbortSignal.timeout(120_000),
@@ -435,7 +439,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (!dataResp.ok) {
       log(`file download failed: HTTP ${dataResp.status}`)
       await sendMessage(ctx, "media download failed")
-      return
+      return false
     }
     const dir = join(ctx.home, ".cache", "tg-cli", "inbound")
     mkdirSync(dir, { recursive: true })
@@ -443,48 +447,74 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     writeFileSync(dest, new Uint8Array(await dataResp.arrayBuffer()))
     const noun = action.mediaKind === "photo" ? "photo" : "file"
     const msg = `sent ${noun}: ${dest}` + (action.caption ? `\n${action.caption}` : "")
-    await injectViaTarget((paneId) =>
+    return injectViaTarget((paneId) =>
       buildTextInjectPlan(paneId, wrapInbound(ctx.cfg.injectWrap, action.from, msg)),
     )
   }
 
-  const executeAction = async (action: Action): Promise<void> => {
+  // Best-effort delivery receipt (spec §10): 👀 on the source message. A
+  // failed reaction is logged and otherwise ignored — receipts must never
+  // break the poll loop (e.g. a Bot API fake without the endpoint).
+  const setSeenReaction = async (messageId: number): Promise<void> => {
+    try {
+      const resp = await fetch(`${api(ctx)}/setMessageReaction`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: ctx.chatId,
+          message_id: messageId,
+          reaction: [{ type: "emoji", emoji: "👀" }],
+        }),
+        signal: AbortSignal.timeout(15_000),
+      })
+      if (!resp.ok) log(`setMessageReaction failed: ${resp.status}`)
+    } catch (err) {
+      log(`setMessageReaction failed: ${err}`)
+    }
+  }
+
+  // Returns true when the action was handled successfully — the 'ack' case
+  // reads the PREVIOUS action's verdict to decide whether the source message
+  // earns its 👀 receipt (actions for one message are contiguous, ack last).
+  let lastActionOk = true
+  const executeAction = async (action: Action): Promise<boolean> => {
     switch (action.kind) {
       case "reply":
         await sendMessage(ctx, action.text)
-        return
+        return true
       case "status":
         await sendMessage(ctx, composeStatus(ctx))
-        return
+        return true
       case "inject-text":
-        await injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text))
-        return
+        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text))
       case "inject-key":
-        await injectViaTarget((paneId) => buildKeyInjectPlan(paneId, action.key))
-        return
+        return injectViaTarget((paneId) => buildKeyInjectPlan(paneId, action.key))
       case "kill-agent": {
         const found = discover()
         if (!found.ok) {
           await replyNotFound(found)
-          return
+          return false
         }
         if (found.target.agentPid === undefined) {
           await sendMessage(ctx, "agent pid unknown — not killed")
-          return
+          return false
         }
         try {
           // SIGINT kills the interactive agent (~1s) — spec §5.2 reserves it
           // for the explicit /kill verb. /stop is the survivable Escape.
           process.kill(found.target.agentPid, "SIGINT")
           await sendMessage(ctx, "session killed — restore via `claude --resume`")
+          return true
         } catch (err) {
           await sendMessage(ctx, `kill failed: ${err}`)
+          return false
         }
-        return
       }
       case "download-media":
-        await downloadMedia(action)
-        return
+        return downloadMedia(action)
+      case "ack":
+        if (lastActionOk) await setSeenReaction(action.messageId)
+        return true
     }
   }
 
@@ -553,7 +583,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         await sendMessage(ctx, `skipped ${step.skippedStale} stale messages`)
       }
       for (const action of step.actions) {
-        await executeAction(action)
+        lastActionOk = await executeAction(action)
       }
     } catch (err) {
       // The daemon must survive anything — malformed updates, network

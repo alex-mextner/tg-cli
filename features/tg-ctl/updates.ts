@@ -48,10 +48,18 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     }
 
     const name = m.from?.first_name || m.from?.username || 'tg';
-    if (m.text) actions.push(textAction(m.text, name, opts));
-    else if (m.photo?.length) actions.push(photoAction(u.update_id, m, name));
-    else if (m.document) actions.push(documentAction(u.update_id, m, name));
+    let action: Action | null = null;
+    if (m.text) action = textAction(m.text, name, opts);
+    else if (m.photo?.length) action = photoAction(u.update_id, m, name);
+    else if (m.document) action = documentAction(u.update_id, m, name);
     // Anything else (sticker, voice, …) → advance silently.
+    if (action) {
+      actions.push(action);
+      // Delivery receipt (👀 reaction) follows every action that represents
+      // handling the message — but NOT a pure error reply (e.g. the too-large
+      // verdict): there the reply itself is the "did not land" signal.
+      if (action.kind !== 'reply') actions.push({ kind: 'ack', messageId: m.message_id });
+    }
   }
 
   return {

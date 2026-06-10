@@ -45,6 +45,7 @@ const QUEUE = [
 
 const offsets: number[] = []; // every offset getUpdates was called with
 const sent: { chat_id: number; text: string }[] = []; // sendMessage bodies
+const reactions: { chat_id: number; message_id: number; reaction: { type: string; emoji: string }[] }[] = [];
 let serveCount = 0; // how many times the queue was (re-)delivered
 let fetchedFileId: string | null = null;
 
@@ -66,6 +67,10 @@ const server = Bun.serve({
     if (url.pathname.endsWith('/sendMessage')) {
       sent.push((await req.json()) as { chat_id: number; text: string });
       return Response.json({ ok: true, result: { message_id: 1 } });
+    }
+    if (url.pathname.endsWith('/setMessageReaction')) {
+      reactions.push((await req.json()) as (typeof reactions)[number]);
+      return Response.json({ ok: true, result: true });
     }
     if (url.pathname.endsWith('/getFile')) {
       fetchedFileId = url.searchParams.get('file_id');
@@ -124,7 +129,7 @@ test('daemon round-trip: stale notice, guard replies, /status, allowlist drop, m
   // getUpdates confirmed offset 105 (max update_id + 1).
   const t0 = Date.now();
   while (Date.now() - t0 < 10_000) {
-    if (sent.length >= 4 && offsets.includes(105)) break;
+    if (sent.length >= 4 && reactions.length >= 1 && offsets.includes(105)) break;
     await Bun.sleep(100);
   }
 
@@ -153,6 +158,13 @@ test('daemon round-trip: stale notice, guard replies, /status, allowlist drop, m
   expect(fetchedFileId).toBe('photo-big');
   const saved = join(cfgDir, '.cache', 'tg-cli', 'inbound', '104.jpg');
   expect(readFileSync(saved, 'utf8')).toBe('JPEGDATA');
+
+  // Delivery receipts (👀): ONLY the handled /status message gets one. The
+  // failed injects (no agent pane → guard reply) must NOT be acknowledged —
+  // the error reply is the failure signal; a 👀 would claim delivery.
+  expect(reactions).toEqual([
+    { chat_id: 1, message_id: 2, reaction: [{ type: 'emoji', emoji: '👀' }] },
+  ]);
 
   // The PATH shim actually intercepted discovery — without this the test
   // could pass by accident while talking to a real tmux server.

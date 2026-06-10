@@ -31,6 +31,8 @@ opt out with `control.enabled: false`):
   staleness window (default 300 s) with a "skipped N stale" notice, 409
   backoff with a one-shot warning, idle TTL (default 30 min), multi-line
   injection via bracketed paste.
+- Delivery receipts: a successfully handled inbound message gets a 👀
+  reaction; every failure answers with an error reply instead.
 - Config: new `control:` block (`enabled`, `transport`, `session`,
   `inject_wrap`, `staleness_sec`, `idle_exit_min`, `allowed_senders`).
   One bot token per machine for inbound (Telegram allows a single `getUpdates`

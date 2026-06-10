@@ -73,6 +73,10 @@ export type Action =
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
   | { kind: 'status' } // /status — entrypoint composes the reply
   | { kind: 'reply'; text: string } // sendMessage back to the chat
+  // Delivery receipt: set a 👀 reaction on the source message IF every action
+  // emitted for it succeeded. Follows the message's delivery action(s); never
+  // emitted for pure error replies (those ARE the failure signal).
+  | { kind: 'ack'; messageId: number }
   | {
       kind: 'download-media';
       fileId: string;
