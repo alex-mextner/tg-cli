@@ -147,6 +147,23 @@ Instead of:
 tg --format html "<b>Important</b>: deployment complete"
 ```
 
+## Autolink tasks (Linear)
+
+Ticket-like codes in the message text — 3 uppercase letters, a dash, digits
+(`HYP-576`) — are verified via the [linear CLI](https://github.com/schpet/linear-cli)
+and linked to their Linear issues:
+
+- **One ticket mentioned** → its title is written on the first line (after the
+  emoji/`[window]` prefix when present).
+- **Several tickets** → a collapsed quote with `code: title` reference lines is
+  appended to the end of the message.
+- Codes Linear doesn't recognize stay plain text. Pasted URLs are never rewritten.
+
+Requires `brew install schpet/tap/linear` and `linear auth login`; without them
+the message is sent unchanged (a hint is printed to stderr once). The feature is
+ON by default — disable with `--no-feature autolink-tasks` or
+`features.autolink-tasks: false` in `~/.config/tg-cli/config.yaml`.
+
 ## Screenshots
 
 <table align="center" width="100%">

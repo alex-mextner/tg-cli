@@ -11,9 +11,11 @@
 
 export type FeatureMap = Record<string, boolean>;
 
-// Default feature state. auto-attach is ON by default per spec §North star.
+// Default feature state. auto-attach is ON by default per spec §North star;
+// autolink-tasks per docs/specs/autolink-tasks.md §North star.
 export const DEFAULT_FEATURES: FeatureMap = {
   'auto-attach': true,
+  'autolink-tasks': true,
 };
 
 // A deliberately tiny YAML reader. We only support the exact shape the spec
