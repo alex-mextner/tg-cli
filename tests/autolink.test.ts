@@ -148,6 +148,22 @@ test('probe: other non-zero exit → error', () => {
   expect(probe.status).toBe('error');
 });
 
+test('probe: retries one unexpected linear failure before degrading', () => {
+  const seen: string[][] = [];
+  const probe = probeTickets(['HYP-576'], (args) => {
+    seen.push(args);
+    if (seen.length === 1) return { exitCode: 1, stdout: '', stderr: 'network sadness' };
+    return ok(goodResponse);
+  });
+
+  expect(probe.status).toBe('ok');
+  if (probe.status === 'ok') {
+    expect(probe.tickets.get('HYP-576')?.title).toBe('Fix the thing');
+  }
+  expect(seen).toHaveLength(2);
+  expect(seen[1]).toEqual(seen[0]);
+});
+
 test('probe: success → ok with the ticket map', () => {
   const probe = probeTickets(['HYP-576'], () => ok(goodResponse));
   expect(probe.status).toBe('ok');

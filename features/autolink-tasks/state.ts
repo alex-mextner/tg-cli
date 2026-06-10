@@ -5,11 +5,19 @@
 // twice is annoying, a send blocked by hint bookkeeping is a bug.
 
 export interface HintState {
+  // autolink-tasks (Linear CLI) hints.
   install?: boolean;
   login?: boolean;
+  // autolink-prs (gh CLI) hints. Shared state file, same once-only contract.
+  'gh-install'?: boolean;
+  'gh-login'?: boolean;
 }
 
 export type HintKind = keyof HintState;
+
+// The set of recognized hint keys, so the parser stays backward-compatible (an
+// old {install,login} file still parses) while accepting the gh kinds.
+const HINT_KINDS: HintKind[] = ['install', 'login', 'gh-install', 'gh-login'];
 
 /** Parse the persisted state; anything unreadable or non-object → empty. */
 export function parseHintState(raw: string | null): HintState {
@@ -18,8 +26,9 @@ export function parseHintState(raw: string | null): HintState {
     const parsed = JSON.parse(raw);
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
     const out: HintState = {};
-    if ((parsed as HintState).install === true) out.install = true;
-    if ((parsed as HintState).login === true) out.login = true;
+    for (const kind of HINT_KINDS) {
+      if ((parsed as HintState)[kind] === true) out[kind] = true;
+    }
     return out;
   } catch {
     return {};

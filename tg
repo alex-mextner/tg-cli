@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { isAbsolute, join, resolve } from "path"
 import { isNeverAttach } from "./features/auto-attach/denylist"
@@ -15,16 +15,31 @@ import { probeTickets, type Runner, type TicketInfo } from "./features/autolink-
 import { convertMdToPdf, isConvertibleMd, type ConvertDeps } from "./features/md-pdf/convert"
 import { applyAutolink } from "./features/autolink-tasks/render"
 import {
+  mergeIntoCache as mergeGhCache,
+  splitByCache as splitGhCache,
+} from "./features/autolink-prs/cache"
+import { detectRefs } from "./features/autolink-prs/detect"
+import { probeRefsInRepo, probeRepo, type GhRef } from "./features/autolink-prs/resolve"
+import { buildEntries, linkifyRefs } from "./features/autolink-prs/render"
+import {
   markHint,
   parseHintState,
   serializeHintState,
   type HintKind,
 } from "./features/autolink-tasks/state"
+import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
+import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
 import { buildSendPlan } from "./features/auto-attach/normalize"
 import { parseLineSpec } from "./features/auto-attach/snippet"
 import { transmit, type Transport } from "./features/auto-attach/transmitter"
 import { CAPTION_LIMIT, type SendItem } from "./features/auto-attach/types"
+import {
+  buildFileIndex,
+  isRecursiveCandidate,
+  matchFromIndex,
+  type ListDir,
+} from "./features/auto-attach/recursive"
 import {
   enumerateWorktreeRoots,
   looksPathLike,
@@ -32,7 +47,7 @@ import {
   runGitReal,
 } from "./features/auto-attach/worktree"
 
-export const VERSION = "1.3.0"
+export const VERSION = "1.4.0"
 
 // --- Config loader ---
 function loadEnv(filePath: string): Record<string, string> {
@@ -324,6 +339,13 @@ export function parseArgs(
   // looking files (.env family, private keys, credential rc-files, …) are
   // silently skipped by the auto-scan and a HARD ERROR for explicit flags.
   attachDenylist = true,
+  // Recursive resolution (feature `recursive-attach`, ON by default): third
+  // fallback after plain and worktree-root joins — search the worktree roots
+  // (or cwd outside a git repo) recursively for the mentioned file (auto-attach
+  // spec §Recursive resolution). The index thunk is injectable for tests;
+  // the default builds one lazy real-fs index per parseArgs call.
+  recursiveAttach = true,
+  getFileIndex?: () => string[],
 ): ParseResult {
   // 1. Help / version win anywhere, before the empty check.
   for (const a of args) {
@@ -426,13 +448,47 @@ export function parseArgs(
         return false
       }
     }
+    // Recursive index (feature `recursive-attach`): built lazily, at most once
+    // per parseArgs call, and ONLY when some token actually reaches the third
+    // fallback — ordinary sends never pay for a tree walk.
+    const realListDir: ListDir = (abs) => {
+      try {
+        return readdirSync(abs, { withFileTypes: true }).map((d) => ({
+          name: d.name,
+          isFile: d.isFile(),
+          isDirectory: d.isDirectory(),
+        }))
+      } catch {
+        return null
+      }
+    }
+    let fileIndexCache: string[] | null = null
+    const getIndex =
+      getFileIndex ??
+      ((): string[] => {
+        if (fileIndexCache === null) {
+          const roots = getWorktreeRoots()
+          fileIndexCache = buildFileIndex(roots.length > 0 ? roots : [cwd], realListDir)
+        }
+        return fileIndexCache
+      })
     const resolveWithWorktrees = (token: string): string | null => {
       const plain = resolveExistingFile(token, cwd, home)
       if (plain) return plain
       if (!looksPathLike(token)) return null
       const roots = getWorktreeRoots()
-      if (roots.length === 0) return null
-      return resolveAcrossWorktrees(token, roots, fileExistsAbs)
+      if (roots.length > 0) {
+        const fromWorktrees = resolveAcrossWorktrees(token, roots, fileExistsAbs)
+        if (fromWorktrees) return fromWorktrees
+      }
+      // Third fallback: recursive search (auto-attach spec §Recursive
+      // resolution). The hit is re-checked against the real fs — the index
+      // may be stale within a long-running process.
+      if (recursiveAttach && isRecursiveCandidate(token)) {
+        const hit = matchFromIndex(token, getIndex())
+        if (hit && fileExistsAbs(hit)) return hit
+      }
+      return null
     }
     const segments = textParts.join(" ").split(/(\s+)/)
     for (let s = 0; s < segments.length; s++) {
@@ -651,15 +707,16 @@ if (import.meta.main) {
     console.error(USAGE)
     process.exit(1)
   }
-  const featureConfig = (() => {
+  // config.yaml is read ONCE; the raw text feeds both the features: block
+  // parser here and the control: block parser for tg-ctl auto-start below.
+  const configYamlRaw = (() => {
     try {
-      return parseFeatureConfig(
-        readFileSync(join(home, ".config", "tg-cli", "config.yaml"), "utf8"),
-      )
+      return readFileSync(join(home, ".config", "tg-cli", "config.yaml"), "utf8")
     } catch {
-      return {}
+      return ""
     }
   })()
+  const featureConfig = parseFeatureConfig(configYamlRaw)
   const features = resolveFeatures(featureConfig, {
     enable: flagResult.enable,
     disable: flagResult.disable,
@@ -678,7 +735,16 @@ if (import.meta.main) {
     }
     return worktreeRootsCache
   }
-  const parsed = parseArgs(args, process.cwd(), home, autoAttachOn, getWorktreeRoots, attachDenylistOn)
+  const recursiveAttachOn = features["recursive-attach"] !== false
+  const parsed = parseArgs(
+    args,
+    process.cwd(),
+    home,
+    autoAttachOn,
+    getWorktreeRoots,
+    attachDenylistOn,
+    recursiveAttachOn,
+  )
 
   // No-send actions resolve BEFORE the credential gate so help/version/info
   // flags work without Telegram credentials configured.
@@ -1069,6 +1135,98 @@ if (import.meta.main) {
   }
   const hasTickets = autolinkTickets.length > 0
 
+  // --- autolink-prs: detect #N refs, resolve them via the gh CLI ---
+  // (docs/specs/autolink-prs.md). Sibling of autolink-tasks: detect → cache
+  // split → probe → merge. Two gh spawns when refs are found — repo identity
+  // (`gh repo view`) then one batched `gh api graphql`. Issues merge into the
+  // tickets reference block; PRs get their own block (handled in render below).
+  // Every failure mode keeps the send going as plain text. The once-only hints
+  // reuse the autolink-tasks state file (AUTOLINK_STATE_PATH) with gh-* kinds.
+  const runGhReal: Runner = (cliArgs) => {
+    try {
+      const proc = Bun.spawnSync(["gh", ...cliArgs], {
+        stdout: "pipe",
+        stderr: "pipe",
+        timeout: 10_000,
+      })
+      return {
+        exitCode: proc.exitCode ?? 1,
+        stdout: proc.stdout.toString(),
+        stderr: proc.stderr.toString(),
+      }
+    } catch {
+      // spawn itself failed → the gh binary is not installed
+      return null
+    }
+  }
+  const autolinkRefs = new Map<number, GhRef>()
+  let autolinkRefOrder: number[] = []
+  const ghInstallHint = (refs: number[]): void =>
+    hintOnce(
+      "gh-install",
+      `autolink-prs: GitHub refs found (${refs.map((n) => `#${n}`).join(", ")}) but the gh CLI is not installed. ` +
+        "Install: brew install gh — or disable with --no-feature autolink-prs. (shown once)",
+    )
+  const ghLoginHint = (): void =>
+    hintOnce("gh-login", "autolink-prs: the gh CLI is not authenticated. Run: gh auth login (shown once)")
+  if (features["autolink-prs"] !== false && caption) {
+    const refs = detectRefs(caption)
+    if (refs.length > 0) {
+      autolinkRefOrder = refs
+      // Resolve repo identity first — the cache is keyed by repo (#260 means
+      // different things in different repos), so we cannot cache-split before we
+      // know the repo. `gh repo view` is cheap; the batched graphql is the spawn
+      // we want to skip when every ref is already cached.
+      const repoProbe = probeRepo(runGhReal)
+      if (repoProbe.status === "ok") {
+        const repo = repoProbe.repo
+        const GH_CACHE_PATH = join(home, ".cache", "tg-cli", "gh-cache.json")
+        const ghCacheRaw = ((): string | null => {
+          try {
+            return readFileSync(GH_CACHE_PATH, "utf8")
+          } catch {
+            return null
+          }
+        })()
+        const now = Date.now()
+        const { hits, missing } = splitGhCache(repo, refs, ghCacheRaw, now)
+        let probed: Map<number, GhRef> | null = null
+        if (missing.length > 0) {
+          const probe = probeRefsInRepo(repo, missing, runGhReal)
+          if (probe.status === "ok") {
+            probed = probe.refs
+            try {
+              mkdirSync(join(home, ".cache", "tg-cli"), { recursive: true })
+              writeFileSync(GH_CACHE_PATH, mergeGhCache(ghCacheRaw, repo, missing, probed, now))
+            } catch {
+              // best-effort cache; never block a send over bookkeeping
+            }
+          } else if (probe.status === "no-cli") {
+            ghInstallHint(refs)
+          } else if (probe.status === "no-auth") {
+            ghLoginHint()
+          } else {
+            console.error(`Warning: autolink-prs: ${probe.message} — sending without links`)
+          }
+        }
+        // Cached hits + live results, in first-appearance order. A null hit is a
+        // cached verified-absent verdict; a failed probe leaves its refs plain.
+        for (const num of refs) {
+          const ref = hits.has(num) ? hits.get(num) : (probed?.get(num) ?? null)
+          if (ref) autolinkRefs.set(num, ref)
+        }
+      } else if (repoProbe.status === "no-cli") {
+        ghInstallHint(refs)
+      } else if (repoProbe.status === "no-auth") {
+        ghLoginHint()
+      } else {
+        // no-repo: not a GitHub repo / no remote — normal for many cwds. Silent.
+      }
+    }
+  }
+  const hasRefs = autolinkRefs.size > 0
+  const hasAutolink = hasTickets || hasRefs
+
   // --- API calls ---
   const detectHtmlTags = (text: string): boolean => {
     const htmlPattern = /<(b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|tg-time|code|pre|blockquote)\b/i
@@ -1208,7 +1366,7 @@ if (import.meta.main) {
     // user HTML → escape the surrounding plain text (&<>) so literal characters
     // can't break parsing.
     const userHtml = fmt === "html" || detectHtmlTags(finalText)
-    const renderToHtml = userHtml || finalEntities.length > 0 || hasQuotes || hasTickets
+    const renderToHtml = userHtml || finalEntities.length > 0 || hasQuotes || hasAutolink
     if (!renderToHtml) return { text: finalText, format: "plain" }
     return {
       text: convertEntitiesToHtml(finalText, finalEntities, !userHtml),
@@ -1250,15 +1408,22 @@ if (import.meta.main) {
     )
   }
 
-  // --- autolink-tasks transform: linkify verified codes, add the title line
-  // (single ticket) or the collapsed reference block (several). Runs BEFORE
+  // --- autolink transform (tasks + prs): linkify verified Linear codes and
+  // GitHub #N refs, then append reference blocks. Single ticket → title on the
+  // first line; several tickets / any GitHub issue → a collapsed block (tickets
+  // then issues); PRs → their own collapsed block after that. Runs BEFORE
   // line-spec quote insertion so injected <pre> bodies are never linkified.
   // plan.textMessages[0] also covers the media-caption ride — the transmitter
-  // promotes that same message to a caption. hasTickets forced HTML in
+  // promotes that same message to a caption. hasAutolink forced HTML in
   // renderText, so the body is already escaped/rendered HTML here.
-  if (hasTickets && plan.textMessages.length > 0) {
+  if (hasAutolink && plan.textMessages.length > 0) {
+    const { issues, prs } = buildEntries(autolinkRefs, autolinkRefOrder)
     plan.textMessages[0] = {
-      text: applyAutolink(plan.textMessages[0].text, autolinkTickets, prefix.text.length > 0),
+      text: applyAutolink(plan.textMessages[0].text, autolinkTickets, prefix.text.length > 0, {
+        linkify: hasRefs ? (html: string): string => linkifyRefs(html, autolinkRefs) : undefined,
+        issues,
+        prs,
+      }),
       format: "html",
     }
   }
@@ -1454,6 +1619,30 @@ if (import.meta.main) {
     } catch {
       // best-effort cleanup
     }
+  }
+
+  // --- tg-ctl lazy auto-start (control spec §7): fires only AFTER a fully
+  // successful send, only inside tmux with a DETECTED AI AGENT (MODEL — the
+  // same in-session detection that brands the message) AND control.enabled.
+  // Fire-and-forget: the daemon's flock makes repeated starts a no-op, and
+  // NOTHING in this block may ever break a send — hence the swallow-all catch.
+  try {
+    const ctlCfg = resolveControlConfig(parseControlConfig(configYamlRaw))
+    if (MODEL && shouldAutoStart(process.env, ctlCfg)) {
+      Bun.spawn(
+        [
+          join(import.meta.dir, "tg-ctl"),
+          "start",
+          "--pane",
+          process.env.TMUX_PANE ?? "",
+          "--cwd",
+          process.cwd(),
+        ],
+        { detached: true, stdio: ["ignore", "ignore", "ignore"] },
+      ).unref()
+    }
+  } catch {
+    // best-effort — auto-start failures are invisible by design
   }
 
   // Reaching here means every send actually went through (checkResponse exits

@@ -3,6 +3,69 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.4.0
+
+Inbound control v1 (`tg-ctl`, spec §16 — poll/tmux transport, ON by default;
+opt out with `control.enabled: false`):
+
+- New `tg-ctl` entrypoint at the repo root: `start` / `run` / `stop` / `status`.
+  A singleton daemon long-polls Telegram `getUpdates` and injects inbound
+  messages into the target agent's tmux pane, wrapped as
+  `[TG from {name}] {msg} — reply via tg`. Outbound stays `tg`-only.
+- Hard singleton via real `flock(2)` (`bun:ffi` → libSystem/libc): the launcher
+  spawns the daemon detached and never takes the lock; the daemon flocks as its
+  first action and exits 0 if another instance holds it.
+- Lazy auto-start: a successful `tg` send from a tmux pane with a detected
+  agent fire-and-forgets `tg-ctl start`, handing over the `TMUX_PANE`/cwd
+  registration snapshot (gated on `control.enabled`).
+- Pane-id targeting with pre-inject verification: the agent process is located
+  by walking the pane's process tree (a Claude Code pane reports its version
+  string, not `claude`, as the pane command); injection refuses + replies in
+  Telegram if the pane no longer hosts an agent — text never lands in a shell.
+- Commands: `/stop` (Escape inject — interrupts the turn, session survives),
+  `/kill` (SIGINT + "restore via `claude --resume`"), `/status`; any other
+  `/cmd` passes through verbatim; plain text is a wrapped prompt.
+- Photo/document inbound: `getFile` download (≤20 MB) to
+  `~/.cache/tg-cli/inbound/`, the local path is injected for the agent to read.
+- Safety/robustness: sender-id allowlist, at-most-once offset persistence,
+  staleness window (default 300 s) with a "skipped N stale" notice, 409
+  backoff with a one-shot warning, idle TTL (default 30 min), multi-line
+  injection via bracketed paste.
+- Delivery receipts: a successfully handled inbound message gets a 👀
+  reaction; every failure answers with an error reply instead.
+- Config: new `control:` block (`enabled`, `transport`, `session`,
+  `inject_wrap`, `staleness_sec`, `idle_exit_min`, `allowed_senders`).
+  One bot token per machine for inbound (Telegram allows a single `getUpdates`
+  consumer); outbound `tg` is unaffected.
+- Deferred (recorded in the spec): question/permission forwarding with inline
+  buttons (v1.1), opencode native adapter (v1.1), `/rename`+`/new` (v1.2),
+  channel mode (v1.2+), configurable Escape prelude.
+
+Also in this release:
+
+- New `autolink-prs` feature (ON by default): GitHub `#N` references in the
+  message text are resolved against the cwd repo via `gh` (one `gh repo view`
+  for identity + one batched `gh api graphql` with aliased `issueOrPullRequest`
+  fields) and linkified. Resolved ISSUES merge into the existing
+  `autolink-tasks` reference block (`#N — Title`); PULL REQUESTS get their own
+  collapsed `PRs:` block at the END of the message with a state annotation
+  (`(merged)`/`(closed)`/`(draft)`/`(open)`). Verdicts (positive and negative)
+  are cached 1 h in `~/.cache/tg-cli/gh-cache.json`, keyed by `owner/repo#N` so
+  the same `#260` in different repos never collides. Every failure mode (no
+  `gh`, not authenticated, non-GitHub cwd, partial/missing numbers) keeps the
+  send going as plain text; missing-CLI / not-authenticated emit a one-time
+  stderr hint reusing the `autolink-tasks` hint-state file. Disable with
+  `--no-feature autolink-prs`.
+- New `recursive-attach` feature (ON by default): a file mentioned by bare
+  name or path suffix that misses plain and worktree-root resolution is now
+  found recursively under the worktree roots (or cwd outside a git repo) —
+  BFS, shallowest match wins, `node_modules`/`.git`/`dist`-style directories
+  pruned, depth/size caps. `2026-06-10-tg-ctl-control-design.md` mentioned
+  from the repo root now attaches from `docs/specs/`.
+- `autolink-tasks` now retries one unexpected `linear api` failure before
+  degrading to plain text, so transient Linear CLI/API failures do not silently
+  drop ticket links.
+
 ## 1.3.0
 
 Never-attach denylist (`attach-denylist` feature, ON by default):

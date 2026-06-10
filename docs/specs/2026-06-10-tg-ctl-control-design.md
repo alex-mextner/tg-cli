@@ -1,6 +1,9 @@
 # tg-ctl — Control Channel for tg-cli
 
-- **Status:** Draft — awaiting review
+- **Status:** Reviewed 2026-06-10 — multi-agent adversarial review (4 lenses; every
+  blocker/major finding independently verified or refuted, two refuted by live
+  experiment). Decisions D1–D4 resolved in §12; v1 scope in §16. Corrections are
+  marked inline as "(corrected by review …)".
 - **Date:** 2026-06-10
 - **Branch:** `feat/tg-ctl-control`
 
@@ -21,7 +24,8 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
 - Get a curated answer back (agent calls `tg`, or replies via channel).
 - Forward agent-initiated questions / permission prompts to Telegram, answerable
   with inline buttons.
-- Two transports: **Channel (priority)** and **tmux (fallback + control verbs)**.
+- Two transports: **tmux/poll (primary)** and **Channel (deferred experiment, v1.2+)**
+  — priority inverted by review, see §3/§12 D1.
 - Single daemon, strictly **singleton**, lazily auto-started by `tg`.
 
 ## 2. Non-goals (explicit)
@@ -37,21 +41,28 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
 - `tg` (existing one-shot sender) — outbound unchanged; gains a guarded lazy
   auto-start of `tg-ctl`.
 - `tg-ctl` — the control daemon / channel server. One binary, two modes:
-  - **Channel mode (priority):** runs as a Claude Code channel (MCP server)
-    spawned by `claude --channels …`. Owns Telegram I/O. Handles inbound
-    text + photo/file, replies via the channel reply tool with `tg` branding.
-  - **Poll mode (fallback):** standalone daemon, long-polls Telegram
-    `getUpdates`, injects into the target tmux session via `send-keys`.
-    Photo/file inbound → advises "restart with channels".
+  - **Poll mode (primary):** standalone daemon, long-polls Telegram
+    `getUpdates`, injects into the target tmux pane via `send-keys` /
+    `paste-buffer`. Photo/file inbound works here too via `getFile` download
+    (corrected by review F6 — media was never channel-only).
+  - **Channel mode (deferred, v1.2+):** runs as a Claude Code channel (MCP
+    server) spawned by `claude`. Owns Telegram I/O; inbound-only (outbound stays
+    `tg`, §4).
 - **Hook installer** — writes the question/permission-forwarding hooks into
   `~/.claude/settings.json`.
 
-**Transport selection / priority:**
-- Channel has priority. If a channel instance is active for the bot → it owns
-  I/O; poll-mode `tg-ctl` must **not** also poll (avoids Telegram 409, the
-  competitor bug class #36800).
-- If no channel → poll mode owns I/O and uses tmux.
-- Enforced by a shared singleton lock keyed on the bot token (§6).
+**Transport selection / priority (corrected by review F3/F5):**
+- **Poll/tmux is the primary transport**, not the fallback. "Channel has
+  priority" was unenforceable as designed: the flock is first-come-first-served,
+  so a poll daemon already holding the lock silently kills a later channel
+  instance (it fails the lock and exits 0 — channel dead until a manual
+  `tg-ctl stop`), and the spec's own "restart with channels" advice walked
+  straight into that deadlock.
+- If a channel instance ever owns the bot, poll-mode `tg-ctl` must **not** also
+  poll (avoids Telegram 409, the competitor bug class #36800) — both modes take
+  the same singleton lock keyed on the bot token (§6). A takeover protocol
+  (channel reads pidfile → SIGTERM the poll daemon → bounded wait → acquire) is
+  specced together with channel mode in v1.2+.
 
 ## 4. Round-trip mechanic
 
@@ -86,37 +97,84 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   stays exclusively `tg`. Photo/file is the channel-only capability tmux cannot match.
   A one-way (inbound) channel is explicitly supported by the protocol, so no reply tool
   is implemented.
-- **Launch:** alias/wrapper `claude --channels …`. The channel server is spawned by
-  `claude` as a subprocess; its lifetime equals `claude`'s.
+- **Launch (corrected by review EXT-2):** `claude --channels` alone does NOT load
+  a development channel — the working invocation is
+  `claude --dangerously-load-development-channels server:<name>`. The channel
+  server is spawned by `claude` as a subprocess; its lifetime equals `claude`'s.
+- **Deferred to v1.2+ (review D1):** research-preview flag with consent dialogs,
+  preview bugs #36800/#40064, and no `bun test`-able e2e (the claude-spawned path
+  is manual-only; the MCP-protocol layer itself IS testable with a fake host —
+  see §11). Poll/tmux covers v1 including media inbound (§5.2).
 
 ### 5.2 tmux (fallback + control verbs)
 
-- **Target discovery:** locate the tmux session running `claude` (reuse `tg`'s pane
-  detection via `TMUX_PANE`; `pgrep -f claude`). Target by session name.
+- **Target discovery (corrected by review F2/F7):** target a concrete **pane id**
+  (`%N`), never a session name — a session's active pane may be a shell prompt,
+  where injected text + Enter would EXECUTE as a command. Sources: the
+  registration snapshot `tg` hands over at auto-start (`TMUX_PANE` + cwd), plus
+  outside-in discovery by walking the process tree under `pane_pid` from
+  `tmux list-panes -a` (note: a Claude Code pane reports its VERSION string as
+  `pane_current_command`, e.g. `2.1.150`, not `claude` — match the `claude`
+  child process under `pane_pid`, verified live). Before EVERY injection,
+  re-verify the pane still hosts the agent process; refuse + reply in TG
+  otherwise. `tg`'s own env-based `detectAiModel` does NOT transfer to the
+  daemon (it relies on inherited session env) — only the snapshot does.
 - **Injection (proven recipe, extracted from competitor source):**
-  - `tmux send-keys -t <S> -l "<text>"` — literal mode (multi-line / special-char safe).
-  - `sleep ~0.4s`.
-  - `tmux send-keys -t <S> Enter`.
+  - Single-line: `tmux send-keys -t <pane> -l "<text>"` — literal mode
+    (special-char safe).
+  - Multi-line: `tmux load-buffer -` + `tmux paste-buffer -p -t <pane>`
+    (bracketed paste). Live experiment showed Claude Code treats a literal
+    `send-keys -l` LF as "insert newline" (review F10 refuted the submit-early
+    fear for CC specifically), but bracketed paste is the universally safe path
+    across the tmux floor (canonical-mode REPLs DO submit on LF).
+  - `sleep ~0.5s` (competitor source uses 0.5s, not 0.4s).
+  - `tmux send-keys -t <pane> Enter`.
   - Text and Enter are **separate** calls with a gap — a combined/too-fast Enter is
     dropped by the Ink TUI (the single most common failure in the other bots).
   - Control verbs (raw keys, no `-l`): `Escape` (exit picker), `BTab` (cycle
     permission mode).
-- **`!stop` / interrupt:** `kill -SIGINT <claude-pid>` (via `pgrep`), not tmux `C-c`.
-- **Photo/file inbound in tmux mode** → reply in TG: "tmux can't inject media —
-  restart with channels."
+- **`/stop` / interrupt (corrected by review EXT-1):** `tmux send-keys -t <pane>
+  Escape` — interrupts the current turn, the session survives (verified live on
+  CC 2.1.170). A single `kill -SIGINT <claude-pid>` KILLS the interactive
+  `claude` process (~1s, idle or mid-turn) — it is reserved for an explicit
+  `/kill` verb whose TG reply says "session killed — restore via
+  `claude --resume`". The pid comes from the registered pane's process tree,
+  never a global `pgrep -f claude` (matches every claude on the machine).
+- **Photo/file inbound works in poll mode (corrected by review F6):**
+  `getUpdates` delivers `file_id` → `getFile` download (≤20 MB; polite size
+  error above) into `~/.cache/tg-cli/inbound/<update_id>.<ext>` (daemon-chosen
+  filename, never Telegram-supplied) → inject the wrapped local path. The old
+  "restart with channels" reply is dropped — media was never channel-only.
+  Channel mode's residual advantages are only: works without tmux, and native
+  event delivery instead of keystroke fragility.
 - **No-tmux guard:** inbound arrives but `claude` not in tmux / no session → reply
-  in TG: "Claude Code not in tmux → feedback won't work." The advised relaunch matches
-  the configured transport: tmux mode → `tmux new -s claude 'claude'`; channel mode →
-  `tmux new -s claude 'claude --channels …'`.
+  in TG: "Claude Code not in tmux → feedback won't work. Relaunch:
+  `tmux new -s claude 'claude'`."
 
 ## 6. Singleton / idempotency (HARD requirement)
 
 - **Exactly one poller per bot token.** Never two `tg-ctl` instances; never
   poll-mode + channel-mode polling the same bot.
-- **Mechanism:** non-blocking `flock(2)` on
-  `~/.config/tg-cli/tg-ctl.<botid>.lock`, held for the daemon's lifetime. A second
-  start fails the `flock` → exits 0 (idempotent no-op). PID file
-  `tg-ctl.<botid>.pid` for `status`/`stop`; stale pidfile cleared via `kill -0`.
+- **Mechanism (pinned by review F1/F2/F4 — F1 was the blocker):** non-blocking
+  `flock(2)` on `~/.config/tg-cli/tg-ctl.<botid>.lock`, held for the daemon's
+  lifetime. Neither Bun nor Node expose flock and macOS has no `flock(1)` CLI,
+  so the implementation is `bun:ffi`: `dlopen` of `libSystem.B.dylib` (darwin) /
+  `libc.so.6` (linux), symbol `flock(i32, i32)`, `LOCK_EX|LOCK_NB = 6`, fd kept
+  open for the daemon's lifetime — the kernel releases the lock on ANY exit,
+  including SIGKILL (verified working on this machine, contention included).
+  A second start fails the `flock` → exits 0 (idempotent no-op). PID file
+  `tg-ctl.<botid>.pid` is purely informational for `status`/`stop`; stale
+  pidfile cleared via `kill -0`.
+- **Launcher/daemon split (review F1, blocker):** `tg-ctl start` (and the lazy
+  auto-start from `tg`) spawns the daemon with
+  `{detached: true, stdio: ['ignore', logFd, logFd]}` + `unref()` and exits
+  immediately, WITHOUT taking the lock. The daemon process itself (internal
+  `tg-ctl run`) opens the lockfile and takes the flock as its FIRST action,
+  exiting 0 on failure. Rationale, both verified on Bun 1.4.0: (a) flock is
+  bound to the open file description — a launcher-held lock dies with the
+  launcher, opening a two-daemon window; (b) piped/inherited stdio makes the
+  launcher (and therefore every agent `tg` call) hang for the daemon's entire
+  lifetime.
 - Channel mode takes the **same** lock (our custom channel can — a reason to prefer
   custom over official). If the lock is held by a channel instance, poll-mode
   auto-start is a no-op.
@@ -131,9 +189,11 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
 ## 7. Lifecycle & auto-start
 
 - **Commands:**
-  - `tg-ctl start` — acquire lock, daemonize, begin poll (poll mode). No-op if running.
-  - `tg-ctl stop` — read pidfile, `SIGTERM`, clean lock/pidfile.
-  - `tg-ctl status` — running? mode? target session? bot id?
+  - `tg-ctl start` — spawn the detached daemon and exit (no lock here — §6).
+    No-op if already running.
+  - `tg-ctl run` — internal: the daemon itself. flock first, then poll loop.
+  - `tg-ctl stop` — read pidfile, `SIGTERM`, clean pidfile.
+  - `tg-ctl status` — running? mode? target pane? bot id? last update age?
 - **Lazy auto-start from `tg`:** on `tg` invocation, auto-start `tg-ctl` **only if both hold**:
   - inside a tmux pane (`TMUX` set) with a detected AI agent, **and**
   - config `control.enabled: true`.
@@ -157,8 +217,35 @@ Installed idempotently into `~/.claude/settings.json` (backup first):
   `{hookSpecificOutput:{decision:{behavior:"allow"|"deny"}}}`.
 
 These work **without** channels (pure hook return-value path). **No completion/Stop
-hook.** The hook process hands the question to the running `tg-ctl` (local socket /
-file handoff) and awaits the button answer.
+hook.** The hook process hands the question to the running `tg-ctl` over a **Unix
+domain socket** (review F8 pinned the handoff: socket path in the registration
+file, JSON request/response, hard client-side timeout) and awaits the button
+answer.
+
+**Verification status (review F5/F7 — live spike PASSED on CC 2.1.170):** a
+PreToolUse hook on `AskUserQuestion` returning
+`{hookSpecificOutput:{permissionDecision:"allow", updatedInput:{questions,
+answers:{<question text>:<label>}}}}` pre-answers the question with NO dialog
+rendered — the mechanism works as written. Caveats that go into the
+implementation: `answers` is keyed by the QUESTION TEXT (not header); multiSelect
+answers are a comma-joined string; `updatedInput` replaces the input wholesale so
+it MUST include `questions`; and the contract is an UNDOCUMENTED internal of the
+permission component — add a canary e2e (synthetic payload against a real
+`claude -p`) that fails loudly on contract drift. The `PermissionRequest` shape
+(`hookSpecificOutput.decision.behavior`) is documented and exact.
+
+**Timeout semantics (review F6):** set an explicit per-hook `timeout` (~120 s) in
+settings.json; the daemon's own deadline is slightly shorter. On expiry the hook
+returns NO decision → the normal local dialog takes over; the daemon edits the TG
+message to "expired — answer in terminal". Late button taps get
+`answerCallbackQuery("expired")`; every callback_query is acked with
+`answerCallbackQuery` immediately (review EXT-5 — otherwise the client spins).
+The daemon must also expire the TG message when the hook process dies (local
+Esc abort), not only on timeout.
+
+**Deferred to v1.1 (review D4):** the mechanism is verified, but the full path
+(UDS protocol, inline buttons, callback routing, expiry editing, canary test) is
+its own work package. v1 ships injection + commands only (§16).
 
 **Fast-passthrough guard (critical):** these hooks live in `~/.claude/settings.json`
 and fire for **every** Claude Code session, including keyboard sessions with no
@@ -170,59 +257,143 @@ delayed, or hung waiting for a button tap.
 
 ## 9. Config
 
-- `~/.config/tg-cli/.env`: `TG_BOT_TOKEN`, `TG_CHAT_ID` (existing). Allowlist =
-  `TG_CHAT_ID` (+ optional extra IDs).
-- `config.yaml` (under the existing feature-flag system):
-  - `control.enabled`: bool, default `false` — gates inbound + auto-start.
-  - `control.transport`: `auto | channel | tmux`, default `auto` (channel-priority).
+- `~/.config/tg-cli/.env`: `TG_BOT_TOKEN`, `TG_CHAT_ID` (existing).
+- **Allowlist (corrected by review F13): sender user ids**, not chat id —
+  checked on `message.from.id` AND `callback_query.from.id`. Default:
+  `TG_CHAT_ID` (correct for DMs, where they coincide); optional
+  `control.allowed_senders` for extras. Gating on chat id alone would let any
+  member of a group chat inject prompts into the agent session.
+- `config.yaml` — a new `control:` block. NOTE (review F1/repo-fit): the existing
+  feature-flag parser reads only a boolean `features:` block; `control.*` needs
+  its own tiny parser in the same hand-rolled style (strings + booleans + ints,
+  one nesting level, no yaml dependency):
+  - `control.enabled`: bool, default `true` (flipped from `false` by user
+    decision 2026-06-10 post-review) — gates inbound + auto-start. Inbound is
+    armed out of the box; opt OUT per machine with `enabled: false`. This makes
+    D3 (bot-per-machine) a practical requirement, not just a recommendation.
+  - `control.transport`: `auto | tmux` in v1 (`channel` reserved for v1.2+),
+    default `auto`.
   - `control.session`: optional fixed tmux session name (else auto-discover).
   - `control.inject_wrap`: template, default `[TG from {name}] {msg} — reply via tg`.
+  - `control.staleness_sec`: int, default `300` — inbound older than this is
+    dropped on arrival (§10).
+  - `control.idle_exit_min`: int, default `30` — daemon exits when no agent pane
+    has existed for this long (§10).
+  - `control.allowed_senders`: comma-separated extra sender ids.
+- `TG_API_BASE` (env, default `https://api.telegram.org`) — injectable Bot API
+  base URL; exists so tests can point the spawned daemon at a local fake
+  (review F12).
 
 ## 10. Error handling / edge cases
 
 - Bot token shared by `tg` (`sendMessage`) and `tg-ctl` (`getUpdates`): `sendMessage`
   does not conflict with the long-poll; only one `getUpdates` consumer is allowed →
   enforced by the singleton.
+- **Offset persistence & delivery semantics (added by review F4):** persist the
+  last-confirmed `update_id` per bot id in `~/.config/tg-cli/tg-ctl.<botid>.offset`,
+  shared between modes so a future handover doesn't replay. Semantics:
+  **at-most-once** — advance the offset BEFORE acting on an update. A crash
+  between confirm and inject loses that message (the human notices no response
+  and resends); the alternative (at-least-once) double-injects ghost prompts
+  into a live agent session, which is strictly worse for a control channel.
+- **Stale flood (review F4):** offset persistence does NOT stop the 24 h Telegram
+  backlog accumulated while the daemon was down. Drop every inbound whose
+  `message.date` is older than `control.staleness_sec` (default 300 s) and send
+  ONE summary notice: "skipped N stale messages".
+- **409 in the poll loop (review F9):** exponential backoff with cap; after N
+  consecutive 409s send one TG/log notice "another consumer is polling this bot"
+  and idle. The flock cannot prevent a lingering server-side long poll right
+  after a restart, nor a consumer on another machine.
+- **Idle TTL (review F12):** if no agent pane has existed for
+  `control.idle_exit_min` (default 30 min), exit cleanly — lazy auto-start
+  resurrects the daemon on the next `tg` call. No stray processes.
+- **Delivery receipts (user request 2026-06-10):** every inbound message whose
+  handling fully succeeded gets a **👀 reaction** (`setMessageReaction`,
+  best-effort) — the human sees at a glance that the message landed in the
+  session. Every failure path replies with an error instead (no-agent,
+  ambiguous target, inject abort, kill/download failures, too-large media);
+  a failed message NEVER gets the reaction. Stale-dropped and
+  disallowed-sender messages get neither.
 - `claude` not running → inbound reply: "no active session".
-- Multiple tmux sessions with `claude` → pick the one matching cwd/pane; if
-  ambiguous, ask which (buttons) or use `control.session`.
-- Channel preview bugs → poll/tmux is the stable fallback.
+- Multiple tmux sessions with `claude` → pick the one matching the registration
+  snapshot (pane id), else `control.session`, else most recently active agent
+  pane; if still ambiguous, reply in TG naming the candidates (buttons arrive
+  with v1.1 hooks work).
+- Channel preview bugs → poll/tmux is the primary transport (§3).
 - send-keys into an open picker → optional `Escape` prelude (configurable), matching
   oscarsterling.
 - Hook fires but `tg-ctl` is not running, or this session is not the TG-control target
   → **fast passthrough**, no decision, no latency (§8). A keyboard session is never blocked.
 
-## 11. Testing
+## 11. Testing (corrected by review F3/F12)
 
-- **Unit:** `tg-ctl` arg parse; flock singleton (spawn two, assert one exits);
-  wrapped-inject formatting; `settings.json` hook install/uninstall idempotency +
-  backup; no-TTY auto-start skip.
-- **Integration (tmux):** throwaway tmux session running a stub TUI; assert
-  `send-keys -l` + `Enter` lands the line; assert the `SIGINT` path.
-- **Hook:** feed a synthetic `AskUserQuestion` payload on stdin; assert the correct
-  `updatedInput` JSON on stdout after a simulated button answer.
-- **No live Telegram in CI:** mock the Bot API (`getUpdates`/`sendMessage`) with a
-  local fake.
+- **Unit (pure modules, injected I/O):** arg parse; config `control:` block
+  parsing; update→action step function (allowlist, staleness, command split,
+  offset advance); inject plan building (single-line, multi-line, control
+  verbs); discovery from canned `list-panes` + process-tree output.
+- **Process-level (NOT unit — it spawns real processes):** flock singleton —
+  spawn two `tg-ctl run` against a tmpdir lock path, assert exactly one
+  survives, assert the loser exits 0.
+- **Auto-start gating:** the skip test asserts on **no `TMUX`**, not no TTY —
+  §7 explicitly mandates NO TTY gate (the old "no-TTY auto-start skip" test
+  item contradicted §7 and is gone).
+- **Integration (tmux, `test.skipIf(!tmuxAvailable)`):** throwaway tmux session
+  running a stub TUI (a tiny Bun readline script); assert single-line
+  `send-keys -l` + delayed `Enter` lands one submission; assert a 3-line
+  message via `load-buffer`/`paste-buffer -p` lands as ONE submission; assert
+  the `Escape` verb. Tests MAY use `capture-pane` for assertions — the §2 ban
+  is on the production round-trip only.
+- **No live Telegram in CI:** a local `Bun.serve` fake of the Bot API
+  (`getUpdates`/`sendMessage`/`getFile`), reached via `TG_API_BASE` (§9); the
+  daemon is spawned as a real subprocess against the fake.
+- **Hook (v1.1):** feed a synthetic `AskUserQuestion` payload on stdin; assert
+  correct `updatedInput` JSON after a simulated button answer; plus the canary
+  e2e against a real `claude -p` for contract drift (§8).
+- **Channel (v1.2+):** the MCP-protocol layer is testable with a fake host
+  (spawn `tg-ctl`, JSON-RPC initialize, assert
+  `capabilities.experimental['claude/channel']`, feed a fake update, assert the
+  channel notification); the claude-spawned e2e is manual-only.
 
-## 12. Open decisions for review
+## 12. Decisions (RESOLVED by review, 2026-06-10)
 
-- **D1 — Channel: custom inbound-only (recommended) vs official two-way plugin.**
-  Recommendation: custom inbound-only channel + outbound always `tg` (one branded
-  voice). The official plugin is a two-way bridge whose reply is the unbranded voice we
-  avoid. Affects branding, lock-sharing, preview-risk exposure. Pick before the plan.
-- **D2 — Outbound voice.** Recommended: `tg` only (channel inbound-only). Alternative:
-  a channel reply tool for native threading / typing, at the cost of `tg`'s branding /
-  auto-attach. Confirm `tg`-only.
-- **D3 — Fleet.** One machine per bot token (Telegram `getUpdates` limit). For
-  mbp + home on one bot, choose: bot-per-machine, or a central router that owns the
-  single poll and fans out. Decide before multi-machine use.
-- **D4 — v1 harness set.** Ship `cc` (channel+hooks+tmux) + `opencode` (native) as
-  first-class; `codex`/`pi`/`aider`/`gemini` as the tmux-floor long tail. Confirm the cut.
+- **D1 — RESOLVED: custom inbound-only channel, but deferred to v1.2+.** When
+  built, it is the custom inbound-only channel (one branded voice, shares the
+  singleton lock; one-way channels are officially supported — omit
+  `capabilities.tools`), NOT the official two-way plugin: the official plugin
+  owns the bot's update stream, which silently breaks hook-button routing
+  (review F8) and double-forwards permissions. Channel mode is demoted from
+  "priority" to a config-gated experiment for the research preview's duration
+  (permanent `--dangerously-load-development-channels`, consent dialogs, bugs
+  #36800/#40064 — both confirmed real). A side fact in the design's favor:
+  #40064 breaks the native channel permission relay for `server:` channels, and
+  this spec routes permissions through hooks anyway, so the bug is contained.
+- **D2 — RESOLVED: `tg`-only outbound.** Matches the repo's positioning
+  (curated, branded outbound IS the moat), reuses auto-attach/limits/branding
+  for free, avoids a second unbranded voice and a second outbound codepath.
+- **D3 — RESOLVED: bot-per-machine.** Config-only (one BotFather call per
+  machine), keeps "one lock = one bot = one machine" exactly right. A central
+  router is a new always-on service with its own SPOF — defer until a real
+  fleet need exists. README gets one sentence: "one bot token per machine for
+  inbound". The 409 symptom of ignoring this is documented in §10.
+- **D4 — RESOLVED: cut harder than proposed.** v1 = `cc` via the tmux floor
+  (poll daemon; §16). Hooks forwarding (§8) and the opencode native adapter →
+  v1.1 (the opencode API surface was re-verified end-to-end against a live
+  1.16.2 OpenAPI — the matrix is correct — but it is a second product surface,
+  not a one-session build). `/rename`, `/new`, `HarnessAdapter` → v1.2 (an
+  interface with one implementation is premature). Channel mode → v1.2+.
+  `codex`/`pi`/`aider` need zero v1 code — the tmux floor covers them by
+  construction. **`gemini` is dropped entirely**: Gemini CLI stops serving
+  requests 2026-06-18; its successor (`agy`) gets a new row when verified.
 
 ## 13. Command layer
 
 Telegram messages starting with `/` are commands; everything else is a prompt (§4).
 Two commands are harness-aware; the rest pass through.
+
+**v1 command set (review D4):** `/stop` (Escape inject — §5.2), `/kill` (SIGINT
+to the registered pane's agent pid + "restore via `claude --resume`" reply),
+`/status` (daemon + target info). `/rename` and `/new` ship in v1.2 with the
+adapter layer; until then unknown `/cmd` passes through verbatim (below).
 
 - **`/rename <name>`** — rename the harness session **and** the tmux window together:
   - tmux window: `tmux rename-window -t <pane> <name>` (universal).
@@ -253,7 +424,14 @@ is missing, the bot states it plainly rather than faking it.
 process/pane). The CC adapter is the channel+hooks+tmux design of §5/§8; other adapters
 plug into the same `tg-ctl` lifecycle.
 
-**Capability matrix (verified June 2026):**
+**Capability matrix (verified June 2026; re-verified by review against the live
+OpenAPI of opencode 1.16.2 at `GET /doc` — all opencode claims confirmed,
+including `/question/{requestID}/reply`, `/permission/{requestID}/reply` and the
+`question.asked`/`permission.asked` SSE events. Pin the opencode version in the
+adapter and validate routes against the live `/doc` at startup: v2 event
+variants signal churn. Codex caveat: its hooks must be explicitly trusted by
+hash via `/hooks` — first run is manual. Gemini row kept for history only —
+dropped per D4):**
 
 | Harness | Native inject | Native question/perm forward | Rename | Reset | Feedback strategy |
 |---|---|---|---|---|---|
@@ -290,3 +468,46 @@ the long tail. See D4 (§12).
 
 - Voice inbound, file-preview tunnels, multi-machine fleet routing, web dashboard
   (the monetization-hypothesis layer) — separate specs.
+
+## 16. v1 scope (review verdict — what this branch implements)
+
+**Integration with the repo (review F14):** `tg-ctl` is a second single-file
+entrypoint at the repo root mirroring `tg` (`#!/usr/bin/env bun`,
+`import.meta.main` guard, exported helpers so tests can import it). It shares
+`tg`'s release: one `CHANGELOG.md` `## 1.4.0` section, `VERSION = "1.4.0"` in
+`tg`. Deploy adds a `~/.files/bin/tg-ctl` symlink **after merge to main** (the
+live-symlink rule: the main checkout IS the deployed tool). Pure logic lives in
+`features/tg-ctl/` with injected I/O per AGENTS.md.
+
+**v1 modules:**
+1. `tg-ctl` (root) — thin wiring: `start`/`run`/`stop`/`status`, real flock via
+   `bun:ffi` (§6), detached spawn, fetch loop against `TG_API_BASE`, real tmux
+   spawns, `getFile` media download.
+2. `features/tg-ctl/config.ts` — `control:` block parser (§9), pure.
+3. `features/tg-ctl/lock.ts` — singleton decision logic (flock + kill-0
+   injected), pidfile staleness, pure.
+4. `features/tg-ctl/updates.ts` — pure step function:
+   `(updates, state, now) → {actions, replies, newOffset}`; sender allowlist,
+   staleness drop, command-vs-prompt split, media→download actions.
+5. `features/tg-ctl/inject.ts` — pure: wrap template + tmux command plans as
+   data (single-line `send-keys -l`, multi-line `load-buffer`/`paste-buffer -p`,
+   separate delayed `Enter`, `Escape` verb, pre-inject pane verification step).
+6. `features/tg-ctl/discover.ts` — pure: pick the target pane from injected
+   `list-panes -a` output + process-tree info (cc shows VERSION as pane command
+   — match the `claude` child under `pane_pid`).
+7. `tg` wiring: ~20 gated lines — fire-and-forget auto-start after a successful
+   send, only if `TMUX` is set AND `control.enabled: true`; hands over the
+   `TMUX_PANE`/cwd registration snapshot.
+8. Tests per §11 (unit + process-level singleton + skipIf tmux integration +
+   `Bun.serve` Telegram fake).
+
+**Deferred:** §8 hooks forwarding + inline buttons + UDS protocol → v1.1;
+**reply-routing → v1.1** (user request 2026-06-10, after the first live
+round-trip): `tg` records `message_id → {paneId, cwd}` into a routing map on
+every outbound send; the daemon routes an inbound that carries
+`reply_to_message` to the mapped pane, while plain (non-reply) text keeps the
+v1 last-write-wins registration target. This turns one-bot-many-sessions into
+a usable fan-in without buttons or threads; opencode native adapter → v1.1;
+`/rename`, `/new`, `HarnessAdapter` → v1.2; channel mode + takeover protocol
+→ v1.2+; the §10 Escape prelude is built in `inject.ts` but not wired (no
+config key yet). Each deferral is annotated at its section.
