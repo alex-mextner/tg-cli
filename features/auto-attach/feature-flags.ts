@@ -14,12 +14,15 @@ export type FeatureMap = Record<string, boolean>;
 // Default feature state. auto-attach is ON by default per spec §North star;
 // autolink-tasks per docs/specs/autolink-tasks.md §North star; md-as-pdf
 // converts attached markdown to PDF (emoji/Cyrillic-safe preview);
-// attach-denylist blocks secret-looking files (.env, keys, credentials).
+// attach-denylist blocks secret-looking files (.env, keys, credentials);
+// recursive-attach finds mentioned files deeper than cwd (auto-attach spec
+// §Recursive resolution).
 export const DEFAULT_FEATURES: FeatureMap = {
   'auto-attach': true,
   'autolink-tasks': true,
   'md-as-pdf': true,
   'attach-denylist': true,
+  'recursive-attach': true,
 };
 
 // A deliberately tiny YAML reader. We only support the exact shape the spec

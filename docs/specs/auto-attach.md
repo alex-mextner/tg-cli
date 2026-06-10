@@ -264,3 +264,44 @@ Semantics differ from the extensionless gate on purpose:
 Override consciously with `--no-feature attach-denylist` or
 `features.attach-denylist: false` in `~/.config/tg-cli/config.yaml`. Matching is
 basename-only so a file living in a directory named `.env/` is not blocked.
+
+### Recursive resolution (v1.4, `recursive-attach`, ON by default)
+
+A mentioned file often lives deeper than the cwd: a report says
+`2026-06-10-tg-ctl-control-design.md` while the file sits at
+`docs/specs/2026-06-10-tg-ctl-control-design.md`. Plain and worktree-root
+resolution both miss it (they only join the token against the roots). The
+`recursive-attach` feature adds a THIRD fallback after plain → worktree-roots:
+search the tree recursively.
+
+Trigger (all must hold):
+
+- plain cwd/~/absolute resolution failed AND worktree-root resolution failed;
+- the token is relative, contains no `..` segment, and ends with a
+  recursion-worthy extension (`md mdx txt ts tsx js jsx mjs cjs py rb go rs
+  java kt json yaml yml toml sh sql csv html css svg png jpg jpeg gif webp
+  pdf log` — case-insensitive). Other extensions never trigger a tree walk.
+
+Search:
+
+- Roots: the SAME priority-ordered git worktree roots the worktree fallback
+  uses (current → main → branch-matched → rest); outside a git repo, the cwd
+  is the single root.
+- One lazy file index per process: BFS from each root in order, directory
+  entries sorted for determinism, results concatenated root-by-root. BFS makes
+  shallower files come first; the first index entry whose path ends with
+  `/<token>` wins (a bare filename therefore matches by basename, a relative
+  token like `specs/x.md` by path suffix). Cross-root priority falls out of the
+  concatenation order.
+- Pruned directories (never descended into): `node_modules`, `.git`, `dist`,
+  `build`, `out`, `.next`, `.nuxt`, `.turbo`, `.cache`, `coverage`, `vendor`,
+  `target`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.idea`,
+  `.vscode`, `tmp`.
+- Caps: depth ≤ 10, ≤ 50 000 visited entries across all roots (the walk stops
+  there — a miss past the cap is a miss; never an error).
+
+The recursive hit feeds the SAME downstream gates as any auto-detected path:
+extensionless gate (vacuously passed — the trigger requires an extension),
+never-attach denylist, R1–R4 attach rules, line-spec quotes (`foo.md:12` works:
+the base path goes through the same chain). Failures anywhere degrade to
+"token stays plain text", matching the feature's overall philosophy.

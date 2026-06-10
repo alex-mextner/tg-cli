@@ -39,6 +39,15 @@ opt out with `control.enabled: false`):
   buttons (v1.1), opencode native adapter (v1.1), `/rename`+`/new` (v1.2),
   channel mode (v1.2+), configurable Escape prelude.
 
+Also in this release:
+
+- New `recursive-attach` feature (ON by default): a file mentioned by bare
+  name or path suffix that misses plain and worktree-root resolution is now
+  found recursively under the worktree roots (or cwd outside a git repo) —
+  BFS, shallowest match wins, `node_modules`/`.git`/`dist`-style directories
+  pruned, depth/size caps. `2026-06-10-tg-ctl-control-design.md` mentioned
+  from the repo root now attaches from `docs/specs/`.
+
 ## 1.3.0
 
 Never-attach denylist (`attach-denylist` feature, ON by default):

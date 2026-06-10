@@ -54,7 +54,7 @@ tests can pass fakes.
 ### Existing Features
 
 - `features/auto-attach/` — path detection → attach files, R1-R4 text rules, line-spec quotes,
-  transmitter with Telegram message/caption limits.
+  worktree-aware + recursive path resolution, transmitter with Telegram message/caption limits.
 - `features/autolink-tasks/` — detects Linear ticket codes in messages, resolves titles via the
   `linear` CLI, and rewrites text with hyperlinks.
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile

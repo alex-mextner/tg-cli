@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { isAbsolute, join, resolve } from "path"
 import { isNeverAttach } from "./features/auto-attach/denylist"
@@ -27,6 +27,12 @@ import { buildSendPlan } from "./features/auto-attach/normalize"
 import { parseLineSpec } from "./features/auto-attach/snippet"
 import { transmit, type Transport } from "./features/auto-attach/transmitter"
 import { CAPTION_LIMIT, type SendItem } from "./features/auto-attach/types"
+import {
+  buildFileIndex,
+  isRecursiveCandidate,
+  matchFromIndex,
+  type ListDir,
+} from "./features/auto-attach/recursive"
 import {
   enumerateWorktreeRoots,
   looksPathLike,
@@ -326,6 +332,13 @@ export function parseArgs(
   // looking files (.env family, private keys, credential rc-files, …) are
   // silently skipped by the auto-scan and a HARD ERROR for explicit flags.
   attachDenylist = true,
+  // Recursive resolution (feature `recursive-attach`, ON by default): third
+  // fallback after plain and worktree-root joins — search the worktree roots
+  // (or cwd outside a git repo) recursively for the mentioned file (auto-attach
+  // spec §Recursive resolution). The index thunk is injectable for tests;
+  // the default builds one lazy real-fs index per parseArgs call.
+  recursiveAttach = true,
+  getFileIndex?: () => string[],
 ): ParseResult {
   // 1. Help / version win anywhere, before the empty check.
   for (const a of args) {
@@ -428,13 +441,47 @@ export function parseArgs(
         return false
       }
     }
+    // Recursive index (feature `recursive-attach`): built lazily, at most once
+    // per parseArgs call, and ONLY when some token actually reaches the third
+    // fallback — ordinary sends never pay for a tree walk.
+    const realListDir: ListDir = (abs) => {
+      try {
+        return readdirSync(abs, { withFileTypes: true }).map((d) => ({
+          name: d.name,
+          isFile: d.isFile(),
+          isDirectory: d.isDirectory(),
+        }))
+      } catch {
+        return null
+      }
+    }
+    let fileIndexCache: string[] | null = null
+    const getIndex =
+      getFileIndex ??
+      ((): string[] => {
+        if (fileIndexCache === null) {
+          const roots = getWorktreeRoots()
+          fileIndexCache = buildFileIndex(roots.length > 0 ? roots : [cwd], realListDir)
+        }
+        return fileIndexCache
+      })
     const resolveWithWorktrees = (token: string): string | null => {
       const plain = resolveExistingFile(token, cwd, home)
       if (plain) return plain
       if (!looksPathLike(token)) return null
       const roots = getWorktreeRoots()
-      if (roots.length === 0) return null
-      return resolveAcrossWorktrees(token, roots, fileExistsAbs)
+      if (roots.length > 0) {
+        const fromWorktrees = resolveAcrossWorktrees(token, roots, fileExistsAbs)
+        if (fromWorktrees) return fromWorktrees
+      }
+      // Third fallback: recursive search (auto-attach spec §Recursive
+      // resolution). The hit is re-checked against the real fs — the index
+      // may be stale within a long-running process.
+      if (recursiveAttach && isRecursiveCandidate(token)) {
+        const hit = matchFromIndex(token, getIndex())
+        if (hit && fileExistsAbs(hit)) return hit
+      }
+      return null
     }
     const segments = textParts.join(" ").split(/(\s+)/)
     for (let s = 0; s < segments.length; s++) {
@@ -681,7 +728,16 @@ if (import.meta.main) {
     }
     return worktreeRootsCache
   }
-  const parsed = parseArgs(args, process.cwd(), home, autoAttachOn, getWorktreeRoots, attachDenylistOn)
+  const recursiveAttachOn = features["recursive-attach"] !== false
+  const parsed = parseArgs(
+    args,
+    process.cwd(),
+    home,
+    autoAttachOn,
+    getWorktreeRoots,
+    attachDenylistOn,
+    recursiveAttachOn,
+  )
 
   // No-send actions resolve BEFORE the credential gate so help/version/info
   // flags work without Telegram credentials configured.
