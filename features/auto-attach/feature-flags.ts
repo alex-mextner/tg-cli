@@ -12,14 +12,16 @@
 export type FeatureMap = Record<string, boolean>;
 
 // Default feature state. auto-attach is ON by default per spec §North star;
-// autolink-tasks per docs/specs/autolink-tasks.md §North star; md-as-pdf
-// converts attached markdown to PDF (emoji/Cyrillic-safe preview);
-// attach-denylist blocks secret-looking files (.env, keys, credentials);
-// recursive-attach finds mentioned files deeper than cwd (auto-attach spec
-// §Recursive resolution).
+// autolink-tasks per docs/specs/autolink-tasks.md §North star; autolink-prs
+// resolves GitHub #N refs (issues into the tickets block, PRs in their own
+// block) per docs/specs/autolink-prs.md §North star; md-as-pdf converts attached
+// markdown to PDF (emoji/Cyrillic-safe preview); attach-denylist blocks
+// secret-looking files (.env, keys, credentials); recursive-attach finds
+// mentioned files deeper than cwd (auto-attach spec §Recursive resolution).
 export const DEFAULT_FEATURES: FeatureMap = {
   'auto-attach': true,
   'autolink-tasks': true,
+  'autolink-prs': true,
   'md-as-pdf': true,
   'attach-denylist': true,
   'recursive-attach': true,

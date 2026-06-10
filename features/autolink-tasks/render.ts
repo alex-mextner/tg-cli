@@ -73,20 +73,61 @@ function linkifyTextSegment(text: string, tickets: Map<string, TicketInfo>): str
   return out;
 }
 
+// A pre-rendered reference line contributed by a sibling feature (autolink-prs).
+// `label` is the already-linkified anchor (or plain text) for the left side; the
+// title is escaped and appended as `label — title`. This lets autolink-tasks own
+// the blockquote shape while autolink-prs supplies GitHub issue/PR entries, with
+// no dependency from autolink-tasks back onto autolink-prs.
+export interface LinkEntry {
+  label: string; // already-built HTML for the left side (e.g. an <a href> anchor)
+  title: string; // RAW title, escaped here
+  suffix?: string; // optional already-built/escaped trailing annotation, e.g. " (merged)"
+}
+
+function entryLine(e: LinkEntry): string {
+  return `${e.label} — ${escapeHtml(e.title)}${e.suffix ?? ''}`;
+}
+
+export interface AutolinkExtras {
+  // Linkify table for sibling refs (e.g. GitHub #N → anchor HTML), applied to
+  // the body in the same tag-safe pass as ticket codes via linkifyTokens below.
+  linkify?: (html: string) => string;
+  // Entries merged INTO the tickets reference block (GitHub issues).
+  issues?: LinkEntry[];
+  // Entries rendered in their OWN block AFTER the tickets/issues block (PRs).
+  prs?: LinkEntry[];
+}
+
 /**
  * Full autolink transform of a rendered message body:
- *   1. linkify every verified code in place;
- *   2. one ticket → its (escaped) title on the first line: appended after the
- *      emoji/[window] prefix when one exists, otherwise as its own first line;
- *   3. several tickets → a collapsed <blockquote expandable> reference block
- *      appended at the end, one "CODE: title" line per ticket (codes linked).
- * `tickets` is in first-appearance order. Empty → body returned unchanged.
+ *   1. linkify every verified code in place (and any sibling refs via
+ *      `extras.linkify`);
+ *   2. one ticket and no sibling issues → its (escaped) title on the first line:
+ *      appended after the emoji/[window] prefix when one exists, otherwise as
+ *      its own first line;
+ *   3. several tickets, OR any sibling issues → a collapsed
+ *      <blockquote expandable> reference block appended at the end (tickets
+ *      first, then issues), one entry line each;
+ *   4. sibling PRs → a SEPARATE collapsed block after that one, even for a
+ *      single PR (`PRs:` header line).
+ * `tickets` is in first-appearance order. Everything empty → body unchanged.
  */
-export function applyAutolink(body: string, tickets: TicketInfo[], hasPrefixLine: boolean): string {
-  if (tickets.length === 0) return body;
-  let out = linkifyCodes(body, new Map(tickets.map((t) => [t.code, t])));
+export function applyAutolink(
+  body: string,
+  tickets: TicketInfo[],
+  hasPrefixLine: boolean,
+  extras: AutolinkExtras = {},
+): string {
+  const issues = extras.issues ?? [];
+  const prs = extras.prs ?? [];
+  if (tickets.length === 0 && issues.length === 0 && prs.length === 0) return body;
 
-  if (tickets.length === 1) {
+  let out = linkifyCodes(body, new Map(tickets.map((t) => [t.code, t])));
+  if (extras.linkify) out = extras.linkify(out);
+
+  // A single ticket with no sibling issues keeps the first-line title behavior.
+  // Any issue forces the block form (issues never ride the first line).
+  if (tickets.length === 1 && issues.length === 0) {
     const title = escapeHtml(tickets[0].title);
     if (hasPrefixLine) {
       const lines = out.split('\n');
@@ -95,9 +136,16 @@ export function applyAutolink(body: string, tickets: TicketInfo[], hasPrefixLine
     } else {
       out = `${title}\n${out}`;
     }
-    return out;
+  } else if (tickets.length > 0 || issues.length > 0) {
+    // Ticket lines keep the historical `CODE: title` shape; GitHub issue lines
+    // use `#N — title` (spec §Rendering). Both coexist in the one block.
+    const ticketLines = tickets.map((t) => `${anchor(t)}: ${escapeHtml(t.title)}`);
+    const issueLines = issues.map(entryLine);
+    out = `${out}\n<blockquote expandable>${[...ticketLines, ...issueLines].join('\n')}</blockquote>`;
   }
 
-  const refLines = tickets.map((t) => `${anchor(t)}: ${escapeHtml(t.title)}`);
-  return `${out}\n<blockquote expandable>${refLines.join('\n')}</blockquote>`;
+  if (prs.length > 0) {
+    out = `${out}\n<blockquote expandable>PRs:\n${prs.map(entryLine).join('\n')}</blockquote>`;
+  }
+  return out;
 }

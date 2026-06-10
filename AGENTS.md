@@ -57,6 +57,8 @@ tests can pass fakes.
   worktree-aware + recursive path resolution, transmitter with Telegram message/caption limits.
 - `features/autolink-tasks/` — detects Linear ticket codes in messages, resolves titles via the
   `linear` CLI, and rewrites text with hyperlinks.
+- `features/autolink-prs/` — detects GitHub `#N` refs, resolves them against the cwd repo via
+  `gh` (issues merge into the tickets block, PRs get their own block), repo-keyed 1 h cache.
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile
   helpers, the update→action step function (allowlist, staleness, command split), tmux inject
   plans as data, agent pane discovery (process-tree walk — a Claude Code pane reports its
