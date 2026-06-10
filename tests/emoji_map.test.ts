@@ -18,6 +18,25 @@ function fakePgrepBinDir(): string {
   return dir
 }
 
+// Drop a fake `ps` into `dir` whose ancestry snapshot makes tg's PARENT look
+// like the given agent command (or, when agentCommand is empty, like a plain
+// shell with no agent ancestor). tg climbs from process.ppid, so we resolve the
+// real ppid of the tg process ($PPID of this fake ps) via the absolute /bin/ps
+// and label it. This lets us prove ancestry detection beats the pgrep fallback.
+function writeFakePs(dir: string, agentCommand: string): void {
+  const parentCmd = agentCommand || "-zsh"
+  const script =
+    "#!/bin/sh\n" +
+    'TG="$PPID"\n' +
+    'TGPPID=$(/bin/ps -o ppid= -p "$TG" 2>/dev/null | tr -d " ")\n' +
+    '[ -z "$TGPPID" ] && TGPPID=1\n' +
+    'echo "$TG $TGPPID bun run tg"\n' +
+    `echo "$TGPPID 1 ${parentCmd}"\n`
+  const p = join(dir, "ps")
+  writeFileSync(p, script)
+  chmodSync(p, 0o755)
+}
+
 // Sanitize environment for subprocess tests
 // Whitelist only essential vars to prevent env leakage
 function sanitizeEnv(): Record<string, string> {
@@ -975,6 +994,9 @@ test("--detect-model works without Telegram credentials (info-only flag)", async
 test("CLAUDECODE beats a genuinely-running ollama (fake pgrep)", async () => {
   const env = sanitizeEnv()
   const binDir = fakePgrepBinDir()
+  // Pin a no-agent ancestry so detection can't pick up a real `claude`/`codex`
+  // in the test runner's own process tree — this test is about the pgrep path.
+  writeFakePs(binDir, "")
   const PATH = `${binDir}:${env.PATH}`
 
   // Control: with a fake ollama 'running' and NO CLAUDECODE, detection falls
@@ -999,4 +1021,42 @@ test("CLAUDECODE beats a genuinely-running ollama (fake pgrep)", async () => {
   const stdout = await new Response(proc.stdout).text()
   expect((await proc.exited)).toBe(0)
   expect(stdout.startsWith("claude")).toBe(true)
+}, 10000)
+
+test("codex ancestor beats a background ollama daemon (fake ps + fake pgrep)", async () => {
+  // Regression for the real bug: codex exports no env marker for the shell
+  // commands it spawns (CODEX unset, CODEX_HOME empty), so detection fell
+  // through to the pgrep block and a background `ollama` daemon won — branding
+  // codex sessions as ollama. Ancestry detection must now win.
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  const ollamaScript =
+    '#!/bin/sh\nfor a in "$@"; do [ "$a" = "ollama" ] && exit 0; done\nexit 1\n'
+  writeFileSync(join(binDir, "pgrep"), ollamaScript)
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  const PATH = `${binDir}:${env.PATH}`
+
+  // Control: a plain shell ancestor (no agent) + ollama 'running' → ollama.
+  writeFakePs(binDir, "")
+  const control = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const controlOut = await new Response(control.stdout).text()
+  await control.exited
+  expect(controlOut.startsWith("ollama")).toBe(true)
+
+  // Now make tg's parent look like codex: ancestry must beat the ollama pgrep.
+  writeFakePs(binDir, "/opt/homebrew/bin/codex exec --json")
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("codex")).toBe(true)
 }, 10000)

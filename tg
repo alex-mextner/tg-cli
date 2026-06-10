@@ -28,6 +28,7 @@ import {
   type HintKind,
 } from "./features/autolink-tasks/state"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
+import { findAgentInAncestry, parseProcList } from "./features/tg-ctl/discover"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
 import { buildSendPlan } from "./features/auto-attach/normalize"
@@ -47,7 +48,7 @@ import {
   runGitReal,
 } from "./features/auto-attach/worktree"
 
-export const VERSION = "1.5.0"
+export const VERSION = "1.5.1"
 
 // --- Config loader ---
 function loadEnv(filePath: string): Record<string, string> {
@@ -677,6 +678,27 @@ function isProcessRunning(name: string): boolean {
   }
 }
 
+// Which agent launched this `tg` process? Climb the ppid chain and match the
+// nearest ancestor command (codex/aider/pi/opencode/claude). This is the
+// reliable signal for agents that — unlike Claude Code's CLAUDECODE — export no
+// env marker: a `codex exec` is the direct parent of the shell command it runs.
+// Crucially it runs BEFORE the pgrep fallbacks so a background `ollama` daemon
+// (a sibling, never an ancestor) can no longer hijack the label.
+function detectAgentViaAncestry(): string | null {
+  try {
+    const result = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], {
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    if (result.exitCode !== 0) return null
+    const procs = parseProcList(new TextDecoder().decode(result.stdout))
+    const found = findAgentInAncestry(procs, process.ppid)
+    return found?.agent ?? null
+  } catch {
+    return null
+  }
+}
+
 function extractBaseModel(modelName: string): string {
   const lower = modelName.toLowerCase()
   // Exact match first
@@ -854,6 +876,16 @@ if (import.meta.main) {
 
     // 3. Detect Codex CLI (only via explicit env, not pgrep — codex is often background)
     if (process.env.CODEX) return "codex"
+
+    // 3a. Walk the ancestor process tree. An agent that launched `tg` as a
+    // subprocess (codex, aider, pi, opencode) is the real sender even when it
+    // exports no env marker — codex notably sets neither CODEX nor CODEX_HOME
+    // for the shell commands it runs. This MUST run before the pgrep fallbacks:
+    // otherwise a background `ollama` daemon (common on macOS) wins and a codex
+    // session gets mislabeled as ollama.
+    const ancestorAgent = detectAgentViaAncestry()
+    if (ancestorAgent) return ancestorAgent
+
     // 3b. Detect other known CLI tools
     if (isProcessRunning("aider")) return "aider"
     if (isProcessRunning("cursor")) return "cursor"

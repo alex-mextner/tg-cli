@@ -3,6 +3,7 @@ import {
   parsePaneList,
   parseProcList,
   findAgentInPane,
+  findAgentInAncestry,
   pickTargetPane,
 } from '../features/tg-ctl/discover';
 import type { PaneInfo, ProcInfo } from '../features/tg-ctl/types';
@@ -153,6 +154,62 @@ test('survives a ppid cycle in the snapshot without hanging', () => {
   const p = pane('main', 0, '%9', 50, '-zsh', '/home');
   const procs = [proc(50, 60, '-zsh'), proc(60, 50, 'bash')];
   expect(findAgentInPane(p, procs)).toBeNull();
+});
+
+// --- findAgentInAncestry ---
+// Mirror of findAgentInPane but walking UP the ppid chain from a start pid.
+// Used by outbound `tg` to learn which agent launched it as a subprocess
+// (codex/aider/pi export no env marker, unlike Claude Code's CLAUDECODE).
+
+test('finds codex as the direct parent of tg (codex launched the shell command)', () => {
+  // Real shape verified live: `codex exec` is the immediate parent of the shell
+  // command it runs, so process.ppid points straight at a `codex` argv0.
+  const procs = [
+    proc(900, 800, '/opt/homebrew/bin/codex exec --json'),
+    proc(950, 900, 'tg some report'),
+  ];
+  expect(findAgentInAncestry(procs, 900)).toEqual({ agent: 'codex', pid: 900 });
+});
+
+test('finds codex through an intermediate shell (codex → bash -lc → tg)', () => {
+  const procs = [
+    proc(700, 1, 'codex --dangerously-bypass-approvals-and-sandbox'),
+    proc(710, 700, 'bash -lc tg ...'),
+    proc(720, 710, 'bun run tg'),
+  ];
+  // tg's process.ppid is 710 (the shell); walk up past it to codex.
+  expect(findAgentInAncestry(procs, 710)).toEqual({ agent: 'codex', pid: 700 });
+});
+
+test('a background ollama daemon is NOT in the ancestry, so it never matches', () => {
+  // The whole point of the fix: ollama runs as a sibling daemon, not an
+  // ancestor of tg, so ancestry returns null and the caller must NOT pick it.
+  const procs = [
+    proc(11196, 1, '/opt/homebrew/bin/ollama serve'), // background daemon
+    proc(800, 1, '-zsh'),
+    proc(850, 800, 'bun run tg report'),
+  ];
+  expect(findAgentInAncestry(procs, 800)).toBeNull();
+});
+
+test('returns the shallowest agent ancestor (nearest parent wins)', () => {
+  const procs = [
+    proc(100, 1, 'codex exec'),
+    proc(110, 100, 'aider --model x'), // nearer to tg than codex
+    proc(120, 110, 'tg ...'),
+  ];
+  expect(findAgentInAncestry(procs, 110)).toEqual({ agent: 'aider', pid: 110 });
+});
+
+test('survives a ppid cycle in the ancestry snapshot without hanging', () => {
+  const procs = [proc(50, 60, '-zsh'), proc(60, 50, 'bash')];
+  expect(findAgentInAncestry(procs, 50)).toBeNull();
+});
+
+test('stops cleanly at pid 1 / missing parent', () => {
+  const procs = [proc(300, 1, '-zsh')];
+  expect(findAgentInAncestry(procs, 300)).toBeNull();
+  expect(findAgentInAncestry(procs, 999999)).toBeNull(); // unknown start pid
 });
 
 // --- pickTargetPane ---
