@@ -41,6 +41,19 @@ opt out with `control.enabled: false`):
 
 Also in this release:
 
+- New `autolink-prs` feature (ON by default): GitHub `#N` references in the
+  message text are resolved against the cwd repo via `gh` (one `gh repo view`
+  for identity + one batched `gh api graphql` with aliased `issueOrPullRequest`
+  fields) and linkified. Resolved ISSUES merge into the existing
+  `autolink-tasks` reference block (`#N — Title`); PULL REQUESTS get their own
+  collapsed `PRs:` block at the END of the message with a state annotation
+  (`(merged)`/`(closed)`/`(draft)`/`(open)`). Verdicts (positive and negative)
+  are cached 1 h in `~/.cache/tg-cli/gh-cache.json`, keyed by `owner/repo#N` so
+  the same `#260` in different repos never collides. Every failure mode (no
+  `gh`, not authenticated, non-GitHub cwd, partial/missing numbers) keeps the
+  send going as plain text; missing-CLI / not-authenticated emit a one-time
+  stderr hint reusing the `autolink-tasks` hint-state file. Disable with
+  `--no-feature autolink-prs`.
 - New `recursive-attach` feature (ON by default): a file mentioned by bare
   name or path suffix that misses plain and worktree-root resolution is now
   found recursively under the worktree roots (or cwd outside a git repo) —
