@@ -495,7 +495,12 @@ live-symlink rule: the main checkout IS the deployed tool). Pure logic lives in
    `Bun.serve` Telegram fake).
 
 **Deferred:** §8 hooks forwarding + inline buttons + UDS protocol → v1.1;
-opencode native adapter → v1.1; `/rename`, `/new`, `HarnessAdapter` → v1.2;
-channel mode + takeover protocol → v1.2+; the §10 Escape prelude is built in
-`inject.ts` but not wired (no config key yet). Each deferral is annotated at
-its section.
+**reply-routing → v1.1** (user request 2026-06-10, after the first live
+round-trip): `tg` records `message_id → {paneId, cwd}` into a routing map on
+every outbound send; the daemon routes an inbound that carries
+`reply_to_message` to the mapped pane, while plain (non-reply) text keeps the
+v1 last-write-wins registration target. This turns one-bot-many-sessions into
+a usable fan-in without buttons or threads; opencode native adapter → v1.1;
+`/rename`, `/new`, `HarnessAdapter` → v1.2; channel mode + takeover protocol
+→ v1.2+; the §10 Escape prelude is built in `inject.ts` but not wired (no
+config key yet). Each deferral is annotated at its section.
