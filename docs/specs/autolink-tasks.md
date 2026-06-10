@@ -30,7 +30,9 @@ ON by default, toggled like any feature: `--no-feature autolink-tasks` or
 
 ## Verification (linear CLI)
 
-One `linear api '<GraphQL>'` spawn per send, only when detection found codes:
+One live Linear probe per send, only when detection found codes. The probe runs
+`linear api '<GraphQL>'` once, with one immediate retry using the same query if the
+first attempt fails unexpectedly:
 
 ```
 query { issues(filter: { or: [
@@ -44,8 +46,9 @@ query { issues(filter: { or: [
 - Issues missing in Linear simply don't come back → those codes are **ignored** (stay
   plain text). This also survives the aliased-`issue(id:)` pitfall: a single missing id
   there nukes the whole response (`data: null`), the filter query does not.
-- Spawn timeout 10s; on timeout/any unexpected failure the message is sent UNCHANGED
-  with a one-line stderr warning. Autolink must never block or fail a send.
+- Spawn timeout 10s per attempt. A transient unexpected failure is retried once; if
+  the retry also fails, the message is sent UNCHANGED with a one-line stderr warning.
+  Autolink must never block or fail a send.
 
 ### CLI missing / not authenticated → hint ONCE
 

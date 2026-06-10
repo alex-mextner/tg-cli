@@ -62,6 +62,9 @@ Also in this release:
   BFS, shallowest match wins, `node_modules`/`.git`/`dist`-style directories
   pruned, depth/size caps. `2026-06-10-tg-ctl-control-design.md` mentioned
   from the repo root now attaches from `docs/specs/`.
+- `autolink-tasks` now retries one unexpected `linear api` failure before
+  degrading to plain text, so transient Linear CLI/API failures do not silently
+  drop ticket links.
 
 ## 1.3.0
 

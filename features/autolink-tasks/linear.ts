@@ -99,18 +99,24 @@ export function probeTickets(codes: string[], run: Runner): LinearProbe {
   // would be invalid GraphQL, so don't spawn at all.
   const valid = codes.filter((c) => c.length - c.indexOf('-') - 1 <= MAX_NUMBER_DIGITS);
   if (valid.length === 0) return { status: 'ok', tickets: new Map() };
-  const result = run(['api', buildIssuesQuery(valid)]);
-  if (result === null) return { status: 'no-cli' };
-  const combined = `${result.stdout}\n${result.stderr}`;
-  if (NO_AUTH_MARKERS.some((marker) => combined.includes(marker))) {
-    return { status: 'no-auth' };
+  const args = ['api', buildIssuesQuery(valid)];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = run(args);
+    if (result === null) return { status: 'no-cli' };
+    const combined = `${result.stdout}\n${result.stderr}`;
+    if (NO_AUTH_MARKERS.some((marker) => combined.includes(marker))) {
+      return { status: 'no-auth' };
+    }
+    if (result.exitCode !== 0) {
+      if (attempt === 0) continue;
+      return { status: 'error', message: result.stderr.trim() || `linear exited ${result.exitCode}` };
+    }
+    const tickets = parseIssuesResponse(result.stdout, codes);
+    if (tickets === null) {
+      if (attempt === 0) continue;
+      return { status: 'error', message: 'unexpected linear api response' };
+    }
+    return { status: 'ok', tickets };
   }
-  if (result.exitCode !== 0) {
-    return { status: 'error', message: result.stderr.trim() || `linear exited ${result.exitCode}` };
-  }
-  const tickets = parseIssuesResponse(result.stdout, codes);
-  if (tickets === null) {
-    return { status: 'error', message: 'unexpected linear api response' };
-  }
-  return { status: 'ok', tickets };
+  return { status: 'error', message: 'unexpected linear api response' };
 }
