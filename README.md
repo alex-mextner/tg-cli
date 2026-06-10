@@ -169,6 +169,55 @@ tg --format html "<b>Important</b>: deployment complete"
   </tr>
 </table>
 
+## How tg-cli compares
+
+Every other Telegram + AI-agent tool is a **remote terminal**: it mirrors or streams
+the whole session and you drive it from chat — the same shape as Claude Code's own
+first-party Remote Control (`/rc`) and Channels. `tg-cli` inverts that. The **agent
+curates** what is worth sending (it calls `tg` deliberately), it works for **any**
+agent in tmux (not just Claude), and inbound control is a thin, optional layer — not a
+full mirror. No existing tool takes this outbound-first, moderated, multi-agent stance.
+
+Inbound control (`tg-ctl`) is in design — see
+[`docs/specs/2026-06-10-tg-ctl-control-design.md`](docs/specs/2026-06-10-tg-ctl-control-design.md).
+Below, ○ = planned, — = absent by design, ~ = partial.
+
+### Philosophy
+
+| Tool | Direction | Mental model | Agents |
+|---|---|---|---|
+| **tg-cli** | Outbound-first, thin inbound | Curated agent reporting + poke-back | Any (multi-agent) |
+| Anthropic Channels / Remote Control | Inbound-first | Remote terminal / chat bridge (first-party) | Claude only |
+| Imolatte/tg-claude | Full-duplex | Remote terminal | Claude |
+| oscarsterling/claude-telegram-remote | Full-duplex | Remote terminal (tmux) | Claude |
+| RichardAtCT/claude-code-telegram | Full-duplex | Remote terminal (SDK) | Claude |
+| JessyTsui/Claude-Code-Remote | Full-duplex | Remote terminal + trace delivery | Claude |
+| jsayubi/ccgram | Full-duplex | Approvals + remote terminal | Claude |
+
+### Features
+
+| Tool | Curated out | Multi-agent brand | Media out | Inbound | Q→buttons | Voice | Full mirror |
+|---|---|---|---|---|---|---|---|
+| **tg-cli** | ✓ | ✓ | ✓ | ○ | ○ | — | — (by design) |
+| Anthropic Channels / RC | ~ (reply-only) | — | ✓ | ✓ | — | — | ✓ (RC) |
+| Imolatte/tg-claude | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| oscarsterling | ~ (channel reply) | — | — | ✓ | ✓ | — | ~ |
+| RichardAtCT | — | — | ✓ | ✓ | ~ | ✓ | ✓ |
+| JessyTsui | — (full trace) | — | — | ✓ | — | — | ✓ |
+| ccgram | — | — | — | ✓ | ✓ | — | ✓ |
+
+### Implementation
+
+| Tool | Connects via | Inbound inject | Completion detect | Bootstrap |
+|---|---|---|---|---|
+| **tg-cli** | `tg` CLI (out) + tmux send-keys / custom channel (in, ○) | `send-keys -l` / channel event | none (by design) | manual tmux / alias |
+| Anthropic Channels / RC | MCP channel / RC tunnel | `<channel>` event / RC | n/a | `--channels` / RC launch |
+| Imolatte/tg-claude | CLI subprocess (stream-json) + hooks; opt. tmux | stream-json / tmux | hooks (Stop/PreToolUse) | spawns or manual tmux |
+| oscarsterling | tmux send-keys + official channel | `send-keys -l` | Stop hook (anti-leak) | manual tmux |
+| RichardAtCT | Agent SDK (CLI fallback) | n/a (spawns session) | SDK events | bot launches session |
+| JessyTsui | tmux / PTY injection | send-keys + scrape | capture-pane scrape | manual tmux / PTY |
+| ccgram | tmux / Ghostty / PTY | send-keys + hook | capture-pane scrape | auto-create or manual |
+
 ## Ecosystem
 
 Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
