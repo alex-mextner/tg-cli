@@ -35,6 +35,24 @@ TG_BOT_TOKEN=<your bot token from @BotFather>
 TG_CHAT_ID=<your chat or user ID>
 ```
 
+### Inbound control (optional, OFF by default)
+
+`tg-ctl` lets you talk back to a running tmux agent session from Telegram.
+Enable it in `~/.config/tg-cli/config.yaml`:
+
+```yaml
+control:
+  enabled: true
+```
+
+The daemon auto-starts on the next `tg` send from inside tmux (or run
+`tg-ctl start`). From Telegram: plain text is injected into the agent's tmux
+pane as `[TG from you] … — reply via tg` (the agent answers by calling `tg`);
+`/stop` interrupts the current turn (Escape); `/kill` kills the session;
+`/status` reports daemon state; photos/files are downloaded locally and their
+path injected. Inbound needs **one bot token per machine** (Telegram allows a
+single `getUpdates` consumer per token) — outbound `tg` is unaffected.
+
 ## Usage
 
 ```bash
@@ -221,8 +239,10 @@ curates** what is worth sending (it calls `tg` deliberately), it works for **any
 agent in tmux (not just Claude), and inbound control is a thin, optional layer — not a
 full mirror. No existing tool takes this outbound-first, moderated, multi-agent stance.
 
-Inbound control (`tg-ctl`) is in design — see
-[`docs/specs/2026-06-10-tg-ctl-control-design.md`](docs/specs/2026-06-10-tg-ctl-control-design.md).
+Inbound control (`tg-ctl`) v1 shipped: poll/tmux transport, commands, media
+inbound — see
+[`docs/specs/2026-06-10-tg-ctl-control-design.md`](docs/specs/2026-06-10-tg-ctl-control-design.md)
+(§16 for the v1 scope and deferrals).
 Below, ○ = planned, — = absent by design, ~ = partial.
 
 ### Philosophy
@@ -241,7 +261,7 @@ Below, ○ = planned, — = absent by design, ~ = partial.
 
 | Tool | Curated out | Multi-agent brand | Media out | Inbound | Q→buttons | Voice | Full mirror |
 |---|---|---|---|---|---|---|---|
-| **tg-cli** | ✓ | ✓ | ✓ | ○ | ○ | — | — (by design) |
+| **tg-cli** | ✓ | ✓ | ✓ | ✓ | ○ | — | — (by design) |
 | Anthropic Channels / RC | ~ (reply-only) | — | ✓ | ✓ | — | — | ✓ (RC) |
 | Imolatte/tg-claude | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
 | oscarsterling | ~ (channel reply) | — | — | ✓ | ✓ | — | ~ |
@@ -253,7 +273,7 @@ Below, ○ = planned, — = absent by design, ~ = partial.
 
 | Tool | Connects via | Inbound inject | Completion detect | Bootstrap |
 |---|---|---|---|---|
-| **tg-cli** | `tg` CLI (out) + tmux send-keys / custom channel (in, ○) | `send-keys -l` / channel event | none (by design) | manual tmux / alias |
+| **tg-cli** | `tg` CLI (out) + tmux send-keys (in) / custom channel (○) | `send-keys -l` / bracketed paste | none (by design) | auto-start from `tg` |
 | Anthropic Channels / RC | MCP channel / RC tunnel | `<channel>` event / RC | n/a | `--channels` / RC launch |
 | Imolatte/tg-claude | CLI subprocess (stream-json) + hooks; opt. tmux | stream-json / tmux | hooks (Stop/PreToolUse) | spawns or manual tmux |
 | oscarsterling | tmux send-keys + official channel | `send-keys -l` | Stop hook (anti-leak) | manual tmux |

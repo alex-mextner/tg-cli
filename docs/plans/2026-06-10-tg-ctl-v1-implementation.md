@@ -38,8 +38,10 @@ modules import it, never redefine the shapes.
   - commands: text starting with `/`: `/stop` → inject-key Escape; `/kill` →
     kill-agent; `/status` → status; any other `/cmd …` → inject-text VERBATIM
     (passthrough, no wrap).
-  - plain text → inject-text with `wrapInbound(cfg.injectWrap, name, text)`
-    (import from inject.ts). Name = `from.first_name || from.username || 'tg'`.
+  - plain text → inject-text with `opts.wrap(name, text)` — the wrap function
+    is INJECTED via opts (no cross-module import; the entrypoint passes
+    inject.ts's `wrapInbound` bound to the template). Name =
+    `from.first_name || from.username || 'tg'`.
   - photo (largest size) / document → download-media action with
     `suggestedName = <update_id>.<ext>` (photo → .jpg; document → sanitized ext
     from file_name, default .bin; NEVER the Telegram-supplied basename);

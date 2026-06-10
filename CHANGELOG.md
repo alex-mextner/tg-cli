@@ -3,6 +3,41 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.4.0
+
+Inbound control v1 (`tg-ctl`, spec §16 — poll/tmux transport, OFF by default):
+
+- New `tg-ctl` entrypoint at the repo root: `start` / `run` / `stop` / `status`.
+  A singleton daemon long-polls Telegram `getUpdates` and injects inbound
+  messages into the target agent's tmux pane, wrapped as
+  `[TG from {name}] {msg} — reply via tg`. Outbound stays `tg`-only.
+- Hard singleton via real `flock(2)` (`bun:ffi` → libSystem/libc): the launcher
+  spawns the daemon detached and never takes the lock; the daemon flocks as its
+  first action and exits 0 if another instance holds it.
+- Lazy auto-start: a successful `tg` send inside tmux with `control.enabled:
+  true` in `~/.config/tg-cli/config.yaml` fire-and-forgets `tg-ctl start`,
+  handing over the `TMUX_PANE`/cwd registration snapshot.
+- Pane-id targeting with pre-inject verification: the agent process is located
+  by walking the pane's process tree (a Claude Code pane reports its version
+  string, not `claude`, as the pane command); injection refuses + replies in
+  Telegram if the pane no longer hosts an agent — text never lands in a shell.
+- Commands: `/stop` (Escape inject — interrupts the turn, session survives),
+  `/kill` (SIGINT + "restore via `claude --resume`"), `/status`; any other
+  `/cmd` passes through verbatim; plain text is a wrapped prompt.
+- Photo/document inbound: `getFile` download (≤20 MB) to
+  `~/.cache/tg-cli/inbound/`, the local path is injected for the agent to read.
+- Safety/robustness: sender-id allowlist, at-most-once offset persistence,
+  staleness window (default 300 s) with a "skipped N stale" notice, 409
+  backoff with a one-shot warning, idle TTL (default 30 min), multi-line
+  injection via bracketed paste.
+- Config: new `control:` block (`enabled`, `transport`, `session`,
+  `inject_wrap`, `staleness_sec`, `idle_exit_min`, `allowed_senders`).
+  One bot token per machine for inbound (Telegram allows a single `getUpdates`
+  consumer); outbound `tg` is unaffected.
+- Deferred (recorded in the spec): question/permission forwarding with inline
+  buttons (v1.1), opencode native adapter (v1.1), `/rename`+`/new` (v1.2),
+  channel mode (v1.2+), configurable Escape prelude.
+
 ## 1.3.0
 
 Never-attach denylist (`attach-denylist` feature, ON by default):

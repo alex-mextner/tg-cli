@@ -1,0 +1,618 @@
+#!/usr/bin/env bun
+// tg-ctl — inbound control daemon for tg-cli
+// (spec: docs/specs/2026-06-10-tg-ctl-control-design.md, v1 scope §16).
+//
+// All decision logic lives in features/tg-ctl/* as pure modules; this file owns
+// every real effect: fetch, spawns, file I/O, signals, and the bun:ffi flock.
+//
+// Launcher/daemon split (spec §6, review blocker F1, both halves verified on
+// Bun 1.4.0): `start` NEVER takes the lock (a launcher-held flock dies with the
+// launcher, opening a two-daemon window) and NEVER pipes stdio (a piped child
+// makes every agent `tg` call hang for the daemon's lifetime). The daemon
+// (`run`) takes the flock as its FIRST action and exits 0 when another
+// instance already owns the bot.
+
+import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
+import { join } from "path"
+import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
+import { findAgentInPane, parsePaneList, parseProcList, pickTargetPane } from "./features/tg-ctl/discover"
+import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
+import { botIdFromToken, ctlPaths, pidStatus, readPidFile } from "./features/tg-ctl/lock"
+import { stepUpdates } from "./features/tg-ctl/updates"
+import type {
+  Action,
+  ControlConfig,
+  CtlPaths,
+  DiscoverResult,
+  InjectStep,
+  PaneInfo,
+  ProcInfo,
+  Registration,
+  TargetPane,
+  TgUpdate,
+} from "./features/tg-ctl/types"
+
+export const USAGE = `Usage:
+  tg-ctl start [--pane %N] [--cwd PATH] [--session NAME]
+  tg-ctl stop
+  tg-ctl status
+  tg-ctl run    # internal: the daemon process itself
+
+Credentials: <config dir>/.env (TG_BOT_TOKEN, TG_CHAT_ID).
+Config:      <config dir>/config.yaml, top-level control: block.
+Env:         TG_CTL_CONFIG_DIR (default ~/.config/tg-cli),
+             TG_API_BASE (default https://api.telegram.org).
+`
+
+// Spec §5.2 no-tmux guard, verbatim.
+export const NO_AGENT_REPLY =
+  "Claude Code not in tmux → feedback won't work. Relaunch: `tmux new -s claude 'claude'`."
+
+// --- Pure helpers (exported for tests) ---
+
+// Same .env shape `tg` reads (KEY=VALUE lines, # comments). Reimplemented
+// locally on purpose: importing from ./tg would drag the entire sender module
+// graph into the daemon for a 15-line parser.
+export function loadEnv(filePath: string): Record<string, string> {
+  const env: Record<string, string> = {}
+  try {
+    const lines = readFileSync(filePath, "utf8").split("\n")
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith("#")) continue
+      const eq = trimmed.indexOf("=")
+      if (eq === -1) continue
+      const key = trimmed.slice(0, eq).trim()
+      const value = trimmed.slice(eq + 1).trim()
+      if (key) env[key] = value
+    }
+  } catch {
+    // file doesn't exist — skip
+  }
+  return env
+}
+
+export interface StartFlags {
+  paneId?: string
+  cwd?: string
+  session?: string
+}
+
+// `tg` passes `--pane ''` when TMUX_PANE is unset — empty values are skipped,
+// not stored, so the registration never carries hollow fields.
+export function parseStartFlags(args: string[]): StartFlags {
+  const out: StartFlags = {}
+  for (let i = 0; i < args.length; i++) {
+    const value = args[i + 1]
+    if (!value) continue
+    if (args[i] === "--pane") {
+      out.paneId = value
+      i++
+    } else if (args[i] === "--cwd") {
+      out.cwd = value
+      i++
+    } else if (args[i] === "--session") {
+      out.session = value
+      i++
+    }
+  }
+  return out
+}
+
+// Offset file content → next getUpdates offset. Malformed/absent → 0
+// (Telegram treats 0 as "no confirmed updates yet").
+export function readOffset(content: string | null): number {
+  if (content === null) return 0
+  const trimmed = content.trim()
+  return /^\d+$/.test(trimmed) ? Number(trimmed) : 0
+}
+
+// One line per candidate so the ambiguity reply names realistic choices.
+export function formatCandidates(candidates: TargetPane[]): string {
+  return candidates
+    .map((c) => `${c.pane.sessionName}:${c.pane.windowIndex} ${c.pane.paneId} (${c.agent}, ${c.pane.panePath})`)
+    .join("\n")
+}
+
+// --- Effectful plumbing (only ever invoked from the import.meta.main block) ---
+
+interface Ctx {
+  configDir: string
+  paths: CtlPaths
+  cfg: ControlConfig
+  token: string
+  chatId: number
+  apiBase: string
+  botId: string
+  home: string
+}
+
+function log(msg: string): void {
+  console.error(`[${new Date().toISOString()}] ${msg}`)
+}
+
+function readFileOrNull(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8")
+  } catch {
+    return null
+  }
+}
+
+function fileMtimeMs(path: string): number | null {
+  try {
+    return statSync(path).mtimeMs
+  } catch {
+    return null
+  }
+}
+
+function kill0(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function api(ctx: Ctx): string {
+  return `${ctx.apiBase}/bot${ctx.token}`
+}
+
+// Daemon-side outbound. Never throws and never exits — a failed notice must
+// not take the poll loop down with it.
+async function sendMessage(ctx: Ctx, text: string): Promise<void> {
+  try {
+    const resp = await fetch(`${api(ctx)}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: ctx.chatId, text }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    if (!resp.ok) log(`sendMessage failed: ${resp.status} ${(await resp.text()).slice(0, 200)}`)
+  } catch (err) {
+    log(`sendMessage failed: ${err}`)
+  }
+}
+
+// Tab separator — pane_current_path may contain spaces (see discover.ts).
+const PANE_FORMAT =
+  "#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}"
+
+// tmux absent / no server / ps failure → empty snapshot, never a crash:
+// discovery then degrades to the no-agent reply path.
+function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
+  let panes: PaneInfo[] = []
+  let procs: ProcInfo[] = []
+  try {
+    const tmux = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", PANE_FORMAT], {
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    if (tmux.exitCode === 0) panes = parsePaneList(tmux.stdout.toString())
+  } catch {
+    // tmux binary missing
+  }
+  try {
+    const ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], {
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    if (ps.exitCode === 0) procs = parseProcList(ps.stdout.toString())
+  } catch {
+    // ps missing — never on a supported platform
+  }
+  return { panes, procs }
+}
+
+function readRegistration(paths: CtlPaths): Registration | null {
+  try {
+    const parsed = JSON.parse(readFileSync(paths.registration, "utf8"))
+    return parsed && typeof parsed === "object" ? (parsed as Registration) : null
+  } catch {
+    return null
+  }
+}
+
+// Fresh discovery on every call — the registration file may have been
+// rewritten by a newer `tg`/`tg-ctl start` since the last poll.
+// An explicit `tg-ctl start --session X` (stored in the registration) outranks
+// config.yaml's control.session: it is the fresher, more specific intent, and
+// the auto-start path never sets it (tg passes only --pane/--cwd).
+function discoverTarget(ctx: Ctx): DiscoverResult {
+  const { panes, procs } = snapshot()
+  const reg = readRegistration(ctx.paths)
+  return pickTargetPane(panes, procs, reg, reg?.sessionName ?? ctx.cfg.session)
+}
+
+// Execute an InjectStep plan. verify-pane re-runs discovery on a CURRENT
+// snapshot — the agent may have exited between picking the target and typing
+// into it, and injecting into a bare shell would EXECUTE the text (spec §5.2).
+async function executeInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | { ok: false; error: string }> {
+  for (const step of steps) {
+    if (step.kind === "verify-pane") {
+      const { panes, procs } = snapshot()
+      const pane = panes.find((p) => p.paneId === step.paneId)
+      if (!pane || findAgentInPane(pane, procs) === null) {
+        return { ok: false, error: `pane ${step.paneId} no longer hosts an agent — message not injected` }
+      }
+    } else if (step.kind === "tmux") {
+      const proc = Bun.spawnSync(step.argv, {
+        stdin: step.stdin !== undefined ? new TextEncoder().encode(step.stdin) : undefined,
+        stdout: "ignore",
+        stderr: "pipe",
+      })
+      if (proc.exitCode !== 0) {
+        return { ok: false, error: `${step.argv.join(" ")} failed: ${proc.stderr.toString().trim()}` }
+      }
+    } else {
+      await Bun.sleep(step.ms)
+    }
+  }
+  return { ok: true }
+}
+
+// Shared by `tg-ctl status` (CLI) and the /status command (TG reply). Works
+// with no daemon running — everything is read from files + live discovery.
+function composeStatus(ctx: Ctx): string {
+  const pid = readPidFile(readFileOrNull(ctx.paths.pid))
+  const alive = pidStatus(pid, kill0)
+  const lines: string[] = [
+    alive === "running"
+      ? `tg-ctl: running (pid ${pid}) — bot ${ctx.botId}`
+      : alive === "stale"
+        ? `tg-ctl: not running (stale pidfile, pid ${pid}) — bot ${ctx.botId}`
+        : `tg-ctl: not running — bot ${ctx.botId}`,
+  ]
+  const reg = readRegistration(ctx.paths)
+  lines.push(
+    reg
+      ? `registration: pane ${reg.paneId ?? "?"}, cwd ${reg.cwd ?? "?"}` +
+          (reg.sessionName ? `, session ${reg.sessionName}` : "")
+      : "registration: none",
+  )
+  const found = discoverTarget(ctx)
+  lines.push(
+    found.ok
+      ? `target: ${found.target.agent} in ${found.target.pane.sessionName}:${found.target.pane.windowIndex} ` +
+          `${found.target.pane.paneId}` +
+          (found.target.agentPid !== undefined ? ` (pid ${found.target.agentPid})` : "")
+      : found.reason === "ambiguous"
+        ? `target: ambiguous —\n${formatCandidates(found.candidates)}`
+        : "target: no agent pane found",
+  )
+  const offsetMtime = fileMtimeMs(ctx.paths.offset)
+  lines.push(
+    offsetMtime === null
+      ? "offset: none"
+      : `offset: ${readOffset(readFileOrNull(ctx.paths.offset))} ` +
+          `(file age ${Math.round((Date.now() - offsetMtime) / 1000)}s)`,
+  )
+  return lines.join("\n")
+}
+
+// --- start: registration snapshot + detached daemon spawn, then exit ---
+
+function startLauncher(ctx: Ctx, flags: StartFlags): void {
+  mkdirSync(ctx.configDir, { recursive: true })
+  // Registration is written synchronously EVEN IF the daemon already runs —
+  // a fresh `tg` call re-targets a long-lived daemon at the current pane.
+  const reg: Registration = { registeredAt: Math.floor(Date.now() / 1000) }
+  if (flags.paneId) reg.paneId = flags.paneId
+  if (flags.cwd) reg.cwd = flags.cwd
+  if (flags.session) reg.sessionName = flags.session
+  writeFileSync(ctx.paths.registration, JSON.stringify(reg))
+
+  // No lock, no pipes (see header). The daemon flocks first and exits 0 if
+  // another instance holds the bot, so double-starts are a cheap no-op.
+  const logFd = openSync(ctx.paths.log, "a")
+  const proc = Bun.spawn([process.execPath, import.meta.path, "run"], {
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+  })
+  proc.unref()
+  closeSync(logFd) // the child holds its own dup
+  console.log(`tg-ctl: daemon launch requested (bot ${ctx.botId}) — log: ${ctx.paths.log}`)
+}
+
+// --- stop / status ---
+
+function stopDaemon(ctx: Ctx): void {
+  const pid = readPidFile(readFileOrNull(ctx.paths.pid))
+  const alive = pidStatus(pid, kill0)
+  if (alive === "absent") {
+    console.log("tg-ctl: not running")
+    return
+  }
+  if (alive === "stale") {
+    try {
+      unlinkSync(ctx.paths.pid)
+    } catch {}
+    console.log(`tg-ctl: not running (cleaned stale pidfile, pid ${pid})`)
+    return
+  }
+  try {
+    process.kill(pid!, "SIGTERM")
+  } catch (err) {
+    console.error(`tg-ctl: SIGTERM failed for pid ${pid}: ${err}`)
+    process.exit(1)
+  }
+  // Brief wait so `stop && status` doesn't race the dying daemon.
+  for (let i = 0; i < 20 && kill0(pid!); i++) Bun.sleepSync(100)
+  try {
+    unlinkSync(ctx.paths.pid)
+  } catch {}
+  console.log(kill0(pid!) ? `tg-ctl: SIGTERM sent (pid ${pid}, still exiting)` : `tg-ctl: stopped (pid ${pid})`)
+}
+
+// --- run: the daemon itself ---
+
+async function runDaemon(ctx: Ctx): Promise<never> {
+  mkdirSync(ctx.configDir, { recursive: true })
+
+  // flock FIRST (spec §6): bound to the open file description, released by the
+  // kernel on ANY exit including SIGKILL. Neither Bun nor Node expose flock
+  // and macOS has no flock(1), hence bun:ffi. The fd stays open for the
+  // daemon's lifetime.
+  const { dlopen, FFIType } = await import("bun:ffi")
+  const lib = process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6"
+  const ffi = dlopen(lib, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } })
+  const LOCK_EX_NB = 6 // LOCK_EX (2) | LOCK_NB (4)
+  const lockFd = openSync(ctx.paths.lock, "w")
+  if (ffi.symbols.flock(lockFd, LOCK_EX_NB) !== 0) {
+    // Another daemon owns this bot — idempotent no-op (spec §6).
+    process.exit(0)
+  }
+
+  writeFileSync(ctx.paths.pid, `${process.pid}\n`)
+  const cleanExit = (code: number): never => {
+    try {
+      unlinkSync(ctx.paths.pid)
+    } catch {}
+    process.exit(code)
+  }
+  process.on("SIGTERM", () => cleanExit(0))
+  process.on("SIGINT", () => cleanExit(0))
+
+  if (ctx.cfg.transport === "channel") {
+    log("transport 'channel' is reserved for v1.2+ — falling back to tmux")
+  }
+
+  let offset = readOffset(readFileOrNull(ctx.paths.offset))
+  let lastAgentSeenMs = Date.now() // grace period from daemon start
+  let consecutive409 = 0
+  let warned409 = false
+
+  const discover = (): DiscoverResult => {
+    const result = discoverTarget(ctx)
+    // Agent panes existing — even ambiguous ones — keep the daemon alive.
+    if (result.ok || result.candidates.length > 0) lastAgentSeenMs = Date.now()
+    return result
+  }
+
+  const replyNotFound = async (found: Extract<DiscoverResult, { ok: false }>): Promise<void> => {
+    await sendMessage(
+      ctx,
+      found.reason === "ambiguous"
+        ? `ambiguous target — candidates:\n${formatCandidates(found.candidates)}`
+        : NO_AGENT_REPLY,
+    )
+  }
+
+  // Pick a target, run the plan; every failure mode turns into a TG reply so
+  // the human is never left wondering whether the message landed.
+  const injectViaTarget = async (buildPlan: (paneId: string) => InjectStep[]): Promise<void> => {
+    const found = discover()
+    if (!found.ok) {
+      await replyNotFound(found)
+      return
+    }
+    const result = await executeInjectSteps(buildPlan(found.target.pane.paneId))
+    if (!result.ok) {
+      log(`inject aborted: ${result.error}`)
+      await sendMessage(ctx, result.error)
+    }
+  }
+
+  const downloadMedia = async (action: Extract<Action, { kind: "download-media" }>): Promise<void> => {
+    // getFile resolves the file_id to a server path; the bytes come from the
+    // /file/ endpoint. The local name is ALWAYS the daemon-chosen
+    // suggestedName — never the Telegram-supplied basename (spec §5.2).
+    const fileResp = await fetch(`${api(ctx)}/getFile?file_id=${encodeURIComponent(action.fileId)}`, {
+      signal: AbortSignal.timeout(30_000),
+    })
+    const fileJson = (await fileResp.json()) as { ok: boolean; result?: { file_path?: string } }
+    const remotePath = fileJson.ok ? fileJson.result?.file_path : undefined
+    if (!remotePath) {
+      log(`getFile failed for ${action.fileId}`)
+      await sendMessage(ctx, "media download failed")
+      return
+    }
+    const dataResp = await fetch(`${ctx.apiBase}/file/bot${ctx.token}/${remotePath}`, {
+      signal: AbortSignal.timeout(120_000),
+    })
+    if (!dataResp.ok) {
+      log(`file download failed: HTTP ${dataResp.status}`)
+      await sendMessage(ctx, "media download failed")
+      return
+    }
+    const dir = join(ctx.home, ".cache", "tg-cli", "inbound")
+    mkdirSync(dir, { recursive: true })
+    const dest = join(dir, action.suggestedName)
+    writeFileSync(dest, new Uint8Array(await dataResp.arrayBuffer()))
+    const noun = action.mediaKind === "photo" ? "photo" : "file"
+    const msg = `sent ${noun}: ${dest}` + (action.caption ? `\n${action.caption}` : "")
+    await injectViaTarget((paneId) =>
+      buildTextInjectPlan(paneId, wrapInbound(ctx.cfg.injectWrap, action.from, msg)),
+    )
+  }
+
+  const executeAction = async (action: Action): Promise<void> => {
+    switch (action.kind) {
+      case "reply":
+        await sendMessage(ctx, action.text)
+        return
+      case "status":
+        await sendMessage(ctx, composeStatus(ctx))
+        return
+      case "inject-text":
+        await injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text))
+        return
+      case "inject-key":
+        await injectViaTarget((paneId) => buildKeyInjectPlan(paneId, action.key))
+        return
+      case "kill-agent": {
+        const found = discover()
+        if (!found.ok) {
+          await replyNotFound(found)
+          return
+        }
+        if (found.target.agentPid === undefined) {
+          await sendMessage(ctx, "agent pid unknown — not killed")
+          return
+        }
+        try {
+          // SIGINT kills the interactive agent (~1s) — spec §5.2 reserves it
+          // for the explicit /kill verb. /stop is the survivable Escape.
+          process.kill(found.target.agentPid, "SIGINT")
+          await sendMessage(ctx, "session killed — restore via `claude --resume`")
+        } catch (err) {
+          await sendMessage(ctx, `kill failed: ${err}`)
+        }
+        return
+      }
+      case "download-media":
+        await downloadMedia(action)
+        return
+    }
+  }
+
+  log(`daemon up — pid ${process.pid}, bot ${ctx.botId}, offset ${offset}`)
+
+  for (;;) {
+    try {
+      // Idle TTL first, so even an error-backoff loop eventually exits. A
+      // newer registration file also counts as agent activity (the daemon may
+      // have been retargeted while no pane was discoverable yet).
+      const regMtime = fileMtimeMs(ctx.paths.registration)
+      if (regMtime !== null && regMtime > lastAgentSeenMs) lastAgentSeenMs = regMtime
+      discover()
+      if (Date.now() - lastAgentSeenMs > ctx.cfg.idleExitMin * 60_000) {
+        log(`no agent pane for ${ctx.cfg.idleExitMin} min — idle exit`)
+        cleanExit(0)
+      }
+
+      const resp = await fetch(
+        `${api(ctx)}/getUpdates?timeout=50&offset=${offset}&allowed_updates=${encodeURIComponent('["message"]')}`,
+        { signal: AbortSignal.timeout(60_000) },
+      )
+      if (resp.status === 409) {
+        // Another consumer is long-polling this bot (other machine, or a
+        // lingering server-side poll right after a restart) — the flock can't
+        // prevent that. Back off 1,2,4…60s; warn ONCE per streak.
+        consecutive409 += 1
+        if (consecutive409 === 5 && !warned409) {
+          warned409 = true
+          log("5 consecutive 409s — another consumer is polling this bot")
+          await sendMessage(ctx, "another consumer is polling this bot")
+        }
+        await Bun.sleep(Math.min(2 ** (consecutive409 - 1), 60) * 1000)
+        continue
+      }
+      if (!resp.ok) {
+        log(`getUpdates HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`)
+        await Bun.sleep(5000)
+        continue
+      }
+      const json = (await resp.json()) as { ok: boolean; result?: TgUpdate[]; description?: string }
+      if (!json.ok || !Array.isArray(json.result)) {
+        log(`getUpdates API error: ${json.description ?? "malformed response"}`)
+        await Bun.sleep(5000)
+        continue
+      }
+      consecutive409 = 0
+      warned409 = false
+
+      const step = stepUpdates(json.result, {
+        cfg: ctx.cfg,
+        chatId: ctx.chatId,
+        nowSec: Math.floor(Date.now() / 1000),
+        currentOffset: offset,
+        wrap: (name, msg) => wrapInbound(ctx.cfg.injectWrap, name, msg),
+      })
+
+      // At-most-once (spec §10): persist the offset BEFORE acting. A crash
+      // mid-action loses the message (the human resends); a replay would
+      // double-inject ghost prompts into a live agent session — strictly worse.
+      if (step.newOffset !== offset) {
+        offset = step.newOffset
+        writeFileSync(ctx.paths.offset, `${offset}\n`)
+      }
+      if (step.skippedStale > 0) {
+        await sendMessage(ctx, `skipped ${step.skippedStale} stale messages`)
+      }
+      for (const action of step.actions) {
+        await executeAction(action)
+      }
+    } catch (err) {
+      // The daemon must survive anything — malformed updates, network
+      // failures, tmux races. Log and back off.
+      log(`poll loop error: ${err}`)
+      await Bun.sleep(5000)
+    }
+  }
+}
+
+// --- CLI entrypoint (only runs when executed directly, not when imported) ---
+if (import.meta.main) {
+  const cmd = process.argv[2]
+  if (cmd === "-h" || cmd === "--help") {
+    console.log(USAGE)
+    process.exit(0)
+  }
+  if (!cmd || !["start", "run", "stop", "status"].includes(cmd)) {
+    console.error(USAGE)
+    process.exit(1)
+  }
+
+  const home = process.env.HOME ?? "~"
+  // TG_CTL_CONFIG_DIR exists so tests can point a spawned daemon at a tmpdir.
+  const configDir = process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")
+  const fileEnv = loadEnv(join(configDir, ".env"))
+  const env = { ...fileEnv, ...process.env }
+
+  const token = env.TG_BOT_TOKEN ?? ""
+  const botId = botIdFromToken(token)
+  if (!botId || !env.TG_CHAT_ID) {
+    console.error(`Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ${join(configDir, ".env")}`)
+    process.exit(1)
+  }
+
+  const cfg = resolveControlConfig(parseControlConfig(readFileOrNull(join(configDir, "config.yaml")) ?? ""))
+
+  const ctx: Ctx = {
+    configDir,
+    paths: ctlPaths(configDir, botId),
+    cfg,
+    token,
+    chatId: Number(env.TG_CHAT_ID),
+    apiBase: env.TG_API_BASE || "https://api.telegram.org",
+    botId,
+    home,
+  }
+
+  if (cmd === "start") {
+    startLauncher(ctx, parseStartFlags(process.argv.slice(3)))
+    process.exit(0)
+  }
+  if (cmd === "stop") {
+    stopDaemon(ctx)
+    process.exit(0)
+  }
+  if (cmd === "status") {
+    console.log(composeStatus(ctx))
+    process.exit(0)
+  }
+  await runDaemon(ctx)
+}

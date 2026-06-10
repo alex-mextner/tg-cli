@@ -1,0 +1,112 @@
+import { expect, test } from 'bun:test';
+import {
+  ctlPaths,
+  botIdFromToken,
+  readPidFile,
+  pidStatus,
+  shouldAutoStart,
+} from '../features/tg-ctl/lock';
+import { DEFAULT_CONTROL, type ControlConfig } from '../features/tg-ctl/types';
+
+const cfg = (over: Partial<ControlConfig> = {}): ControlConfig => ({
+  ...DEFAULT_CONTROL,
+  ...over,
+});
+
+// --- ctlPaths: all five files are tg-ctl.<botid>.* under configDir ---
+test('ctlPaths builds lock/pid/offset/registration/log under configDir', () => {
+  const p = ctlPaths('/home/u/.config/tg-cli', '123456');
+  expect(p.lock).toBe('/home/u/.config/tg-cli/tg-ctl.123456.lock');
+  expect(p.pid).toBe('/home/u/.config/tg-cli/tg-ctl.123456.pid');
+  expect(p.offset).toBe('/home/u/.config/tg-cli/tg-ctl.123456.offset');
+  expect(p.registration).toBe('/home/u/.config/tg-cli/tg-ctl.123456.registration.json');
+  expect(p.log).toBe('/home/u/.config/tg-cli/tg-ctl.123456.log');
+});
+
+test('ctlPaths tolerates a trailing slash in configDir', () => {
+  const p = ctlPaths('/tmp/cfg/', '99');
+  expect(p.lock).toBe('/tmp/cfg/tg-ctl.99.lock');
+});
+
+// --- botIdFromToken: digits before the colon, nothing else ---
+test('botIdFromToken extracts the numeric id before the colon', () => {
+  expect(botIdFromToken('123456:ABC-DEF1234')).toBe('123456');
+});
+
+test('botIdFromToken returns empty string for malformed tokens', () => {
+  expect(botIdFromToken('')).toBe('');
+  expect(botIdFromToken('no-colon-here')).toBe('');
+  expect(botIdFromToken(':ABC')).toBe('');
+  expect(botIdFromToken('12ab34:XYZ')).toBe(''); // non-digit id → not a bot id
+});
+
+// --- readPidFile: trim + NaN-safe, only positive integers count ---
+test('readPidFile parses a plain pid with surrounding whitespace', () => {
+  expect(readPidFile('12345\n')).toBe(12345);
+  expect(readPidFile('  777  ')).toBe(777);
+});
+
+test('readPidFile rejects missing/empty/garbage content', () => {
+  expect(readPidFile(null)).toBeNull();
+  expect(readPidFile('')).toBeNull();
+  expect(readPidFile('   \n')).toBeNull();
+  expect(readPidFile('abc')).toBeNull();
+  expect(readPidFile('12.5')).toBeNull();
+  expect(readPidFile('0')).toBeNull(); // kill(0, …) targets the process group
+  expect(readPidFile('-5')).toBeNull();
+});
+
+// --- pidStatus: kill0 is injected, no real signals here ---
+test('pidStatus is absent when there is no pid at all', () => {
+  expect(
+    pidStatus(null, () => {
+      throw new Error('kill0 must not be called for a null pid');
+    }),
+  ).toBe('absent');
+});
+
+test('pidStatus is running when kill0 confirms the pid', () => {
+  const seen: number[] = [];
+  expect(
+    pidStatus(4242, (pid) => {
+      seen.push(pid);
+      return true;
+    }),
+  ).toBe('running');
+  expect(seen).toEqual([4242]);
+});
+
+test('pidStatus is stale when the pidfile exists but the process is gone', () => {
+  expect(pidStatus(4242, () => false)).toBe('stale');
+});
+
+// --- shouldAutoStart: gate is TMUX + enabled, NOTHING else (spec §7) ---
+test('shouldAutoStart fires inside tmux with control enabled', () => {
+  expect(shouldAutoStart({ TMUX: '/tmp/tmux-501/default,123,0' }, cfg({ enabled: true }))).toBe(
+    true,
+  );
+});
+
+test('shouldAutoStart is false without TMUX or with empty TMUX', () => {
+  expect(shouldAutoStart({}, cfg({ enabled: true }))).toBe(false);
+  expect(shouldAutoStart({ TMUX: '' }, cfg({ enabled: true }))).toBe(false);
+});
+
+test('shouldAutoStart is false when control is disabled', () => {
+  expect(shouldAutoStart({ TMUX: '/tmp/tmux-501/default,123,0' }, cfg({ enabled: false }))).toBe(
+    false,
+  );
+});
+
+// Spec §7 explicitly mandates NO TTY check: the agent calls tg through a piped
+// Bash tool, so isatty is false in exactly the scenario that must fire. This
+// test pins the gate to TMUX+enabled — no other env key may influence it.
+test('shouldAutoStart ignores everything except TMUX (no TTY gate)', () => {
+  const env = {
+    TMUX: '/tmp/tmux-501/default,123,0',
+    CI: 'true',
+    SSH_TTY: '',
+    TERM: 'dumb',
+  };
+  expect(shouldAutoStart(env, cfg({ enabled: true }))).toBe(true);
+});

@@ -1,0 +1,154 @@
+import { expect, test } from 'bun:test';
+import {
+  wrapInbound,
+  buildTextInjectPlan,
+  buildKeyInjectPlan,
+} from '../features/tg-ctl/inject';
+import type { InjectStep } from '../features/tg-ctl/types';
+
+// --- wrapInbound: {name}/{msg} template substitution ---
+
+test('wrapInbound substitutes {name} and {msg}', () => {
+  expect(wrapInbound('[TG from {name}] {msg} — reply via tg', 'alex', 'hi')).toBe(
+    '[TG from alex] hi — reply via tg',
+  );
+});
+
+test('wrapInbound substitutes ALL occurrences of each placeholder', () => {
+  expect(wrapInbound('{name}/{name}: {msg} ({msg})', 'a', 'b')).toBe('a/a: b (b)');
+});
+
+test('wrapInbound leaves templates without placeholders untouched', () => {
+  expect(wrapInbound('static text', 'a', 'b')).toBe('static text');
+});
+
+test('wrapInbound does not re-substitute placeholders inside values', () => {
+  // Single pass over the TEMPLATE only — a "{name}" living inside the user's
+  // message must come out literal, not expanded again.
+  expect(wrapInbound('{name}: {msg}', 'x', 'msg has {name} inside')).toBe(
+    'x: msg has {name} inside',
+  );
+  expect(wrapInbound('{name}: {msg}', '{msg}', 'm')).toBe('{msg}: m');
+});
+
+// --- buildTextInjectPlan: single-line ---
+
+test('single-line text → verify-pane, literal send-keys, sleep, Enter', () => {
+  expect(buildTextInjectPlan('%3', 'hello world')).toEqual([
+    { kind: 'verify-pane', paneId: '%3' },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%3', '-l', 'hello world'] },
+    { kind: 'sleep', ms: 500 },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%3', 'Enter'] },
+  ]);
+});
+
+test('single-line send-keys uses -l (literal mode, special-char safe)', () => {
+  const plan = buildTextInjectPlan('%1', 'rm -rf; echo "q"');
+  const send = plan.find(
+    (s): s is Extract<InjectStep, { kind: 'tmux' }> =>
+      s.kind === 'tmux' && s.argv.includes('-l'),
+  );
+  expect(send).toBeDefined();
+  expect(send!.argv).toEqual(['tmux', 'send-keys', '-t', '%1', '-l', 'rm -rf; echo "q"']);
+  expect(send!.stdin).toBeUndefined();
+});
+
+// --- buildTextInjectPlan: multi-line ---
+
+test('multi-line text → load-buffer with stdin, then bracketed paste-buffer', () => {
+  const text = 'line one\nline two\nline three';
+  expect(buildTextInjectPlan('%7', text)).toEqual([
+    { kind: 'verify-pane', paneId: '%7' },
+    { kind: 'tmux', argv: ['tmux', 'load-buffer', '-'], stdin: text },
+    { kind: 'tmux', argv: ['tmux', 'paste-buffer', '-p', '-d', '-t', '%7'] },
+    { kind: 'sleep', ms: 500 },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%7', 'Enter'] },
+  ]);
+});
+
+test('stdin appears ONLY on the load-buffer step', () => {
+  const plan = buildTextInjectPlan('%7', 'a\nb');
+  for (const step of plan) {
+    if (step.kind !== 'tmux') continue;
+    if (step.argv[1] === 'load-buffer') expect(step.stdin).toBe('a\nb');
+    else expect(step.stdin).toBeUndefined();
+  }
+});
+
+// --- escapePrelude option ---
+
+test('escapePrelude inserts Escape + 200ms sleep right after verify-pane', () => {
+  const plan = buildTextInjectPlan('%2', 'hi', { escapePrelude: true });
+  expect(plan.slice(0, 3)).toEqual([
+    { kind: 'verify-pane', paneId: '%2' },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%2', 'Escape'] },
+    { kind: 'sleep', ms: 200 },
+  ]);
+  // Text injection still follows, ending with the separate Enter.
+  expect(plan[3]).toEqual({
+    kind: 'tmux',
+    argv: ['tmux', 'send-keys', '-t', '%2', '-l', 'hi'],
+  });
+});
+
+test('no escapePrelude by default', () => {
+  const plan = buildTextInjectPlan('%2', 'hi');
+  const escapes = plan.filter((s) => s.kind === 'tmux' && s.argv.includes('Escape'));
+  expect(escapes).toEqual([]);
+});
+
+// --- gapMs option ---
+
+test('custom gapMs replaces the default 500ms pre-Enter sleep', () => {
+  const plan = buildTextInjectPlan('%4', 'hi', { gapMs: 1200 });
+  expect(plan.at(-2)).toEqual({ kind: 'sleep', ms: 1200 });
+});
+
+test('prelude sleep stays 200ms even with custom gapMs', () => {
+  const plan = buildTextInjectPlan('%4', 'hi', { escapePrelude: true, gapMs: 1200 });
+  const sleeps = plan.filter((s) => s.kind === 'sleep');
+  expect(sleeps).toEqual([
+    { kind: 'sleep', ms: 200 },
+    { kind: 'sleep', ms: 1200 },
+  ]);
+});
+
+// --- invariants: verify-pane first, Enter separate and last ---
+
+test('verify-pane is ALWAYS the first step', () => {
+  const variants = [
+    buildTextInjectPlan('%9', 'one'),
+    buildTextInjectPlan('%9', 'one\ntwo'),
+    buildTextInjectPlan('%9', 'one', { escapePrelude: true }),
+    buildKeyInjectPlan('%9', 'Escape'),
+  ];
+  for (const plan of variants) {
+    expect(plan[0]).toEqual({ kind: 'verify-pane', paneId: '%9' });
+  }
+});
+
+test('Enter is ALWAYS its own final step, preceded by a sleep', () => {
+  const variants = [
+    buildTextInjectPlan('%5', 'one'),
+    buildTextInjectPlan('%5', 'one\ntwo'),
+    buildTextInjectPlan('%5', 'one', { escapePrelude: true, gapMs: 50 }),
+  ];
+  for (const plan of variants) {
+    const last = plan.at(-1)!;
+    expect(last).toEqual({ kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%5', 'Enter'] });
+    expect(plan.at(-2)!.kind).toBe('sleep');
+    // Enter must never ride along with the text payload.
+    for (const step of plan.slice(0, -1)) {
+      if (step.kind === 'tmux') expect(step.argv).not.toContain('Enter');
+    }
+  }
+});
+
+// --- buildKeyInjectPlan ---
+
+test('key plan: verify-pane + raw send-keys, no -l, no Enter, no sleep', () => {
+  expect(buildKeyInjectPlan('%6', 'Escape')).toEqual([
+    { kind: 'verify-pane', paneId: '%6' },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%6', 'Escape'] },
+  ]);
+});

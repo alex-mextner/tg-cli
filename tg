@@ -20,6 +20,8 @@ import {
   serializeHintState,
   type HintKind,
 } from "./features/autolink-tasks/state"
+import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
+import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
 import { buildSendPlan } from "./features/auto-attach/normalize"
 import { parseLineSpec } from "./features/auto-attach/snippet"
@@ -32,7 +34,7 @@ import {
   runGitReal,
 } from "./features/auto-attach/worktree"
 
-export const VERSION = "1.3.0"
+export const VERSION = "1.4.0"
 
 // --- Config loader ---
 function loadEnv(filePath: string): Record<string, string> {
@@ -651,15 +653,16 @@ if (import.meta.main) {
     console.error(USAGE)
     process.exit(1)
   }
-  const featureConfig = (() => {
+  // config.yaml is read ONCE; the raw text feeds both the features: block
+  // parser here and the control: block parser for tg-ctl auto-start below.
+  const configYamlRaw = (() => {
     try {
-      return parseFeatureConfig(
-        readFileSync(join(home, ".config", "tg-cli", "config.yaml"), "utf8"),
-      )
+      return readFileSync(join(home, ".config", "tg-cli", "config.yaml"), "utf8")
     } catch {
-      return {}
+      return ""
     }
   })()
+  const featureConfig = parseFeatureConfig(configYamlRaw)
   const features = resolveFeatures(featureConfig, {
     enable: flagResult.enable,
     disable: flagResult.disable,
@@ -1454,6 +1457,30 @@ if (import.meta.main) {
     } catch {
       // best-effort cleanup
     }
+  }
+
+  // --- tg-ctl lazy auto-start (control spec §7): fires only AFTER a fully
+  // successful send, only inside tmux with a DETECTED AI AGENT (MODEL — the
+  // same in-session detection that brands the message) AND control.enabled.
+  // Fire-and-forget: the daemon's flock makes repeated starts a no-op, and
+  // NOTHING in this block may ever break a send — hence the swallow-all catch.
+  try {
+    const ctlCfg = resolveControlConfig(parseControlConfig(configYamlRaw))
+    if (MODEL && shouldAutoStart(process.env, ctlCfg)) {
+      Bun.spawn(
+        [
+          join(import.meta.dir, "tg-ctl"),
+          "start",
+          "--pane",
+          process.env.TMUX_PANE ?? "",
+          "--cwd",
+          process.cwd(),
+        ],
+        { detached: true, stdio: ["ignore", "ignore", "ignore"] },
+      ).unref()
+    }
+  } catch {
+    // best-effort — auto-start failures are invisible by design
   }
 
   // Reaching here means every send actually went through (checkResponse exits

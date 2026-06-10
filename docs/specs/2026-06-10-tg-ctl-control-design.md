@@ -493,5 +493,6 @@ live-symlink rule: the main checkout IS the deployed tool). Pure logic lives in
 
 **Deferred:** §8 hooks forwarding + inline buttons + UDS protocol → v1.1;
 opencode native adapter → v1.1; `/rename`, `/new`, `HarnessAdapter` → v1.2;
-channel mode + takeover protocol → v1.2+. Each deferral is annotated at its
-section.
+channel mode + takeover protocol → v1.2+; the §10 Escape prelude is built in
+`inject.ts` but not wired (no config key yet). Each deferral is annotated at
+its section.
