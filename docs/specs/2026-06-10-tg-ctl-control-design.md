@@ -209,18 +209,45 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
 
 ## 8. Question / permission forwarding (the only hooks)
 
-Installed idempotently into `~/.claude/settings.json` (backup first):
-- `PreToolUse` matcher `AskUserQuestion` → forward question + options to TG as inline
-  buttons → return
+Core handoff shipped in `tg-ctl`: a hook process runs `tg-ctl ask`, writes a
+normalized question/permission JSON request on stdin, and waits on the running
+daemon over a bot-scoped Unix domain socket (`tg-ctl.<botid>.sock`). The daemon
+sends Telegram inline buttons, consumes `callback_query` updates in the same
+poll stream as messages, immediately `answerCallbackQuery`s every tap, edits
+answered/expired prompt messages, and returns agent-specific JSON to the hook
+client. A missing daemon/socket or timeout returns no decision so the local
+agent UI takes over. The daemon also checks the hook request against the active
+registration: `paneId` is authoritative — when both sides know the pane, a
+mismatch fast-passes even if `cwd`/`sessionName` agree (a second keyboard
+session in the same cwd must never block on Telegram); `cwd` and `sessionName`
+match only when the pane is unknown on either side. Mismatches fast-pass with
+no Telegram prompt so globally installed hooks cannot block unrelated keyboard
+sessions.
+
+Hardening: the daemon `chmod 0600`s the socket on listen (the guard trusts
+client-supplied fields, so other local users must not reach it); hook requests
+are capped at 64 KiB per connection; a tap is matched against the prompt's own
+Telegram `message_id`, so a stale tap on an earlier message that reused the
+callback key answers "expired" instead of resolving a later hook (skipped only
+while `sendMessage` is in flight — that race resolves in the tap's favor).
+
+Claude Code hook installation remains an automation layer over that handoff
+(backup first):
+- `PreToolUse` matcher `AskUserQuestion` → call `tg-ctl ask` with question +
+  options → return
   `{hookSpecificOutput:{permissionDecision:"allow", updatedInput:{questions, answers:{<q>:<label>}}}}`.
-- `PermissionRequest` → forward tool + args → Approve/Reject buttons → return
+- `PermissionRequest` → call `tg-ctl ask` with tool + args → Approve/Reject
+  buttons → return
   `{hookSpecificOutput:{decision:{behavior:"allow"|"deny"}}}`.
 
+Codex uses the same `tg-ctl ask` handoff for `PermissionRequest` and returns
+the documented Codex shape:
+`{hookSpecificOutput:{hookEventName:"PermissionRequest",decision:{behavior:"allow"|"deny"}}}`.
+Codex hooks still require manual trust via `/hooks` on first run.
+
 These work **without** channels (pure hook return-value path). **No completion/Stop
-hook.** The hook process hands the question to the running `tg-ctl` over a **Unix
-domain socket** (review F8 pinned the handoff: socket path in the registration
-file, JSON request/response, hard client-side timeout) and awaits the button
-answer.
+hook.** The hook process awaits the button answer over the UDS request/response
+path with a hard client-side timeout.
 
 **Verification status (review F5/F7 — live spike PASSED on CC 2.1.170):** a
 PreToolUse hook on `AskUserQuestion` returning
@@ -243,9 +270,10 @@ message to "expired — answer in terminal". Late button taps get
 The daemon must also expire the TG message when the hook process dies (local
 Esc abort), not only on timeout.
 
-**Deferred to v1.1 (review D4):** the mechanism is verified, but the full path
-(UDS protocol, inline buttons, callback routing, expiry editing, canary test) is
-its own work package. v1 ships injection + commands only (§16).
+**Shipped core path (user request 2026-06-10):** UDS protocol, inline buttons,
+callback routing, expiry editing, Claude/Codex hook output formatting, opencode
+adapter helpers, and `pi` limited-status handling. Deferred: idempotent hook
+installer, Claude canary test, and long-running opencode SSE ownership.
 
 **Fast-passthrough guard (critical):** these hooks live in `~/.claude/settings.json`
 and fire for **every** Claude Code session, including keyboard sessions with no
@@ -375,14 +403,15 @@ delayed, or hung waiting for a button tap.
   router is a new always-on service with its own SPOF — defer until a real
   fleet need exists. README gets one sentence: "one bot token per machine for
   inbound". The 409 symptom of ignoring this is documented in §10.
-- **D4 — RESOLVED: cut harder than proposed.** v1 = `cc` via the tmux floor
-  (poll daemon; §16). Hooks forwarding (§8) and the opencode native adapter →
-  v1.1 (the opencode API surface was re-verified end-to-end against a live
-  1.16.2 OpenAPI — the matrix is correct — but it is a second product surface,
-  not a one-session build). `/rename`, `/new`, `HarnessAdapter` → v1.2 (an
+- **D4 — UPDATED: v1 plus Q→buttons core.** v1 = `cc` via the tmux floor
+  (poll daemon; §16). Hooks forwarding core (§8) is now shipped through
+  `tg-ctl ask` + UDS + Telegram callbacks; opencode has pure native adapter
+  helpers against the live 1.16.2 OpenAPI, while daemon-owned SSE subscription
+  remains deferred. `/rename`, `/new`, `HarnessAdapter` → v1.2 (an
   interface with one implementation is premature). Channel mode → v1.2+.
-  `codex`/`pi`/`aider` need zero v1 code — the tmux floor covers them by
-  construction. **`gemini` is dropped entirely**: Gemini CLI stops serving
+  `codex` now supports `PermissionRequest` hook output; `pi`/`aider` stay on
+  the tmux floor with honest limited replies. **`gemini` is dropped entirely**:
+  Gemini CLI stops serving
   requests 2026-06-18; its successor (`agy`) gets a new row when verified.
 
 ## 13. Command layer
@@ -426,29 +455,32 @@ plug into the same `tg-ctl` lifecycle.
 
 **Capability matrix (verified June 2026; re-verified by review against the live
 OpenAPI of opencode 1.16.2 at `GET /doc` — all opencode claims confirmed,
-including `/question/{requestID}/reply`, `/permission/{requestID}/reply` and the
-`question.asked`/`permission.asked` SSE events. Pin the opencode version in the
-adapter and validate routes against the live `/doc` at startup: v2 event
-variants signal churn. Codex caveat: its hooks must be explicitly trusted by
+including `/question/{requestID}/reply`, `/permission/{requestID}/reply`, the v2
+session question/permission reply routes, and the `question.asked` /
+`question.v2.asked` / `permission.asked` / `permission.v2.asked` SSE events. Pin the
+opencode version in the adapter and validate routes against the live `/doc` at startup:
+v2 event variants signal churn. Codex caveat: its hooks must be explicitly trusted by
 hash via `/hooks` — first run is manual. Gemini row kept for history only —
 dropped per D4):**
 
 | Harness | Native inject | Native question/perm forward | Rename | Reset | Feedback strategy |
 |---|---|---|---|---|---|
-| **opencode** (`oc`) | `POST /session/{id}/prompt_async` | **YES** — SSE `question.asked`/`permission.asked` + reply endpoints | `PATCH /session {title}` | `POST /session` | **Native HTTP+SSE — best, no tmux** |
+| **opencode** (`oc`) | `POST /session/{id}/prompt_async` | **YES** — SSE question/permission events + reply endpoints | `PATCH /session {title}` | `POST /session` | **Native HTTP+SSE — best, no tmux** |
 | **Claude Code** (`cc`) | tmux (no public inject API) | YES — hooks `PreToolUse`/`PermissionRequest`/`Notification` | `/rename` | `/clear` | hooks + channel + tmux |
 | **Codex** | `codex exec` / app-server | YES — `PermissionRequest` hook | — | `/new` | hooks + tmux |
-| **pi** | tmux | unknown (TS extensions could) — treat as none for v1 | — | — | tmux + agent-calls-`tg` |
+| **pi** | tmux | NO verified native API — no scraping | — | — | tmux + agent-calls-`tg`; Q→buttons says limited |
 | **Aider** | `--message` (one-shot) | **NO** | — | `/reset` | tmux-only; bot says "limited" |
 | **Gemini CLI** | `-p` | **NO** (retiring 2026-06-18 → Antigravity `agy`) | — | `/clear` (screen only) | tmux-only; bot says "limited" |
 
 **opencode is the standout** — server-first (the TUI is one client of a local HTTP
 server). The bot owns `opencode serve` on a fixed port; the user's TUI/web attaches to
-it. The bot subscribes to `GET /event` (SSE), forwards `question.asked` /
-`permission.asked` to Telegram as inline buttons, answers via `/question/{id}/reply` /
-`/permission/{id}/reply`. No tmux, no scraping, no core patch (it's MIT and accepts PRs,
-but none is needed). `QuestionInfo` (`question`, `header`, `options[]`, `multiple`,
-`custom`) maps 1:1 to Telegram buttons. Caveat: a user-launched TUI binds a random port
+it. The bot subscribes to `GET /event` (SSE), forwards legacy/v2 question and
+permission events to Telegram as inline buttons, answers via `/question/{id}/reply`,
+`/permission/{id}/reply`, or the v2 session-scoped question/permission reply routes.
+No tmux, no scraping, no core patch (it's MIT and accepts PRs, but none is needed). A
+single single-select `QuestionInfo` with concrete `options[]` and `custom: false` maps
+to Telegram buttons; multi-question, multi-select, and free-form prompts fall back
+until the bot has a multi-answer UI. Caveat: a user-launched TUI binds a random port
 unless started with a fixed `--port` (or discovered via `--mdns`) — so the clean path is
 "bot owns the server, clients attach", not "inject into an arbitrary TUI".
 
@@ -501,13 +533,16 @@ live-symlink rule: the main checkout IS the deployed tool). Pure logic lives in
 8. Tests per §11 (unit + process-level singleton + skipIf tmux integration +
    `Bun.serve` Telegram fake).
 
-**Deferred:** §8 hooks forwarding + inline buttons + UDS protocol → v1.1;
+**Shipped after v1 scope:** §8 hooks forwarding core (`tg-ctl ask` + inline
+buttons + callback routing + UDS protocol) for Claude Code/Codex normalized
+hook requests, plus opencode native adapter helpers and `pi` limited handling.
+**Deferred:**
 **reply-routing → v1.1** (user request 2026-06-10, after the first live
 round-trip): `tg` records `message_id → {paneId, cwd}` into a routing map on
 every outbound send; the daemon routes an inbound that carries
 `reply_to_message` to the mapped pane, while plain (non-reply) text keeps the
 v1 last-write-wins registration target. This turns one-bot-many-sessions into
-a usable fan-in without buttons or threads; opencode native adapter → v1.1;
+a usable fan-in without threads; opencode daemon-owned SSE subscription → v1.1;
 `/rename`, `/new`, `HarnessAdapter` → v1.2; channel mode + takeover protocol
 → v1.2+; the §10 Escape prelude is built in `inject.ts` but not wired (no
 config key yet). Each deferral is annotated at its section.

@@ -59,9 +59,21 @@ export interface TgMessage {
   document?: TgDocument;
 }
 
+export interface TgCallbackQuery {
+  id: string;
+  from: TgUser;
+  message?: {
+    message_id: number;
+    chat: { id: number };
+    date: number;
+  };
+  data?: string;
+}
+
 export interface TgUpdate {
   update_id: number;
   message?: TgMessage;
+  callback_query?: TgCallbackQuery;
 }
 
 // --- update step function (spec §16 module 4) ---
@@ -73,6 +85,17 @@ export type Action =
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
   | { kind: 'status' } // /status — entrypoint composes the reply
   | { kind: 'reply'; text: string } // sendMessage back to the chat
+  | { kind: 'answer-callback'; callbackQueryId: string; text: string }
+  // messageId is the Telegram message the tapped button belongs to (null when
+  // Telegram omits it); the daemon rejects taps whose message does not match
+  // the pending prompt, so a stale tap can never answer a later same-key hook.
+  | {
+      kind: 'answer-question';
+      callbackQueryId: string;
+      requestId: string;
+      value: string;
+      messageId: number | null;
+    }
   // Delivery receipt: set a 👀 reaction on the source message IF every action
   // emitted for it succeeded. Follows the message's delivery action(s); never
   // emitted for pure error replies (those ARE the failure signal).
@@ -117,7 +140,7 @@ export interface ProcInfo {
   command: string; // full command line
 }
 
-export type AgentKind = 'claude' | 'opencode' | 'codex' | 'aider' | 'unknown';
+export type AgentKind = 'claude' | 'opencode' | 'codex' | 'pi' | 'aider' | 'unknown';
 
 // Snapshot written by `tg` / `tg-ctl start` at auto-start time (spec §5.2).
 export interface Registration {
@@ -144,5 +167,6 @@ export interface CtlPaths {
   pid: string;
   offset: string;
   registration: string;
+  socket: string;
   log: string;
 }

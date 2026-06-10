@@ -13,13 +13,14 @@ const cfg = (over: Partial<ControlConfig> = {}): ControlConfig => ({
   ...over,
 });
 
-// --- ctlPaths: all five files are tg-ctl.<botid>.* under configDir ---
-test('ctlPaths builds lock/pid/offset/registration/log under configDir', () => {
+// --- ctlPaths: all state files are tg-ctl.<botid>.* under configDir ---
+test('ctlPaths builds lock/pid/offset/registration/socket/log under configDir', () => {
   const p = ctlPaths('/home/u/.config/tg-cli', '123456');
   expect(p.lock).toBe('/home/u/.config/tg-cli/tg-ctl.123456.lock');
   expect(p.pid).toBe('/home/u/.config/tg-cli/tg-ctl.123456.pid');
   expect(p.offset).toBe('/home/u/.config/tg-cli/tg-ctl.123456.offset');
   expect(p.registration).toBe('/home/u/.config/tg-cli/tg-ctl.123456.registration.json');
+  expect(p.socket).toBe('/home/u/.config/tg-cli/tg-ctl.123456.sock');
   expect(p.log).toBe('/home/u/.config/tg-cli/tg-ctl.123456.log');
 });
 

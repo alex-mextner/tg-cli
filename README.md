@@ -261,7 +261,7 @@ Below, ○ = planned, — = absent by design, ~ = partial.
 
 | Tool | Curated out | Multi-agent brand | Media out | Inbound | Q→buttons | Voice | Full mirror |
 |---|---|---|---|---|---|---|---|
-| **tg-cli** | ✓ | ✓ | ✓ | ✓ | ○ | — | — (by design) |
+| **tg-cli** | ✓ | ✓ | ✓ | ✓ | ✓ | — | — (by design) |
 | Anthropic Channels / RC | ~ (reply-only) | — | ✓ | ✓ | — | — | ✓ (RC) |
 | Imolatte/tg-claude | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
 | oscarsterling | ~ (channel reply) | — | — | ✓ | ✓ | — | ~ |

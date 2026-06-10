@@ -75,6 +75,7 @@ function matchAgentCommand(command: string): AgentKind | null {
   }
   if (base === 'opencode' || base === 'opencode.exe') return 'opencode';
   if (base === 'codex') return 'codex';
+  if (base === 'pi') return 'pi';
   if (base === 'aider') return 'aider';
   return null;
 }

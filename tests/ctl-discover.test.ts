@@ -121,6 +121,12 @@ test('matches opencode.exe basename', () => {
   expect(findAgentInPane(p, procs)).toEqual({ agent: 'opencode', pid: 700 });
 });
 
+test('matches pi by argv0 basename', () => {
+  const p = pane('a', 0, '%7', 710, 'pi', '/x');
+  const procs = [proc(710, 1, '/opt/homebrew/bin/pi')];
+  expect(findAgentInPane(p, procs)).toEqual({ agent: 'pi', pid: 710 });
+});
+
 test('shells and unrelated processes are traversed but never matched', () => {
   const p = pane('main', 0, '%7', 800, '-zsh', '/home');
   const procs = [
