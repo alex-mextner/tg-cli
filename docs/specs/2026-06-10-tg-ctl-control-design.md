@@ -58,18 +58,23 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
 - **Poll/tmux mode:** `tg-ctl` injects the inbound message **wrapped**:
   `[TG from <name>] <message> — reply via tg`. The agent does the work and calls
   `tg "answer"` (curated, branded). Loop closes with no scrape, no completion hook.
-- **Channel mode:** the message arrives as a native `<channel>` event; the agent
-  replies via the channel reply tool (branded by our custom channel) or via `tg`.
-  Photo/file inbound is delivered as a downloaded path the agent can read.
+- **Channel mode:** the message arrives as a native `<channel>` event, wrapped the
+  same way (`… — reply via tg`). **Outbound is always `tg`** — one branded, curated
+  voice. The channel is **inbound-only** (one-way channels are supported); we do not
+  implement a channel reply tool, so there is never a second, unbranded outbound
+  format. Photo/file inbound is delivered as a downloaded path the agent can read.
+  Trade-off: a channel reply tool would give native threading / typing indicators but
+  would lose `tg`'s branding / auto-attach — rejected to keep a single voice (see D2, §12).
 
 ## 5. Transports
 
 ### 5.1 Channel (priority)
 
-- **Recommendation: build our own custom channel** (an MCP server implementing the
-  channel protocol), not the official plugin. Rationale: the official `reply` is
-  generic; our channel carries `tg`'s branding / curation / auto-attach identity,
-  and shares the singleton lock so it can't double-poll the bot.
+- **Recommendation: build our own custom inbound-only channel** (an MCP server
+  implementing the channel protocol), not the official plugin. Rationale: the official
+  plugin is a two-way bridge whose `reply` is the generic, unbranded voice we avoid;
+  an inbound-only channel pushes messages in, leaves all outbound to `tg`, and shares
+  the singleton lock so it can't double-poll the bot.
 - **Risk:** custom channels ride `--dangerously-load-development-channels`
   (research preview, gated) with known preview bugs (#40064 permission relay,
   #36800 duplicate instances / 409). Document and keep poll/tmux as the stable
@@ -77,8 +82,10 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
 - **Alternative (faster, less control):** reuse `telegram@claude-plugins-official`
   and run `tg-ctl` in poll/tmux only when the official channel is absent.
   **DECISION DEFERRED TO REVIEW (§12).**
-- **Capabilities:** inbound text + photo/file (auto-download), reply/edit/react.
-  Photo/file is the channel-only capability tmux cannot match.
+- **Capabilities (inbound-only):** inbound text + photo/file (auto-download). Outbound
+  stays exclusively `tg`. Photo/file is the channel-only capability tmux cannot match.
+  A one-way (inbound) channel is explicitly supported by the protocol, so no reply tool
+  is implemented.
 - **Launch:** alias/wrapper `claude --channels …`. The channel server is spawned by
   `claude` as a subprocess; its lifetime equals `claude`'s.
 
@@ -98,8 +105,9 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
 - **Photo/file inbound in tmux mode** → reply in TG: "tmux can't inject media —
   restart with channels."
 - **No-tmux guard:** inbound arrives but `claude` not in tmux / no session → reply
-  in TG: "Claude Code not in tmux → feedback won't work; restart:
-  `tmux new -s claude 'claude'`."
+  in TG: "Claude Code not in tmux → feedback won't work." The advised relaunch matches
+  the configured transport: tmux mode → `tmux new -s claude 'claude'`; channel mode →
+  `tmux new -s claude 'claude --channels …'`.
 
 ## 6. Singleton / idempotency (HARD requirement)
 
@@ -114,6 +122,11 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   auto-start is a no-op.
 - **Race:** two concurrent `tg` calls both attempt auto-start → `flock` serializes;
   the loser exits.
+- **Scope boundary (local-only):** `flock` guarantees one `tg-ctl` per *machine*.
+  Telegram `getUpdates` allows one consumer per bot token *globally* — two machines
+  polling the same `TG_BOT_TOKEN` → 409. So inbound control is **one machine per bot
+  token**; multi-machine fleets need a bot-per-machine or a central router (D3, §12).
+  Outbound `tg` (`sendMessage`) is unaffected — it works from any number of machines.
 
 ## 7. Lifecycle & auto-start
 
@@ -121,11 +134,17 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
   - `tg-ctl start` — acquire lock, daemonize, begin poll (poll mode). No-op if running.
   - `tg-ctl stop` — read pidfile, `SIGTERM`, clean lock/pidfile.
   - `tg-ctl status` — running? mode? target session? bot id?
-- **Lazy auto-start from `tg`:** on `tg` invocation, auto-start `tg-ctl` **only if all hold**:
-  - stdout/stderr is a TTY (interactive), **and**
+- **Lazy auto-start from `tg`:** on `tg` invocation, auto-start `tg-ctl` **only if both hold**:
   - inside a tmux pane (`TMUX` set) with a detected AI agent, **and**
   - config `control.enabled: true`.
-  - Otherwise (CI / cron / no TTY) → silently skip. This protects the ubiquitous `tg`.
+  - **No TTY check.** The agent calls `tg` through Claude Code's Bash tool with stdout
+    piped, so `isatty` is false in the *exact* scenario we want to fire — a TTY gate
+    would kill the headline trigger. The `TMUX` check already excludes CI/cron (no
+    `TMUX` there), doing the protective work without breaking the feature. (Verify
+    `isatty` under the Bash tool before relying on this.)
+  - **Cleaner alternative / complement:** a `SessionStart` hook starts `tg-ctl` once
+    when `claude` launches in tmux, instead of on every `tg` call. Auto-start-from-`tg`
+    stays as a fallback; both are idempotent via `flock`.
 - Auto-start is fire-and-forget and idempotent (`flock` guarantees a single instance).
 
 ## 8. Question / permission forwarding (the only hooks)
@@ -140,6 +159,14 @@ Installed idempotently into `~/.claude/settings.json` (backup first):
 These work **without** channels (pure hook return-value path). **No completion/Stop
 hook.** The hook process hands the question to the running `tg-ctl` (local socket /
 file handoff) and awaits the button answer.
+
+**Fast-passthrough guard (critical):** these hooks live in `~/.claude/settings.json`
+and fire for **every** Claude Code session, including keyboard sessions with no
+Telegram. They MUST return *no decision* instantly unless **(a)** `tg-ctl` is running
+**and (b)** this session is the active TG-control target (matched by tmux session / cwd
+via a registration file written by `tg-ctl`). Otherwise they passthrough with zero added
+latency — a normal keyboard session, or any session with no `tg-ctl`, is never blocked,
+delayed, or hung waiting for a button tap.
 
 ## 9. Config
 
@@ -162,6 +189,8 @@ file handoff) and awaits the button answer.
 - Channel preview bugs → poll/tmux is the stable fallback.
 - send-keys into an open picker → optional `Escape` prelude (configurable), matching
   oscarsterling.
+- Hook fires but `tg-ctl` is not running, or this session is not the TG-control target
+  → **fast passthrough**, no decision, no latency (§8). A keyboard session is never blocked.
 
 ## 11. Testing
 
@@ -175,10 +204,18 @@ file handoff) and awaits the button answer.
 - **No live Telegram in CI:** mock the Bot API (`getUpdates`/`sendMessage`) with a
   local fake.
 
-## 12. Open decision for review
+## 12. Open decisions for review
 
-- **Custom channel (recommended) vs official telegram plugin.** Affects branding,
-  lock-sharing, and preview-risk exposure. Pick before the plan.
+- **D1 — Channel: custom inbound-only (recommended) vs official two-way plugin.**
+  Recommendation: custom inbound-only channel + outbound always `tg` (one branded
+  voice). The official plugin is a two-way bridge whose reply is the unbranded voice we
+  avoid. Affects branding, lock-sharing, preview-risk exposure. Pick before the plan.
+- **D2 — Outbound voice.** Recommended: `tg` only (channel inbound-only). Alternative:
+  a channel reply tool for native threading / typing, at the cost of `tg`'s branding /
+  auto-attach. Confirm `tg`-only.
+- **D3 — Fleet.** One machine per bot token (Telegram `getUpdates` limit). For
+  mbp + home on one bot, choose: bot-per-machine, or a central router that owns the
+  single poll and fans out. Decide before multi-machine use.
 
 ## 13. Out of scope / future
 
