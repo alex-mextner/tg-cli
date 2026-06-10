@@ -240,3 +240,27 @@ Implementation: `hasRealExtension(name)` helper in `parseArgs`; returns `false` 
 with no dot or only a leading dot (dotfiles). The size-gate and R1–R4 rules apply normally
 once the extensionless gate is passed (i.e. the gate is a pre-check, not a replacement for
 the existing path-matching logic).
+
+### Never-attach denylist (v1.3)
+
+Files whose BASENAME matches a secrets-focused pattern list are never attached, whatever
+the user typed (`attach-denylist` feature, ON by default; patterns in
+`features/auto-attach/denylist.ts`):
+
+- dotenv family: `.env`, `.env.*`, `*.env`;
+- SSH private keys: `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519` (`.pub` stays allowed);
+- key material: `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.ppk`;
+- credential rc-files: `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `.htpasswd`,
+  `.pgpass`, `.my.cnf`;
+- shell/REPL histories (`.*_history`), `*.tfvars`, `credentials(.json)`,
+  `client_secret*.json`, `kubeconfig`.
+
+Semantics differ from the extensionless gate on purpose:
+
+- auto-detected mention → silently skipped, token stays in the text;
+- explicit `--photo`/`--file` → **hard error** before anything is sent. An explicit
+  secret attach is almost certainly a mistake or a leak; a silent skip would hide it.
+
+Override consciously with `--no-feature attach-denylist` or
+`features.attach-denylist: false` in `~/.config/tg-cli/config.yaml`. Matching is
+basename-only so a file living in a directory named `.env/` is not blocked.

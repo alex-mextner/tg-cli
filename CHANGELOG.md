@@ -3,6 +3,21 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.3.0
+
+Never-attach denylist (`attach-denylist` feature, ON by default):
+
+- Secret-looking files are never attached: the `.env` family, SSH private
+  keys (`id_rsa`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.ppk`), credential
+  rc-files (`.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `.pgpass`,
+  `.my.cnf`, `.htpasswd`), shell/REPL histories, `*.tfvars`,
+  `credentials.json` / `client_secret*.json`, `kubeconfig`.
+- Auto-detected mentions in the text are silently skipped (the token stays);
+  an explicit `--photo`/`--file` of a denylisted file is a hard ERROR before
+  anything is sent.
+- Conscious override: `--no-feature attach-denylist` or
+  `features.attach-denylist: false` in `~/.config/tg-cli/config.yaml`.
+
 ## 1.2.0
 
 Attachment quality pass:

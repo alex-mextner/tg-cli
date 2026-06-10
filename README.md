@@ -183,6 +183,13 @@ on disk is not touched. (`.sh` and `.json` are excluded — BOM breaks shebangs 
 Extensionless files (`LICENSE`, `Makefile`, dotfiles like `.env`) detected from path
 scanning are not auto-attached; use `--file LICENSE` to attach them explicitly.
 
+Secret-looking files are **never attached** (`attach-denylist` feature, ON by default):
+the `.env` family, SSH private keys, `*.pem`/`*.key`/`*.p12`/`*.pfx`/`*.ppk`, credential
+rc-files (`.netrc`, `.npmrc`, `.git-credentials`, …), shell histories, `*.tfvars`,
+`credentials.json`/`client_secret*.json`, `kubeconfig`. Auto-detected mentions are
+silently skipped; an explicit `--file prod.env` is a hard error. Conscious override:
+`--no-feature attach-denylist`.
+
 ## Screenshots
 
 <table align="center" width="100%">

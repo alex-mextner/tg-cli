@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { isAbsolute, join, resolve } from "path"
+import { isNeverAttach } from "./features/auto-attach/denylist"
 import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
 import {
   applyFeatureFlags,
@@ -31,7 +32,7 @@ import {
   runGitReal,
 } from "./features/auto-attach/worktree"
 
-export const VERSION = "1.2.0"
+export const VERSION = "1.3.0"
 
 // --- Config loader ---
 function loadEnv(filePath: string): Record<string, string> {
@@ -161,6 +162,15 @@ Attachment encoding and extensionless files:
   the encoding correctly. Auto-detected files without a real extension
   (LICENSE, Makefile, .env) are NOT attached; explicit --photo/--file always
   attach.
+
+Never-attach denylist (feature, ON by default — toggle with --feature/--no-feature):
+  Secret-looking files are NEVER attached: the .env family (.env, .env.local,
+  prod.env), SSH private keys (id_rsa, *.pem, *.key, *.p12, *.pfx, *.ppk),
+  credential rc-files (.netrc, .npmrc, .pypirc, .git-credentials, .pgpass),
+  shell histories, *.tfvars, credentials.json / client_secret*.json,
+  kubeconfig. Auto-detected mentions are silently skipped; an explicit
+  --photo/--file of such a file is an ERROR. Override consciously with
+  --no-feature attach-denylist.
 
 Unknown flags:
   Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
@@ -310,6 +320,10 @@ export function parseArgs(
   // the real `enumerateWorktreeRoots`). Defaults to "no extra roots" — with the
   // thunk absent, resolution is exactly the old cwd-only behavior.
   getWorktreeRoots: () => string[] = () => [],
+  // Never-attach denylist (feature `attach-denylist`, ON by default): secret-
+  // looking files (.env family, private keys, credential rc-files, …) are
+  // silently skipped by the auto-scan and a HARD ERROR for explicit flags.
+  attachDenylist = true,
 ): ParseResult {
   // 1. Help / version win anywhere, before the empty check.
   for (const a of args) {
@@ -358,6 +372,14 @@ export function parseArgs(
         !!nextArg && nextArg.startsWith("-") && resolveExistingFile(nextArg, cwd, home) === null
       if (!nextArg || dashedButNotAFile) {
         return { action: "error", message: `${arg} requires a file path argument` }
+      }
+      if (attachDenylist && isNeverAttach(nextArg)) {
+        return {
+          action: "error",
+          message:
+            `refusing to attach '${nextArg}': matches the never-attach denylist (secrets). ` +
+            "Override with --no-feature attach-denylist",
+        }
       }
       explicit.push({ type: arg === "--photo" ? "photo" : "document", path: nextArg })
       i += 2
@@ -442,6 +464,9 @@ export function parseArgs(
       // Extensionless gate: an auto-DETECTED file without a real extension is
       // never attached (the token stays in the text as plain words).
       if (!hasRealExtension(resolved)) continue
+      // Never-attach denylist: a secret-looking file mentioned in the text is
+      // never attached (the token stays as plain words).
+      if (attachDenylist && isNeverAttach(resolved)) continue
       if (explicitResolved.has(resolved)) {
         // Already attached (explicit --file/--photo or an earlier mention). Don't
         // attach twice, but if THIS mention carried a line-spec and the existing
@@ -640,6 +665,7 @@ if (import.meta.main) {
     disable: flagResult.disable,
   })
   const autoAttachOn = features["auto-attach"] !== false
+  const attachDenylistOn = features["attach-denylist"] !== false
 
   const args = flagResult.rest
   // Memoize the worktree-root enumeration: git is spawned at most once per
@@ -652,7 +678,7 @@ if (import.meta.main) {
     }
     return worktreeRootsCache
   }
-  const parsed = parseArgs(args, process.cwd(), home, autoAttachOn, getWorktreeRoots)
+  const parsed = parseArgs(args, process.cwd(), home, autoAttachOn, getWorktreeRoots, attachDenylistOn)
 
   // No-send actions resolve BEFORE the credential gate so help/version/info
   // flags work without Telegram credentials configured.
