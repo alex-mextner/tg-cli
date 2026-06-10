@@ -160,9 +160,28 @@ and linked to their Linear issues:
 - Codes Linear doesn't recognize stay plain text. Pasted URLs are never rewritten.
 
 Requires `brew install schpet/tap/linear` and `linear auth login`; without them
-the message is sent unchanged (a hint is printed to stderr once). The feature is
+the message is sent unchanged (a hint is printed to stderr once). Resolved verdicts
+(found and not-found alike) are cached for 1 hour in `~/.cache/tg-cli/linear-cache.json`
+so repeated sends with the same codes do not spawn a subprocess. The feature is
 ON by default — disable with `--no-feature autolink-tasks` or
 `features.autolink-tasks: false` in `~/.config/tg-cli/config.yaml`.
+
+## Markdown as PDF
+
+`.md` and `.markdown` files attached from disk are silently converted to PDF before upload
+via **pandoc** (GFM → standalone HTML5) and **headless Chrome** (`--headless=new
+--no-pdf-header-footer`). Emoji and non-ASCII text render through the system font stack. On
+any conversion failure the original `.md` is uploaded with a one-line stderr warning — the
+send is never blocked. Chrome is auto-discovered; override with `TG_CHROME_PATH`. Requires
+`pandoc` on `PATH` and Chromium/Chrome 112+. Disable with `--no-feature md-as-pdf`.
+
+Text attachments whose content is valid UTF-8 with non-ASCII bytes receive a UTF-8 BOM on
+the uploaded copy to prevent Telegram's preview from guessing a legacy codepage. The file
+on disk is not touched. (`.sh` and `.json` are excluded — BOM breaks shebangs and
+`JSON.parse`.)
+
+Extensionless files (`LICENSE`, `Makefile`, dotfiles like `.env`) detected from path
+scanning are not auto-attached; use `--file LICENSE` to attach them explicitly.
 
 ## Screenshots
 

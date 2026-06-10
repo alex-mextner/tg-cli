@@ -92,3 +92,41 @@ Edge cases:
 - No scanning of attachments' contents.
 - Lowercase codes (`hyp-576`) are not tickets.
 - No second hint after the first (per kind), even across months.
+
+## v1.2 amendment: response cache
+
+Linear API calls are cached to avoid spawning a `linear api` subprocess on every `tg`
+invocation when the same codes appear repeatedly (common in agent workflows that send
+multiple progress updates per task).
+
+### Cache location and TTL
+
+- File: `~/.cache/tg-cli/linear-cache.json`
+- TTL: **1 hour** per entry, measured from the time of the last verified lookup.
+- The cache directory is created on first write if absent.
+
+### What is cached
+
+Both **positive** (ticket found, title + URL stored) and **negative** (ticket confirmed
+absent from Linear) verdicts are cached. Negative caching is intentional: an unknown code
+is not retried on every send — it stays absent for 1 hour. This prevents repeated API
+calls for typos or codes from other systems.
+
+Cache shape: `{ entries: { "<CODE>": { t: <unix ms>, info: TicketInfo | null } } }` —
+`info: null` is a cached verified-absent verdict. Expired entries are pruned on write.
+
+### Behavior
+
+1. On each send, all detected codes are looked up in the cache.
+2. Only codes with no valid (non-expired) cache entry trigger a `linear api` spawn.
+3. If all codes hit the cache, no subprocess is spawned at all.
+4. Fresh results from the API are merged back and written with a plain best-effort
+   `writeFileSync` (no atomic rename — a torn write just parses as corrupt and the
+   cache self-heals on the next probe).
+
+### Degradation policy
+
+Cache read/write failures (permission error, corrupt JSON, disk full) are caught and
+swallowed silently. The feature degrades to the pre-cache behavior: spawn `linear api` for
+all codes on that invocation. A failed write does not retry and does not block the send.
+Cache errors are never surfaced to the user.

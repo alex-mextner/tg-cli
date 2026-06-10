@@ -1,13 +1,17 @@
 #!/usr/bin/env bun
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
+import { tmpdir } from "os"
 import { isAbsolute, join, resolve } from "path"
+import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
 import {
   applyFeatureFlags,
   parseFeatureConfig,
   resolveFeatures,
 } from "./features/auto-attach/feature-flags"
+import { mergeIntoCache, splitByCache } from "./features/autolink-tasks/cache"
 import { detectTicketCodes } from "./features/autolink-tasks/detect"
 import { probeTickets, type Runner, type TicketInfo } from "./features/autolink-tasks/linear"
+import { convertMdToPdf, isConvertibleMd, type ConvertDeps } from "./features/md-pdf/convert"
 import { applyAutolink } from "./features/autolink-tasks/render"
 import {
   markHint,
@@ -27,7 +31,7 @@ import {
   runGitReal,
 } from "./features/auto-attach/worktree"
 
-export const VERSION = "1.1.0"
+export const VERSION = "1.2.0"
 
 // --- Config loader ---
 function loadEnv(filePath: string): Record<string, string> {
@@ -141,8 +145,22 @@ Autolink tasks (feature, ON by default — toggle with --feature/--no-feature):
   reference block (code: title) is appended. Codes Linear doesn't know are
   left as plain text. Requires the linear CLI (brew install schpet/tap/linear)
   and linear auth login; without them the message is sent unchanged.
+  Verified results are cached for 1 hour (~/.cache/tg-cli/linear-cache.json).
   Disable with --no-feature autolink-tasks or features.autolink-tasks: false
   in ~/.config/tg-cli/config.yaml.
+
+Markdown as PDF (feature, ON by default — toggle with --feature/--no-feature):
+  Attached .md/.markdown files are converted to PDF before sending (pandoc +
+  headless Chrome; emoji and Cyrillic render correctly). Requires pandoc and
+  Google Chrome (override binary with TG_CHROME_PATH); on any failure the
+  original .md is attached unchanged. Disable with --no-feature md-as-pdf.
+
+Attachment encoding and extensionless files:
+  Text documents containing non-ASCII UTF-8 get a BOM prepended to the
+  UPLOADED COPY (the file on disk is untouched) so Telegram's preview detects
+  the encoding correctly. Auto-detected files without a real extension
+  (LICENSE, Makefile, .env) are NOT attached; explicit --photo/--file always
+  attach.
 
 Unknown flags:
   Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
@@ -233,6 +251,16 @@ function isImagePath(path: string): boolean {
   const dot = path.lastIndexOf(".")
   if (dot === -1) return false
   return IMAGE_EXTENSIONS.has(path.slice(dot + 1).toLowerCase())
+}
+
+// A "real" extension = a dot at basename position >0 with word chars after it.
+// LICENSE, Makefile, tg → none; .env (dot at 0, nothing more) → none either.
+// The auto-attach scanner skips extensionless files: they are usually
+// code-adjacent artifacts the receiver can't preview, and dotfiles tend to
+// hold secrets. Explicit --photo/--file remain a direct instruction.
+function hasRealExtension(path: string): boolean {
+  const base = path.slice(path.lastIndexOf("/") + 1)
+  return /^.+\.[A-Za-z0-9]+$/.test(base)
 }
 
 function expandHome(token: string, home: string): string {
@@ -411,6 +439,9 @@ export function parseArgs(
         }
       }
       if (!resolved) continue
+      // Extensionless gate: an auto-DETECTED file without a real extension is
+      // never attached (the token stays in the text as plain words).
+      if (!hasRealExtension(resolved)) continue
       if (explicitResolved.has(resolved)) {
         // Already attached (explicit --file/--photo or an earlier mention). Don't
         // attach twice, but if THIS mention carried a line-spec and the existing
@@ -963,25 +994,51 @@ if (import.meta.main) {
   if (features["autolink-tasks"] !== false && caption) {
     const codes = detectTicketCodes(caption)
     if (codes.length > 0) {
-      const probe = probeTickets(codes, runLinearReal)
-      if (probe.status === "ok") {
-        autolinkTickets = codes
-          .filter((c) => probe.tickets.has(c))
-          .map((c) => probe.tickets.get(c) as TicketInfo)
-      } else if (probe.status === "no-cli") {
-        hintOnce(
-          "install",
-          `autolink-tasks: ticket-like codes found (${codes.join(", ")}) but the linear CLI is not installed. ` +
-            "Install: brew install schpet/tap/linear — or disable with --no-feature autolink-tasks. (shown once)",
-        )
-      } else if (probe.status === "no-auth") {
-        hintOnce(
-          "login",
-          "autolink-tasks: the linear CLI is not authenticated. Run: linear auth login (shown once)",
-        )
-      } else {
-        console.error(`Warning: autolink-tasks: ${probe.message} — sending without links`)
+      // 1h response cache (positive AND negative verdicts) so repeated reports
+      // mentioning the same tickets don't re-spawn the linear CLI every send.
+      // Cache failures degrade to a plain probe; probe failures degrade to
+      // cached hits only — the send itself is never blocked.
+      const CACHE_PATH = join(home, ".cache", "tg-cli", "linear-cache.json")
+      const cacheRaw = ((): string | null => {
+        try {
+          return readFileSync(CACHE_PATH, "utf8")
+        } catch {
+          return null
+        }
+      })()
+      const now = Date.now()
+      const { hits, missing } = splitByCache(codes, cacheRaw, now)
+      let probed: Map<string, TicketInfo> | null = null
+      if (missing.length > 0) {
+        const probe = probeTickets(missing, runLinearReal)
+        if (probe.status === "ok") {
+          probed = probe.tickets
+          try {
+            mkdirSync(join(home, ".cache", "tg-cli"), { recursive: true })
+            writeFileSync(CACHE_PATH, mergeIntoCache(cacheRaw, missing, probed, now))
+          } catch {
+            // best-effort cache; never block a send over bookkeeping
+          }
+        } else if (probe.status === "no-cli") {
+          hintOnce(
+            "install",
+            `autolink-tasks: ticket-like codes found (${codes.join(", ")}) but the linear CLI is not installed. ` +
+              "Install: brew install schpet/tap/linear — or disable with --no-feature autolink-tasks. (shown once)",
+          )
+        } else if (probe.status === "no-auth") {
+          hintOnce(
+            "login",
+            "autolink-tasks: the linear CLI is not authenticated. Run: linear auth login (shown once)",
+          )
+        } else {
+          console.error(`Warning: autolink-tasks: ${probe.message} — sending without links`)
+        }
       }
+      // Cached hits + live results, in first-appearance order. A null hit is a
+      // cached verified-absent verdict; a failed probe leaves its codes plain.
+      autolinkTickets = codes
+        .map((c) => (hits.has(c) ? hits.get(c) : (probed?.get(c) ?? null)))
+        .filter((t): t is TicketInfo => t != null)
     }
   }
   const hasTickets = autolinkTickets.length > 0
@@ -1223,6 +1280,48 @@ if (import.meta.main) {
     }
   }
 
+  // --- md-as-pdf: convert disk-sourced markdown documents to PDF ---
+  // (features/md-pdf/convert.ts). Runs AFTER the marker swap above, so a
+  // line-spec'd .md (now a memory marker copy) is intentionally left as
+  // markdown — its marker comments would be invisible in a PDF. Conversion
+  // failure attaches the original .md unchanged (BOM'd below for the preview).
+  const mdPdfTempDirs: string[] = []
+  if (features["md-as-pdf"] !== false) {
+    const mdDeps: ConvertDeps = {
+      run: (cmd, timeoutMs) => {
+        try {
+          const proc = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe", timeout: timeoutMs })
+          return { exitCode: proc.exitCode ?? 1, stderr: proc.stderr.toString() }
+        } catch {
+          return null
+        }
+      },
+      makeTempDir: () => mkdtempSync(join(tmpdir(), "tg-mdpdf-")),
+      writeFile: (p, c) => writeFileSync(p, c),
+      fileExists: (p) => existsSync(p),
+      fileSize: (p) => {
+        try {
+          return statSync(p).size
+        } catch {
+          return -1
+        }
+      },
+      whichCmd: (name) => Bun.which(name),
+      env,
+    }
+    for (const doc of plan.documents) {
+      if (!isConvertibleMd(doc) || doc.source.kind !== "disk") continue
+      const { pdfPath, error, tmpDir } = convertMdToPdf(doc.source.path, mdDeps)
+      if (pdfPath) {
+        doc.source = { kind: "disk", path: pdfPath }
+        if (tmpDir) mdPdfTempDirs.push(tmpDir) // removed after transmit
+      } else {
+        console.error(`Warning: md-as-pdf: ${doc.source.path}: ${error} — attaching the original .md`)
+        if (tmpDir) rmSync(tmpDir, { recursive: true, force: true })
+      }
+    }
+  }
+
   if (
     plan.photos.length === 0 &&
     plan.documents.length === 0 &&
@@ -1235,9 +1334,30 @@ if (import.meta.main) {
   // --- Transport: the only place that talks to the Telegram API. ---
   // A SendItem source is either a real path (Bun.file) or in-memory content
   // (Blob), so R4 fragment files and marker-injected copies never touch disk.
+  // Upload bytes for an item. Text DOCUMENTS with non-ASCII UTF-8 content get
+  // a BOM prepended to the uploaded copy (features/auto-attach/encoding.ts) so
+  // Telegram's preview stops guessing legacy codepages for Cyrillic; the file
+  // on disk is never modified. Photos and big/binary files stream unchanged.
   const blobFor = (item: SendItem): { body: Blob | ReturnType<typeof Bun.file>; name?: string } => {
     if (item.source.kind === "memory") {
-      return { body: new Blob([item.source.content]), name: item.source.filename }
+      const bytes = new TextEncoder().encode(item.source.content)
+      const processed = item.type === "document" ? maybeAddBom(bytes, item.source.filename) : bytes
+      return { body: new Blob([processed]), name: item.source.filename }
+    }
+    if (item.type === "document") {
+      try {
+        const size = statSync(item.source.path).size
+        if (size > 0 && size <= BOM_MAX_BYTES) {
+          const bytes = new Uint8Array(readFileSync(item.source.path))
+          const processed = maybeAddBom(bytes, item.source.path)
+          if (processed !== bytes) {
+            const name = item.source.path.slice(item.source.path.lastIndexOf("/") + 1)
+            return { body: new Blob([processed]), name }
+          }
+        }
+      } catch {
+        // unreadable here → let Bun.file surface the real error downstream
+      }
     }
     return { body: Bun.file(item.source.path) }
   }
@@ -1299,6 +1419,16 @@ if (import.meta.main) {
   // The transmitter applies caption-overflow + the >4096 split + the
   // photos→text→documents ordering, then calls the transport primitives.
   await transmit(plan, transport)
+
+  // Generated md→pdf artifacts are uploaded by now — drop their temp dirs so
+  // repeated reports don't pile up in the OS tmp (codex review finding).
+  for (const dir of mdPdfTempDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // best-effort cleanup
+    }
+  }
 
   // Reaching here means every send actually went through (checkResponse exits
   // the process on any API failure).

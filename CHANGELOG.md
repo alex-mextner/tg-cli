@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.2.0
+
+Attachment quality pass:
+
+- Markdown as PDF (`md-as-pdf` feature, ON by default): attached `.md` files
+  are converted to PDF via pandoc + headless Chrome — emoji and Cyrillic
+  render correctly. Any conversion failure attaches the original `.md`.
+- UTF-8 BOM for text attachments: documents with non-ASCII UTF-8 content get
+  a BOM prepended to the uploaded copy (disk file untouched), fixing
+  Telegram's preview mojibake for Cyrillic. Scripts (`.sh`) and `.json` are
+  deliberately excluded.
+- Extensionless files (LICENSE, Makefile, `.env`) are no longer auto-attached;
+  explicit `--photo`/`--file` still attach anything.
+- Linear response cache: autolink-tasks verdicts (including verified-absent)
+  are cached for 1 hour in `~/.cache/tg-cli/linear-cache.json` — repeated
+  reports about the same tickets no longer spawn the `linear` CLI each send.
+
 ## 1.1.0
 
 Autolink tasks (`autolink-tasks` feature, ON by default):

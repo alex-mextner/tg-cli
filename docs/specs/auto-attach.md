@@ -200,3 +200,43 @@ Length measurement: the caption-overflow decision (1024) uses an approximate VIS
 chars rides as a caption instead of being wrongly split off. The >4096 splitter still
 measures raw `.length` (it splits a hair earlier under HTML — benign conservatism, every
 chunk stays valid).
+
+## v1.2 amendments
+
+### BOM-on-upload (encoding fix)
+
+Text documents sent to Telegram were rendered with mojibake for non-ASCII content because
+Telegram's preview heuristic guessed a legacy codepage for BOM-less UTF-8 files. v1.2 fixes
+this by prepending a UTF-8 BOM (`\xEF\xBB\xBF`) to the **uploaded copy only** — the file on
+disk is never modified.
+
+Rules:
+- Applied to a **whitelist** of prose/code extensions: `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`,
+  `.cjs`, `.py`, `.rb`, `.go`, `.rs`, `.md`, `.markdown`, `.txt`, `.csv`, `.log`, `.yaml`,
+  `.yml`, `.toml`, `.ini`, `.xml`, `.sql`, `.css`, `.html`, `.htm`, `.vue`, `.svelte`.
+- **Deliberately excluded**: `.sh` (BOM breaks shebangs) and `.json` (BOM breaks
+  `JSON.parse` in every standard parser).
+- Pre-conditions: the uploaded bytes must be valid UTF-8, contain at least one non-ASCII
+  byte, and must not already start with a BOM. Files that fail these checks are uploaded
+  verbatim.
+- Size cap: 2 MB. Files above the cap skip BOM injection and upload as-is.
+- Module: `features/auto-attach/encoding.ts`.
+
+### Extensionless file gate
+
+Auto-detected files whose name carries no recognizable extension — `LICENSE`, `Makefile`,
+`tg`, dotfiles such as `.env`, `.gitignore`, binaries, etc. — are **not attached** when
+detected from path-scanning. The path token stays in the message text.
+
+Rationale: extensionless names are almost always plain-text prose or scripts; attaching them
+without a user signal produces more noise than value, and type-inference on them is
+unreliable.
+
+Exception: **explicit flags always attach**. `--file LICENSE` or `--photo somefile`
+unconditionally attaches the named file regardless of extension (or lack thereof). An
+explicit flag is a direct instruction.
+
+Implementation: `hasRealExtension(name)` helper in `parseArgs`; returns `false` for names
+with no dot or only a leading dot (dotfiles). The size-gate and R1–R4 rules apply normally
+once the extensionless gate is passed (i.e. the gate is a pre-check, not a replacement for
+the existing path-matching logic).
