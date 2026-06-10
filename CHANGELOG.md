@@ -3,6 +3,34 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.5.0
+
+Q→buttons (`tg-ctl`, spec §8 core path):
+
+- New `tg-ctl ask` hook client: reads a normalized question / permission JSON
+  request, hands it to the running daemon over a bot-scoped Unix socket
+  (`tg-ctl.<botid>.sock`), sends Telegram inline buttons, consumes
+  `callback_query` updates in the same poll stream, immediately
+  `answerCallbackQuery`s every tap, edits expired/answered prompts, enforces
+  the active registration guard (`paneId`/`cwd`/`sessionName`), and returns
+  agent-specific hook output. A missing daemon/socket, timeout, or send
+  failure returns no decision so the local agent UI takes over.
+- Claude Code question and permission shapes are supported; Codex
+  `PermissionRequest` emits the documented
+  `hookEventName: "PermissionRequest"` decision shape; opencode
+  `question.asked` / `question.v2.asked` / `permission.asked` /
+  `permission.v2.asked` adapter helpers map to the matching native reply
+  endpoints; `pi` is detected but reports native Q→buttons as unsupported.
+- Hardening (post-review): the hook socket is `chmod 0600` on listen and
+  caps requests at 64 KiB; taps are validated against the prompt's own
+  Telegram `message_id` (a stale tap on an earlier message that reused the
+  callback key answers "expired"); the registration guard treats `paneId` as
+  authoritative — a pane mismatch fast-passes even when `cwd`/`sessionName`
+  agree, so a second keyboard session in the same cwd never blocks on
+  Telegram.
+- Deferred (recorded in the spec): hook installer/canary automation,
+  long-running opencode SSE ownership.
+
 ## 1.4.0
 
 Inbound control v1 (`tg-ctl`, spec §16 — poll/tmux transport, ON by default;

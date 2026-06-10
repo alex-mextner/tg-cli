@@ -16,6 +16,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     pid: join(configDir, `${base}.pid`),
     offset: join(configDir, `${base}.offset`),
     registration: join(configDir, `${base}.registration.json`),
+    socket: join(configDir, `${base}.sock`),
     log: join(configDir, `${base}.log`),
   };
 }

@@ -11,6 +11,7 @@
 // included — so nothing is ever replayed into a live agent session.
 
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate } from './types';
+import { parseButtonCallback } from './questions';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
 const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -25,22 +26,41 @@ export interface StepOpts {
 }
 
 export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
+  const callbackActions: Action[] = [];
   const actions: Action[] = [];
   let skippedStale = 0;
   let maxId = -1;
 
   for (const u of updates) {
     if (u.update_id > maxId) maxId = u.update_id;
+    const cb = u.callback_query;
+    if (cb) {
+      if (!senderAllowed(cb.from?.id, opts)) {
+        callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' });
+        continue;
+      }
+      const parsed = parseButtonCallback(cb.data);
+      callbackActions.push(
+        parsed
+          ? {
+              kind: 'answer-question',
+              callbackQueryId: cb.id,
+              requestId: parsed.requestId,
+              value: parsed.value,
+              messageId: cb.message?.message_id ?? null,
+            }
+          : { kind: 'answer-callback', callbackQueryId: cb.id, text: 'expired' },
+      );
+      continue;
+    }
+
     const m = u.message;
-    if (!m) continue; // non-message update → advance silently
+    if (!m) continue; // non-message/callback update → advance silently
 
     // Sender allowlist FIRST (spec §9: from.id, not chat id — a group member
     // must not inject prompts). Rejected senders also never inflate the stale
     // count, so the "skipped N stale" notice only reports the owner's backlog.
-    const sender = m.from?.id;
-    if (sender === undefined || (sender !== opts.chatId && !opts.cfg.allowedSenders.includes(sender))) {
-      continue;
-    }
+    if (!senderAllowed(m.from?.id, opts)) continue;
 
     if (opts.nowSec - m.date > opts.cfg.stalenessSec) {
       skippedStale += 1;
@@ -63,10 +83,14 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   }
 
   return {
-    actions,
+    actions: [...callbackActions, ...actions],
     newOffset: updates.length ? maxId + 1 : opts.currentOffset,
     skippedStale,
   };
+}
+
+function senderAllowed(sender: number | undefined, opts: StepOpts): boolean {
+  return sender !== undefined && (sender === opts.chatId || opts.cfg.allowedSenders.includes(sender));
 }
 
 // Command-vs-prompt split (spec §13). Verbs match on the first whitespace

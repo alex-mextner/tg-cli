@@ -56,6 +56,105 @@ test('update with no message advances offset silently', () => {
   expect(r.newOffset).toBe(8);
 });
 
+test('callback_query from allowed sender resolves a button answer and advances offset', () => {
+  const r = stepUpdates(
+    [
+      {
+        update_id: 8,
+        callback_query: {
+          id: 'cb1',
+          from: { id: CHAT_ID, first_name: 'Alex' },
+          message: { message_id: 50, chat: { id: CHAT_ID }, date: NOW },
+          data: 'tgq:q_123:o1',
+        },
+      },
+    ],
+    makeOpts(),
+  );
+  expect(r.actions).toEqual([
+    { kind: 'answer-question', callbackQueryId: 'cb1', requestId: 'q_123', value: 'o1', messageId: 50 },
+  ]);
+  expect(r.newOffset).toBe(9);
+});
+
+test('callback_query without a message reference carries messageId null', () => {
+  const r = stepUpdates(
+    [
+      {
+        update_id: 8,
+        callback_query: {
+          id: 'cb1',
+          from: { id: CHAT_ID, first_name: 'Alex' },
+          data: 'tgq:q_123:o1',
+        },
+      },
+    ],
+    makeOpts(),
+  );
+  expect(r.actions).toEqual([
+    { kind: 'answer-question', callbackQueryId: 'cb1', requestId: 'q_123', value: 'o1', messageId: null },
+  ]);
+});
+
+test('callback_query from disallowed sender is acknowledged but not resolved', () => {
+  const r = stepUpdates(
+    [
+      {
+        update_id: 8,
+        callback_query: {
+          id: 'cb1',
+          from: { id: 666, first_name: 'Mallory' },
+          message: { message_id: 50, chat: { id: CHAT_ID }, date: NOW },
+          data: 'tgq:q_123:o1',
+        },
+      },
+    ],
+    makeOpts(),
+  );
+  expect(r.actions).toEqual([{ kind: 'answer-callback', callbackQueryId: 'cb1', text: 'not allowed' }]);
+  expect(r.newOffset).toBe(9);
+});
+
+test('callback_query with unknown data is answered as expired/unknown, not injected', () => {
+  const r = stepUpdates(
+    [
+      {
+        update_id: 8,
+        callback_query: {
+          id: 'cb1',
+          from: { id: CHAT_ID, first_name: 'Alex' },
+          message: { message_id: 50, chat: { id: CHAT_ID }, date: NOW },
+          data: 'other:q_123:o1',
+        },
+      },
+    ],
+    makeOpts(),
+  );
+  expect(r.actions).toEqual([{ kind: 'answer-callback', callbackQueryId: 'cb1', text: 'expired' }]);
+  expect(r.newOffset).toBe(9);
+});
+
+test('callback_query actions are prioritized before slower message actions in the same batch', () => {
+  const r = stepUpdates(
+    [
+      upd(7, { photo: [{ file_id: 'photo', file_size: 1024 }] }),
+      {
+        update_id: 8,
+        callback_query: {
+          id: 'cb1',
+          from: { id: CHAT_ID, first_name: 'Alex' },
+          message: { message_id: 50, chat: { id: CHAT_ID }, date: NOW },
+          data: 'tgq:q_123:o1',
+        },
+      },
+    ],
+    makeOpts(),
+  );
+  expect(r.actions.map((a) => a.kind)).toEqual(['answer-question', 'download-media', 'ack']);
+  expect(r.actions[0]).toEqual({ kind: 'answer-question', callbackQueryId: 'cb1', requestId: 'q_123', value: 'o1', messageId: 50 });
+  expect(r.newOffset).toBe(9);
+});
+
 test('unsupported message kind (no text/photo/document) is silent', () => {
   const r = stepUpdates([upd(9)], makeOpts());
   expect(r.actions).toEqual([]);

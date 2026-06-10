@@ -12,12 +12,22 @@
 // (`run`) takes the flock as its FIRST action and exits 0 when another
 // instance already owns the bot.
 
-import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
-import { join } from "path"
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
+import { createConnection, createServer, type Server, type Socket } from "net"
+import { join, resolve } from "path"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { findAgentInPane, parsePaneList, parseProcList, pickTargetPane } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
 import { botIdFromToken, ctlPaths, pidStatus, readPidFile } from "./features/tg-ctl/lock"
+import {
+  buildButtonMessage,
+  callbackRequestId,
+  formatAgentHookOutput,
+  questionCapability,
+  registrationAllowsHook,
+  resolveButtonCallback,
+  type ButtonRequest,
+} from "./features/tg-ctl/questions"
 import { stepUpdates } from "./features/tg-ctl/updates"
 import type {
   Action,
@@ -34,6 +44,7 @@ import type {
 
 export const USAGE = `Usage:
   tg-ctl start [--pane %N] [--cwd PATH] [--session NAME]
+  tg-ctl ask    # internal: hook client, reads a ButtonRequest JSON from stdin
   tg-ctl stop
   tg-ctl status
   tg-ctl run    # internal: the daemon process itself
@@ -160,20 +171,42 @@ function api(ctx: Ctx): string {
   return `${ctx.apiBase}/bot${ctx.token}`
 }
 
-// Daemon-side outbound. Never throws and never exits — a failed notice must
-// not take the poll loop down with it.
-async function sendMessage(ctx: Ctx, text: string): Promise<void> {
+// Daemon-side Bot API call. Never throws and never exits — a failed notice
+// must not take the poll loop down with it.
+async function botPost(ctx: Ctx, method: string, body: unknown): Promise<Record<string, unknown> | null> {
   try {
-    const resp = await fetch(`${api(ctx)}/sendMessage`, {
+    const resp = await fetch(`${api(ctx)}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: ctx.chatId, text }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(15_000),
     })
-    if (!resp.ok) log(`sendMessage failed: ${resp.status} ${(await resp.text()).slice(0, 200)}`)
+    if (!resp.ok) {
+      log(`${method} failed: ${resp.status} ${(await resp.text()).slice(0, 200)}`)
+      return null
+    }
+    const json = (await resp.json()) as Record<string, unknown>
+    return json && typeof json === "object" ? json : null
   } catch (err) {
-    log(`sendMessage failed: ${err}`)
+    log(`${method} failed: ${err}`)
+    return null
   }
+}
+
+async function sendMessage(ctx: Ctx, text: string, extra: Record<string, unknown> = {}): Promise<number | null> {
+  const json = await botPost(ctx, "sendMessage", { chat_id: ctx.chatId, text, ...extra })
+  const result = json?.result
+  if (!result || typeof result !== "object") return null
+  const messageId = (result as { message_id?: unknown }).message_id
+  return typeof messageId === "number" ? messageId : null
+}
+
+async function answerCallbackQuery(ctx: Ctx, callbackQueryId: string, text: string): Promise<void> {
+  await botPost(ctx, "answerCallbackQuery", { callback_query_id: callbackQueryId, text })
+}
+
+async function editMessageText(ctx: Ctx, messageId: number, text: string): Promise<void> {
+  await botPost(ctx, "editMessageText", { chat_id: ctx.chatId, message_id: messageId, text })
 }
 
 // Tab separator — pane_current_path may contain spaces (see discover.ts).
@@ -346,6 +379,228 @@ function stopDaemon(ctx: Ctx): void {
   console.log(kill0(pid!) ? `tg-ctl: SIGTERM sent (pid ${pid}, still exiting)` : `tg-ctl: stopped (pid ${pid})`)
 }
 
+// --- hook/client handoff over a local Unix socket ---
+
+const MAX_HOOK_REQUEST_BYTES = 64 * 1024
+
+interface PendingButton {
+  req: ButtonRequest
+  socket: Socket
+  messageId: number | null
+  timer: ReturnType<typeof setTimeout>
+  finalText?: string
+}
+
+function normalizeButtonRequest(value: unknown): ButtonRequest | null {
+  if (!value || typeof value !== "object") return null
+  const rec = value as Record<string, unknown>
+  const requestId = typeof rec.requestId === "string" && rec.requestId ? rec.requestId : null
+  const agent = typeof rec.agent === "string" ? rec.agent : null
+  const kind = rec.kind === "question" || rec.kind === "permission" ? rec.kind : null
+  const question = typeof rec.question === "string" && rec.question ? rec.question : null
+  if (!requestId || !agent || !kind || !question) return null
+  const options = Array.isArray(rec.options)
+    ? rec.options
+        .filter((o): o is Record<string, unknown> => Boolean(o) && typeof o === "object")
+        .map((o) => {
+          const label = typeof o.label === "string" ? o.label : ""
+          const description = typeof o.description === "string" ? o.description : undefined
+          return label ? (description ? { label, description } : { label }) : null
+        })
+        .filter((o): o is { label: string; description?: string } => o !== null)
+    : undefined
+
+  return {
+    requestId,
+    buttonId: typeof rec.buttonId === "string" ? rec.buttonId : undefined,
+    paneId: typeof rec.paneId === "string" ? rec.paneId : undefined,
+    cwd: typeof rec.cwd === "string" ? rec.cwd : undefined,
+    sessionName: typeof rec.sessionName === "string" ? rec.sessionName : undefined,
+    agent: agent as ButtonRequest["agent"],
+    kind,
+    question,
+    title: typeof rec.title === "string" ? rec.title : undefined,
+    options,
+  }
+}
+
+function canForwardButtonRequest(req: ButtonRequest): boolean {
+  if (questionCapability(req.agent) !== "buttons") return false
+  return !(req.agent === "codex" && req.kind !== "permission")
+}
+
+function hookMatchesRegistration(ctx: Ctx, req: ButtonRequest): boolean {
+  return registrationAllowsHook(readRegistration(ctx.paths), req, resolve)
+}
+
+function startHookServer(ctx: Ctx, pending: Map<string, PendingButton>, activeKeys: Set<string>): Server | null {
+  try {
+    try {
+      unlinkSync(ctx.paths.socket)
+    } catch {}
+    const server = createServer((socket) => {
+      socket.setEncoding("utf8")
+      let raw = ""
+      socket.on("data", (chunk) => {
+        raw += chunk
+        const newline = raw.indexOf("\n")
+        if (newline === -1) {
+          // A hook request is a single small JSON line; anything bigger is a
+          // misbehaving client trying to grow the buffer forever.
+          if (raw.length > MAX_HOOK_REQUEST_BYTES) socket.destroy()
+          return
+        }
+        const line = raw.slice(0, newline).trim()
+        raw = raw.slice(newline + 1)
+        void handleHookSocketLine(ctx, pending, activeKeys, socket, line)
+      })
+    })
+    server.on("error", (err) => {
+      log(`hook socket failed: ${err}`)
+    })
+    server.listen(ctx.paths.socket, () => {
+      // Owner-only: the socket answers with approved hook JSON, so other local
+      // users must not be able to connect (the guard trusts client-sent fields).
+      try {
+        chmodSync(ctx.paths.socket, 0o600)
+      } catch {}
+    })
+    return server
+  } catch (err) {
+    log(`hook socket failed: ${err}`)
+    return null
+  }
+}
+
+async function handleHookSocketLine(
+  ctx: Ctx,
+  pending: Map<string, PendingButton>,
+  activeKeys: Set<string>,
+  socket: Socket,
+  line: string,
+): Promise<void> {
+  let req: ButtonRequest | null = null
+  try {
+    req = normalizeButtonRequest(JSON.parse(line))
+  } catch {
+    // malformed hook payload: let the local agent UI take over
+  }
+  if (!req) {
+    socket.end("null\n")
+    return
+  }
+
+  if (!hookMatchesRegistration(ctx, req)) {
+    socket.end("null\n")
+    return
+  }
+
+  if (!canForwardButtonRequest(req)) {
+    socket.end("null\n")
+    void sendMessage(
+      ctx,
+      `native question forwarding isn't available for \`${req.agent}\` — answer in the terminal`,
+    )
+    return
+  }
+
+  const pendingKey = callbackRequestId(req)
+  if (activeKeys.has(pendingKey)) {
+    socket.end("null\n")
+    return
+  }
+  activeKeys.add(pendingKey)
+  const entry: PendingButton = {
+    req,
+    socket,
+    messageId: null,
+    timer: undefined as unknown as ReturnType<typeof setTimeout>,
+  }
+  entry.timer = setTimeout(() => {
+    if (pending.get(pendingKey) !== entry) return
+    pending.delete(pendingKey)
+    activeKeys.delete(pendingKey)
+    if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, "expired — answer in terminal")
+    else entry.finalText = "expired — answer in terminal"
+    socket.end("null\n")
+  }, 110_000)
+  pending.set(pendingKey, entry)
+
+  let socketClosed = false
+  socket.on("close", () => {
+    socketClosed = true
+    const current = pending.get(pendingKey)
+    if (current !== entry) return
+    clearTimeout(entry.timer)
+    pending.delete(pendingKey)
+    activeKeys.delete(pendingKey)
+    if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, "expired — answer in terminal")
+    else entry.finalText = "expired — answer in terminal"
+  })
+
+  const payload = buildButtonMessage(ctx.chatId, req)
+  const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+  if (messageId === null) {
+    if (pending.get(pendingKey) === entry) {
+      pending.delete(pendingKey)
+      activeKeys.delete(pendingKey)
+      clearTimeout(entry.timer)
+      if (!socketClosed) socket.end("null\n")
+    }
+    return
+  }
+  entry.messageId = messageId
+  if (pending.get(pendingKey) !== entry || entry.finalText) {
+    void editMessageText(ctx, messageId, entry.finalText ?? "expired — answer in terminal")
+  }
+}
+
+async function askDaemon(ctx: Ctx): Promise<void> {
+  const input = await readStdinText()
+  if (!input.trim()) return
+  let requestLine: string
+  try {
+    requestLine = JSON.stringify(JSON.parse(input))
+  } catch {
+    return
+  }
+
+  const output = await new Promise<string | null>((resolve) => {
+    const socket = createConnection(ctx.paths.socket)
+    let raw = ""
+    const timer = setTimeout(() => {
+      socket.destroy()
+      resolve(null)
+    }, 120_000)
+    socket.setEncoding("utf8")
+    socket.on("connect", () => socket.write(requestLine + "\n"))
+    socket.on("data", (chunk) => {
+      raw += chunk
+    })
+    socket.on("error", () => {
+      clearTimeout(timer)
+      resolve(null)
+    })
+    socket.on("end", () => {
+      clearTimeout(timer)
+      resolve(raw.trim() || null)
+    })
+  })
+  if (output && output !== "null") console.log(output)
+}
+
+async function readStdinText(): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    let out = ""
+    process.stdin.setEncoding("utf8")
+    process.stdin.on("data", (chunk) => {
+      out += chunk
+    })
+    process.stdin.on("end", () => resolve(out))
+    process.stdin.on("error", reject)
+  })
+}
+
 // --- run: the daemon itself ---
 
 async function runDaemon(ctx: Ctx): Promise<never> {
@@ -366,14 +621,25 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
 
   writeFileSync(ctx.paths.pid, `${process.pid}\n`)
+  const pendingButtons = new Map<string, PendingButton>()
+  const activeButtonKeys = new Set<string>()
+  let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
     try {
       unlinkSync(ctx.paths.pid)
+    } catch {}
+    try {
+      hookServer?.close()
+    } catch {}
+    try {
+      unlinkSync(ctx.paths.socket)
     } catch {}
     process.exit(code)
   }
   process.on("SIGTERM", () => cleanExit(0))
   process.on("SIGINT", () => cleanExit(0))
+
+  hookServer = startHookServer(ctx, pendingButtons, activeButtonKeys)
 
   if (ctx.cfg.transport === "channel") {
     log("transport 'channel' is reserved for v1.2+ — falling back to tmux")
@@ -482,6 +748,43 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "reply":
         await sendMessage(ctx, action.text)
         return true
+      case "answer-callback":
+        await answerCallbackQuery(ctx, action.callbackQueryId, action.text)
+        return true
+      case "answer-question": {
+        const pending = pendingButtons.get(action.requestId)
+        if (!pending) {
+          await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+          return true
+        }
+        // A tap must come from THIS prompt's Telegram message: a stale tap on
+        // an earlier prompt that reused the callback key must not answer this
+        // one. Skipped only while sendMessage is still in flight (messageId
+        // unknown) — that race is resolved in the tap's favor by design.
+        if (
+          pending.messageId !== null &&
+          action.messageId !== null &&
+          action.messageId !== pending.messageId
+        ) {
+          await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+          return true
+        }
+        const answer = resolveButtonCallback(pending.req, { requestId: action.requestId, value: action.value })
+        if (answer.status !== "answered") {
+          await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+          return true
+        }
+        pendingButtons.delete(action.requestId)
+        activeButtonKeys.delete(action.requestId)
+        clearTimeout(pending.timer)
+        const finalText = `answered: ${answer.label}`
+        if (pending.messageId === null) pending.finalText = finalText
+        const output = formatAgentHookOutput(pending.req, answer)
+        pending.socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
+        void answerCallbackQuery(ctx, action.callbackQueryId, "answered")
+        if (pending.messageId !== null) void editMessageText(ctx, pending.messageId, finalText)
+        return true
+      }
       case "status":
         await sendMessage(ctx, composeStatus(ctx))
         return true
@@ -534,7 +837,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
 
       const resp = await fetch(
-        `${api(ctx)}/getUpdates?timeout=50&offset=${offset}&allowed_updates=${encodeURIComponent('["message"]')}`,
+        `${api(ctx)}/getUpdates?timeout=50&offset=${offset}&allowed_updates=${encodeURIComponent('["message","callback_query"]')}`,
         { signal: AbortSignal.timeout(60_000) },
       )
       if (resp.status === 409) {
@@ -601,7 +904,7 @@ if (import.meta.main) {
     console.log(USAGE)
     process.exit(0)
   }
-  if (!cmd || !["start", "run", "stop", "status"].includes(cmd)) {
+  if (!cmd || !["start", "run", "stop", "status", "ask"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -614,6 +917,9 @@ if (import.meta.main) {
 
   const token = env.TG_BOT_TOKEN ?? ""
   const botId = botIdFromToken(token)
+  if (cmd === "ask" && (!botId || !env.TG_CHAT_ID)) {
+    process.exit(0)
+  }
   if (!botId || !env.TG_CHAT_ID) {
     console.error(`Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ${join(configDir, ".env")}`)
     process.exit(1)
@@ -642,6 +948,10 @@ if (import.meta.main) {
   }
   if (cmd === "status") {
     console.log(composeStatus(ctx))
+    process.exit(0)
+  }
+  if (cmd === "ask") {
+    await askDaemon(ctx)
     process.exit(0)
   }
   await runDaemon(ctx)
