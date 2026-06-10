@@ -267,7 +267,10 @@ delayed, or hung waiting for a button tap.
   feature-flag parser reads only a boolean `features:` block; `control.*` needs
   its own tiny parser in the same hand-rolled style (strings + booleans + ints,
   one nesting level, no yaml dependency):
-  - `control.enabled`: bool, default `false` — gates inbound + auto-start.
+  - `control.enabled`: bool, default `true` (flipped from `false` by user
+    decision 2026-06-10 post-review) — gates inbound + auto-start. Inbound is
+    armed out of the box; opt OUT per machine with `enabled: false`. This makes
+    D3 (bot-per-machine) a practical requirement, not just a recommendation.
   - `control.transport`: `auto | tmux` in v1 (`channel` reserved for v1.2+),
     default `auto`.
   - `control.session`: optional fixed tmux session name (else auto-discover).

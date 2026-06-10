@@ -5,7 +5,8 @@ semantic versioning.
 
 ## 1.4.0
 
-Inbound control v1 (`tg-ctl`, spec §16 — poll/tmux transport, OFF by default):
+Inbound control v1 (`tg-ctl`, spec §16 — poll/tmux transport, ON by default;
+opt out with `control.enabled: false`):
 
 - New `tg-ctl` entrypoint at the repo root: `start` / `run` / `stop` / `status`.
   A singleton daemon long-polls Telegram `getUpdates` and injects inbound
@@ -14,9 +15,9 @@ Inbound control v1 (`tg-ctl`, spec §16 — poll/tmux transport, OFF by default)
 - Hard singleton via real `flock(2)` (`bun:ffi` → libSystem/libc): the launcher
   spawns the daemon detached and never takes the lock; the daemon flocks as its
   first action and exits 0 if another instance holds it.
-- Lazy auto-start: a successful `tg` send inside tmux with `control.enabled:
-  true` in `~/.config/tg-cli/config.yaml` fire-and-forgets `tg-ctl start`,
-  handing over the `TMUX_PANE`/cwd registration snapshot.
+- Lazy auto-start: a successful `tg` send from a tmux pane with a detected
+  agent fire-and-forgets `tg-ctl start`, handing over the `TMUX_PANE`/cwd
+  registration snapshot (gated on `control.enabled`).
 - Pane-id targeting with pre-inject verification: the agent process is located
   by walking the pane's process tree (a Claude Code pane reports its version
   string, not `claude`, as the pane command); injection refuses + replies in

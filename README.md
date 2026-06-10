@@ -35,18 +35,18 @@ TG_BOT_TOKEN=<your bot token from @BotFather>
 TG_CHAT_ID=<your chat or user ID>
 ```
 
-### Inbound control (optional, OFF by default)
+### Inbound control (ON by default)
 
 `tg-ctl` lets you talk back to a running tmux agent session from Telegram.
-Enable it in `~/.config/tg-cli/config.yaml`:
+It works out of the box; opt out per machine in `~/.config/tg-cli/config.yaml`:
 
 ```yaml
 control:
-  enabled: true
+  enabled: false
 ```
 
-The daemon auto-starts on the next `tg` send from inside tmux (or run
-`tg-ctl start`). From Telegram: plain text is injected into the agent's tmux
+The daemon auto-starts on the next `tg` send from a tmux pane with a detected
+agent (or run `tg-ctl start`). From Telegram: plain text is injected into the agent's tmux
 pane as `[TG from you] … — reply via tg` (the agent answers by calling `tg`);
 `/stop` interrupts the current turn (Escape); `/kill` kills the session;
 `/status` reports daemon state; photos/files are downloaded locally and their

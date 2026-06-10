@@ -16,8 +16,12 @@ export interface ControlConfig {
   allowedSenders: number[]; // extra allowed sender user ids
 }
 
+// enabled defaults ON (user decision 2026-06-10, post-review): inbound is armed
+// out of the box wherever the bot token exists; opt OUT per machine with
+// `control.enabled: false`. The auto-start gate still requires tmux + a
+// detected agent, and D3 (bot-per-machine) becomes a practical requirement.
 export const DEFAULT_CONTROL: ControlConfig = {
-  enabled: false,
+  enabled: true,
   transport: 'auto',
   injectWrap: '[TG from {name}] {msg} — reply via tg',
   stalenessSec: 300,
