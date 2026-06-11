@@ -338,8 +338,8 @@ test('line-spec :N on an existing file → attached with lineSpec, token KEPT', 
       {
         type: 'document',
         path: tsAbs,
-        // Auto-detected from the text → carries `auto: true` (FIX 1 size gate
-        // applies to auto items only; explicit --file does not).
+        // Auto-detected from the text → carries `auto: true` (provenance marker;
+        // explicit --file/--photo items don't carry it).
         auto: true,
         lineSpec: { token: `${tsAbs}:3`, startLine: 3, endLine: 3, col: undefined },
       },
