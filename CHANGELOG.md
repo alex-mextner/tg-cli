@@ -3,6 +3,19 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.5.1
+
+Agent detection fix (outbound branding):
+
+- `tg` now identifies a `codex` (and `aider`/`pi`/`opencode`) session by walking
+  its own ancestor process tree, not just an env marker. Codex exports no env
+  signal for the shell commands it spawns (`CODEX` unset, `CODEX_HOME` empty),
+  so detection used to fall through to the `pgrep` fallbacks where a background
+  `ollama` daemon (common on macOS) won — mislabeling codex reports as `ollama`.
+  The ancestry walk runs before the `pgrep` block, so the launching agent wins
+  and a sibling daemon can no longer hijack the label. Mirrors `tg-ctl`'s
+  inbound `findAgentInPane` (new `findAgentInAncestry`, shared `matchAgentCommand`).
+
 ## 1.5.0
 
 Q→buttons (`tg-ctl`, spec §8 core path):

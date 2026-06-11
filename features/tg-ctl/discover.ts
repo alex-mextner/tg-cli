@@ -60,7 +60,7 @@ function basename(path: string): string {
 
 // Match a single process command line to an agent. Shells (-zsh, bash, …) and
 // everything else fall through to null — they are traversed, never matched.
-function matchAgentCommand(command: string): AgentKind | null {
+export function matchAgentCommand(command: string): AgentKind | null {
   const trimmed = command.trim();
   const argv0 = trimmed.split(/\s+/, 1)[0] ?? '';
   const base = basename(argv0);
@@ -112,6 +112,34 @@ export function findAgentInPane(
       if (agent) return { agent, pid: proc.pid };
     }
     for (const child of byPpid.get(pid) ?? []) queue.push(child.pid);
+  }
+  return null;
+}
+
+// Walk UP the ppid chain from `startPid`, returning the nearest ancestor that
+// matches an agent. This is the outbound mirror of findAgentInPane (which walks
+// DOWN to a pane's children): when `tg` runs, it asks "which agent launched
+// me?" by climbing its own ancestry. Codex/aider/pi export no env marker (only
+// Claude Code sets CLAUDECODE), so the process tree is the reliable signal —
+// and a background ollama daemon is a sibling, never an ancestor, so it is
+// correctly ignored. The visited set guards against pid-reuse cycles in the
+// ps snapshot, matching findAgentInPane's robustness.
+export function findAgentInAncestry(
+  procs: ProcInfo[],
+  startPid: number,
+): { agent: AgentKind; pid: number } | null {
+  const byPid = new Map<number, ProcInfo>();
+  for (const p of procs) byPid.set(p.pid, p);
+
+  const seen = new Set<number>();
+  let pid: number | undefined = startPid;
+  while (pid !== undefined && pid > 1 && !seen.has(pid)) {
+    seen.add(pid);
+    const proc = byPid.get(pid);
+    if (!proc) break;
+    const agent = matchAgentCommand(proc.command);
+    if (agent) return { agent, pid: proc.pid };
+    pid = proc.ppid;
   }
   return null;
 }
