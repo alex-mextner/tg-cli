@@ -920,7 +920,9 @@ if (import.meta.main) {
       }
     }
 
-    return "🗂"
+    // Unknown / undeterminable model (e.g. an opencode session whose inner model
+    // couldn't be read) — a neutral folder icon rather than misbranding.
+    return "📁"
   }
 
   const AI_EMOJI = detectAiEmoji()
