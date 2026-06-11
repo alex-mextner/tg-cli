@@ -1,212 +1,174 @@
-# tg-cli
+# tg — Telegram bridge for AI coding agents
 
-> **Built for AI agents.** When you run `tg` inside a tmux session, it auto-detects which AI model is running (Kimi, Claude, Codex, Gemini, etc.) and prefixes every Telegram message with the corresponding custom emoji. No manual configuration — the icon just appears.
+The best way to monitor several coding agents at once: they push only what matters — status updates, blockers, a question — and you reply from your phone. Agent questions and permission prompts arrive as **tappable inline buttons**; no terminal round-trip needed.
 
-## Installation
+Works with any agent in tmux: Claude Code, Codex, opencode, aider, and more.
 
-1. Clone the repo:
-   ```bash
-   git clone git@github.com:alex-mextner/tg-cli.git
-   cd tg-cli
-   ```
+## What it looks like
 
-2. Create config:
-   ```bash
-   mkdir -p ~/.config/tg-cli
-   cp .env.example ~/.config/tg-cli/.env
-   # edit ~/.config/tg-cli/.env with your bot token and chat ID
-   ```
+**An agent finishes a task:**
+```bash
+tg --format html "<b>HYP-576 done</b>\nAll tests pass. PR #42 opened."
+# → Telegram message with ticket title inlined, PR linked, agent emoji prefix
+```
 
-3. Add to PATH (symlink or copy):
-   ```bash
-   ln -sf "$(pwd)/tg" ~/.local/bin/tg
-   ```
+**An agent asks a question — arrives as buttons:**
+```
+[Claude 🤖] Should I delete the old migration files?
+  [Yes, delete]  [No, keep them]
+```
+Tap a button. The answer injects directly into the agent's tmux pane.
 
-## Requirements
+**An agent sends a generated artifact:**
+```bash
+tg --file report.md "Weekly summary"
+# .md files are auto-converted to PDF before upload
+```
 
-- [Bun](https://bun.sh) — `#!/usr/bin/env bun`
+---
 
-## Config
+## Install
 
-Place your credentials in `~/.config/tg-cli/.env`:
+**One-liner** (installs deps via bun, links `tg` into PATH, registers the agent skill):
+```bash
+curl -fsSL https://raw.githubusercontent.com/alex-mextner/tg-cli/main/install.sh | bash
+```
 
+**Register the skill manually** (idempotent; run automatically by the installer):
+```bash
+tg install-skill
+```
+
+`tg install-skill` makes agent harnesses aware of `tg`. It writes a skill file to
+`~/.agents/skills/tg/` and, **for each detected harness**, appends a short always-on
+blurb to its global instruction file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`,
+`~/.config/opencode/AGENTS.md`, `~/.gemini/GEMINI.md`) and adds a Claude Code
+`SessionStart` hook that surfaces installed agent CLIs at session start. All edits are
+marked and idempotent — safe to re-run, and trivial to remove (delete the marked
+blocks). Run automatically by the installer.
+
+> Notes: the `SessionStart` hook prints the contents of `~/.agents/skills/.blurbs/*.md`
+> into each session, so treat that directory as trusted (only the installers write there).
+> `install-skill` is an exact-match subcommand — to send the literal text `install-skill`
+> as a message, pipe it (`echo install-skill | tg -`) or add any other token.
+
+**Manual clone:**
+```bash
+git clone git@github.com:alex-mextner/tg-cli.git
+cd tg-cli
+ln -sf "$(pwd)/tg" ~/.local/bin/tg
+```
+
+**Requirements:** [Bun](https://bun.sh)
+
+**Config** — create `~/.config/tg-cli/.env`:
 ```
 TG_BOT_TOKEN=<your bot token from @BotFather>
 TG_CHAT_ID=<your chat or user ID>
 ```
 
-### Inbound control (ON by default)
+---
 
-`tg-ctl` lets you talk back to a running tmux agent session from Telegram.
-It works out of the box; opt out per machine in `~/.config/tg-cli/config.yaml`:
+## Outbound — agents push to Telegram
 
+### Text and HTML reports
+
+```bash
+# Plain text (auto-detects agent, adds branded emoji prefix)
+tg "Build finished, 0 errors"
+
+# HTML — use Telegram's supported tag subset
+tg --format html "<b>Status</b>\nAll checks green."
+
+# HTML auto-detected when tags are present — --format html is optional
+tg "<b>Important</b>: migration complete"
+```
+
+### Files, photos, and PDFs
+
+```bash
+tg --photo screenshot.png "Looks good"
+tg --photo before.png --photo after.png "Comparison"
+tg --file report.md "Weekly summary"    # .md auto-converted to PDF
+tg --file data.csv --file chart.png "Results"
+```
+
+Markdown files (`*.md`, `*.markdown`) are silently converted to PDF via pandoc + headless Chrome before upload. On conversion failure the original file is sent instead — the send is never blocked. Requires `pandoc` and Chrome/Chromium 112+. Disable with `--no-feature md-as-pdf`.
+
+### Auto-attach from message text
+
+File paths mentioned in the message text are detected and attached automatically (images as photos, everything else as documents). The path token stays in the caption verbatim — it's only detected and attached, never removed. Recursive search across the worktree finds files by bare name or path suffix — `BFS`, shallowest match wins, `node_modules`/`.git`/`dist`-style dirs pruned.
+
+### Secret-file denylist
+
+Secret-looking files are **never** attached: `.env` family, SSH private keys, `*.pem`/`*.key`/`*.p12`/`*.pfx`/`*.ppk`, credential rc-files (`.netrc`, `.npmrc`, `.git-credentials`, …), shell histories, `*.tfvars`, `credentials.json`/`client_secret*.json`, `kubeconfig`. Auto-detected mentions are silently skipped; an explicit `--file prod.env` is a hard error. Override: `--no-feature attach-denylist`.
+
+### Autolinks
+
+**Linear tickets** (`HYP-576` style) — verified via the `linear` CLI, title inlined or appended. Requires `brew install schpet/tap/linear` + `linear auth login`. Disable: `--no-feature autolink-tasks`.
+
+**GitHub PRs and issues** (`#42` style) — resolved against the cwd repo via `gh`. PRs get a state annotation (`(merged)`/`(open)`/`(draft)`). Disable: `--no-feature autolink-prs`.
+
+Both features are ON by default. Both cache verdicts for 1 hour. Both degrade gracefully to plain text if the CLI is missing or not authenticated.
+
+---
+
+## Inbound — you reply from your phone
+
+`tg-ctl` is the inbound daemon. It starts automatically on the first outbound `tg` send from a tmux pane with a detected agent. Stop it with `tg-ctl stop`.
+
+### Sending a reply
+Plain text from Telegram is injected into the agent's tmux pane as:
+```
+[TG from you] your message — reply via tg
+```
+The agent reads it and responds by calling `tg`.
+
+### Q→buttons (v1.5.0)
+Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
+
+### Commands
+| Command | Effect |
+|---------|--------|
+| `/stop` | Inject Escape — interrupts the current agent turn, session survives |
+| `/kill` | SIGINT the agent — session ends |
+| `/status` | Report daemon state |
+
+Photos and documents sent from Telegram are downloaded to `~/.cache/tg-cli/inbound/` and the local path is injected for the agent to read.
+
+A successfully handled message gets a 👀 reaction as a delivery receipt.
+
+### Opt out
 ```yaml
+# ~/.config/tg-cli/config.yaml
 control:
   enabled: false
 ```
 
-The daemon auto-starts on the next `tg` send from a tmux pane with a detected
-agent (or run `tg-ctl start`). From Telegram: plain text is injected into the agent's tmux
-pane as `[TG from you] … — reply via tg` (the agent answers by calling `tg`);
-`/stop` interrupts the current turn (Escape); `/kill` kills the session;
-`/status` reports daemon state; photos/files are downloaded locally and their
-path injected. Inbound needs **one bot token per machine** (Telegram allows a
-single `getUpdates` consumer per token) — outbound `tg` is unaffected.
+> **One bot token per machine.** Telegram allows a single `getUpdates` consumer per token. Outbound `tg` is unaffected.
 
-## Usage
+---
 
+## Agent branding
+
+`tg` auto-detects which agent is running by walking the tmux pane's process tree and prefixes every message with the agent's custom emoji icon. No configuration needed.
+
+Detected: Claude Code, Codex, opencode, aider, Kimi, Gemini, DeepSeek, Qwen, Mistral, Grok, Copilot, Perplexity, Cursor, Windsurf, Ollama, HyperIDE.
+
+**v1.5.1 fix:** a background `ollama` daemon no longer mislabels a Codex session — env-var signals from the agent take priority over `pgrep` fallbacks.
+
+Override if needed:
 ```bash
-# Send a text message (auto-detects AI model, adds custom emoji prefix)
-tg "Hello from the terminal"
-
-# Send formatted HTML (auto-detected if tags present)
-tg --format html "<b>Status</b>\nDone"
-tg "<b>Auto-detected</b> HTML tags"  # same as --format html
-
-# Send with custom emoji helpers
-# (AI model auto-detected from running process)
-tg "Hello :kimi: from the terminal"
-
-# Send a photo
-tg --photo screenshot.png
-
-# Send a photo with caption
-tg --photo screenshot.png "Look at this"
-
-# Send a photo with HTML caption and custom emoji
-tg --format html --photo diagram.png "<b>Report</b> :hyperide:"
-
-# Send a file
-tg --file report.pdf
-
-# Send a file with caption
-tg --file report.pdf "Monthly report"
-
-# Send multiple photos with caption
-tg --photo a.png --photo b.png "Two screenshots"
-
-# Send multiple files
-tg --file a.pdf --file b.pdf
-
-# Mix photos and files
-tg --photo diagram.png --file data.csv "Diagram and data"
-
-# List all emoji helpers
-tg --ls-emoji-helpers
-```
-
-Message text and captions decode `\n`, `\r`, `\t`, and `\\` into real newlines, carriage
-returns, tabs, and backslashes. File paths are not decoded.
-
-## Custom Emoji System
-
-The CLI auto-detects your AI model from the running process and sends custom emoji icons.
-Everything works automatically — no manual configuration needed.
-
-### Auto-detected models
-
-<img src="emoji-icons/mini_kimi.png" width="16" height="16" align="top" alt="Kimi" /> <b>Kimi</b> — Moonshot AI<br/>
-<img src="emoji-icons/mini_claude.png" width="16" height="16" align="top" alt="Claude" /> <b>Claude</b> — Anthropic<br/>
-<img src="emoji-icons/mini_codex.png" width="16" height="16" align="top" alt="Codex" /> <b>Codex</b> — OpenAI<br/>
-<img src="emoji-icons/mini_gemini.png" width="16" height="16" align="top" alt="Gemini" /> <b>Gemini</b> — Google<br/>
-<img src="emoji-icons/mini_deepseek.png" width="16" height="16" align="top" alt="DeepSeek" /> <b>DeepSeek</b><br/>
-<img src="emoji-icons/mini_qwen.png" width="16" height="16" align="top" alt="Qwen" /> <b>Qwen</b> — Alibaba<br/>
-<img src="emoji-icons/mini_mistral.png" width="16" height="16" align="top" alt="Mistral" /> <b>Mistral</b><br/>
-<img src="emoji-icons/mini_grok.png" width="16" height="16" align="top" alt="Grok" /> <b>Grok</b> — xAI<br/>
-<img src="emoji-icons/mini_copilot.png" width="16" height="16" align="top" alt="Copilot" /> <b>Copilot</b> — GitHub<br/>
-<img src="emoji-icons/mini_perplexity.png" width="16" height="16" align="top" alt="Perplexity" /> <b>Perplexity</b><br/>
-<img src="emoji-icons/mini_cursor.png" width="16" height="16" align="top" alt="Cursor" /> <b>Cursor</b><br/>
-<img src="emoji-icons/mini_windsurf.png" width="16" height="16" align="top" alt="Windsurf" /> <b>Windsurf</b><br/>
-<img src="emoji-icons/mini_ollama.png" width="16" height="16" align="top" alt="Ollama" /> <b>Ollama</b><br/>
-<img src="emoji-icons/mini_hyperide.png" width="16" height="16" align="top" alt="HyperIDE" /> <b>HyperIDE</b><br/>
-
-### How it works
-
-When you run `tg` inside a tmux pane, it:
-1. Detects the current AI model from process list (opencode, codex, aider, etc.)
-2. Looks up the custom emoji ID for that model
-3. Sends a `custom_emoji` entity alongside your message
-4. Telegram displays the model's branded icon instead of plain text
-
-### Emoji helpers
-
-You can also manually insert any model's emoji:
-
-```bash
-tg "Testing :codex: and :gemini: side by side"
-tg --format html "<b>Models:</b> :claude: :deepseek: :qwen:"
-```
-
-### Advanced: environment overrides
-
-Everything works automatically. Manual overrides are rarely needed:
-
-```bash
-# Override the detected model
 TG_AI_MODEL=kimi tg "message"
-
-# Override a specific emoji ID
-TG_EMOJI_ID_kimi=1234567890123456789 tg "message"
 ```
 
-See [docs/custom-emoji-system.md](docs/custom-emoji-system.md) for the full specification.
+List all emoji helpers: `tg --ls-emoji-helpers`
 
-## HTML Auto-detection
+Manual emoji in message text: `tg "done :codex: :gemini:"` — use any agent name as a `:name:` token.
 
-If `--format` is omitted but the text contains HTML tags (`<b>`, `<i>`, `<code>`, etc.), `parse_mode=HTML` is automatically enabled. This means you can write:
+See [docs/custom-emoji-system.md](docs/custom-emoji-system.md) for the full spec.
 
-```bash
-tg "<b>Important</b>: deployment complete"
-```
-
-Instead of:
-
-```bash
-tg --format html "<b>Important</b>: deployment complete"
-```
-
-## Autolink tasks (Linear)
-
-Ticket-like codes in the message text — 3 uppercase letters, a dash, digits
-(`HYP-576`) — are verified via the [linear CLI](https://github.com/schpet/linear-cli)
-and linked to their Linear issues:
-
-- **One ticket mentioned** → its title is written on the first line (after the
-  emoji/`[window]` prefix when present).
-- **Several tickets** → a collapsed quote with `code: title` reference lines is
-  appended to the end of the message.
-- Codes Linear doesn't recognize stay plain text. Pasted URLs are never rewritten.
-
-Requires `brew install schpet/tap/linear` and `linear auth login`; without them
-the message is sent unchanged (a hint is printed to stderr once). Resolved verdicts
-(found and not-found alike) are cached for 1 hour in `~/.cache/tg-cli/linear-cache.json`
-so repeated sends with the same codes do not spawn a subprocess. The feature is
-ON by default — disable with `--no-feature autolink-tasks` or
-`features.autolink-tasks: false` in `~/.config/tg-cli/config.yaml`.
-
-## Markdown as PDF
-
-`.md` and `.markdown` files attached from disk are silently converted to PDF before upload
-via **pandoc** (GFM → standalone HTML5) and **headless Chrome** (`--headless=new
---no-pdf-header-footer`). Emoji and non-ASCII text render through the system font stack. On
-any conversion failure the original `.md` is uploaded with a one-line stderr warning — the
-send is never blocked. Chrome is auto-discovered; override with `TG_CHROME_PATH`. Requires
-`pandoc` on `PATH` and Chromium/Chrome 112+. Disable with `--no-feature md-as-pdf`.
-
-Text attachments whose content is valid UTF-8 with non-ASCII bytes receive a UTF-8 BOM on
-the uploaded copy to prevent Telegram's preview from guessing a legacy codepage. The file
-on disk is not touched. (`.sh` and `.json` are excluded — BOM breaks shebangs and
-`JSON.parse`.)
-
-Extensionless files (`LICENSE`, `Makefile`, dotfiles like `.env`) detected from path
-scanning are not auto-attached; use `--file LICENSE` to attach them explicitly.
-
-Secret-looking files are **never attached** (`attach-denylist` feature, ON by default):
-the `.env` family, SSH private keys, `*.pem`/`*.key`/`*.p12`/`*.pfx`/`*.ppk`, credential
-rc-files (`.netrc`, `.npmrc`, `.git-credentials`, …), shell histories, `*.tfvars`,
-`credentials.json`/`client_secret*.json`, `kubeconfig`. Auto-detected mentions are
-silently skipped; an explicit `--file prod.env` is a hard error. Conscious override:
-`--no-feature attach-denylist`.
+---
 
 ## Screenshots
 
@@ -230,26 +192,17 @@ silently skipped; an explicit `--file prod.env` is a hard error. Conscious overr
   </tr>
 </table>
 
-## How tg-cli compares
+---
 
-Every other Telegram + AI-agent tool is a **remote terminal**: it mirrors or streams
-the whole session and you drive it from chat — the same shape as Claude Code's own
-first-party Remote Control (`/rc`) and Channels. `tg-cli` inverts that. The **agent
-curates** what is worth sending (it calls `tg` deliberately), it works for **any**
-agent in tmux (not just Claude), and inbound control is a thin, optional layer — not a
-full mirror. No existing tool takes this outbound-first, moderated, multi-agent stance.
+## How tg compares
 
-Inbound control (`tg-ctl`) v1 shipped: poll/tmux transport, commands, media
-inbound — see
-[`docs/specs/2026-06-10-tg-ctl-control-design.md`](docs/specs/2026-06-10-tg-ctl-control-design.md)
-(§16 for the v1 scope and deferrals).
-Below, ○ = planned, — = absent by design, ~ = partial.
+Every other Telegram + AI-agent tool is a **remote terminal**: it mirrors the full session and you drive it from chat — the same shape as Claude Code's own first-party Remote Control (`/rc`). `tg` inverts that. The **agent curates** what is worth sending; it works for **any** agent in tmux (not just Claude); and inbound control is a thin, optional layer — not a full mirror.
 
 ### Philosophy
 
 | Tool | Direction | Mental model | Agents |
 |---|---|---|---|
-| **tg-cli** | Outbound-first, thin inbound | Curated agent reporting + poke-back | Any (multi-agent) |
+| **tg** | Outbound-first, thin inbound | Curated agent reporting + poke-back | Any (multi-agent) |
 | Anthropic Channels / Remote Control | Inbound-first | Remote terminal / chat bridge (first-party) | Claude only |
 | Imolatte/tg-claude | Full-duplex | Remote terminal | Claude |
 | oscarsterling/claude-telegram-remote | Full-duplex | Remote terminal (tmux) | Claude |
@@ -259,36 +212,31 @@ Below, ○ = planned, — = absent by design, ~ = partial.
 
 ### Features
 
-| Tool | Curated out | Multi-agent brand | Media out | Inbound | Q→buttons | Voice | Full mirror |
-|---|---|---|---|---|---|---|---|
-| **tg-cli** | ✓ | ✓ | ✓ | ✓ | ✓ | — | — (by design) |
-| Anthropic Channels / RC | ~ (reply-only) | — | ✓ | ✓ | — | — | ✓ (RC) |
-| Imolatte/tg-claude | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
-| oscarsterling | ~ (channel reply) | — | — | ✓ | ✓ | — | ~ |
-| RichardAtCT | — | — | ✓ | ✓ | ~ | ✓ | ✓ |
-| JessyTsui | — (full trace) | — | — | ✓ | — | — | ✓ |
-| ccgram | — | — | — | ✓ | ✓ | — | ✓ |
+| Tool | Curated out | Multi-agent brand | Media out | Inbound | Q→buttons | Full mirror |
+|---|---|---|---|---|---|---|
+| **tg** | ✓ | ✓ | ✓ | ✓ | ✓ | — (by design) |
+| Anthropic Channels / RC | ~ (reply-only) | — | ✓ | ✓ | — | ✓ (RC) |
+| Imolatte/tg-claude | — | — | ✓ | ✓ | ✓ | ✓ |
+| oscarsterling | ~ (channel reply) | — | — | ✓ | ✓ | ~ |
+| RichardAtCT | — | — | ✓ | ✓ | ~ | ✓ |
+| JessyTsui | — (full trace) | — | — | ✓ | — | ✓ |
+| ccgram | — | — | — | ✓ | ✓ | ✓ |
 
-### Implementation
-
-| Tool | Connects via | Inbound inject | Completion detect | Bootstrap |
-|---|---|---|---|---|
-| **tg-cli** | `tg` CLI (out) + tmux send-keys (in) / custom channel (○) | `send-keys -l` / bracketed paste | none (by design) | auto-start from `tg` |
-| Anthropic Channels / RC | MCP channel / RC tunnel | `<channel>` event / RC | n/a | `--channels` / RC launch |
-| Imolatte/tg-claude | CLI subprocess (stream-json) + hooks; opt. tmux | stream-json / tmux | hooks (Stop/PreToolUse) | spawns or manual tmux |
-| oscarsterling | tmux send-keys + official channel | `send-keys -l` | Stop hook (anti-leak) | manual tmux |
-| RichardAtCT | Agent SDK (CLI fallback) | n/a (spawns session) | SDK events | bot launches session |
-| JessyTsui | tmux / PTY injection | send-keys + scrape | capture-pane scrape | manual tmux / PTY |
-| ccgram | tmux / Ghostty / PTY | send-keys + hook | capture-pane scrape | auto-create or manual |
+---
 
 ## Ecosystem
 
-Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
+`tg` is part of a small toolkit of CLIs built for AI coding agents — call them from any shell or harness:
 
-- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
-- **[review-cli](https://github.com/alex-mextner/review-cli)** — multi-model read-only code review
-- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
-- **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
+| Tool | What it does |
+|------|--------------|
+| [**tg**](https://github.com/alex-mextner/tg-cli) | Telegram bridge — agents push status/questions to your phone, you reply back, questions & permissions arrive as inline buttons. tmux-aware, auto-brands by agent. |
+| [review](https://github.com/alex-mextner/review-cli) | Multi-model read-only code review across providers (codex, claude, gemini, opencode), plus quorum & brainstorm panels. |
+| [draw](https://github.com/alex-mextner/draw-cli) | Text-to-image from the CLI via Hugging Face (FLUX by default). |
+
+Each tool installs a skill into your agent harnesses so agents know it exists — see Install.
+
+---
 
 ## License
 

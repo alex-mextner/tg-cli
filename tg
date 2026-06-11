@@ -29,6 +29,7 @@ import {
 } from "./features/autolink-tasks/state"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { findAgentInAncestry, parseProcList } from "./features/tg-ctl/discover"
+import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
 import { buildSendPlan } from "./features/auto-attach/normalize"
@@ -717,6 +718,12 @@ function extractBaseModel(modelName: string): string {
 // --- CLI entrypoint (only runs when executed directly, not when imported) ---
 if (import.meta.main) {
   const rawArgs = process.argv.slice(2)
+  // Register `tg` as a skill in agent harnesses. Runs before any flag/feature
+  // parsing so it works in a bare environment (e.g. from the installer).
+  // Exact-match only, so `tg "install-skill"` still sends that as a message.
+  if (rawArgs.length === 1 && rawArgs[0] === "install-skill") {
+    process.exit(installSkill())
+  }
   const home = process.env.HOME ?? "~"
 
   // Resolve feature flags FIRST: pull --feature/--no-feature out of argv, load
