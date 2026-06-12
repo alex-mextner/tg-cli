@@ -1038,7 +1038,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const byPane = new Map(candidates.map((c) => [c.paneId, c]))
     const sorted = order.map((pid) => byPane.get(pid)!).filter(Boolean)
     const token = `a${++agentTokenSeq}`
-    const payload = buildAgentSelectMessage(ctx.chatId, sorted, token, action.injectText)
+    // preserveOrder: keep the LRU/MRU ranking — groupBySession must not re-sort.
+    const payload = buildAgentSelectMessage(ctx.chatId, sorted, token, action.injectText, true)
     const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
     if (messageId === null) {
       await sendMessage(ctx, "couldn't post the reply picker")

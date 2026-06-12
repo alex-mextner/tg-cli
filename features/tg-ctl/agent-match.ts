@@ -129,9 +129,11 @@ export interface SessionGroup {
   candidates: AgentCandidate[]; // ordered by windowIndex
 }
 
-// Group candidates by tmux session, sessions in first-appearance order, panes
-// within a session by window index. Used to lay out the selection buttons.
-export function groupBySession(candidates: AgentCandidate[]): SessionGroup[] {
+// Group candidates by tmux session, sessions in first-appearance order. Within a
+// session, panes are sorted by window index UNLESS `preserveOrder` — the reply
+// picker passes the candidates already in LRU/MRU order and must keep it (a
+// windowIndex re-sort would discard the most-recent-first ranking).
+export function groupBySession(candidates: AgentCandidate[], preserveOrder = false): SessionGroup[] {
   const order: string[] = [];
   const bySession = new Map<string, AgentCandidate[]>();
   for (const c of candidates) {
@@ -142,10 +144,13 @@ export function groupBySession(candidates: AgentCandidate[]): SessionGroup[] {
       order.push(c.sessionName);
     }
   }
-  return order.map((session) => ({
-    session,
-    candidates: bySession.get(session)!.sort((a, b) => a.windowIndex - b.windowIndex),
-  }));
+  return order.map((session) => {
+    const inSession = bySession.get(session)!;
+    return {
+      session,
+      candidates: preserveOrder ? inSession : [...inSession].sort((a, b) => a.windowIndex - b.windowIndex),
+    };
+  });
 }
 
 // --- selection button payload ---
@@ -166,8 +171,9 @@ export function buildAgentSelectMessage(
   candidates: AgentCandidate[],
   token: string,
   messagePreview: string,
+  preserveOrder = false,
 ): AgentSelectPayload & { chat_id: number } {
-  const groups = groupBySession(candidates);
+  const groups = groupBySession(candidates, preserveOrder);
   const indexOf = new Map(candidates.map((c, i) => [c, i] as const));
   const lines: string[] = [];
   const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];

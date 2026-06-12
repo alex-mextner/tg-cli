@@ -101,6 +101,13 @@ test('group: sessions in first-appearance order, panes by window index', () => {
   expect(groups[0].candidates.map((c) => c.paneId)).toEqual(['%1', '%2']);
 });
 
+test('group: preserveOrder keeps the given (LRU/MRU) order within a session', () => {
+  // reply picker passes candidates already in LRU/MRU order — a windowIndex
+  // re-sort would discard the most-recent-first ranking (codex review P2).
+  const groups = groupBySession([cand('%2', 'work', 5, 'recent'), cand('%1', 'work', 0, 'old')], true);
+  expect(groups[0].candidates.map((c) => c.paneId)).toEqual(['%2', '%1']);
+});
+
 // --- buttons round-trip ---
 
 test('buttons: one per candidate, callback round-trips to the right pane', () => {

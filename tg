@@ -1321,16 +1321,13 @@ if (import.meta.main) {
     return out
   }
 
-  const checkResponse = async (
-    resp: Response,
-    method: string,
-  ): Promise<Record<string, unknown> | undefined> => {
+  const checkResponse = async (resp: Response, method: string): Promise<unknown> => {
     if (!resp.ok) {
       const body = await resp.text()
       console.error(`Telegram API error (${method}): ${resp.status} ${body}`)
       process.exit(1)
     }
-    const json = (await resp.json()) as { ok: boolean; description?: string; result?: Record<string, unknown> }
+    const json = (await resp.json()) as { ok: boolean; description?: string; result?: unknown }
     if (!json.ok) {
       console.error(`Telegram API error (${method}): ${json.description ?? "unknown error"}`)
       process.exit(1)
@@ -1361,6 +1358,18 @@ if (import.meta.main) {
       // best-effort: never let route bookkeeping break a send
     }
   }
+  // A Bot API send `result` is a Message (text/photo/document) or an array of
+  // Messages (sendMediaGroup) — record a route for every message id so a reply to
+  // ANY of them (including a media report) routes to this pane (codex review P2).
+  const recordRouteFromResult = (result: unknown): void => {
+    if (Array.isArray(result)) {
+      for (const m of result) recordRouteFromResult(m)
+      return
+    }
+    if (result && typeof result === "object" && typeof (result as { message_id?: unknown }).message_id === "number") {
+      recordRoute((result as { message_id: number }).message_id)
+    }
+  }
 
   const sendMessage = async (text: string, formatValue: Format, entities: EmojiEntity[]): Promise<void> => {
     const parseMode = parseModeFor(formatValue, text)
@@ -1382,8 +1391,7 @@ if (import.meta.main) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     })
-    const result = await checkResponse(resp, "sendMessage")
-    if (result && typeof result.message_id === "number") recordRoute(result.message_id)
+    recordRouteFromResult(await checkResponse(resp, "sendMessage"))
   }
 
   // Per-item photo/document sending now lives in the Transport below (the
@@ -1633,7 +1641,7 @@ if (import.meta.main) {
       if (cap) form.append("caption", cap)
       if (parseMode) form.append("parse_mode", parseMode)
       const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
-      await checkResponse(resp, "sendPhoto")
+      recordRouteFromResult(await checkResponse(resp, "sendPhoto"))
     },
     sendDocument: async (item, cap, fmt) => {
       const { body, name } = blobFor(item)
@@ -1645,7 +1653,7 @@ if (import.meta.main) {
       if (cap) form.append("caption", cap)
       if (parseMode) form.append("parse_mode", parseMode)
       const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
-      await checkResponse(resp, "sendDocument")
+      recordRouteFromResult(await checkResponse(resp, "sendDocument"))
     },
     // Album send (FIX 2): 2..10 same-type items as a single Telegram media
     // group. Each item is uploaded as a multipart field and referenced from the
@@ -1672,7 +1680,7 @@ if (import.meta.main) {
       })
       form.append("media", JSON.stringify(media))
       const resp = await fetch(`${API}/sendMediaGroup`, { method: "POST", body: form })
-      await checkResponse(resp, "sendMediaGroup")
+      recordRouteFromResult(await checkResponse(resp, "sendMediaGroup"))
     },
   }
 
