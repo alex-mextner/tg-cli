@@ -3,7 +3,8 @@
 // forces HTML whenever verified tickets exist, same as line-spec quotes), and
 // BEFORE line-spec quote insertion so injected <pre> bodies are never touched.
 
-import { findCodeMatches } from './detect';
+import { linkifyCompound } from '../autolink-refs/compound';
+import { findCodeMatches, ticketLeads } from './detect';
 import type { TicketInfo } from './linear';
 
 export function escapeHtml(s: string): string {
@@ -73,6 +74,15 @@ function linkifyTextSegment(text: string, tickets: Map<string, TicketInfo>): str
   return out;
 }
 
+// Compound-aware ticket linkify (item 7): links the lead code AND every bare
+// trailing number of a range/list group (HYP-100..103 → links 100 and 103),
+// mapping each to its verified ticket URL. For a separator-free code this is
+// byte-identical to linkifyCodes, so it is a safe drop-in.
+export function linkifyTicketsCompound(html: string, tickets: Map<string, TicketInfo>): string {
+  if (tickets.size === 0) return html;
+  return linkifyCompound(html, ticketLeads, (key, value) => tickets.get(`${key}-${value}`)?.url ?? null);
+}
+
 // A pre-rendered reference line contributed by a sibling feature (autolink-prs).
 // `label` is the already-linkified anchor (or plain text) for the left side; the
 // title is escaped and appended as `label — title`. This lets autolink-tasks own
@@ -96,6 +106,14 @@ export interface AutolinkExtras {
   issues?: LinkEntry[];
   // Entries rendered in their OWN block AFTER the tickets/issues block (PRs).
   prs?: LinkEntry[];
+  // Style + escape the single-ticket first-line title (item 5: Unicode Bold
+  // Script). Takes the RAW title, returns final HTML. Defaults to plain
+  // escapeHtml so callers without styling keep the historical behavior.
+  styleTitle?: (raw: string) => string;
+  // Override the ticket-code body linkify (item 7: compound ranges/lists).
+  // Defaults to the legacy single-code linkifyCodes so existing callers are
+  // unchanged. Receives the rendered body, returns it with tickets linked.
+  linkifyTickets?: (html: string) => string;
 }
 
 /**
@@ -122,13 +140,14 @@ export function applyAutolink(
   const prs = extras.prs ?? [];
   if (tickets.length === 0 && issues.length === 0 && prs.length === 0) return body;
 
-  let out = linkifyCodes(body, new Map(tickets.map((t) => [t.code, t])));
+  const ticketMap = new Map(tickets.map((t) => [t.code, t]));
+  let out = (extras.linkifyTickets ?? ((h: string) => linkifyCodes(h, ticketMap)))(body);
   if (extras.linkify) out = extras.linkify(out);
 
   // A single ticket with no sibling issues keeps the first-line title behavior.
   // Any issue forces the block form (issues never ride the first line).
   if (tickets.length === 1 && issues.length === 0) {
-    const title = escapeHtml(tickets[0].title);
+    const title = (extras.styleTitle ?? escapeHtml)(tickets[0].title);
     if (hasPrefixLine) {
       const lines = out.split('\n');
       lines[0] = `${lines[0]} ${title}`;

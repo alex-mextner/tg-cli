@@ -4,8 +4,9 @@
 // the GitHub-specific bits: a tag-safe #N linkifier and the LinkEntry adapters
 // for issues (merged into the tickets block) and PRs (their own block).
 
+import { linkifyCompound } from '../autolink-refs/compound';
 import { escapeHtml, type LinkEntry } from '../autolink-tasks/render';
-import { findRefMatches } from './detect';
+import { findRefMatches, refLeads } from './detect';
 import type { GhRef } from './resolve';
 
 function escapeAttr(s: string): string {
@@ -67,6 +68,15 @@ function linkifyTextSegment(text: string, refs: Map<number, GhRef>): string {
     out += rebuilt + piece.slice(cursor);
   }
   return out;
+}
+
+// Compound-aware #N linkify (item 7): links the lead #N AND every bare trailing
+// number of a range/list group (#100..103 → links #100 and 103). A
+// separator-free ref renders byte-identical to linkifyRefs, so it is a safe
+// drop-in for the autolink-prs body pass.
+export function linkifyRefsCompound(html: string, refs: Map<number, GhRef>): string {
+  if (refs.size === 0) return html;
+  return linkifyCompound(html, refLeads, (_key, value) => refs.get(value)?.url ?? null);
 }
 
 /**

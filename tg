@@ -10,17 +10,18 @@ import {
   resolveFeatures,
 } from "./features/auto-attach/feature-flags"
 import { mergeIntoCache, splitByCache } from "./features/autolink-tasks/cache"
-import { detectTicketCodes } from "./features/autolink-tasks/detect"
+import { detectTicketCodesExpanded } from "./features/autolink-tasks/detect"
 import { probeTickets, type Runner, type TicketInfo } from "./features/autolink-tasks/linear"
 import { convertMdToPdf, isConvertibleMd, type ConvertDeps } from "./features/md-pdf/convert"
-import { applyAutolink } from "./features/autolink-tasks/render"
+import { applyAutolink, linkifyTicketsCompound } from "./features/autolink-tasks/render"
+import { styleTaskTitle, styleWindowName } from "./features/prefix-style/style"
 import {
   mergeIntoCache as mergeGhCache,
   splitByCache as splitGhCache,
 } from "./features/autolink-prs/cache"
-import { detectRefs } from "./features/autolink-prs/detect"
+import { detectRefsExpanded } from "./features/autolink-prs/detect"
 import { probeRefsInRepo, probeRepo, type GhRef } from "./features/autolink-prs/resolve"
-import { buildEntries, linkifyRefs } from "./features/autolink-prs/render"
+import { buildEntries, linkifyRefsCompound } from "./features/autolink-prs/render"
 import {
   markHint,
   parseHintState,
@@ -1012,7 +1013,10 @@ if (import.meta.main) {
   }
 
   // --- Tmux context ---
-  const getTmuxPrefix = (): string => {
+  // The raw tmux window name (no brackets). buildPrefix wraps it in [] and
+  // styles it (item 5: Mathematical Sans-Serif Bold, with a <b> fallback for
+  // Cyrillic/non-Latin names the math block can't represent).
+  const getTmuxWindow = (): string => {
     if (!process.env.TMUX) return ""
     try {
       const pane = process.env.TMUX_PANE
@@ -1023,7 +1027,7 @@ if (import.meta.main) {
       })
       if (result.exitCode === 0) {
         const name = new TextDecoder().decode(result.stdout).trim()
-        if (name) return `[${name}]`
+        if (name) return name
       }
     } catch {
       // ignore — tmux not available or not in a pane
@@ -1031,19 +1035,25 @@ if (import.meta.main) {
     return ""
   }
 
-  const tmuxPrefix = getTmuxPrefix()
+  const tmuxWindow = getTmuxWindow()
 
-  // --- Build prefix with custom emoji ---
-  const buildPrefix = (): ParsedText => {
-    const parts: string[] = []
-    const entities: EmojiEntity[] = []
-    let offset = 0
+  // --- Build the message prefix (branded emoji + styled [window]) ---
+  // Returns the prefix in two finished forms — `html` (custom emoji →
+  // <tg-emoji>, window name → Mathematical Sans-Serif Bold or an escaped <b>
+  // fallback) and `plain` (unicode only, no tags) — plus `forceHtml`, true when
+  // the html form carries a real tag (custom emoji, or the <b> Cyrillic
+  // fallback) so the whole message MUST be sent as HTML. `present` replaces the
+  // old `prefix.text.length > 0` signal. The emoji tag + styled window are ours,
+  // not user-authored HTML, so renderText keeps the caption's escaping separate.
+  const buildPrefix = (): { html: string; plain: string; present: boolean; forceHtml: boolean } => {
+    let html = ""
+    let plain = ""
+    let forceHtml = false
 
     if (AI_EMOJI) {
-      // Convert AI_EMOJI (Unicode) to custom emoji if available
+      // Resolve the branded custom-emoji id (exact key, then substring match).
       const base = extractBaseModel(MODEL)
       let emojiId = EMBEDDABLE_EMOJI_MAP[base]
-      // If not found by exact key, try substring matching
       if (!emojiId) {
         for (const [key, id] of Object.entries(EMBEDDABLE_EMOJI_MAP)) {
           if (base.includes(key)) {
@@ -1053,29 +1063,27 @@ if (import.meta.main) {
         }
       }
       if (emojiId) {
-        entities.push({
-          type: "custom_emoji",
-          offset: offset,
-          length: AI_EMOJI.length,
-          custom_emoji_id: emojiId,
-        })
+        html += `<tg-emoji emoji-id="${emojiId}">${AI_EMOJI}</tg-emoji>`
+        forceHtml = true // a custom-emoji tag only renders in HTML mode
+      } else {
+        html += escapeHtml(AI_EMOJI) // no branded id → plain unicode emoji
       }
-      parts.push(AI_EMOJI)
-      offset += AI_EMOJI.length
+      plain += AI_EMOJI
     }
 
-    if (tmuxPrefix) {
-      if (parts.length > 0) {
-        parts.push(" ")
-        offset += 1
+    if (tmuxWindow) {
+      if (plain.length > 0) {
+        html += " "
+        plain += " "
       }
-      parts.push(tmuxPrefix)
-      offset += tmuxPrefix.length
+      const styled = styleWindowName(tmuxWindow)
+      html += `[${styled.html}]`
+      plain += `[${styled.plain}]`
+      if (styled.tag) forceHtml = true // the <b> Cyrillic fallback forces HTML
     }
 
-    if (parts.length === 0) return { text: "", entities: [] }
-    parts.push("\n")
-    return { text: parts.join(""), entities }
+    if (!plain && !html) return { html: "", plain: "", present: false, forceHtml: false }
+    return { html: html + "\n", plain: plain + "\n", present: true, forceHtml }
   }
 
   const { items, caption: rawCaption, format } = parsed
@@ -1125,7 +1133,7 @@ if (import.meta.main) {
   }
   let autolinkTickets: TicketInfo[] = []
   if (features["autolink-tasks"] !== false && caption) {
-    const codes = detectTicketCodes(caption)
+    const codes = detectTicketCodesExpanded(caption)
     if (codes.length > 0) {
       // 1h response cache (positive AND negative verdicts) so repeated reports
       // mentioning the same tickets don't re-spawn the linear CLI every send.
@@ -1211,7 +1219,7 @@ if (import.meta.main) {
   const ghLoginHint = (): void =>
     hintOnce("gh-login", "autolink-prs: the gh CLI is not authenticated. Run: gh auth login (shown once)")
   if (features["autolink-prs"] !== false && caption) {
-    const refs = detectRefs(caption)
+    const refs = detectRefsExpanded(caption)
     if (refs.length > 0) {
       autolinkRefOrder = refs
       // Resolve repo identity first — the cache is keyed by repo (#260 means
@@ -1393,26 +1401,21 @@ if (import.meta.main) {
   const prefix = buildPrefix()
   const renderText = (stripped: string, fmt: Format): { text: string; format: Format } => {
     const parsedCaption = parseEmojiHelpers(stripped)
-    const finalText = prefix.text + parsedCaption.text
-    const finalEntities: EmojiEntity[] = [
-      ...prefix.entities,
-      ...parsedCaption.entities.map((e) => ({ ...e, offset: e.offset + prefix.text.length })),
-    ]
-    // The transmitter only deals in (string, format). Custom-emoji entities are
-    // offset-based and would be invalidated by the >4096 splitter, so we render
-    // them to inline <tg-emoji> HTML now. Emoji always live in the prefix
-    // (message start), so they never straddle a split boundary.
-    // "User HTML" = user asked for it or wrote real tags → leave verbatim.
-    // "Forced HTML" = emoji present, OR we will inject line-spec quotes, but no
-    // user HTML → escape the surrounding plain text (&<>) so literal characters
-    // can't break parsing.
-    const userHtml = fmt === "html" || detectHtmlTags(finalText)
-    const renderToHtml = userHtml || finalEntities.length > 0 || hasQuotes || hasAutolink
-    if (!renderToHtml) return { text: finalText, format: "plain" }
-    return {
-      text: convertEntitiesToHtml(finalText, finalEntities, !userHtml),
-      format: "html",
-    }
+    // buildPrefix already rendered the prefix to finished html/plain (its emoji
+    // tag and styled [window] are OURS, not user-authored HTML), so userHtml is
+    // decided by the CAPTION alone. The caption's own custom-emoji entities are
+    // rendered to inline <tg-emoji> here (offset-based, they would be
+    // invalidated by the >4096 splitter); the trusted prefix is then prepended.
+    //   "User HTML"  = caption asked for --format html or wrote real tags.
+    //   "Forced HTML" = a custom emoji / <b> window fallback, line-spec quotes,
+    //     or autolink — escape the caption's plain text so literals can't break
+    //     parsing.
+    const userHtml = fmt === "html" || detectHtmlTags(parsedCaption.text)
+    const renderToHtml =
+      userHtml || prefix.forceHtml || parsedCaption.entities.length > 0 || hasQuotes || hasAutolink
+    if (!renderToHtml) return { text: prefix.plain + parsedCaption.text, format: "plain" }
+    const captionHtml = convertEntitiesToHtml(parsedCaption.text, parsedCaption.entities, !userHtml)
+    return { text: prefix.html + captionHtml, format: "html" }
   }
 
   // --- File contents for R2 (duplicated-paste detection) ---
@@ -1448,10 +1451,15 @@ if (import.meta.main) {
   if (hasAutolink && plan.textMessages.length > 0) {
     const { issues, prs } = buildEntries(autolinkRefs, autolinkRefOrder)
     plan.textMessages[0] = {
-      text: applyAutolink(plan.textMessages[0].text, autolinkTickets, prefix.text.length > 0, {
-        linkify: hasRefs ? (html: string): string => linkifyRefs(html, autolinkRefs) : undefined,
+      text: applyAutolink(plan.textMessages[0].text, autolinkTickets, prefix.present, {
+        linkifyTickets: hasTickets
+          ? (html: string): string =>
+              linkifyTicketsCompound(html, new Map(autolinkTickets.map((t) => [t.code, t])))
+          : undefined,
+        linkify: hasRefs ? (html: string): string => linkifyRefsCompound(html, autolinkRefs) : undefined,
         issues,
         prs,
+        styleTitle: styleTaskTitle,
       }),
       format: "html",
     }
