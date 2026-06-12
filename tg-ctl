@@ -15,6 +15,12 @@
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { join, resolve } from "path"
+import {
+  buildAgentSelectMessage,
+  groupBySession,
+  matchWindows,
+  type AgentCandidate,
+} from "./features/tg-ctl/agent-match"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { findAgentInPane, parsePaneList, parseProcList, pickTargetPane } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
@@ -257,6 +263,42 @@ function discoverTarget(ctx: Ctx): DiscoverResult {
   const { panes, procs } = snapshot()
   const reg = readRegistration(ctx.paths)
   return pickTargetPane(panes, procs, reg, reg?.sessionName ?? ctx.cfg.session)
+}
+
+// All tmux panes that host an agent, as /agent selection candidates (item 1).
+// Window names are fetched in a SEPARATE tmux call so the core PANE_FORMAT /
+// parsePaneList (relied on by inject + q→buttons) stays untouched; a pane with
+// no name falls back to its session name.
+function listAgentCandidates(): AgentCandidate[] {
+  const { panes, procs } = snapshot()
+  const nameByPane = new Map<string, string>()
+  try {
+    const r = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{window_name}"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    if (r.exitCode === 0) {
+      for (const line of r.stdout.toString().split("\n")) {
+        const tab = line.indexOf("\t")
+        if (tab > 0) nameByPane.set(line.slice(0, tab), line.slice(tab + 1).trim())
+      }
+    }
+  } catch {
+    // tmux missing — candidates will just use session names as window names
+  }
+  const out: AgentCandidate[] = []
+  for (const pane of panes) {
+    const found = findAgentInPane(pane, procs)
+    if (!found) continue
+    out.push({
+      paneId: pane.paneId,
+      sessionName: pane.sessionName,
+      windowIndex: pane.windowIndex,
+      windowName: nameByPane.get(pane.paneId) || pane.sessionName,
+      agent: found.agent,
+    })
+  }
+  return out
 }
 
 // Execute an InjectStep plan. verify-pane re-runs discovery on a CURRENT
@@ -623,6 +665,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   writeFileSync(ctx.paths.pid, `${process.pid}\n`)
   const pendingButtons = new Map<string, PendingButton>()
   const activeButtonKeys = new Set<string>()
+  // /agent selection awaiting a button tap: token → message + candidate list.
+  const pendingAgent = new Map<
+    string,
+    { message: string; candidates: AgentCandidate[]; messageId: number | null; timer: ReturnType<typeof setTimeout> }
+  >()
+  let agentTokenSeq = 0
   let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
     try {
@@ -683,6 +731,111 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     return true
+  }
+
+  // Inject a wrapped message into ONE specific pane (the /agent target). The
+  // plan's verify-pane step still re-checks the pane hosts an agent first.
+  const injectToPane = async (paneId: string, from: string, msg: string): Promise<{ ok: boolean; error?: string }> => {
+    const res = await executeInjectSteps(buildTextInjectPlan(paneId, wrapInbound(ctx.cfg.injectWrap, from, msg)))
+    return res.ok ? { ok: true } : { ok: false, error: res.error }
+  }
+
+  // /agent routing (item 1): bare list, confident phonetic match → direct
+  // inject, ambiguous / no-selector → session-grouped selection buttons.
+  const handleAgentRoute = async (action: Extract<Action, { kind: "agent-route" }>): Promise<boolean> => {
+    const candidates = listAgentCandidates()
+    if (candidates.length === 0) {
+      await sendMessage(ctx, NO_AGENT_REPLY)
+      return false
+    }
+    if (!action.all.trim()) {
+      const groups = groupBySession(candidates)
+      const lines = groups.flatMap((g) => [`▸ ${g.session}`, ...g.candidates.map((c) => `   ${c.windowName} · ${c.agent}`)])
+      await sendMessage(ctx, `agents (address with /agent <window> <message>):\n${lines.join("\n")}`)
+      return true
+    }
+
+    let subset = candidates
+    let message = action.all
+    if (action.selector) {
+      const m = matchWindows(action.selector, candidates)
+      if (m.matches.length > 0) {
+        if (!action.rest.trim()) {
+          const names = m.matches.map((c) => c.windowName).join(", ")
+          await sendMessage(ctx, `matched ${names} — add a message: /agent ${action.selector} <message>`)
+          return true
+        }
+        if (m.confident) {
+          const target = m.matches[0]
+          const res = await injectToPane(target.paneId, action.from, action.rest)
+          if (!res.ok) {
+            await sendMessage(ctx, res.error ?? "inject failed")
+            return false
+          }
+          await sendMessage(ctx, `→ ${target.windowName} · ${target.agent}`)
+          return true
+        }
+        subset = m.matches
+        message = action.rest
+      }
+      // selector matched nothing → the whole text is the message, ask over all
+    }
+
+    if (subset.length === 1) {
+      const target = subset[0]
+      const res = await injectToPane(target.paneId, action.from, message)
+      if (!res.ok) {
+        await sendMessage(ctx, res.error ?? "inject failed")
+        return false
+      }
+      await sendMessage(ctx, `→ ${target.windowName} · ${target.agent}`)
+      return true
+    }
+
+    const token = `a${++agentTokenSeq}`
+    const payload = buildAgentSelectMessage(ctx.chatId, subset, token, message)
+    const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+    // Picker send failed (Telegram rejected / >4096-char list / network): do NOT
+    // store a pending route it can never resolve, and do NOT earn a 👀 receipt.
+    if (messageId === null) {
+      await sendMessage(ctx, "couldn't post the agent picker — try a narrower /agent <window>")
+      return false
+    }
+    const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
+    pendingAgent.set(token, { message, candidates: subset, messageId, timer })
+    return true
+  }
+
+  const handleAgentCallback = async (action: Extract<Action, { kind: "agent-callback" }>): Promise<boolean> => {
+    const pending = pendingAgent.get(action.token)
+    if (!pending) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    // A tap must come from THIS prompt's Telegram message. After a restart
+    // agentTokenSeq reuses tokens (a1, a2…), so a tap on an OLD prompt that
+    // reused the token must not consume the new pending route (codex P2).
+    if (pending.messageId !== null && action.messageId !== null && action.messageId !== pending.messageId) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    const target = pending.candidates[action.index]
+    if (!target) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    pendingAgent.delete(action.token)
+    clearTimeout(pending.timer)
+    const res = await injectToPane(target.paneId, action.from, pending.message)
+    await answerCallbackQuery(ctx, action.callbackQueryId, res.ok ? "sent" : "failed")
+    if (pending.messageId !== null) {
+      void editMessageText(
+        ctx,
+        pending.messageId,
+        res.ok ? `→ ${target.windowName} · ${target.agent}` : `inject failed: ${res.error ?? ""}`,
+      )
+    }
+    return res.ok
   }
 
   const downloadMedia = async (action: Extract<Action, { kind: "download-media" }>): Promise<boolean> => {
@@ -788,6 +941,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "status":
         await sendMessage(ctx, composeStatus(ctx))
         return true
+      case "agent-route":
+        return handleAgentRoute(action)
+      case "agent-callback":
+        return handleAgentCallback(action)
       case "inject-text":
         return injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text))
       case "inject-key":
@@ -873,6 +1030,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         nowSec: Math.floor(Date.now() / 1000),
         currentOffset: offset,
         wrap: (name, msg) => wrapInbound(ctx.cfg.injectWrap, name, msg),
+        // Local-time quote anchor for replies (item 3); pure module defaults to UTC.
+        fmtTime: (s) => {
+          const d = new Date(s * 1000)
+          const p = (n: number): string => String(n).padStart(2, "0")
+          return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+        },
       })
 
       // At-most-once (spec §10): persist the offset BEFORE acting. A crash

@@ -48,6 +48,12 @@ export interface TgDocument {
   file_size?: number;
 }
 
+// The user's partial selection when replying (Bot API 7.0+): the substring of
+// the replied-to message they highlighted. Forwarded verbatim into the agent.
+export interface TgTextQuote {
+  text: string;
+}
+
 export interface TgMessage {
   message_id: number;
   from?: TgUser;
@@ -57,6 +63,8 @@ export interface TgMessage {
   caption?: string;
   photo?: TgPhotoSize[];
   document?: TgDocument;
+  reply_to_message?: TgMessage; // the message this one replies to (items 2,3)
+  quote?: TgTextQuote; // the user's partial-quote selection from it (item 2)
 }
 
 export interface TgCallbackQuery {
@@ -84,6 +92,19 @@ export type Action =
   | { kind: 'inject-key'; key: 'Escape' } // /stop
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
   | { kind: 'status' } // /status — entrypoint composes the reply
+  // /agent [<win>] <msg> — entrypoint discovers panes, fuzzy-matches the window
+  // (phonetic), routes <msg> to that agent or asks via session-grouped buttons.
+  | { kind: 'agent-route'; selector: string | null; rest: string; all: string; from: string }
+  // A tap on a /agent selection button (tga:<token>:<index>): the entrypoint
+  // looks up the pending message + candidate and injects it into the chosen pane.
+  | {
+      kind: 'agent-callback';
+      callbackQueryId: string;
+      token: string;
+      index: number;
+      from: string;
+      messageId: number | null;
+    }
   | { kind: 'reply'; text: string } // sendMessage back to the chat
   | { kind: 'answer-callback'; callbackQueryId: string; text: string }
   // messageId is the Telegram message the tapped button belongs to (null when
