@@ -50,7 +50,7 @@ import {
   runGitReal,
 } from "./features/auto-attach/worktree"
 
-export const VERSION = "1.5.1"
+export const VERSION = "1.6.0"
 
 // --- Config loader ---
 function loadEnv(filePath: string): Record<string, string> {

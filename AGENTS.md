@@ -59,10 +59,18 @@ tests can pass fakes.
   `linear` CLI, and rewrites text with hyperlinks.
 - `features/autolink-prs/` — detects GitHub `#N` refs, resolves them against the cwd repo via
   `gh` (issues merge into the tickets block, PRs get their own block), repo-keyed 1 h cache.
+- `features/autolink-refs/` — shared compound-ref parser (ranges/lists like `HYP-100..103/110`,
+  `#5-7,9`): body links the written numbers, the bottom block enumerates the full range. Used by
+  both autolink features (docs/specs/autolink-compound.md).
+- `features/prefix-style/` — Unicode styling of the outbound prefix: tmux window name → Sans-Serif
+  Bold, single-ticket task title → Bold Script, with `<b>`/`<i>` fallback for Cyrillic
+  (docs/specs/unicode-prefix-styling.md).
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile
-  helpers, the update→action step function (allowlist, staleness, command split), tmux inject
-  plans as data, agent pane discovery (process-tree walk — a Claude Code pane reports its
-  VERSION string as `pane_current_command`, not `claude`). Shared shapes in `types.ts`.
+  helpers, the update→action step function (allowlist, staleness, command split, `/agent`
+  routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree
+  walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`),
+  and `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons).
+  Shared shapes in `types.ts`.
 
 ### Feature Flags
 
@@ -79,7 +87,7 @@ touching any feature.
 
 ## Conventions
 
-- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All ~446 tests must pass.
+- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All ~559 tests must pass.
 - **Codex review** before committing non-trivial changes: `codex exec review --uncommitted`
   (findings appear at the end of output after thinking/exec noise — use `tail -80`).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in

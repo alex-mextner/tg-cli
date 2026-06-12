@@ -124,6 +124,16 @@ Plain text from Telegram is injected into the agent's tmux pane as:
 ```
 The agent reads it and responds by calling `tg`.
 
+**Reply with a quote (v1.6.0)** — reply to a message (optionally highlighting a
+part of it) and the agent receives a quote anchor identifying what you answered:
+`↩ «[date time] the quoted text…»` above your message.
+
+### Addressing a specific agent (v1.6.0)
+With several agents running, `/agent <window> <message>` routes to one of them.
+The window name is fuzzy-matched (phonetic, Cyrillic-aware), so `/agent апи deploy`
+finds the `api-bot` window. If the target is ambiguous or omitted, you get inline
+buttons grouped by tmux session; tap one to route. Bare `/agent` lists the agents.
+
 ### Q→buttons (v1.5.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
 
@@ -133,6 +143,7 @@ Agent questions and permission prompts are forwarded to Telegram as inline butto
 | `/stop` | Inject Escape — interrupts the current agent turn, session survives |
 | `/kill` | SIGINT the agent — session ends |
 | `/status` | Report daemon state |
+| `/agent [<window>] <msg>` | Route a message to a specific agent (fuzzy window match, else selection buttons) |
 
 Photos and documents sent from Telegram are downloaded to `~/.cache/tg-cli/inbound/` and the local path is injected for the agent to read.
 

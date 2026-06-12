@@ -3,6 +3,32 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.6.0
+
+Agent addressing, reply quotes, prefix styling, and compound autolinks.
+
+- **`/agent [<window>] <message>`** — address a specific agent when several run
+  at once. The window is fuzzy-matched with phonetic normalization (Cyrillic→
+  Latin, sound-folding), a confident match routes the message straight to that
+  pane, and an ambiguous / unspecified target shows session-grouped inline
+  selection buttons. Bare `/agent` lists the addressable agents.
+  (`features/tg-ctl/agent-match.ts`, docs/specs/agent-addressing.md.)
+- **Reply quotes** — replying to a message in the control chat forwards a quote
+  anchor into the agent: `↩ «[date time] <quote>…»`. A partial Telegram quote
+  selection is forwarded verbatim; otherwise the beginning of the replied-to
+  message is used. (docs/specs/reply-quotes.md.)
+- **Unicode prefix styling** — the tmux window name in `[]` renders in
+  Mathematical Sans-Serif Bold and a single-ticket task title in Bold Script,
+  with a `<b>`/`<i>` fallback for Cyrillic names the math blocks can't represent.
+  (`features/prefix-style/`, docs/specs/unicode-prefix-styling.md.)
+- **Compound autolinks** — one token may carry a range or list of refs
+  (`HYP-100..103/110`, `#5-7,9`): the body links only the written numbers
+  (range endpoints), and the bottom reference block enumerates the full range.
+  (`features/autolink-refs/`, docs/specs/autolink-compound.md.)
+- Documented the q→buttons prerequisites and the missing hook installer
+  (docs/q-buttons-prerequisites.md), and a WhatsApp companion-transport
+  implementation spec (docs/specs/whatsapp-transport.md, spec only).
+
 ## 1.5.1
 
 Agent detection fix (outbound branding):
