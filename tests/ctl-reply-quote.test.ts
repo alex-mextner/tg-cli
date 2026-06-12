@@ -68,11 +68,13 @@ function upd(id: number, m: TgMessage): TgUpdate {
   return { update_id: id, message: m };
 }
 
-test('reply with prose → inject-text with the quote anchor + ack', () => {
+test('reply with prose → reply-route with the quote anchor + ack', () => {
   const r = stepUpdates([upd(1, reply('please fix', 'Original report text', 'report text'))], opts);
   expect(r.actions[0]).toEqual({
-    kind: 'inject-text',
-    text: '↩ «[2026-06-12 14:30] report text…»\n[TG from Alex] please fix — reply via tg',
+    kind: 'reply-route',
+    replyToMessageId: 0,
+    injectText: '↩ «[2026-06-12 14:30] report text…»\n[TG from Alex] please fix — reply via tg',
+    from: 'Alex',
   });
   expect(r.actions[1]).toEqual({ kind: 'ack', messageId: 9 });
 });

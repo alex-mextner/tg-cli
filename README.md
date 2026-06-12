@@ -134,8 +134,12 @@ The window name is fuzzy-matched (phonetic, Cyrillic-aware), so `/agent апи d
 finds the `api-bot` window. If the target is ambiguous or omitted, you get inline
 buttons grouped by tmux session; tap one to route. Bare `/agent` lists the agents.
 
-### Q→buttons (v1.5.0)
+### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
+
+**Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hook into `~/.claude/settings.json` (backup first, existing hooks preserved), then restart the agent session. `tg-ctl status` tells you whether the hook is installed. (Codex/opencode: see the command's printed guidance.)
+
+While an agent is **waiting on a question**, new messages you send it are **deferred** (queued, marked ✍️ on the message) and delivered once the question is answered — they don't interrupt the prompt.
 
 ### Commands
 | Command | Effect |

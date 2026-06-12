@@ -69,8 +69,10 @@ tests can pass fakes.
   helpers, the update→action step function (allowlist, staleness, command split, `/agent`
   routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree
   walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`),
-  and `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons).
-  Shared shapes in `types.ts`.
+  `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons),
+  `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker), `hook-normalize.ts`
+  (raw harness hook payload → ButtonRequest), and `hook-install.ts` (idempotent q→buttons hook
+  merge for `tg-ctl install-hooks`). Shared shapes in `types.ts`.
 
 ### Feature Flags
 
@@ -87,7 +89,7 @@ touching any feature.
 
 ## Conventions
 
-- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All ~559 tests must pass.
+- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All ~578 tests must pass.
 - **Codex review** before committing non-trivial changes: `codex exec review --uncommitted`
   (findings appear at the end of output after thinking/exec noise — use `tail -80`).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in

@@ -113,11 +113,17 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     const name = m.from?.first_name || m.from?.username || 'tg';
     let action: Action | null = null;
     if (m.text) {
-      // A reply carrying prose forwards the quote anchor (items 2,3); a reply
-      // whose text is a /command still runs the command verbatim.
+      // A reply carrying prose forwards the quote anchor (items 2,3) via
+      // reply-route — the daemon picks the recognized origin pane or a LRU/MRU
+      // picker. A reply whose text is a /command still runs the command verbatim.
       action =
         m.reply_to_message && !m.text.startsWith('/')
-          ? { kind: 'inject-text', text: buildReplyInject(m, name, opts) }
+          ? {
+              kind: 'reply-route',
+              replyToMessageId: m.reply_to_message.message_id,
+              injectText: buildReplyInject(m, name, opts),
+              from: name,
+            }
           : textAction(m.text, name, opts);
     } else if (m.photo?.length) action = photoAction(u.update_id, m, name);
     else if (m.document) action = documentAction(u.update_id, m, name);

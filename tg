@@ -29,6 +29,8 @@ import {
   type HintKind,
 } from "./features/autolink-tasks/state"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
+import { botIdFromToken, ctlPaths } from "./features/tg-ctl/lock"
+import { appendRoute, parseRoutes, serializeRoutes } from "./features/tg-ctl/routes"
 import { findAgentInAncestry, parseProcList } from "./features/tg-ctl/discover"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
@@ -1319,16 +1321,44 @@ if (import.meta.main) {
     return out
   }
 
-  const checkResponse = async (resp: Response, method: string): Promise<void> => {
+  const checkResponse = async (
+    resp: Response,
+    method: string,
+  ): Promise<Record<string, unknown> | undefined> => {
     if (!resp.ok) {
       const body = await resp.text()
       console.error(`Telegram API error (${method}): ${resp.status} ${body}`)
       process.exit(1)
     }
-    const json = await resp.json() as { ok: boolean; description?: string }
+    const json = (await resp.json()) as { ok: boolean; description?: string; result?: Record<string, unknown> }
     if (!json.ok) {
       console.error(`Telegram API error (${method}): ${json.description ?? "unknown error"}`)
       process.exit(1)
+    }
+    return json.result
+  }
+
+  // Record an outbound message_id → this pane so the daemon can route a REPLY to
+  // the agent that produced it, and order the unrecognized-reply picker by
+  // LRU/MRU (docs/specs/reply-quotes.md). Best-effort, tmux-only; a corrupt or
+  // unwritable file just degrades the daemon to the picker.
+  const TMUX_PANE = process.env.TMUX_PANE
+  const ROUTES_PATH = TMUX_PANE
+    ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).routes
+    : null
+  const recordRoute = (messageId: number): void => {
+    if (!ROUTES_PATH || !TMUX_PANE) return
+    try {
+      const existing = parseRoutes(existsSync(ROUTES_PATH) ? readFileSync(ROUTES_PATH, "utf8") : null)
+      const next = appendRoute(existing, {
+        id: messageId,
+        paneId: TMUX_PANE,
+        cwd: process.cwd(),
+        ts: Math.floor(Date.now() / 1000),
+      })
+      writeFileSync(ROUTES_PATH, serializeRoutes(next))
+    } catch {
+      // best-effort: never let route bookkeeping break a send
     }
   }
 
@@ -1352,7 +1382,8 @@ if (import.meta.main) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     })
-    await checkResponse(resp, "sendMessage")
+    const result = await checkResponse(resp, "sendMessage")
+    if (result && typeof result.message_id === "number") recordRoute(result.message_id)
   }
 
   // Per-item photo/document sending now lives in the Transport below (the

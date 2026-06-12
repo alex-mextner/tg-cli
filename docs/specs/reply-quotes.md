@@ -37,23 +37,33 @@ the `[date time]` + `…` framing.
 ## Routing into the step function
 
 In `stepUpdates`, a text message that **is a reply** and whose text is **not a
-`/command`** becomes an `inject-text` action built by `buildReplyInject`; a reply
-whose text starts with `/` still runs the command verbatim (so you can reply
-`/stop` to a message). The reply inject is routed to the current target like any
-inbound message and earns the 👀 receipt.
+`/command`** becomes a `reply-route` action carrying the replied-to message id +
+the `buildReplyInject` text; a reply whose text starts with `/` still runs the
+command verbatim (so you can reply `/stop` to a message).
 
-## Scope boundary (reply-to-origin-pane routing)
+## Reply routing: recognized origin vs LRU/MRU picker (v1.6.0)
 
-This delivers the **quote forwarding** (items 2, 3): the agent receives the
-reply *with* the anchor identifying the original message. It routes to the
-daemon's current target (last-`tg`-sender registration), which is correct in the
-common single-active-agent case.
+`tg` records every outbound message id → `{paneId, cwd, ts}` into a bounded
+routes map (`features/tg-ctl/routes.ts`, `tg-ctl.<botid>.routes.json`, tmux-only,
+last 300). The daemon's `handleReplyRoute`:
 
-Routing a reply to the EXACT pane that produced the replied-to message — the
-`message_id → {paneId, cwd}` map written by `tg` on every send (spec
-`2026-06-10-tg-ctl-control-design.md` §16, deferred v1.1) — is the natural
-companion for multi-agent fan-in and remains a separate follow-up. The quote
-anchor already gives the receiving agent the context it needs to disambiguate.
+- **Recognized** — the replied-to id maps to a pane that STILL hosts an agent →
+  inject the reply (with its anchor) straight into that origin pane. This is the
+  multi-agent fan-in: replying to agent X's report reaches X, not the last
+  sender.
+- **Unrecognized** (id not in the map, or the pane is gone) → show the
+  session-grouped **window picker** ordered by **LRU+MRU**: most-recently-messaged
+  panes first, send-frequency as the tiebreaker, panes with no history last. Both
+  signals are derived from the same routes map (`aggregateUsage` + `orderByLruMru`)
+  — no separate usage state. A single agent skips the picker and injects directly.
+
+The picker reuses the `/agent` selection machinery (`pendingAgent`, `tga:`
+callbacks); the reply's pending message is stored `prewrapped` so the tap injects
+the anchored text verbatim (no double-wrap).
+
+Both paths honor defer-while-waiting: a reply to a pane with an open question is
+queued (✍️) and flushed when the question is answered (see
+`docs/q-buttons-prerequisites.md`).
 
 ## Non-goals
 

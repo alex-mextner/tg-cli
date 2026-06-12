@@ -4,10 +4,15 @@ Verification done 2026-06-12 on this machine.
 
 ## Short answer
 
-The **daemon half works and is tested**; the feature does **NOT** function
-end-to-end out of the box because the **agent-side hook is not installed and the
-repo ships no installer for it**. Agent questions never reach Telegram until that
-hook exists.
+The **daemon half works and is tested**. As of v1.6.0 the missing pieces are now
+shipped (this branch): a one-command **installer** (`tg-ctl install-hooks`)
+idempotently wires the Claude Code hook, `tg-ctl ask` **normalizes the raw
+harness payload** (so the installed hook is trivial), and `tg-ctl status` reports
+whether the hook is installed. Run `tg-ctl install-hooks` once + restart the
+agent session, and agent questions reach Telegram as buttons.
+
+> Original verification (2026-06-12) found the feature dead out of the box: the
+> hook was not installed and no installer existed. That gap is closed below.
 
 ## What is shipped and proven
 
@@ -23,17 +28,28 @@ hook exists.
 - A `tg-ctl run` daemon was **live on this machine** during verification
   (PID confirmed), so the socket path is real.
 
-## The blocker: no hook installed, no installer
+## Seamless setup (v1.6.0)
 
-- `~/.claude/settings.json` `PreToolUse` entries are `Bash`→rtk and
-  `EnterWorktree`→deps — **no `AskUserQuestion` / `PermissionRequest` → `tg-ctl
-  ask` hook**.
-- The only installer in the repo is `features/install-skill` (a SessionStart hook
-  for *skill awareness*) — unrelated. The q→buttons hook installer was explicitly
-  **deferred** in the spec (`docs/specs/2026-06-10-tg-ctl-control-design.md` §8,
-  §16 "Deferred: idempotent hook installer, Claude canary test").
+- **`tg-ctl install-hooks`** — idempotently merges into `~/.claude/settings.json`
+  (backing it up first): a `PreToolUse` matcher `AskUserQuestion` and a
+  `PermissionRequest` group, both running `tg-ctl ask`. Existing hooks are
+  preserved; re-running is a no-op. Pure merge in
+  `features/tg-ctl/hook-install.ts`. Codex/opencode get printed guidance (Codex
+  needs a manual `/hooks` trust; opencode is native SSE).
+- **`tg-ctl ask` normalizes the raw harness payload** — the hook pipes Claude
+  Code's native `PreToolUse(AskUserQuestion)` / `PermissionRequest` JSON straight
+  in; `features/tg-ctl/hook-normalize.ts` maps it to a `ButtonRequest` using the
+  hook process's own `TMUX_PANE`/cwd/session. Single non-multiSelect questions
+  with concrete options forward; multi-question / multiSelect / free-form fall
+  back to the local dialog. (Codex uses `tg-ctl ask --agent codex`.)
+- **`tg-ctl status`** prints `q→buttons hooks: installed / NOT installed — run
+  tg-ctl install-hooks` so the state is never silently wrong.
 
-So today the user must hand-add the hook to `~/.claude/settings.json`.
+The verified-live AskUserQuestion contract (CC 2.1.170) — `answers` keyed by
+question TEXT, `updatedInput` replaces wholesale — is unchanged in
+`formatAgentHookOutput`. The hook matcher is the `AskUserQuestion` tool under
+`PreToolUse` (confirmed against the live hooks docs: there is no separate
+`AskUserQuestion` hook event).
 
 ## Full prerequisite checklist
 
@@ -69,10 +85,23 @@ So today the user must hand-add the hook to `~/.claude/settings.json`.
 | opencode | ✅ | ✅ | native, no tmux |
 | pi / aider / gemini | ❌ | ❌ | tmux floor only; bot replies "limited" |
 
-## Recommendation
+## Defer inbound while the agent is waiting (v1.6.0)
 
-Build the deferred **idempotent hook installer** (`tg-ctl install-hooks` or fold
-into `tg install-skill`) plus the **Claude canary e2e** that fails loudly on
-contract drift. Until then, q→buttons is "daemon-ready, hook-missing" — wire the
-hook manually to use it. (Offered as a follow-up, not built here — it edits the
-user's global `~/.claude/settings.json` and the spec wants the canary alongside.)
+When an agent has an outstanding button question (a `pendingButton` whose pane is
+known) and a NEW inbound message would inject into that pane, the daemon does NOT
+inject over the waiting prompt. It **queues** the message per-pane and reacts on
+the source Telegram message with **✍️** ("noted, queued") — Telegram's allowed
+reaction set has no ⏳, so ✍️ is the closest. When the question is answered, the
+queue is **flushed** into the pane (after a short settle delay). Control verbs
+(`/stop` = Escape) are never deferred — they go through to interrupt the prompt.
+
+## Still open
+
+- A **Claude canary e2e** (synthetic `AskUserQuestion` against a real `claude -p`)
+  that fails loudly on contract drift — recommended next, not built here.
+- Codex/opencode hook auto-write (currently guided, not auto-installed).
+
+## Agent capability matrix (unchanged)
+
+See the table above; the installer + normalization wire the Claude Code path
+end-to-end. Codex needs the manual `/hooks` trust; opencode is native SSE.

@@ -105,6 +105,10 @@ export type Action =
       from: string;
       messageId: number | null;
     }
+  // A reply: route by the recognized origin pane (routes map) when known, else
+  // a session-grouped picker ordered LRU/MRU. injectText is already wrapped +
+  // carries the quote anchor (items 2,3); it is injected verbatim.
+  | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string }
   | { kind: 'reply'; text: string } // sendMessage back to the chat
   | { kind: 'answer-callback'; callbackQueryId: string; text: string }
   // messageId is the Telegram message the tapped button belongs to (null when
@@ -190,4 +194,5 @@ export interface CtlPaths {
   registration: string;
   socket: string;
   log: string;
+  routes: string; // message_id→pane map for reply recognition + LRU/MRU picker
 }
