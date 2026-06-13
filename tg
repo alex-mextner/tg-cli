@@ -40,6 +40,8 @@ import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
 import { buildSendPlan } from "./features/auto-attach/normalize"
+import { gatePhotos, hooksActive } from "./features/hooks/run-photo-hooks"
+import { runHooksCli } from "./features/hooks/cli"
 import { transmit } from "./features/auto-attach/transmitter"
 import { parseArgs, type Format } from "./features/cli/args"
 import { versionOutput } from "./features/cli/version"
@@ -195,6 +197,13 @@ if (import.meta.main) {
   // Exact-match only, so `tg "install-skill"` still sends that as a message.
   if (rawArgs.length === 1 && rawArgs[0] === "install-skill") {
     process.exit(installSkill())
+  }
+  // `tg hooks ...` — the TOFU activation path for pre-send-photo hooks (trust /
+  // list / untrust). Exact-match leading token, so `tg "hooks ..."` as a plain
+  // message still sends. Returns null when argv is not a hooks subcommand.
+  if (rawArgs[0] === "hooks") {
+    const code = runHooksCli(rawArgs)
+    if (code !== null) process.exit(code)
   }
   const home = process.env.HOME ?? "~"
 
@@ -759,6 +768,38 @@ if (import.meta.main) {
 
   // --- Build the SendPlan (normalization layer: R2/R3/R4 + render) ---
   const plan = buildSendPlan(items, caption, format, { fileContents, renderText })
+
+  // --- pre-send-photo hooks (agents-hooks/v1). NON-BREAKING SEAM. ---
+  // Guarded by ONE `stat ~/.agents/hooks/tg/` (hooksActive). With no descriptors
+  // dir the whole block is skipped and the send path is byte-for-byte today's
+  // behaviour. Hooks fire ONLY here (the photo subcommand) — plain `tg "msg"`
+  // never reaches this. A `block` (a hook exits 10, e.g. review --visual judging
+  // the screenshot unstyled/broken) HOLDS the send. Everything else (hook error,
+  // timeout, untrusted/quarantined descriptor) fails open per the runner policy.
+  if (
+    features["hooks"] !== false &&
+    plan.photos.length > 0 &&
+    hooksActive(env)
+  ) {
+    const diskPhotoPaths = plan.photos
+      .filter((p) => p.source.kind === "disk")
+      .map((p) => (p.source as { kind: "disk"; path: string }).path)
+    if (diskPhotoPaths.length > 0) {
+      // `env` is the merged config+process env (the `{ ...configEnv,
+      // ...process.env }` built in main()), so AGENTS_HOOKS=0 /
+      // AGENTS_HOOKS_TRUST=auto / API keys set in ~/.config/tg-cli/.env are
+      // honored and forwarded to the hook subprocess.
+      const gate = gatePhotos(diskPhotoPaths, { caption, chatId: CHAT_ID }, env)
+      if (gate.blocked) {
+        console.error(
+          `Blocked: pre-send-photo hook rejected ${gate.blockedPath}` +
+            (gate.message ? `\n  ${gate.message}` : ""),
+        )
+        process.exit(10)
+      }
+    }
+  }
+
 
   // --- autolink transform (tasks + prs): linkify verified Linear codes and
   // GitHub #N refs, then append reference blocks. Single ticket → title on the
