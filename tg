@@ -16,6 +16,14 @@ import { convertMdToPdf, isConvertibleMd, type ConvertDeps } from "./features/md
 import { applyAutolink, linkifyTicketsCompound } from "./features/autolink-tasks/render"
 import { styleTaskTitle, styleWindowName } from "./features/prefix-style/style"
 import {
+  EMBEDDABLE_EMOJI_MAP,
+  UNICODE_EMOJI_MAP,
+  MODEL_EMOJI_MAP,
+  extractBaseModel,
+  type EmojiEntity,
+  type ParsedText,
+} from "./features/branding/emoji"
+import {
   mergeIntoCache as mergeGhCache,
   splitByCache as splitGhCache,
 } from "./features/autolink-prs/cache"
@@ -31,7 +39,7 @@ import {
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { botIdFromToken, ctlPaths } from "./features/tg-ctl/lock"
 import { appendRoute, parseRoutes, serializeRoutes } from "./features/tg-ctl/routes"
-import { findAgentInAncestry, parseProcList } from "./features/tg-ctl/discover"
+import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
@@ -562,105 +570,6 @@ export function parseArgs(
   return { action: "send", items, caption, format }
 }
 
-// --- Embeddable emoji helpers ---
-// WARNING: The structure of these maps is regex-parsed by tests in tests/emoji_map.test.ts.
-// If you change formatting (e.g., add nested braces, comments containing `}`, or remove trailing commas),
-// tests may break. Update tests in lockstep with any structural changes here.
-// Default: HyperIDE.ai custom emoji set (https://t.me/addemoji/agents_by_HyperIDE_Bot)
-const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
-  hyperide: "5274191514178723918", // 🚁 HyperIDE
-  codex: "5273797309195393626",   // 👐 OpenAI
-  openai: "5273797309195393626",  // 👐 OpenAI
-  claude: "5274170649227600531",  // ✳️ Claude
-  anthropic: "5274170649227600531", // ✳️ Claude
-  gemini: "5274254027427716477",  // ♊️ Gemini
-  google: "5274254027427716477",  // ♊️ Gemini
-  deepseek: "5274018976752511967", // 🐳 DeepSeek
-  qwen: "5274109179655661197",    // 🟣 Qwen
-  alibaba: "5274109179655661197", // 🟣 Qwen
-  kimi: "5273889053991805596",    // 🌙 Kimi
-  moonshot: "5273889053991805596", // 🌙 Kimi
-  o3: "5273797309195393626",      // 👐 OpenAI
-  o1: "5273797309195393626",      // 👐 OpenAI
-  gpt4: "5273797309195393626",    // 👐 OpenAI
-  gpt3: "5273797309195393626",    // 👐 OpenAI
-  llama: "5274259902942977093",   // 🦙 Meta/llama
-  meta: "5274259902942977093",    // 🦙 Meta
-  ollama: "5273886056104634966",  // 🦙 Ollama
-  mistral: "5273823740424134905", // Ⓜ️ Mistral
-  grok: "5273973737861981852",    // 🤘 Grok
-  xai: "5273973737861981852",     // 🤘 Grok
-  copilot: "5274136375388580049", // 🦾 Copilot
-  github: "5274136375388580049",   // 🦾 Copilot
-  perplexity: "5273733846758631156", // 🔮 Perplexity
-  cursor: "5273731871073672487",  // 👆 Cursor
-  windsurf: "5273875761068025296", // 🏄 Windsurf
-  devin: "5274170649227600531",   // Custom ID: shares Claude's ✳️ ID. Unicode: 🧑‍💻
-  cognition: "5274170649227600531", // Custom ID: shares Claude's ✳️ ID. Unicode: 🧑‍💻
-  aider: "5274170649227600531",    // Custom ID: shares Claude's ✳️ ID. Unicode: 🤝
-  continue: "5274170649227600531", // Custom ID: shares Claude's ✳️ ID. Unicode: ⏩
-  gpt: "5273797309195393626",       // Custom ID: shares OpenAI's 👐 ID. Unicode: ⚡
-}
-
-// Unicode emoji fallback map
-const UNICODE_EMOJI_MAP: Record<string, string> = {
-  claude: "✳️", anthropic: "✳️",
-  codex: "👐", openai: "👐", o3: "👐", o1: "👐", gpt4: "👐", gpt3: "👐", gpt: "⚡",
-  gemini: "♊️", google: "♊️",
-  deepseek: "🐳",
-  qwen: "🟣", alibaba: "🟣",
-  kimi: "🌙", moonshot: "🌙",
-  glm: "🗂", chatglm: "🗂",
-  llama: "🦙", meta: "🦙", ollama: "🦙",
-  mistral: "Ⓜ️",
-  grok: "🤘", xai: "🤘",
-  copilot: "🦾", github: "🦾",
-  perplexity: "🔮",
-  cursor: "👆",
-  windsurf: "🏄",
-  devin: "🧑‍💻", cognition: "🧑‍💻",
-  aider: "🤝",
-  continue: "⏩",
-  hyperide: "🚁",
-  fireworks: "🎆",
-}
-
-interface EmojiEntity {
-  type: "custom_emoji"
-  offset: number
-  length: number
-  custom_emoji_id: string
-}
-
-interface ParsedText {
-  text: string
-  entities: EmojiEntity[]
-}
-
-// --- AI emoji mapping (plum11 convention + extended) ---
-const MODEL_EMOJI_MAP: Record<string, string> = {
-  claude: "✳️", anthropic: "✳️",
-  codex: "👐", openai: "👐", o3: "👐", o1: "👐", gpt4: "👐", gpt3: "👐",
-  gemini: "♊️", google: "♊️",
-  deepseek: "🐳",
-  qwen: "🟣", alibaba: "🟣",
-  kimi: "🌙", moonshot: "🌙",
-  glm: "🗂", chatglm: "🗂",
-  llama: "🦙", meta: "🦙", ollama: "🦙",
-  mistral: "Ⓜ️",
-  grok: "🤘", xai: "🤘",
-  copilot: "🦾", github: "🦾",
-  perplexity: "🔮",
-  cursor: "👆",
-  windsurf: "🏄",
-  devin: "🧑‍💻", cognition: "🧑‍💻",
-  aider: "🤝",
-  continue: "⏩",
-  hyperide: "🚁",
-  fireworks: "🎆",
-  gpt: "⚡",
-}
-
 function decodeTextEscapes(value: string): string {
   return value.replace(/\\([nrt\\])/g, (_match: string, escaped: string) => {
     if (escaped === "n") return "\n"
@@ -668,54 +577,6 @@ function decodeTextEscapes(value: string): string {
     if (escaped === "t") return "\t"
     return "\\"
   })
-}
-
-function isProcessRunning(name: string): boolean {
-  try {
-    const result = Bun.spawnSync(["pgrep", "-x", name], {
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    return result.exitCode === 0
-  } catch {
-    return false
-  }
-}
-
-// Which agent launched this `tg` process? Climb the ppid chain and match the
-// nearest ancestor command (codex/aider/pi/opencode/claude). This is the
-// reliable signal for agents that — unlike Claude Code's CLAUDECODE — export no
-// env marker: a `codex exec` is the direct parent of the shell command it runs.
-// Crucially it runs BEFORE the pgrep fallbacks so a background `ollama` daemon
-// (a sibling, never an ancestor) can no longer hijack the label.
-function detectAgentViaAncestry(): string | null {
-  try {
-    const result = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], {
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    if (result.exitCode !== 0) return null
-    const procs = parseProcList(new TextDecoder().decode(result.stdout))
-    const found = findAgentInAncestry(procs, process.ppid)
-    return found?.agent ?? null
-  } catch {
-    return null
-  }
-}
-
-function extractBaseModel(modelName: string): string {
-  const lower = modelName.toLowerCase()
-  // Exact match first
-  if (MODEL_EMOJI_MAP[lower]) return lower
-  if (EMBEDDABLE_EMOJI_MAP[lower]) return lower
-  // Try progressively shorter prefixes split by "-" or "_"
-  const parts = lower.split(/[-_]/)
-  for (let i = parts.length; i > 0; i--) {
-    const prefix = parts.slice(0, i).join("-")
-    if (MODEL_EMOJI_MAP[prefix]) return prefix
-    if (EMBEDDABLE_EMOJI_MAP[prefix]) return prefix
-  }
-  return lower
 }
 
 // --- CLI entrypoint (only runs when executed directly, not when imported) ---
