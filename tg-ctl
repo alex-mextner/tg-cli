@@ -1021,8 +1021,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (recognized) {
       const { panes, procs } = snapshot()
       const pane = panes.find((p) => p.paneId === recognized.paneId)
-      if (pane && findAgentInPane(pane, procs)) return injectVerbatim(recognized.paneId)
-      // recognized pane is gone → fall through to the picker
+      // Route to the origin pane ONLY if it still hosts an agent AND is still the
+      // SAME project: a tmux pane id is reused after kill-pane, so a stale
+      // message_id→%N map could otherwise inject a reply into a DIFFERENT
+      // project's agent — leaking project A's reply into project B (review
+      // --brainstorm finding). Validate cwd; on mismatch (or no recorded cwd for
+      // an old route) fall through to the picker rather than risk mis-routing.
+      const sameProject = recognized.cwd
+        ? pane !== undefined && resolve(pane.panePath) === resolve(recognized.cwd)
+        : false
+      if (pane && sameProject && findAgentInPane(pane, procs)) return injectVerbatim(recognized.paneId)
+      // recognized pane gone / reused / unverifiable → fall through to the picker
     }
 
     const candidates = listAgentCandidates()
