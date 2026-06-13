@@ -15,6 +15,12 @@
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { join, resolve } from "path"
+import {
+  buildAgentSelectMessage,
+  groupBySession,
+  matchWindows,
+  type AgentCandidate,
+} from "./features/tg-ctl/agent-match"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { findAgentInPane, parsePaneList, parseProcList, pickTargetPane } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
@@ -28,9 +34,13 @@ import {
   resolveButtonCallback,
   type ButtonRequest,
 } from "./features/tg-ctl/questions"
+import { claudeHooksInstalled, withClaudeHooks } from "./features/tg-ctl/hook-install"
+import { normalizeHookPayload, type HookEnv } from "./features/tg-ctl/hook-normalize"
+import { aggregateUsage, orderByLruMru, parseRoutes, recognizeRoute } from "./features/tg-ctl/routes"
 import { stepUpdates } from "./features/tg-ctl/updates"
 import type {
   Action,
+  AgentKind,
   ControlConfig,
   CtlPaths,
   DiscoverResult,
@@ -47,6 +57,7 @@ export const USAGE = `Usage:
   tg-ctl ask    # internal: hook client, reads a ButtonRequest JSON from stdin
   tg-ctl stop
   tg-ctl status
+  tg-ctl install-hooks   # wire q→buttons: agent questions → Telegram buttons
   tg-ctl run    # internal: the daemon process itself
 
 Credentials: <config dir>/.env (TG_BOT_TOKEN, TG_CHAT_ID).
@@ -259,6 +270,42 @@ function discoverTarget(ctx: Ctx): DiscoverResult {
   return pickTargetPane(panes, procs, reg, reg?.sessionName ?? ctx.cfg.session)
 }
 
+// All tmux panes that host an agent, as /agent selection candidates (item 1).
+// Window names are fetched in a SEPARATE tmux call so the core PANE_FORMAT /
+// parsePaneList (relied on by inject + q→buttons) stays untouched; a pane with
+// no name falls back to its session name.
+function listAgentCandidates(): AgentCandidate[] {
+  const { panes, procs } = snapshot()
+  const nameByPane = new Map<string, string>()
+  try {
+    const r = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{window_name}"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    if (r.exitCode === 0) {
+      for (const line of r.stdout.toString().split("\n")) {
+        const tab = line.indexOf("\t")
+        if (tab > 0) nameByPane.set(line.slice(0, tab), line.slice(tab + 1).trim())
+      }
+    }
+  } catch {
+    // tmux missing — candidates will just use session names as window names
+  }
+  const out: AgentCandidate[] = []
+  for (const pane of panes) {
+    const found = findAgentInPane(pane, procs)
+    if (!found) continue
+    out.push({
+      paneId: pane.paneId,
+      sessionName: pane.sessionName,
+      windowIndex: pane.windowIndex,
+      windowName: nameByPane.get(pane.paneId) || pane.sessionName,
+      agent: found.agent,
+    })
+  }
+  return out
+}
+
 // Execute an InjectStep plan. verify-pane re-runs discovery on a CURRENT
 // snapshot — the agent may have exited between picking the target and typing
 // into it, and injecting into a bare shell would EXECUTE the text (spec §5.2).
@@ -322,7 +369,57 @@ function composeStatus(ctx: Ctx): string {
       : `offset: ${readOffset(readFileOrNull(ctx.paths.offset))} ` +
           `(file age ${Math.round((Date.now() - offsetMtime) / 1000)}s)`,
   )
+  // Guide the user when q→buttons isn't wired (the hook is what forwards an
+  // agent's question to Telegram — without it the feature is silently dead).
+  const hooksRaw = readFileOrNull(join(ctx.home, ".claude", "settings.json"))
+  let hooksOk = false
+  if (hooksRaw) {
+    try {
+      hooksOk = claudeHooksInstalled(JSON.parse(hooksRaw), "tg-ctl ask")
+    } catch {}
+  }
+  lines.push(
+    hooksOk
+      ? "q→buttons hooks: installed (Claude Code)"
+      : "q→buttons hooks: NOT installed — run `tg-ctl install-hooks`",
+  )
   return lines.join("\n")
+}
+
+// Idempotently install the q→buttons agent-question hooks into Claude Code's
+// user settings (backing the file up first), then print guidance for the other
+// harnesses. Pure JSON merge lives in features/tg-ctl/hook-install.ts.
+function installHooks(home: string): void {
+  const settingsPath = join(home, ".claude", "settings.json")
+  const command = "tg-ctl ask"
+  const raw = readFileOrNull(settingsPath)
+  let existing: Record<string, unknown> = {}
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === "object") existing = parsed as Record<string, unknown>
+    } catch {
+      console.error(`tg-ctl: ${settingsPath} is not valid JSON — fix or move it aside, then re-run`)
+      process.exit(1)
+    }
+  }
+  const { settings, changed } = withClaudeHooks(existing, command)
+  if (!changed) {
+    console.log("tg-ctl: Claude Code q→buttons hooks already installed — nothing to do.")
+  } else {
+    if (raw) {
+      try {
+        writeFileSync(`${settingsPath}.bak`, raw)
+      } catch {}
+    }
+    mkdirSync(join(home, ".claude"), { recursive: true })
+    writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`)
+    console.log(`tg-ctl: installed Claude Code q→buttons hooks → ${settingsPath}` + (raw ? ` (backup: ${settingsPath}.bak)` : ""))
+  }
+  console.log("")
+  console.log("Codex: add a PermissionRequest hook running `tg-ctl ask --agent codex`, then trust it via /hooks (manual, first run).")
+  console.log("opencode: native — the bot subscribes to question/permission SSE events; no hook file needed.")
+  console.log("Restart any running agent session so it loads the new hooks.")
 }
 
 // --- start: registration snapshot + detached daemon spawn, then exit ---
@@ -555,15 +652,45 @@ async function handleHookSocketLine(
   }
 }
 
+// The agent kind the hook was installed for (`tg-ctl ask --agent codex`);
+// defaults to claude. Decides how the raw payload is normalized + formatted.
+function hookAgentFromArgv(): AgentKind {
+  const i = process.argv.indexOf("--agent")
+  const v = i >= 0 ? process.argv[i + 1] : undefined
+  const known = ["claude", "codex", "opencode", "pi", "aider"]
+  return (v && known.includes(v) ? v : "claude") as AgentKind
+}
+
+function tmuxSessionName(): string | undefined {
+  if (!process.env.TMUX) return undefined
+  try {
+    const r = Bun.spawnSync(["tmux", "display-message", "-p", "#{session_name}"], { stdout: "pipe", stderr: "pipe" })
+    if (r.exitCode === 0) return r.stdout.toString().trim() || undefined
+  } catch {}
+  return undefined
+}
+
 async function askDaemon(ctx: Ctx): Promise<void> {
   const input = await readStdinText()
   if (!input.trim()) return
-  let requestLine: string
+  let payload: unknown
   try {
-    requestLine = JSON.stringify(JSON.parse(input))
+    payload = JSON.parse(input)
   } catch {
     return
   }
+  // Normalize the harness's raw hook payload (or an already-normalized request)
+  // into a ButtonRequest, filling routing fields from the hook process's own
+  // env. null → unsupported shape; emit nothing so the local agent UI takes over.
+  const env: HookEnv = {
+    agent: hookAgentFromArgv(),
+    paneId: process.env.TMUX_PANE || undefined,
+    cwd: process.cwd(),
+    sessionName: tmuxSessionName(),
+  }
+  const req = normalizeHookPayload(payload, env)
+  if (!req) return
+  const requestLine = JSON.stringify(req)
 
   const output = await new Promise<string | null>((resolve) => {
     const socket = createConnection(ctx.paths.socket)
@@ -623,6 +750,48 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   writeFileSync(ctx.paths.pid, `${process.pid}\n`)
   const pendingButtons = new Map<string, PendingButton>()
   const activeButtonKeys = new Set<string>()
+  // /agent (and unrecognized-reply) selection awaiting a button tap: token →
+  // message + candidate list. `prewrapped` = inject the message verbatim (a reply
+  // already carries its wrap/anchor) instead of wrapping it again.
+  const pendingAgent = new Map<
+    string,
+    {
+      message: string
+      candidates: AgentCandidate[]
+      messageId: number | null
+      timer: ReturnType<typeof setTimeout>
+      prewrapped?: boolean
+    }
+  >()
+  let agentTokenSeq = 0
+  // Inbound queued behind an agent's outstanding question (defer-while-waiting):
+  // pane → already-wrapped texts, flushed when the question is answered. The
+  // flag tells the trailing `ack` to mark the source message ⏳ instead of 👀.
+  const deferredByPane = new Map<string, string[]>()
+  let lastWasDeferred = false
+  const paneHasPendingQuestion = (paneId: string): boolean => {
+    for (const pb of pendingButtons.values()) if (pb.req.paneId && pb.req.paneId === paneId) return true
+    return false
+  }
+  // Enqueue only — the caller sets lastWasDeferred when this came from a MESSAGE
+  // action (which earns a ⏳ ack); a button-callback defer edits its prompt
+  // instead and must NOT leak the flag onto the next message's ack.
+  const enqueueDeferred = (paneId: string, wrappedText: string): void => {
+    const q = deferredByPane.get(paneId)
+    if (q) q.push(wrappedText)
+    else deferredByPane.set(paneId, [wrappedText])
+  }
+  const flushDeferred = async (paneId: string): Promise<void> => {
+    const queue = deferredByPane.get(paneId)
+    if (!queue?.length) return
+    deferredByPane.delete(paneId)
+    // Let the agent consume the just-delivered answer before the next paste.
+    await Bun.sleep(800)
+    for (const text of queue) {
+      const res = await executeInjectSteps(buildTextInjectPlan(paneId, text))
+      if (!res.ok) log(`deferred flush into ${paneId} failed: ${res.error}`)
+    }
+  }
   let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
     try {
@@ -670,18 +839,223 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // the human is never left wondering whether the message landed. Returns
   // true only when the plan actually executed — the caller uses it to decide
   // whether the source message earns its 👀 delivery receipt.
-  const injectViaTarget = async (buildPlan: (paneId: string) => InjectStep[]): Promise<boolean> => {
+  const injectViaTarget = async (
+    buildPlan: (paneId: string) => InjectStep[],
+    deferText?: string,
+  ): Promise<boolean> => {
     const found = discover()
     if (!found.ok) {
       await replyNotFound(found)
       return false
     }
-    const result = await executeInjectSteps(buildPlan(found.target.pane.paneId))
+    const paneId = found.target.pane.paneId
+    // Defer a text message behind the pane's outstanding question (⏳); control
+    // verbs (Escape, no deferText) always go through to interrupt it.
+    if (deferText !== undefined && paneHasPendingQuestion(paneId)) {
+      enqueueDeferred(paneId, deferText)
+      lastWasDeferred = true
+      return true
+    }
+    const result = await executeInjectSteps(buildPlan(paneId))
     if (!result.ok) {
       log(`inject aborted: ${result.error}`)
       await sendMessage(ctx, result.error)
       return false
     }
+    return true
+  }
+
+  // Inject a wrapped message into ONE specific pane (the /agent target). The
+  // plan's verify-pane step still re-checks the pane hosts an agent first.
+  const injectToPane = async (
+    paneId: string,
+    from: string,
+    msg: string,
+  ): Promise<{ ok: boolean; error?: string; deferred?: boolean }> => {
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, from, msg)
+    if (paneHasPendingQuestion(paneId)) {
+      enqueueDeferred(paneId, wrapped)
+      return { ok: true, deferred: true }
+    }
+    const res = await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
+    return res.ok ? { ok: true } : { ok: false, error: res.error }
+  }
+
+  const routedReply = (windowName: string, agent: string, deferred?: boolean): string =>
+    deferred ? `⏳ queued for ${windowName} · ${agent} (answering a question)` : `→ ${windowName} · ${agent}`
+
+  // /agent routing (item 1): bare list, confident phonetic match → direct
+  // inject, ambiguous / no-selector → session-grouped selection buttons.
+  const handleAgentRoute = async (action: Extract<Action, { kind: "agent-route" }>): Promise<boolean> => {
+    const candidates = listAgentCandidates()
+    if (candidates.length === 0) {
+      await sendMessage(ctx, NO_AGENT_REPLY)
+      return false
+    }
+    if (!action.all.trim()) {
+      const groups = groupBySession(candidates)
+      const lines = groups.flatMap((g) => [`▸ ${g.session}`, ...g.candidates.map((c) => `   ${c.windowName} · ${c.agent}`)])
+      await sendMessage(ctx, `agents (address with /agent <window> <message>):\n${lines.join("\n")}`)
+      return true
+    }
+
+    let subset = candidates
+    let message = action.all
+    if (action.selector) {
+      const m = matchWindows(action.selector, candidates)
+      if (m.matches.length > 0) {
+        if (!action.rest.trim()) {
+          const names = m.matches.map((c) => c.windowName).join(", ")
+          await sendMessage(ctx, `matched ${names} — add a message: /agent ${action.selector} <message>`)
+          return true
+        }
+        if (m.confident) {
+          const target = m.matches[0]
+          const res = await injectToPane(target.paneId, action.from, action.rest)
+          if (!res.ok) {
+            await sendMessage(ctx, res.error ?? "inject failed")
+            return false
+          }
+          if (res.deferred) lastWasDeferred = true
+          await sendMessage(ctx, routedReply(target.windowName, target.agent, res.deferred))
+          return true
+        }
+        subset = m.matches
+        message = action.rest
+      }
+      // selector matched nothing → the whole text is the message, ask over all
+    }
+
+    if (subset.length === 1) {
+      const target = subset[0]
+      const res = await injectToPane(target.paneId, action.from, message)
+      if (!res.ok) {
+        await sendMessage(ctx, res.error ?? "inject failed")
+        return false
+      }
+      if (res.deferred) lastWasDeferred = true
+      await sendMessage(ctx, routedReply(target.windowName, target.agent, res.deferred))
+      return true
+    }
+
+    const token = `a${++agentTokenSeq}`
+    const payload = buildAgentSelectMessage(ctx.chatId, subset, token, message)
+    const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+    // Picker send failed (Telegram rejected / >4096-char list / network): do NOT
+    // store a pending route it can never resolve, and do NOT earn a 👀 receipt.
+    if (messageId === null) {
+      await sendMessage(ctx, "couldn't post the agent picker — try a narrower /agent <window>")
+      return false
+    }
+    const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
+    pendingAgent.set(token, { message, candidates: subset, messageId, timer })
+    return true
+  }
+
+  const handleAgentCallback = async (action: Extract<Action, { kind: "agent-callback" }>): Promise<boolean> => {
+    const pending = pendingAgent.get(action.token)
+    if (!pending) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    // A tap must come from THIS prompt's Telegram message. After a restart
+    // agentTokenSeq reuses tokens (a1, a2…), so a tap on an OLD prompt that
+    // reused the token must not consume the new pending route (codex P2).
+    if (pending.messageId !== null && action.messageId !== null && action.messageId !== pending.messageId) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    const target = pending.candidates[action.index]
+    if (!target) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    pendingAgent.delete(action.token)
+    clearTimeout(pending.timer)
+    // A reply's pending text already carries its wrap/anchor → inject verbatim;
+    // a /agent message is raw → wrap it. Both defer behind an open question. A
+    // callback edits its own prompt, so it must NOT set lastWasDeferred.
+    let res: { ok: boolean; error?: string; deferred?: boolean }
+    if (pending.prewrapped) {
+      if (paneHasPendingQuestion(target.paneId)) {
+        enqueueDeferred(target.paneId, pending.message)
+        res = { ok: true, deferred: true }
+      } else {
+        const r = await executeInjectSteps(buildTextInjectPlan(target.paneId, pending.message))
+        res = r.ok ? { ok: true } : { ok: false, error: r.error }
+      }
+    } else {
+      res = await injectToPane(target.paneId, action.from, pending.message)
+    }
+    await answerCallbackQuery(ctx, action.callbackQueryId, res.ok ? (res.deferred ? "queued" : "sent") : "failed")
+    if (pending.messageId !== null) {
+      void editMessageText(
+        ctx,
+        pending.messageId,
+        res.ok ? routedReply(target.windowName, target.agent, res.deferred) : `inject failed: ${res.error ?? ""}`,
+      )
+    }
+    return res.ok
+  }
+
+  // A reply: route to the recognized origin pane (routes map) or, when unknown,
+  // a session-grouped picker ordered LRU/MRU. injectText already carries the
+  // wrap + quote anchor, so it is injected verbatim everywhere here.
+  const handleReplyRoute = async (action: Extract<Action, { kind: "reply-route" }>): Promise<boolean> => {
+    const routes = parseRoutes(readFileOrNull(ctx.paths.routes))
+    const recognized = recognizeRoute(routes, action.replyToMessageId)
+    const injectVerbatim = async (paneId: string): Promise<boolean> => {
+      if (paneHasPendingQuestion(paneId)) {
+        enqueueDeferred(paneId, action.injectText)
+        lastWasDeferred = true
+        return true
+      }
+      const res = await executeInjectSteps(buildTextInjectPlan(paneId, action.injectText))
+      if (!res.ok) {
+        await sendMessage(ctx, res.error)
+        return false
+      }
+      return true
+    }
+
+    if (recognized) {
+      const { panes, procs } = snapshot()
+      const pane = panes.find((p) => p.paneId === recognized.paneId)
+      // Route to the origin pane ONLY if it still hosts an agent AND is still the
+      // SAME project: a tmux pane id is reused after kill-pane, so a stale
+      // message_id→%N map could otherwise inject a reply into a DIFFERENT
+      // project's agent — leaking project A's reply into project B (review
+      // --brainstorm finding). Validate cwd; on mismatch (or no recorded cwd for
+      // an old route) fall through to the picker rather than risk mis-routing.
+      const sameProject = recognized.cwd
+        ? pane !== undefined && resolve(pane.panePath) === resolve(recognized.cwd)
+        : false
+      if (pane && sameProject && findAgentInPane(pane, procs)) return injectVerbatim(recognized.paneId)
+      // recognized pane gone / reused / unverifiable → fall through to the picker
+    }
+
+    const candidates = listAgentCandidates()
+    if (candidates.length === 0) {
+      await sendMessage(ctx, NO_AGENT_REPLY)
+      return false
+    }
+    if (candidates.length === 1) return injectVerbatim(candidates[0].paneId)
+
+    // Unrecognized reply with several agents → picker ordered LRU/MRU.
+    const usage = aggregateUsage(routes)
+    const order = orderByLruMru(candidates.map((c) => c.paneId), usage)
+    const byPane = new Map(candidates.map((c) => [c.paneId, c]))
+    const sorted = order.map((pid) => byPane.get(pid)!).filter(Boolean)
+    const token = `a${++agentTokenSeq}`
+    // preserveOrder: keep the LRU/MRU ranking — groupBySession must not re-sort.
+    const payload = buildAgentSelectMessage(ctx.chatId, sorted, token, action.injectText, true)
+    const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+    if (messageId === null) {
+      await sendMessage(ctx, "couldn't post the reply picker")
+      return false
+    }
+    const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
+    pendingAgent.set(token, { message: action.injectText, candidates: sorted, messageId, timer, prewrapped: true })
     return true
   }
 
@@ -713,15 +1087,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     writeFileSync(dest, new Uint8Array(await dataResp.arrayBuffer()))
     const noun = action.mediaKind === "photo" ? "photo" : "file"
     const msg = `sent ${noun}: ${dest}` + (action.caption ? `\n${action.caption}` : "")
-    return injectViaTarget((paneId) =>
-      buildTextInjectPlan(paneId, wrapInbound(ctx.cfg.injectWrap, action.from, msg)),
-    )
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, msg)
+    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped)
   }
 
   // Best-effort delivery receipt (spec §10): 👀 on the source message. A
   // failed reaction is logged and otherwise ignored — receipts must never
   // break the poll loop (e.g. a Bot API fake without the endpoint).
-  const setSeenReaction = async (messageId: number): Promise<void> => {
+  const setReaction = async (messageId: number, emoji: string): Promise<void> => {
     try {
       const resp = await fetch(`${api(ctx)}/setMessageReaction`, {
         method: "POST",
@@ -729,7 +1102,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         body: JSON.stringify({
           chat_id: ctx.chatId,
           message_id: messageId,
-          reaction: [{ type: "emoji", emoji: "👀" }],
+          reaction: [{ type: "emoji", emoji }],
         }),
         signal: AbortSignal.timeout(15_000),
       })
@@ -738,6 +1111,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`setMessageReaction failed: ${err}`)
     }
   }
+  const setSeenReaction = (messageId: number): Promise<void> => setReaction(messageId, "👀")
+  // ⏳ is NOT in Telegram's allowed reaction set; ✍️ ("noted, queued") is the
+  // closest allowed emoji for "deferred behind the agent's open question".
+  const DEFER_REACTION = "✍️"
 
   // Returns true when the action was handled successfully — the 'ack' case
   // reads the PREVIOUS action's verdict to decide whether the source message
@@ -783,13 +1160,21 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         pending.socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
         void answerCallbackQuery(ctx, action.callbackQueryId, "answered")
         if (pending.messageId !== null) void editMessageText(ctx, pending.messageId, finalText)
+        // The agent is unblocked → deliver anything queued behind this question.
+        if (pending.req.paneId) void flushDeferred(pending.req.paneId)
         return true
       }
       case "status":
         await sendMessage(ctx, composeStatus(ctx))
         return true
+      case "agent-route":
+        return handleAgentRoute(action)
+      case "agent-callback":
+        return handleAgentCallback(action)
       case "inject-text":
-        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text))
+        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text), action.text)
+      case "reply-route":
+        return handleReplyRoute(action)
       case "inject-key":
         return injectViaTarget((paneId) => buildKeyInjectPlan(paneId, action.key))
       case "kill-agent": {
@@ -816,7 +1201,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "download-media":
         return downloadMedia(action)
       case "ack":
-        if (lastActionOk) await setSeenReaction(action.messageId)
+        if (lastWasDeferred) {
+          lastWasDeferred = false
+          await setReaction(action.messageId, DEFER_REACTION)
+        } else if (lastActionOk) {
+          await setSeenReaction(action.messageId)
+        }
         return true
     }
   }
@@ -873,6 +1263,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         nowSec: Math.floor(Date.now() / 1000),
         currentOffset: offset,
         wrap: (name, msg) => wrapInbound(ctx.cfg.injectWrap, name, msg),
+        // Local-time quote anchor for replies (item 3); pure module defaults to UTC.
+        fmtTime: (s) => {
+          const d = new Date(s * 1000)
+          const p = (n: number): string => String(n).padStart(2, "0")
+          return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+        },
       })
 
       // At-most-once (spec §10): persist the offset BEFORE acting. A crash
@@ -904,12 +1300,17 @@ if (import.meta.main) {
     console.log(USAGE)
     process.exit(0)
   }
-  if (!cmd || !["start", "run", "stop", "status", "ask"].includes(cmd)) {
+  if (!cmd || !["start", "run", "stop", "status", "ask", "install-hooks"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
 
   const home = process.env.HOME ?? "~"
+  // install-hooks edits ~/.claude/settings.json only — no bot token needed.
+  if (cmd === "install-hooks") {
+    installHooks(home)
+    process.exit(0)
+  }
   // TG_CTL_CONFIG_DIR exists so tests can point a spawned daemon at a tmpdir.
   const configDir = process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")
   const fileEnv = loadEnv(join(configDir, ".env"))

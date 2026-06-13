@@ -4,6 +4,8 @@
 // (#260). Whether the number is a real Issue or PR is the resolve.ts probe's
 // job; this is pure text analysis. Mirrors features/autolink-tasks/detect.ts.
 
+import { expandGroup, groupsFromLeads, type LeadMatch } from '../autolink-refs/compound';
+
 // One reference occurrence inside a token. The leading digit must be 1-9 (#0 is
 // not a thing on GitHub). The boundary chars (before/after) must not be
 // alphanumeric, so x#1 / #1a are not references while (#260), #260, and #260.
@@ -48,6 +50,36 @@ export function detectRefs(text: string): number[] {
       if (seen.has(number)) continue;
       seen.add(number);
       ordered.push(number);
+    }
+  }
+  return ordered;
+}
+
+// Compound lead matches for a token: every #N ref as a keyless LeadMatch the
+// compound parser consumes (item 7). Reuses findRefMatches so the #1-9 leading
+// digit + boundary rules stay identical to single refs.
+export function refLeads(token: string): LeadMatch[] {
+  return findRefMatches(token).map((m) => ({ start: m.start, end: m.end, key: '', value: m.number }));
+}
+
+/**
+ * Like detectRefs, but expands compound groups (#100..103, #5/6/7) into every
+ * number they denote — unique, first-appearance order. Feeds the gh probe and
+ * the bottom reference block (decision 2026-06-12: enumerate the whole range
+ * below, link only the endpoints in the body). A separator-free token yields
+ * exactly its single number, so this is a strict superset of detectRefs.
+ */
+export function detectRefsExpanded(text: string): number[] {
+  const seen = new Set<number>();
+  const ordered: number[] = [];
+  for (const token of text.split(/\s+/)) {
+    if (!token || token.includes('://')) continue;
+    for (const g of groupsFromLeads(token, refLeads(token))) {
+      for (const n of expandGroup(g)) {
+        if (seen.has(n)) continue;
+        seen.add(n);
+        ordered.push(n);
+      }
     }
   }
   return ordered;

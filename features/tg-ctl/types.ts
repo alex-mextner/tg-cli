@@ -48,6 +48,12 @@ export interface TgDocument {
   file_size?: number;
 }
 
+// The user's partial selection when replying (Bot API 7.0+): the substring of
+// the replied-to message they highlighted. Forwarded verbatim into the agent.
+export interface TgTextQuote {
+  text: string;
+}
+
 export interface TgMessage {
   message_id: number;
   from?: TgUser;
@@ -57,6 +63,8 @@ export interface TgMessage {
   caption?: string;
   photo?: TgPhotoSize[];
   document?: TgDocument;
+  reply_to_message?: TgMessage; // the message this one replies to (items 2,3)
+  quote?: TgTextQuote; // the user's partial-quote selection from it (item 2)
 }
 
 export interface TgCallbackQuery {
@@ -84,6 +92,23 @@ export type Action =
   | { kind: 'inject-key'; key: 'Escape' } // /stop
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
   | { kind: 'status' } // /status — entrypoint composes the reply
+  // /agent [<win>] <msg> — entrypoint discovers panes, fuzzy-matches the window
+  // (phonetic), routes <msg> to that agent or asks via session-grouped buttons.
+  | { kind: 'agent-route'; selector: string | null; rest: string; all: string; from: string }
+  // A tap on a /agent selection button (tga:<token>:<index>): the entrypoint
+  // looks up the pending message + candidate and injects it into the chosen pane.
+  | {
+      kind: 'agent-callback';
+      callbackQueryId: string;
+      token: string;
+      index: number;
+      from: string;
+      messageId: number | null;
+    }
+  // A reply: route by the recognized origin pane (routes map) when known, else
+  // a session-grouped picker ordered LRU/MRU. injectText is already wrapped +
+  // carries the quote anchor (items 2,3); it is injected verbatim.
+  | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string }
   | { kind: 'reply'; text: string } // sendMessage back to the chat
   | { kind: 'answer-callback'; callbackQueryId: string; text: string }
   // messageId is the Telegram message the tapped button belongs to (null when
@@ -169,4 +194,5 @@ export interface CtlPaths {
   registration: string;
   socket: string;
   log: string;
+  routes: string; // message_id→pane map for reply recognition + LRU/MRU picker
 }

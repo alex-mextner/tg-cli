@@ -12,6 +12,7 @@
 
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate } from './types';
 import { parseButtonCallback } from './questions';
+import { parseAgentCallback, parseAgentCommand } from './agent-match';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
 const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -23,6 +24,35 @@ export interface StepOpts {
   nowSec: number;
   currentOffset: number; // returned as newOffset when the batch is empty
   wrap: (name: string, msg: string) => string;
+  // Format a reply's quote-anchor timestamp (item 3). Injected so the daemon
+  // can use local time while tests stay deterministic; defaults to UTC.
+  fmtTime?: (unixSec: number) => string;
+}
+
+// Default quote-anchor time format: deterministic UTC `YYYY-MM-DD HH:MM`.
+function fmtQuoteTimeUtc(unixSec: number): string {
+  const d = new Date(unixSec * 1000);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+
+// First chars of the quote-anchor body, separators collapsed, with a trailing
+// ellipsis (item 3: «… начало сообщения и многоточие …»).
+const QUOTE_HEAD_MAX = 60;
+
+// Build the injected text for a REPLY (items 2, 3). The agent sees which message
+// is being answered — `↩ «[date time] <quote>…»` — followed by the wrapped reply.
+// The quoted content is the user's PARTIAL selection when present (item 2),
+// otherwise the beginning of the replied-to message (item 3).
+export function buildReplyInject(m: TgMessage, name: string, opts: StepOpts): string {
+  const rtm = m.reply_to_message;
+  const original = ((rtm?.text ?? rtm?.caption) ?? '').replace(/\s+/g, ' ').trim();
+  const selected = m.quote?.text?.replace(/\s+/g, ' ').trim();
+  const body = selected || original;
+  const head = body.length > QUOTE_HEAD_MAX ? `${body.slice(0, QUOTE_HEAD_MAX)}…` : `${body}…`;
+  const when = rtm ? (opts.fmtTime ?? fmtQuoteTimeUtc)(rtm.date) : '';
+  const anchor = `↩ «[${when}] ${head}»`;
+  return `${anchor}\n${opts.wrap(name, m.text ?? '')}`;
 }
 
 export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
@@ -37,6 +67,19 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     if (cb) {
       if (!senderAllowed(cb.from?.id, opts)) {
         callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' });
+        continue;
+      }
+      // /agent selection taps (tga:…) route first; q→buttons taps (tgq:…) next.
+      const agentCb = parseAgentCallback(cb.data);
+      if (agentCb) {
+        callbackActions.push({
+          kind: 'agent-callback',
+          callbackQueryId: cb.id,
+          token: agentCb.token,
+          index: agentCb.index,
+          from: cb.from?.first_name || cb.from?.username || 'tg',
+          messageId: cb.message?.message_id ?? null,
+        });
         continue;
       }
       const parsed = parseButtonCallback(cb.data);
@@ -69,8 +112,20 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
 
     const name = m.from?.first_name || m.from?.username || 'tg';
     let action: Action | null = null;
-    if (m.text) action = textAction(m.text, name, opts);
-    else if (m.photo?.length) action = photoAction(u.update_id, m, name);
+    if (m.text) {
+      // A reply carrying prose forwards the quote anchor (items 2,3) via
+      // reply-route — the daemon picks the recognized origin pane or a LRU/MRU
+      // picker. A reply whose text is a /command still runs the command verbatim.
+      action =
+        m.reply_to_message && !m.text.startsWith('/')
+          ? {
+              kind: 'reply-route',
+              replyToMessageId: m.reply_to_message.message_id,
+              injectText: buildReplyInject(m, name, opts),
+              from: name,
+            }
+          : textAction(m.text, name, opts);
+    } else if (m.photo?.length) action = photoAction(u.update_id, m, name);
     else if (m.document) action = documentAction(u.update_id, m, name);
     // Anything else (sticker, voice, …) → advance silently.
     if (action) {
@@ -99,9 +154,14 @@ function senderAllowed(sender: number | undefined, opts: StepOpts): boolean {
 function textAction(text: string, name: string, opts: StepOpts): Action {
   if (text.startsWith('/')) {
     const verb = text.split(/\s+/, 1)[0];
-    if (verb === '/stop') return { kind: 'inject-key', key: 'Escape' };
-    if (verb === '/kill') return { kind: 'kill-agent' };
-    if (verb === '/status') return { kind: 'status' };
+    const cmd = verb.replace(/@\w+$/, ''); // tolerate /cmd@botname in groups
+    if (cmd === '/stop') return { kind: 'inject-key', key: 'Escape' };
+    if (cmd === '/kill') return { kind: 'kill-agent' };
+    if (cmd === '/status') return { kind: 'status' };
+    if (cmd === '/agent') {
+      const p = parseAgentCommand(text);
+      return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name };
+    }
     return { kind: 'inject-text', text };
   }
   return { kind: 'inject-text', text: opts.wrap(name, text) };

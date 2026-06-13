@@ -3,6 +3,41 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.6.0
+
+Agent addressing, reply quotes, prefix styling, and compound autolinks.
+
+- **`/agent [<window>] <message>`** — address a specific agent when several run
+  at once. The window is fuzzy-matched with phonetic normalization (Cyrillic→
+  Latin, sound-folding), a confident match routes the message straight to that
+  pane, and an ambiguous / unspecified target shows session-grouped inline
+  selection buttons. Bare `/agent` lists the addressable agents.
+  (`features/tg-ctl/agent-match.ts`, docs/specs/agent-addressing.md.)
+- **Reply quotes + routing** — replying to a message forwards a quote anchor
+  into the agent: `↩ «[date time] <quote>…»` (partial Telegram selection wins,
+  else the start of the replied-to message). A reply to a **recognized** message
+  routes to the pane that produced it (message_id→pane routes map written by
+  `tg`); an **unrecognized** reply shows the window picker ordered by **LRU+MRU**.
+  (docs/specs/reply-quotes.md.)
+- **q→buttons, now seamless** — `tg-ctl install-hooks` idempotently wires the
+  Claude Code agent-question/permission hooks into `~/.claude/settings.json`
+  (backup first; existing hooks preserved); `tg-ctl ask` normalizes the raw
+  harness payload so the hook is trivial; `tg-ctl status` reports whether it is
+  installed. While an agent is blocked on a question, new inbound messages to it
+  are **deferred** (queued, marked ✍️) and flushed when the question is answered.
+  (docs/q-buttons-prerequisites.md.)
+- **Unicode prefix styling** — the tmux window name in `[]` renders in
+  Mathematical Sans-Serif Bold and a single-ticket task title in Bold Script,
+  with a `<b>`/`<i>` fallback for Cyrillic names the math blocks can't represent.
+  (`features/prefix-style/`, docs/specs/unicode-prefix-styling.md.)
+- **Compound autolinks** — one token may carry a range or list of refs
+  (`HYP-100..103/110`, `#5-7,9`): the body links only the written numbers
+  (range endpoints), and the bottom reference block enumerates the full range.
+  (`features/autolink-refs/`, docs/specs/autolink-compound.md.)
+- Documented the q→buttons prerequisites and the missing hook installer
+  (docs/q-buttons-prerequisites.md), and a WhatsApp companion-transport
+  implementation spec (docs/specs/whatsapp-transport.md, spec only).
+
 ## 1.5.1
 
 Agent detection fix (outbound branding):
