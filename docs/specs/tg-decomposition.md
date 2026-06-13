@@ -64,14 +64,28 @@ closures extract after (Stage 1+).
   `EmojiEntity`/`ParsedText`, `extractBaseModel`. `tg` 1728 → 1622.
 - **Stage 0b — DONE** (`features/branding/detect.ts`): `isProcessRunning`,
   `detectAgentViaAncestry`. `tg` 1622 → 1589.
-- **Stage 0c — NEXT** (`features/cli/args.ts`): `parseArgs` + path helpers +
-  `Item`/`ParseResult`/`Format`/`ItemLineSpec`. Bigger: `parseArgs` pulls in
-  feature imports (`parseLineSpec`, `buildFileIndex`, `isRecursiveCandidate`,
-  `looksPathLike`, `isNeverAttach`) and 5 test files import `parseArgs` from
-  `../tg` (update to `../features/cli/args`). Mechanical but careful.
-- **Stage 0d / 1 / 2** — version, render, transport (below).
+- **Stage 0c — DONE** (`features/cli/args.ts`): `parseArgs` + path helpers
+  (`isImagePath`/`hasRealExtension`/`expandHome`/`resolveExistingFile`, now
+  exported) + `Item`/`ParseResult`/`Format`/`ItemLineSpec`. 5 test files now
+  import `parseArgs` from `../features/cli/args`. `tg` 1589 → 1255.
+- **Stage 0d — DONE** (`features/cli/version.ts`): `VERSION` +
+  `gitShortHash`/`latestChangelogSection`/`versionOutput`; the entrypoint
+  re-exports `VERSION` for back-compat. `tg` 1255 → 1188.
+- **Stage 1 — DONE** (`features/render/html.ts` + `features/render/prefix.ts`):
+  pure `escapeHtml`/`detectHtmlTags`/`parseModeFor`/`convertEntitiesToHtml`/
+  `parseEmojiHelpers` (the emoji transforms read the shared, main-mutated
+  singleton maps by reference); `buildPrefix({ aiEmoji, model, tmuxWindow })`.
+  `tg` 1188 → 1061.
+- **Stage 2 — DONE** (`features/transport/telegram.ts`):
+  `createTelegramTransport({ api, chatId, recordRoute })` factory returning the
+  transmitter `Transport`; owns `checkResponse`/`blobFor`/`recordRouteFromResult`.
+  `main()` keeps `recordRoute` (daemon ROUTES_PATH/TMUX_PANE bookkeeping) and
+  injects it. `tg` 1061 → 926.
+- **Stage 3 — IN PROGRESS**: focused unit tests for the extracted pure modules.
 
-All 579 `bun test` pass after Stages 0a-0b (zero behaviour change).
+All 579 `bun test` pass after every stage (zero behaviour change). The
+decomposition took `tg` from 1728 → 926 lines across 5 new feature modules
+(`cli/args`, `cli/version`, `render/html`, `render/prefix`, `transport/telegram`).
 
 ## Staging (each stage: extract → `bun test` 579 green → commit)
 
@@ -79,13 +93,13 @@ All 579 `bun test` pass after Stages 0a-0b (zero behaviour change).
   `features/cli/version.ts`, `features/branding/emoji.ts` (done),
   `features/branding/detect.ts` (done). No `main` state captured → mechanical
   move + import. Biggest, safest win (~500 lines out of `tg`).
-- **Stage 1** — render: `features/render/html.ts` + `features/render/prefix.ts`
-  (thread the branding/flags state as params).
-- **Stage 2** — transport: `features/transport/telegram.ts` (thread token/chat/API
-  + the routes recorder).
-- **Stage 3** — `tg` is now thin wiring; add focused unit tests for the newly
-  extracted pure modules (args, emoji, detect) that were previously only covered
-  end-to-end.
+- **Stage 1 — done** — render: `features/render/html.ts` +
+  `features/render/prefix.ts` (branding/flags state threaded as params).
+- **Stage 2 — done** — transport: `features/transport/telegram.ts` (token/chat/API
+  + the routes recorder threaded via a `createTelegramTransport` factory).
+- **Stage 3 — in progress** — `tg` is now thin wiring; add focused unit tests for
+  the newly extracted pure modules (args, version, html, prefix) that were
+  previously only covered end-to-end.
 
 ## Non-goals
 
