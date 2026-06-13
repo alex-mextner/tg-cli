@@ -5,6 +5,13 @@ import { join } from "path"
 
 // Import the emoji map from the CLI
 const TG_PATH = new URL("../tg", import.meta.url).pathname
+// The maps were extracted out of `tg` into the branding module (decomposition
+// Stage 0); the source-parse tests read the COMBINED source so a regex finds the
+// maps (now in the module) and the help text / comments (still in `tg`) alike.
+const EMOJI_MODULE_PATH = new URL("../features/branding/emoji.ts", import.meta.url).pathname
+async function combinedSource(): Promise<string> {
+  return (await Bun.file(TG_PATH).text()) + "\n" + (await Bun.file(EMOJI_MODULE_PATH).text())
+}
 
 // Create a temp dir with a fake `pgrep` that reports `ollama` as running.
 // Prepending it to PATH lets us prove the Claude env check wins over the
@@ -55,7 +62,7 @@ function sanitizeEnv(): Record<string, string> {
 
 // Parse the EMBEDDABLE_EMOJI_MAP from the source file
 async function parseEmojiMap(): Promise<Record<string, string>> {
-  const content = await Bun.file(TG_PATH).text()
+  const content = await combinedSource()
   const map: Record<string, string> = {}
   
   // Simple regex extraction
@@ -115,7 +122,7 @@ test("EMBEDDABLE_EMOJI_MAP IDs are valid format", () => {
 
 test("UNICODE_EMOJI_MAP has glm fallback", async () => {
   // Parse UNICODE_EMOJI_MAP from source
-  const content = await Bun.file(TG_PATH).text()
+  const content = await combinedSource()
   const match = content.match(/const UNICODE_EMOJI_MAP.*?= \{([^}]+)\}/s)
   expect(match).toBeTruthy()
   if (match) {
@@ -130,7 +137,7 @@ test("glm is not in EMBEDDABLE_EMOJI_MAP (no custom emoji yet)", () => {
 })
 
 test("fireworks has Unicode fallback", async () => {
-  const content = await Bun.file(TG_PATH).text()
+  const content = await combinedSource()
   const match = content.match(/const UNICODE_EMOJI_MAP.*?= \{([^}]+)\}/s)
   expect(match).toBeTruthy()
   if (match) {
@@ -139,7 +146,7 @@ test("fireworks has Unicode fallback", async () => {
 })
 
 test("gpt has Unicode fallback", async () => {
-  const content = await Bun.file(TG_PATH).text()
+  const content = await combinedSource()
   const match = content.match(/const UNICODE_EMOJI_MAP.*?= \{([^}]+)\}/s)
   expect(match).toBeTruthy()
   if (match) {
@@ -190,7 +197,7 @@ test("EMBEDDABLE_EMOJI_MAP structure is consistent", () => {
 })
 
 test("set URL in comment matches help text", async () => {
-  const content = await Bun.file(TG_PATH).text()
+  const content = await combinedSource()
   // Find the comment URL (anchored to "// Default:")
   const commentMatch = content.match(/\/\/ Default:.*?t\.me\/addemoji\/(agents(?:_v\d+)?_by_[^\s)]+)/)
   // Find the help text URL (anchored to "Set:")
@@ -207,7 +214,7 @@ test("set URL in comment matches help text", async () => {
 // consistency without hardcoding every ID, making updates less brittle.
 
 test("all documented helpers are resolvable (custom or Unicode)", async () => {
-  const content = await Bun.file(TG_PATH).text()
+  const content = await combinedSource()
   // Extract UNICODE_EMOJI_MAP block for accurate matching
   const unicodeMatch = content.match(/const UNICODE_EMOJI_MAP.*?= \{([^}]+)\}/s)
   const unicodeBlock = unicodeMatch ? unicodeMatch[1] : ""
@@ -855,7 +862,7 @@ test("Unicode-only helpers resolve correctly in ls-emoji-helpers", async () => {
 }, 10000)
 
 test("all EMBEDDABLE_EMOJI_MAP keys are documented in help", async () => {
-  const content = await Bun.file(TG_PATH).text()
+  const content = await combinedSource()
   const helpMatch = content.match(/Use :([\w:]+):.*?to embed custom emoji icons/s)
   expect(helpMatch).toBeTruthy()
   if (helpMatch) {
@@ -878,7 +885,7 @@ test("all EMBEDDABLE_EMOJI_MAP keys are documented in help", async () => {
 })
 
 test("every EMBEDDABLE_EMOJI_MAP key has Unicode fallback", async () => {
-  const content = await Bun.file(TG_PATH).text()
+  const content = await combinedSource()
   const match = content.match(/const UNICODE_EMOJI_MAP.*?= \{([^}]+)\}/s)
   expect(match).toBeTruthy()
   if (match) {
