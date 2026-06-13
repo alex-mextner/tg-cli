@@ -58,12 +58,27 @@ the same move reviewlib made. Pure helpers (args, emoji maps, detect, version)
 capture nothing and extract first (Stage 0); the stateful render/transport
 closures extract after (Stage 1+).
 
+## Status
+
+- **Stage 0a — DONE** (`features/branding/emoji.ts`): the 3 emoji maps,
+  `EmojiEntity`/`ParsedText`, `extractBaseModel`. `tg` 1728 → 1622.
+- **Stage 0b — DONE** (`features/branding/detect.ts`): `isProcessRunning`,
+  `detectAgentViaAncestry`. `tg` 1622 → 1589.
+- **Stage 0c — NEXT** (`features/cli/args.ts`): `parseArgs` + path helpers +
+  `Item`/`ParseResult`/`Format`/`ItemLineSpec`. Bigger: `parseArgs` pulls in
+  feature imports (`parseLineSpec`, `buildFileIndex`, `isRecursiveCandidate`,
+  `looksPathLike`, `isNeverAttach`) and 5 test files import `parseArgs` from
+  `../tg` (update to `../features/cli/args`). Mechanical but careful.
+- **Stage 0d / 1 / 2** — version, render, transport (below).
+
+All 579 `bun test` pass after Stages 0a-0b (zero behaviour change).
+
 ## Staging (each stage: extract → `bun test` 579 green → commit)
 
 - **Stage 0** — pure top-level helpers: `features/cli/args.ts`,
-  `features/cli/version.ts`, `features/branding/emoji.ts`,
-  `features/branding/detect.ts`. No `main` state captured → mechanical move +
-  import. Biggest, safest win (~500 lines out of `tg`).
+  `features/cli/version.ts`, `features/branding/emoji.ts` (done),
+  `features/branding/detect.ts` (done). No `main` state captured → mechanical
+  move + import. Biggest, safest win (~500 lines out of `tg`).
 - **Stage 1** — render: `features/render/html.ts` + `features/render/prefix.ts`
   (thread the branding/flags state as params).
 - **Stage 2** — transport: `features/transport/telegram.ts` (thread token/chat/API
