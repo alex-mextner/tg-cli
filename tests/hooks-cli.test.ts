@@ -1,13 +1,19 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { runHooksCli } from '../features/hooks/cli';
 import { toolHooksDir, trustFile } from '../features/hooks/run-photo-hooks';
 
-// `tg hooks trust/list/untrust` — the activation path the quarantine banner
-// advertises. Without this the banner would point at a nonexistent command.
+// `tg hooks trust/list/untrust`. Hooks are trust-by-default, so `trust` is a
+// no-op unless the AGENTS_HOOKS_TRUST=1 guard re-engages the TOFU pin path — at
+// which point the quarantine banner points users back here.
+
+// The opt-in guard env, passed explicitly to runHooksCli so these tests don't
+// depend on the ambient AGENTS_HOOKS_TRUST of the test runner.
+const GUARD = { AGENTS_HOOKS_TRUST: '1' } as NodeJS.ProcessEnv;
+const NO_GUARD = {} as NodeJS.ProcessEnv;
 
 let home: string;
 let logs: string[];
@@ -49,75 +55,94 @@ function writeDescriptor(id: string, cmd: string): void {
 }
 
 test('non-hooks argv returns null (falls through to send)', () => {
-  expect(runHooksCli(['hello world'], home)).toBeNull();
+  expect(runHooksCli(['hello world'], home, NO_GUARD)).toBeNull();
 });
 
-test('hooks list shows an untrusted descriptor as quarantined', () => {
+test('hooks list (guard OFF) shows a descriptor as trusted-by-default', () => {
   const { path } = writeExe('h.sh');
   writeDescriptor('review-visual', path);
-  const code = runHooksCli(['hooks', 'list'], home);
+  const code = runHooksCli(['hooks', 'list'], home, NO_GUARD);
+  expect(code).toBe(0);
+  expect(logs.join('\n')).toContain('review-visual');
+  expect(logs.join('\n')).toContain('trusted (default)');
+  expect(logs.join('\n')).toContain('trust-by-default');
+});
+
+test('hooks list (guard ON) shows an untrusted descriptor as quarantined', () => {
+  const { path } = writeExe('h.sh');
+  writeDescriptor('review-visual', path);
+  const code = runHooksCli(['hooks', 'list'], home, GUARD);
   expect(code).toBe(0);
   expect(logs.join('\n')).toContain('review-visual');
   expect(logs.join('\n')).toContain('untrusted');
 });
 
 test('hooks list on an empty dir says so', () => {
-  const code = runHooksCli(['hooks', 'list'], home);
+  const code = runHooksCli(['hooks', 'list'], home, NO_GUARD);
   expect(code).toBe(0);
   expect(logs.join('\n')).toMatch(/No tg hooks installed|empty/);
 });
 
-test('hooks trust pins the descriptor sha into trust.json (0600)', () => {
+test('hooks trust (guard OFF) is a friendly no-op, writes no trust.json', () => {
+  const { path } = writeExe('h.sh');
+  writeDescriptor('review-visual', path);
+  const code = runHooksCli(['hooks', 'trust', 'review-visual'], home, NO_GUARD);
+  expect(code).toBe(0);
+  expect(logs.join('\n')).toContain('already runs (trust-by-default)');
+  expect(existsSync(trustFile(home))).toBe(false);
+});
+
+test('hooks trust (guard ON) pins the descriptor sha into trust.json (0600)', () => {
   const { path, sha } = writeExe('h.sh');
   writeDescriptor('review-visual', path);
-  const code = runHooksCli(['hooks', 'trust', 'review-visual'], home);
+  const code = runHooksCli(['hooks', 'trust', 'review-visual'], home, GUARD);
   expect(code).toBe(0);
   const trust = JSON.parse(readFileSync(trustFile(home), 'utf8'));
   expect(trust['review-visual.pre-send-photo'].cmd_sha256).toBe(sha);
   expect(trust['review-visual.pre-send-photo'].on_error).toBe('open');
 });
 
-test('hooks trust with on_error override', () => {
+test('hooks trust (guard ON) with on_error override', () => {
   const { path } = writeExe('h.sh');
   writeDescriptor('review-visual', path);
-  runHooksCli(['hooks', 'trust', 'review-visual', 'closed'], home);
+  runHooksCli(['hooks', 'trust', 'review-visual', 'closed'], home, GUARD);
   const trust = JSON.parse(readFileSync(trustFile(home), 'utf8'));
   expect(trust['review-visual.pre-send-photo'].on_error).toBe('closed');
 });
 
-test('hooks trust with an INVALID policy arg errors (no silent default)', () => {
+test('hooks trust with an INVALID policy arg errors (no silent default), even guard OFF', () => {
   const { path } = writeExe('h.sh');
   writeDescriptor('review-visual', path);
-  const code = runHooksCli(['hooks', 'trust', 'review-visual', 'close'], home);
+  const code = runHooksCli(['hooks', 'trust', 'review-visual', 'close'], home, NO_GUARD);
   expect(code).toBe(1);
   expect(errs.join('\n')).toContain("Invalid on_error 'close'");
 });
 
-test('hooks trust on an unknown id errors (exit 1)', () => {
-  const code = runHooksCli(['hooks', 'trust', 'nope'], home);
+test('hooks trust (guard ON) on an unknown id errors (exit 1)', () => {
+  const code = runHooksCli(['hooks', 'trust', 'nope'], home, GUARD);
   expect(code).toBe(1);
   expect(errs.join('\n')).toContain('nope');
 });
 
 test('hooks trust without an id errors', () => {
-  const code = runHooksCli(['hooks', 'trust'], home);
+  const code = runHooksCli(['hooks', 'trust'], home, NO_GUARD);
   expect(code).toBe(1);
 });
 
-test('after trust then list shows trusted', () => {
+test('after trust (guard ON) then list (guard ON) shows trusted', () => {
   const { path } = writeExe('h.sh');
   writeDescriptor('review-visual', path);
-  runHooksCli(['hooks', 'trust', 'review-visual'], home);
+  runHooksCli(['hooks', 'trust', 'review-visual'], home, GUARD);
   logs.length = 0;
-  runHooksCli(['hooks', 'list'], home);
+  runHooksCli(['hooks', 'list'], home, GUARD);
   expect(logs.join('\n')).toContain('trusted (on_error=open)');
 });
 
 test('hooks untrust removes the pin (re-quarantine)', () => {
   const { path } = writeExe('h.sh');
   writeDescriptor('review-visual', path);
-  runHooksCli(['hooks', 'trust', 'review-visual'], home);
-  const code = runHooksCli(['hooks', 'untrust', 'review-visual'], home);
+  runHooksCli(['hooks', 'trust', 'review-visual'], home, GUARD);
+  const code = runHooksCli(['hooks', 'untrust', 'review-visual'], home, NO_GUARD);
   expect(code).toBe(0);
   const trust = JSON.parse(readFileSync(trustFile(home), 'utf8'));
   expect(trust['review-visual.pre-send-photo']).toBeUndefined();
@@ -138,9 +163,9 @@ test('untrust matches the id EXACTLY (does not remove a dotted sibling)', () => 
     join(dir, 'review.visual.pre-send-photo.json'),
     JSON.stringify({ id: 'review.visual', point: 'pre-send-photo', cmd: b.path, on_error: 'open' }),
   );
-  runHooksCli(['hooks', 'trust', 'review'], home);
-  runHooksCli(['hooks', 'trust', 'review.visual'], home);
-  const code = runHooksCli(['hooks', 'untrust', 'review'], home);
+  runHooksCli(['hooks', 'trust', 'review'], home, GUARD);
+  runHooksCli(['hooks', 'trust', 'review.visual'], home, GUARD);
+  const code = runHooksCli(['hooks', 'untrust', 'review'], home, NO_GUARD);
   expect(code).toBe(0);
   const trust = JSON.parse(readFileSync(trustFile(home), 'utf8'));
   expect(trust['review.pre-send-photo']).toBeUndefined();
@@ -149,7 +174,7 @@ test('untrust matches the id EXACTLY (does not remove a dotted sibling)', () => 
 });
 
 test('unknown subcommand prints usage (exit 2)', () => {
-  const code = runHooksCli(['hooks', 'frobnicate'], home);
+  const code = runHooksCli(['hooks', 'frobnicate'], home, NO_GUARD);
   expect(code).toBe(2);
   expect(errs.join('\n')).toContain('Usage');
 });

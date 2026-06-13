@@ -125,16 +125,33 @@ test('review exits 0 with MALFORMED (non-JSON) stdout → fail-open allow (not a
   expect(v.results[0].quarantined).toBe(false);
 });
 
-test('descriptor present but UNTRUSTED → quarantined, never runs review', () => {
+test('descriptor present with NO trust pin → RUNS by default (trust-by-default) → blocks', () => {
   mockReview('{"decision":"rollback","reason":"unstyled"}', 10);
-  // descriptor only, NO trust pin
+  // descriptor only, NO trust pin — trust-by-default means it still runs review.
+  const dir = toolHooksDir(home);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, 'review-visual.pre-send-photo.json'),
+    JSON.stringify({ id: 'review-visual', point: 'pre-send-photo', cmd: PY_HOOK, timeout_ms: 60000 }),
+  );
+  // This test asserts the GUARD-OFF path; clear any ambient AGENTS_HOOKS_TRUST a
+  // dev/CI shell may have exported (keep PATH so the python3 shebang resolves).
+  const guardOffEnv = { ...process.env, AGENTS_HOOKS_TRUST: undefined };
+  const v = runPreSendPhotoHooks({ imagePath: pngPath }, guardOffEnv, home);
+  expect(v.blocked).toBe(true);
+  expect(v.results[0].quarantined).toBe(false);
+  expect(v.results[0].trustState).toBe('trusted-default');
+});
+
+test('AGENTS_HOOKS_TRUST=1 + descriptor with NO trust pin → quarantined, never runs review', () => {
+  mockReview('{"decision":"rollback","reason":"unstyled"}', 10);
   const dir = toolHooksDir(home);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'review-visual.pre-send-photo.json'),
     JSON.stringify({ id: 'review-visual', point: 'pre-send-photo', cmd: PY_HOOK }),
   );
-  const v = runPreSendPhotoHooks({ imagePath: pngPath }, process.env, home);
+  const v = runPreSendPhotoHooks({ imagePath: pngPath }, { ...process.env, AGENTS_HOOKS_TRUST: '1' }, home);
   expect(v.blocked).toBe(false);
   expect(v.results[0].quarantined).toBe(true);
 });

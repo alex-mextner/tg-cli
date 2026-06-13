@@ -135,19 +135,42 @@ test('trusted hook crashing (exit 1) with on_error open → send proceeds', () =
   expect(v.results[0].errored).toBe(true);
 });
 
-// --- TOFU quarantine: untrusted descriptor is inert ------------------------
+// --- trust-by-default: a dropped descriptor RUNS with no pin (the common path) ---
 
-test('untrusted (no pin) blocking hook is QUARANTINED → does NOT block', () => {
+test('untrusted (no pin) blocking hook RUNS by default → BLOCKS', () => {
+  const cmd = join(home, '.agents', 'skills', 'fake', 'hooks', 'block.sh');
+  writeHookScript('block.sh', 'echo \'{"message":"unstyled"}\'; exit 10');
+  writeDescriptor('block.pre-send-photo.json', { id: 'block', point: 'pre-send-photo', cmd });
+  // NO pinTrust — trust-by-default means it still runs.
+  const v = runPreSendPhotoHooks({ imagePath: pngPath }, {}, home);
+  expect(v.blocked).toBe(true);
+  expect(v.results[0].quarantined).toBe(false);
+  expect(v.results[0].trustState).toBe('trusted-default');
+});
+
+// --- AGENTS_HOOKS_TRUST=1 re-engages the TOFU quarantine -------------------
+
+test('AGENTS_HOOKS_TRUST=1: untrusted (no pin) blocking hook is QUARANTINED → does NOT block', () => {
   const cmd = join(home, '.agents', 'skills', 'fake', 'hooks', 'block.sh');
   writeHookScript('block.sh', 'exit 10');
   writeDescriptor('block.pre-send-photo.json', { id: 'block', point: 'pre-send-photo', cmd });
-  // no pinTrust → quarantined
-  const v = runPreSendPhotoHooks({ imagePath: pngPath }, {}, home);
+  // guard ON + no pin → quarantined
+  const v = runPreSendPhotoHooks({ imagePath: pngPath }, { AGENTS_HOOKS_TRUST: '1' }, home);
   expect(v.blocked).toBe(false);
   expect(v.results[0].quarantined).toBe(true);
 });
 
-test('AGENTS_HOOKS_TRUST=auto activates an unpinned hook', () => {
+test('AGENTS_HOOKS_TRUST=1 + a matching pin → the hook runs and blocks', () => {
+  const cmd = join(home, '.agents', 'skills', 'fake', 'hooks', 'block.sh');
+  writeHookScript('block.sh', 'echo \'{"message":"unstyled"}\'; exit 10');
+  writeDescriptor('block.pre-send-photo.json', { id: 'block', point: 'pre-send-photo', cmd });
+  pinTrust('block', cmd, 'open');
+  const v = runPreSendPhotoHooks({ imagePath: pngPath }, { AGENTS_HOOKS_TRUST: '1' }, home);
+  expect(v.blocked).toBe(true);
+  expect(v.results[0].trustState).toBe('trusted');
+});
+
+test('AGENTS_HOOKS_TRUST=auto activates an unpinned hook (escape hatch under the guard)', () => {
   const cmd = join(home, '.agents', 'skills', 'fake', 'hooks', 'block.sh');
   writeHookScript('block.sh', 'echo \'{"message":"blocked"}\'; exit 10');
   writeDescriptor('block.pre-send-photo.json', { id: 'block', point: 'pre-send-photo', cmd });
@@ -155,19 +178,19 @@ test('AGENTS_HOOKS_TRUST=auto activates an unpinned hook', () => {
   expect(v.blocked).toBe(true);
 });
 
-// --- changed executable re-quarantines -------------------------------------
+// --- changed executable re-quarantines (only under the guard) --------------
 
-test('a pinned hook whose executable changed is re-quarantined', () => {
+test('AGENTS_HOOKS_TRUST=1: a pinned hook whose executable changed is re-quarantined', () => {
   const cmd = join(home, '.agents', 'skills', 'fake', 'hooks', 'block.sh');
   writeHookScript('block.sh', 'exit 10');
   writeDescriptor('block.pre-send-photo.json', { id: 'block', point: 'pre-send-photo', cmd });
   pinTrust('block', cmd, 'open', 'STALE_SHA_DOES_NOT_MATCH');
-  const v = runPreSendPhotoHooks({ imagePath: pngPath }, {}, home);
+  const v = runPreSendPhotoHooks({ imagePath: pngPath }, { AGENTS_HOOKS_TRUST: '1' }, home);
   expect(v.blocked).toBe(false);
   expect(v.results[0].trustState).toBe('quarantined-changed');
 });
 
-test('changing descriptor ARGS (same cmd bytes) re-quarantines — TOFU not bypassable', () => {
+test('AGENTS_HOOKS_TRUST=1: changing descriptor ARGS (same cmd bytes) re-quarantines — TOFU not bypassable', () => {
   // A trusted interpreter `cmd` with pinned args, then the descriptor is edited
   // to repoint args. The executable bytes are unchanged, but the invocation
   // digest differs → quarantined-changed (re-trust required). This is the
@@ -200,7 +223,7 @@ test('changing descriptor ARGS (same cmd bytes) re-quarantines — TOFU not bypa
     cmd,
     args: ['--evil'],
   });
-  const v = runPreSendPhotoHooks({ imagePath: pngPath }, {}, home);
+  const v = runPreSendPhotoHooks({ imagePath: pngPath }, { AGENTS_HOOKS_TRUST: '1' }, home);
   expect(v.blocked).toBe(false);
   expect(v.results[0].trustState).toBe('quarantined-changed');
 });

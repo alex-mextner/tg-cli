@@ -198,14 +198,24 @@ if (import.meta.main) {
   if (rawArgs.length === 1 && rawArgs[0] === "install-skill") {
     process.exit(installSkill())
   }
-  // `tg hooks ...` — the TOFU activation path for pre-send-photo hooks (trust /
-  // list / untrust). Exact-match leading token, so `tg "hooks ..."` as a plain
-  // message still sends. Returns null when argv is not a hooks subcommand.
+  const home = process.env.HOME ?? "~"
+
+  // `tg hooks ...` — list / trust / untrust for pre-send-photo hooks. Hooks are
+  // trust-by-default (they run with no trust step), so `trust` is a no-op unless
+  // AGENTS_HOOKS_TRUST=1 re-engages the TOFU pin. Exact-match leading token, so
+  // `tg "hooks ..."` as a plain message still sends. Returns null when argv is
+  // not a hooks subcommand. Pass the SAME merged config+process env the later
+  // gate uses (config `.env` → process.env precedence) so AGENTS_HOOKS_TRUST set
+  // in ~/.config/tg-cli/.env governs `hooks list/trust` exactly as it governs a
+  // real send — otherwise `trust` would no-op while sends still quarantine.
   if (rawArgs[0] === "hooks") {
-    const code = runHooksCli(rawArgs)
+    const hooksEnv = {
+      ...loadEnv(join(home, ".config", "tg-cli", ".env")),
+      ...process.env,
+    }
+    const code = runHooksCli(rawArgs, home, hooksEnv)
     if (code !== null) process.exit(code)
   }
-  const home = process.env.HOME ?? "~"
 
   // Resolve feature flags FIRST: pull --feature/--no-feature out of argv, load
   // ~/.config/tg-cli/config.yaml, and merge (default → config → CLI). The
@@ -775,7 +785,11 @@ if (import.meta.main) {
   // behaviour. Hooks fire ONLY here (the photo subcommand) — plain `tg "msg"`
   // never reaches this. A `block` (a hook exits 10, e.g. review --visual judging
   // the screenshot unstyled/broken) HOLDS the send. Everything else (hook error,
-  // timeout, untrusted/quarantined descriptor) fails open per the runner policy.
+  // timeout) fails open per the runner policy.
+  // SECURITY: descriptors are trust-by-default — a drop-in names an executable
+  // that runs on EVERY photo send, with no trust step. Only the user / their
+  // own tools should ever write to ~/.agents/hooks/tg/. AGENTS_HOOKS_TRUST=1
+  // re-engages the TOFU quarantine for the rare untrusted-input case.
   if (
     features["hooks"] !== false &&
     plan.photos.length > 0 &&

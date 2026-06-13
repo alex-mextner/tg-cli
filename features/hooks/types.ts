@@ -14,14 +14,20 @@
 //     canonical signal — malformed-JSON can never silently bypass a gate.
 //   - Fail-open by DEFAULT (on_error: 'open'): a hook crash / timeout / bad
 //     output must NEVER break a daily `tg` send. A security gate may opt into
-//     on_error: 'closed', but a freshly-dropped, not-yet-trusted descriptor is
-//     QUARANTINED-AS-ABSENT (treated as if it does not exist), so a new gate can
-//     never brick the very first send.
-//   - TOFU trust: a dropped descriptor is INERT until its target executable's
-//     sha256 is pinned in trust.json (or AGENTS_HOOKS_TRUST=auto). Re-hash at
-//     run time; a changed executable falls back to quarantine.
+//     on_error: 'closed'.
+//   - TRUST-BY-DEFAULT: a dropped descriptor LOADS AND RUNS by default — this is
+//     the user's own machine, so the TOFU ceremony is needless. The legacy TOFU
+//     quarantine + sha-pin re-engages ONLY under the opt-in, off-by-default guard
+//     AGENTS_HOOKS_TRUST=1 (the rare paranoid / untrusted-input case). Under the
+//     guard a freshly-dropped, not-yet-trusted descriptor is QUARANTINED-AS-ABSENT
+//     (treated as if it does not exist) until pinned; AGENTS_HOOKS_TRUST=auto is
+//     the batch/agent escape hatch that bypasses the pins inside the guard.
+//   - SECURITY NOTE: a drop-in hook descriptor names an EXECUTABLE that `tg`
+//     runs on EVERY photo send. Since they run with no trust step by default,
+//     ONLY the user (or their own tools) should ever write to ~/.agents/hooks/tg/.
 //   - Append-only audit.jsonl: in a fail-open system the only thing telling
-//     "honestly allowed" from "silently bypassed" is the log line.
+//     "honestly allowed" from "silently bypassed" is the log line. Kept in BOTH
+//     the trust-by-default and the guarded paths.
 
 export const HOOK_API = 'agents-hooks/v1';
 
@@ -62,10 +68,11 @@ export interface LoadedDescriptor {
   file: string;
 }
 
-// The trust pin for one hook, keyed by `${id}.${point}` in trust.json.
-// We pin cmd_sha256 + invocation_sha256 + on_error so neither a one-byte
-// descriptor edit ("closed"→"open") NOR an invocation swap can silently change
-// what runs:
+// The trust pin for one hook, keyed by `${id}.${point}` in trust.json. Pins are
+// ONLY consulted under the AGENTS_HOOKS_TRUST=1 guard; in the trust-by-default
+// common path there is no pin to read. Under the guard we pin cmd_sha256 +
+// invocation_sha256 + on_error so neither a one-byte descriptor edit
+// ("closed"→"open") NOR an invocation swap can silently change what runs:
 //   - cmd_sha256:        the executable's bytes (catches a swapped binary).
 //   - invocation_sha256: a digest of cmd + args (catches a descriptor that
 //     keeps `cmd` = an interpreter like `python3` but repoints `args` at a
@@ -110,10 +117,11 @@ export interface HookOutput {
 
 // Why the trust gate let a hook run, or refused it.
 export type TrustState =
-  | 'trusted' // sha matched a pin
-  | 'auto' // AGENTS_HOOKS_TRUST=auto bypassed the pin
-  | 'quarantined-new' // never seen — inert, banner printed
-  | 'quarantined-changed' // executable changed since pin — inert
+  | 'trusted-default' // trust-by-default: guard off, descriptor runs with no pin
+  | 'trusted' // sha matched a pin (under the AGENTS_HOOKS_TRUST=1 guard)
+  | 'auto' // AGENTS_HOOKS_TRUST=auto bypassed the pin (under the guard)
+  | 'quarantined-new' // guard on, never seen — inert, banner printed
+  | 'quarantined-changed' // guard on, executable changed since pin — inert
   | 'untrusted-missing-cmd'; // descriptor points at a non-existent executable
 
 // The outcome of running ONE hook, for audit + aggregation.

@@ -54,9 +54,15 @@ export interface AuditLine {
 
 // Everything the pure runner needs from the outside world.
 export interface RunnerDeps {
-  // Trust pins (already parsed). Keyed by `${id}.${point}`.
+  // Trust pins (already parsed). Keyed by `${id}.${point}`. Only consulted when
+  // `untrustedGuard` is on; ignored entirely in the trust-by-default common path.
   trust: TrustStore;
-  // true → AGENTS_HOOKS_TRUST=auto: pins are bypassed (escape hatch for batch).
+  // true → AGENTS_HOOKS_TRUST=1: the opt-in, off-by-default untrusted-input guard.
+  // When set, the legacy TOFU quarantine + sha-pin re-engages (the paranoid case).
+  // When UNSET (the default) every loaded descriptor is trusted and runs.
+  untrustedGuard: boolean;
+  // true → AGENTS_HOOKS_TRUST=auto: under the guard, pins are bypassed (the
+  // batch/agent escape hatch). No effect when the guard is off (already trusted).
   trustAuto: boolean;
   // sha256 hex of a file's bytes; null if the file can't be read (missing cmd).
   sha256: (path: string) => string | null;
@@ -84,16 +90,27 @@ export function orderDescriptors(loaded: LoadedDescriptor[]): LoadedDescriptor[]
   });
 }
 
-// Resolve the trust state of a descriptor. A descriptor is INERT (quarantined,
-// treated as absent) unless its executable's current sha matches a pin — or
-// trustAuto is on. A changed executable re-quarantines.
+// Resolve the trust state of a descriptor.
+//
+// DEFAULT (guard off) = TRUST-BY-DEFAULT: any descriptor whose executable exists
+// is trusted and runs, with NO pin and NO quarantine. This is the common case —
+// the user's own machine.
+//
+// Under the opt-in AGENTS_HOOKS_TRUST=1 guard the legacy TOFU re-engages: a
+// descriptor is INERT (quarantined, treated as absent) unless its executable's
+// current sha matches a pin — or trustAuto (AGENTS_HOOKS_TRUST=auto) is on. A
+// changed executable re-quarantines.
 export function resolveTrust(
   d: HookDescriptor,
   currentSha: string | null,
   currentInvocationSha: string,
-  deps: Pick<RunnerDeps, 'trust' | 'trustAuto'>,
+  deps: Pick<RunnerDeps, 'trust' | 'trustAuto' | 'untrustedGuard'>,
 ): { state: TrustState; pinnedOnError?: OnError } {
+  // A missing executable means there is nothing to run, guard or not.
   if (currentSha === null) return { state: 'untrusted-missing-cmd' };
+  // Trust-by-default: the guard is off, so skip the pin machinery entirely.
+  if (!deps.untrustedGuard) return { state: 'trusted-default' };
+  // --- Guarded (paranoid) path: legacy TOFU quarantine + sha-pin. -----------
   if (deps.trustAuto) return { state: 'auto' };
   const pin = deps.trust[`${d.id}.${d.point}`];
   if (!pin) return { state: 'quarantined-new' };
@@ -273,15 +290,18 @@ function effectiveOnError(d: HookDescriptor, pinned?: OnError): OnError {
 }
 
 function bannerFor(state: TrustState, d: HookDescriptor): string {
+  // The quarantine states only arise under the AGENTS_HOOKS_TRUST=1 guard
+  // (trust-by-default never quarantines), so the banners point at the guarded
+  // activation path. 'untrusted-missing-cmd' can fire in either mode.
   if (state === 'quarantined-new') {
     return (
-      `NEW HOOK (not active): ${d.id} → ${d.point}. ` +
-      `Run 'tg hooks trust ${d.id}' or set AGENTS_HOOKS_TRUST=auto to activate it.`
+      `NEW HOOK (not active under AGENTS_HOOKS_TRUST=1): ${d.id} → ${d.point}. ` +
+      `Run 'tg hooks trust ${d.id}', set AGENTS_HOOKS_TRUST=auto, or unset the guard to activate it.`
     );
   }
   if (state === 'quarantined-changed') {
     return (
-      `HOOK CHANGED (not active): ${d.id} → ${d.point} executable changed since trust. ` +
+      `HOOK CHANGED (not active under AGENTS_HOOKS_TRUST=1): ${d.id} → ${d.point} executable changed since trust. ` +
       `Re-trust with 'tg hooks trust ${d.id}'.`
     );
   }

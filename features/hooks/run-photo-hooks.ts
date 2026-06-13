@@ -36,6 +36,18 @@ export function auditFile(home = homedir()): string {
   return join(hooksRoot(home), 'audit.jsonl');
 }
 
+// The opt-in, off-by-default untrusted-input guard. When set, the legacy TOFU
+// quarantine + sha-pin re-engages (the rare paranoid case — a descriptor dropped
+// by something you don't fully control). Unset (the DEFAULT) = trust-by-default:
+// every loaded descriptor runs with no ceremony.
+//
+// AGENTS_HOOKS_TRUST=auto is the batch/agent escape hatch that runs UNDER the
+// guard but auto-trusts (bypasses the pins), so it counts as guard-active too.
+export function untrustedGuardActive(env: NodeJS.ProcessEnv): boolean {
+  const v = (env.AGENTS_HOOKS_TRUST ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on' || v === 'auto';
+}
+
 // THE non-breaking guard. The tg seam calls this first; if it returns false the
 // send path is byte-for-byte today's behaviour (one `stat`, nothing else).
 // AGENTS_HOOKS=0 hard-bypasses everything.
@@ -169,6 +181,10 @@ function freshEventId(): string {
 export function buildRunnerDeps(env: NodeJS.ProcessEnv, home = homedir()): RunnerDeps {
   return {
     trust: loadTrust(home),
+    // Trust-by-default: the TOFU quarantine + pin only re-engages under the
+    // opt-in AGENTS_HOOKS_TRUST=1 guard. AGENTS_HOOKS_TRUST=auto (the legacy
+    // batch escape) also implies the guard is in play — it just auto-trusts.
+    untrustedGuard: untrustedGuardActive(env),
     trustAuto: env.AGENTS_HOOKS_TRUST === 'auto',
     sha256: sha256OfFile,
     sha256Str: sha256OfString,

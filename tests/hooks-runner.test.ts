@@ -39,6 +39,9 @@ interface MockOpts {
     { cmd_sha256: string; invocation_sha256?: string; point: string; on_error: 'open' | 'closed' }
   >;
   trustAuto?: boolean;
+  // Default true here so the existing TOFU/quarantine/pin assertions exercise the
+  // GUARDED path (AGENTS_HOOKS_TRUST=1). Trust-by-default is covered explicitly.
+  untrustedGuard?: boolean;
   sha?: (path: string) => string | null;
 }
 
@@ -48,6 +51,7 @@ function mkDeps(opts: MockOpts = {}): { deps: RunnerDeps; warns: string[]; audit
   const deps: RunnerDeps = {
     trust: opts.trust ?? {},
     trustAuto: opts.trustAuto ?? false,
+    untrustedGuard: opts.untrustedGuard ?? true,
     sha256: opts.sha ?? (() => 'SHA'),
     sha256Str: () => 'INV',
     spawn: opts.spawn ?? (() => ({ exitCode: 0, stdout: '{"decision":"allow"}', stderr: '', timedOut: false })),
@@ -82,46 +86,91 @@ test('orderDescriptors sorts by priority then filename', () => {
   expect(out).toEqual(['a.json', 'b.json', 'z.json']);
 });
 
-// --- trust -----------------------------------------------------------------
+// --- trust-by-default (guard OFF — the common path) ------------------------
 
-test('resolveTrust: unseen descriptor is quarantined-new', () => {
-  const r = resolveTrust(desc(), 'SHA', 'INV', { trust: {}, trustAuto: false });
+test('resolveTrust: guard OFF → any present descriptor is trusted-default (no pin needed)', () => {
+  const r = resolveTrust(desc(), 'SHA', 'INV', { trust: {}, trustAuto: false, untrustedGuard: false });
+  expect(r.state).toBe('trusted-default');
+  expect(r.pinnedOnError).toBeUndefined();
+});
+
+test('resolveTrust: guard OFF still reports a missing cmd (nothing to run)', () => {
+  const r = resolveTrust(desc(), null, 'INV', { trust: {}, trustAuto: false, untrustedGuard: false });
+  expect(r.state).toBe('untrusted-missing-cmd');
+});
+
+// --- guarded TOFU trust (AGENTS_HOOKS_TRUST=1) -----------------------------
+
+test('resolveTrust: guard ON, unseen descriptor is quarantined-new', () => {
+  const r = resolveTrust(desc(), 'SHA', 'INV', { trust: {}, trustAuto: false, untrustedGuard: true });
   expect(r.state).toBe('quarantined-new');
 });
 
-test('resolveTrust: matching pin is trusted and carries on_error', () => {
-  const r = resolveTrust(desc(), 'SHA', 'INV', { trust: trustOk, trustAuto: false });
+test('resolveTrust: guard ON, matching pin is trusted and carries on_error', () => {
+  const r = resolveTrust(desc(), 'SHA', 'INV', { trust: trustOk, trustAuto: false, untrustedGuard: true });
   expect(r.state).toBe('trusted');
   expect(r.pinnedOnError).toBe('open');
 });
 
-test('resolveTrust: changed sha re-quarantines', () => {
-  const r = resolveTrust(desc(), 'DIFFERENT', 'INV', { trust: trustOk, trustAuto: false });
+test('resolveTrust: guard ON, changed sha re-quarantines', () => {
+  const r = resolveTrust(desc(), 'DIFFERENT', 'INV', { trust: trustOk, trustAuto: false, untrustedGuard: true });
   expect(r.state).toBe('quarantined-changed');
 });
 
-test('resolveTrust: changed INVOCATION (cmd+args) re-quarantines even if cmd sha matches', () => {
+test('resolveTrust: guard ON, changed INVOCATION (cmd+args) re-quarantines even if cmd sha matches', () => {
   // The executable bytes are unchanged ('SHA') but args were repointed, so the
   // invocation digest no longer matches the pin → re-trust required.
-  const r = resolveTrust(desc(), 'SHA', 'DIFFERENT_INV', { trust: trustOk, trustAuto: false });
+  const r = resolveTrust(desc(), 'SHA', 'DIFFERENT_INV', { trust: trustOk, trustAuto: false, untrustedGuard: true });
   expect(r.state).toBe('quarantined-changed');
 });
 
-test('resolveTrust: missing cmd → untrusted-missing-cmd', () => {
-  const r = resolveTrust(desc(), null, 'INV', { trust: trustOk, trustAuto: false });
+test('resolveTrust: guard ON, missing cmd → untrusted-missing-cmd', () => {
+  const r = resolveTrust(desc(), null, 'INV', { trust: trustOk, trustAuto: false, untrustedGuard: true });
   expect(r.state).toBe('untrusted-missing-cmd');
 });
 
-test('resolveTrust: trustAuto bypasses pins', () => {
-  const r = resolveTrust(desc(), 'whatever', 'whatever', { trust: {}, trustAuto: true });
+test('resolveTrust: guard ON, trustAuto bypasses pins', () => {
+  const r = resolveTrust(desc(), 'whatever', 'whatever', { trust: {}, trustAuto: true, untrustedGuard: true });
   expect(r.state).toBe('auto');
 });
 
-// --- quarantine = absent (never runs, never blocks) ------------------------
+// --- trust-by-default: a dropped descriptor RUNS with NO trust step --------
 
-test('quarantined-new descriptor does NOT run and does NOT block', () => {
+test('guard OFF: a dropped descriptor with no pin RUNS by default (and can block)', () => {
   let ran = false;
   const { deps, warns } = mkDeps({
+    untrustedGuard: false, // the default world: trust-by-default
+    spawn: () => {
+      ran = true;
+      return { exitCode: 10, stdout: '{"message":"unstyled"}', stderr: '', timedOut: false };
+    },
+  });
+  const v = runHooks([loaded()], evt, deps); // NO trust pin supplied
+  expect(ran).toBe(true);
+  expect(v.blocked).toBe(true);
+  expect(v.blockMessage).toBe('unstyled');
+  expect(v.results[0].trustState).toBe('trusted-default');
+  expect(v.results[0].quarantined).toBe(false);
+  // no quarantine banner in the common path
+  expect(warns.some((w) => w.includes('NEW HOOK'))).toBe(false);
+});
+
+test('guard OFF: a dropped descriptor exiting 0 allows the send (runs, no pin)', () => {
+  const { deps } = mkDeps({
+    untrustedGuard: false,
+    spawn: () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),
+  });
+  const v = runHooks([loaded()], evt, deps);
+  expect(v.blocked).toBe(false);
+  expect(v.results[0].trustState).toBe('trusted-default');
+});
+
+// --- guarded TOFU: quarantine = absent (never runs, never blocks) ----------
+
+test('guard ON: quarantined-new descriptor does NOT run and does NOT block', () => {
+  let ran = false;
+  const { deps, warns } = mkDeps({
+    untrustedGuard: true,
     spawn: () => {
       ran = true;
       return { exitCode: 10, stdout: '', stderr: '', timedOut: false };

@@ -1,6 +1,10 @@
-// `tg hooks ...` subcommand — the TOFU activation path the quarantine banners
-// point users at. Without this, "Run 'tg hooks trust <id>'" is a lie and the
-// only way to activate a hook is hand-editing trust.json or AGENTS_HOOKS_TRUST=auto.
+// `tg hooks ...` subcommand.
+//
+// Hooks are TRUST-BY-DEFAULT: a dropped descriptor loads and runs with no
+// ceremony. So `tg hooks trust` is a friendly NO-OP in the common path (it just
+// prints a one-liner). It only pins a sha under the opt-in AGENTS_HOOKS_TRUST=1
+// guard — the rare paranoid / untrusted-input case where the legacy TOFU
+// quarantine re-engages and the quarantine banners point users back here.
 //
 // The pure logic (compute the new trust store from a descriptor + current sha)
 // lives in computeTrustPin / formatList so it is unit-testable with no disk; the
@@ -11,7 +15,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, chmodS
 import { homedir } from 'os';
 import { dirname, join } from 'path';
 import { validateDescriptor } from './runner';
-import { toolHooksDir, trustFile } from './run-photo-hooks';
+import { toolHooksDir, trustFile, untrustedGuardActive } from './run-photo-hooks';
 import { DEFAULT_ON_ERROR, invocationDigest, type HookDescriptor, type TrustPin, type TrustStore } from './types';
 
 export interface HooksCliDeps {
@@ -76,21 +80,29 @@ export function computeTrustPin(
   };
 }
 
-// Render a `hooks list` table line for one descriptor.
+// Render a `hooks list` table line for one descriptor. `guard` reflects whether
+// the AGENTS_HOOKS_TRUST=1 untrusted-input guard is active: when off (the
+// default) every present-executable descriptor is trusted-by-default; the pin
+// columns only matter under the guard.
 export function formatList(
   descriptors: { descriptor: HookDescriptor; file: string }[],
   trust: TrustStore,
   sha256: (path: string) => string | null,
   sha256Str: (s: string) => string,
+  guard = false,
 ): string {
   if (descriptors.length === 0) return 'No tg hooks installed (~/.agents/hooks/tg/ is empty).';
-  const lines = ['tg hooks:'];
+  const header = guard
+    ? 'tg hooks (AGENTS_HOOKS_TRUST=1 — TOFU quarantine active):'
+    : 'tg hooks (trust-by-default — all present hooks run):';
+  const lines = [header];
   for (const { descriptor: d } of descriptors) {
     const sha = sha256(d.cmd);
     const invSha = sha256Str(invocationDigest(d.cmd, d.args));
     const pin = trust[`${d.id}.${d.point}`];
     let status: string;
     if (sha === null) status = 'MISSING-CMD';
+    else if (!guard) status = 'trusted (default)';
     else if (!pin) status = 'untrusted (quarantined)';
     else if (pin.cmd_sha256 !== sha || pin.invocation_sha256 !== invSha) status = 'CHANGED (re-trust)';
     else status = `trusted (on_error=${pin.on_error})`;
@@ -101,15 +113,31 @@ export function formatList(
 
 // --- subcommand handlers (pure-ish: I/O via deps) --------------------------
 
-export function cmdList(deps: HooksCliDeps, home: string): number {
+export function cmdList(deps: HooksCliDeps, home: string, guard = false): number {
   const dir = toolHooksDir(home);
   const descriptors = loadAllDescriptors(deps, dir);
   const trust = readTrust(deps, home);
-  deps.log(formatList(descriptors, trust, deps.sha256, deps.sha256Str));
+  deps.log(formatList(descriptors, trust, deps.sha256, deps.sha256Str, guard));
   return 0;
 }
 
-export function cmdTrust(deps: HooksCliDeps, home: string, id: string, override?: TrustPin['on_error']): number {
+export function cmdTrust(
+  deps: HooksCliDeps,
+  home: string,
+  id: string,
+  override?: TrustPin['on_error'],
+  guard = false,
+): number {
+  // Trust-by-default: without the AGENTS_HOOKS_TRUST=1 guard a descriptor already
+  // loads and runs, so there is nothing to pin. `trust` is then a friendly no-op
+  // that says so (mirrors review-cli's trust-module). It only pins under the guard.
+  if (!guard) {
+    deps.log(
+      `tg: '${id}' already runs (trust-by-default). ` +
+        `'tg hooks trust' only pins a sha under AGENTS_HOOKS_TRUST=1 (the untrusted-input guard).`,
+    );
+    return 0;
+  }
   const dir = toolHooksDir(home);
   const descriptors = loadAllDescriptors(deps, dir);
   const match = descriptors.filter((x) => x.descriptor.id === id);
@@ -166,18 +194,21 @@ function readTrust(deps: Pick<HooksCliDeps, 'readFile'>, home: string): TrustSto
   }
 }
 
-const HOOKS_USAGE = `Usage:
+const HOOKS_USAGE = `Usage (hooks are trust-by-default — they run with no trust step):
   tg hooks list                       list installed tg hooks + trust status
-  tg hooks trust <id> [open|closed]   pin a hook's executable sha (TOFU activate)
-  tg hooks untrust <id>               remove a hook's trust pin (re-quarantine)`;
+  tg hooks trust <id> [open|closed]   no-op unless AGENTS_HOOKS_TRUST=1; then pins the sha
+  tg hooks untrust <id>               remove a hook's trust pin (only relevant under the guard)`;
 
 // Parse + dispatch `tg hooks <sub> ...`. Returns an exit code, or null if argv
-// is not a hooks subcommand (so the caller falls through to the send path).
-export function runHooksCli(args: string[], home = homedir()): number | null {
+// is not a hooks subcommand (so the caller falls through to the send path). The
+// AGENTS_HOOKS_TRUST=1 guard (off by default) flips `trust`/`list` from no-op /
+// trust-by-default into the legacy TOFU pin path.
+export function runHooksCli(args: string[], home = homedir(), env: NodeJS.ProcessEnv = process.env): number | null {
   if (args[0] !== 'hooks') return null;
   const deps = realDeps(home);
+  const guard = untrustedGuardActive(env);
   const sub = args[1];
-  if (sub === 'list' || sub === undefined) return cmdList(deps, home);
+  if (sub === 'list' || sub === undefined) return cmdList(deps, home, guard);
   if (sub === 'trust') {
     const id = args[2];
     if (!id) {
@@ -195,7 +226,7 @@ export function runHooksCli(args: string[], home = homedir()): number | null {
       }
       override = args[3];
     }
-    return cmdTrust(deps, home, id, override);
+    return cmdTrust(deps, home, id, override, guard);
   }
   if (sub === 'untrust') {
     const id = args[2];
