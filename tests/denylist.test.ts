@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { isNeverAttach } from '../features/auto-attach/denylist';
-import { parseArgs } from '../tg';
+import { parseArgs } from '../features/cli/args';
 
 // --- pattern matching (basename-based) ---
 

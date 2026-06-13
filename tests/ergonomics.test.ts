@@ -2,7 +2,8 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { parseArgs, VERSION } from '../tg';
+import { parseArgs } from '../features/cli/args';
+import { VERSION } from '../tg';
 
 // Real temp files for existence checks — no Telegram API is ever touched.
 let dir: string;

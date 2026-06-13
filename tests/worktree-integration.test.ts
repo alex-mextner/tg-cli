@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { parseArgs } from '../tg';
+import { parseArgs } from '../features/cli/args';
 
 // Two simulated worktree roots. The mentioned file exists ONLY in `feature`.
 // `parseArgs` is invoked with cwd == main; without worktree-aware resolution

@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { parseArgs } from '../tg';
+import { parseArgs } from '../features/cli/args';
 
 // Auto-attach must skip files WITHOUT a real extension (LICENSE, Makefile,
 // binaries like `tg`, dotfiles like `.env`): they are usually code-adjacent
