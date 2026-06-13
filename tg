@@ -39,7 +39,7 @@ import {
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { botIdFromToken, ctlPaths } from "./features/tg-ctl/lock"
 import { appendRoute, parseRoutes, serializeRoutes } from "./features/tg-ctl/routes"
-import { findAgentInAncestry, parseProcList } from "./features/tg-ctl/discover"
+import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
@@ -577,39 +577,6 @@ function decodeTextEscapes(value: string): string {
     if (escaped === "t") return "\t"
     return "\\"
   })
-}
-
-function isProcessRunning(name: string): boolean {
-  try {
-    const result = Bun.spawnSync(["pgrep", "-x", name], {
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    return result.exitCode === 0
-  } catch {
-    return false
-  }
-}
-
-// Which agent launched this `tg` process? Climb the ppid chain and match the
-// nearest ancestor command (codex/aider/pi/opencode/claude). This is the
-// reliable signal for agents that — unlike Claude Code's CLAUDECODE — export no
-// env marker: a `codex exec` is the direct parent of the shell command it runs.
-// Crucially it runs BEFORE the pgrep fallbacks so a background `ollama` daemon
-// (a sibling, never an ancestor) can no longer hijack the label.
-function detectAgentViaAncestry(): string | null {
-  try {
-    const result = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], {
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    if (result.exitCode !== 0) return null
-    const procs = parseProcList(new TextDecoder().decode(result.stdout))
-    const found = findAgentInAncestry(procs, process.ppid)
-    return found?.agent ?? null
-  } catch {
-    return null
-  }
 }
 
 // --- CLI entrypoint (only runs when executed directly, not when imported) ---
