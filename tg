@@ -48,6 +48,14 @@ import { type SendItem } from "./features/auto-attach/types"
 import { parseArgs, type Format } from "./features/cli/args"
 import { versionOutput } from "./features/cli/version"
 import {
+  convertEntitiesToHtml,
+  detectHtmlTags,
+  escapeHtml,
+  parseEmojiHelpers,
+  parseModeFor,
+} from "./features/render/html"
+import { buildPrefix } from "./features/render/prefix"
+import {
   enumerateWorktreeRoots,
   runGitReal,
 } from "./features/auto-attach/worktree"
@@ -437,48 +445,6 @@ if (import.meta.main) {
 
   const API = `https://api.telegram.org/bot${BOT_TOKEN}`
 
-  const parseEmojiHelpers = (text: string): ParsedText => {
-    const entities: EmojiEntity[] = []
-    let result = ""
-
-    const regex = /:([a-zA-Z0-9_-]+):/g
-    let match
-    let lastIndex = 0
-
-    while ((match = regex.exec(text)) !== null) {
-      const [fullMatch, name] = match
-      const lower = name.toLowerCase()
-      const emojiId = EMBEDDABLE_EMOJI_MAP[lower]
-      const unicodeEmoji = UNICODE_EMOJI_MAP[lower]
-
-      // Append text before match
-      result += text.slice(lastIndex, match.index)
-
-      if (emojiId) {
-        // Use placeholder emoji for entity
-        const placeholder = unicodeEmoji || "🤖"
-        entities.push({
-          type: "custom_emoji",
-          offset: result.length,
-          length: placeholder.length,
-          custom_emoji_id: emojiId,
-        })
-        result += placeholder
-      } else if (unicodeEmoji) {
-        result += unicodeEmoji
-      } else {
-        result += fullMatch
-      }
-
-      lastIndex = regex.lastIndex
-    }
-
-    // Append remaining text
-    result += text.slice(lastIndex)
-
-    return { text: result, entities }
-  }
-
   // --- Tmux context ---
   // The raw tmux window name (no brackets). buildPrefix wraps it in [] and
   // styles it (item 5: Mathematical Sans-Serif Bold, with a <b> fallback for
@@ -503,55 +469,6 @@ if (import.meta.main) {
   }
 
   const tmuxWindow = getTmuxWindow()
-
-  // --- Build the message prefix (branded emoji + styled [window]) ---
-  // Returns the prefix in two finished forms — `html` (custom emoji →
-  // <tg-emoji>, window name → Mathematical Sans-Serif Bold or an escaped <b>
-  // fallback) and `plain` (unicode only, no tags) — plus `forceHtml`, true when
-  // the html form carries a real tag (custom emoji, or the <b> Cyrillic
-  // fallback) so the whole message MUST be sent as HTML. `present` replaces the
-  // old `prefix.text.length > 0` signal. The emoji tag + styled window are ours,
-  // not user-authored HTML, so renderText keeps the caption's escaping separate.
-  const buildPrefix = (): { html: string; plain: string; present: boolean; forceHtml: boolean } => {
-    let html = ""
-    let plain = ""
-    let forceHtml = false
-
-    if (AI_EMOJI) {
-      // Resolve the branded custom-emoji id (exact key, then substring match).
-      const base = extractBaseModel(MODEL)
-      let emojiId = EMBEDDABLE_EMOJI_MAP[base]
-      if (!emojiId) {
-        for (const [key, id] of Object.entries(EMBEDDABLE_EMOJI_MAP)) {
-          if (base.includes(key)) {
-            emojiId = id
-            break
-          }
-        }
-      }
-      if (emojiId) {
-        html += `<tg-emoji emoji-id="${emojiId}">${AI_EMOJI}</tg-emoji>`
-        forceHtml = true // a custom-emoji tag only renders in HTML mode
-      } else {
-        html += escapeHtml(AI_EMOJI) // no branded id → plain unicode emoji
-      }
-      plain += AI_EMOJI
-    }
-
-    if (tmuxWindow) {
-      if (plain.length > 0) {
-        html += " "
-        plain += " "
-      }
-      const styled = styleWindowName(tmuxWindow)
-      html += `[${styled.html}]`
-      plain += `[${styled.plain}]`
-      if (styled.tag) forceHtml = true // the <b> Cyrillic fallback forces HTML
-    }
-
-    if (!plain && !html) return { html: "", plain: "", present: false, forceHtml: false }
-    return { html: html + "\n", plain: plain + "\n", present: true, forceHtml }
-  }
 
   const { items, caption: rawCaption, format } = parsed
   const caption = decodeTextEscapes(rawCaption)
@@ -744,47 +661,6 @@ if (import.meta.main) {
   const hasAutolink = hasTickets || hasRefs
 
   // --- API calls ---
-  const detectHtmlTags = (text: string): boolean => {
-    const htmlPattern = /<(b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|tg-time|code|pre|blockquote)\b/i
-    return htmlPattern.test(text)
-  }
-
-  const parseModeFor = (formatValue: Format, text?: string): "HTML" | undefined => {
-    if (formatValue === "html") return "HTML"
-    if (text && detectHtmlTags(text)) return "HTML"
-    return undefined
-  }
-
-  const escapeHtml = (s: string): string =>
-    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-
-  // Render custom-emoji entities to inline <tg-emoji> tags.
-  //   escape=false → the surrounding text is intentional HTML (user asked for
-  //     --format html or wrote real tags); leave it verbatim.
-  //   escape=true  → we are forcing HTML ONLY to carry the emoji; the
-  //     surrounding text is plain, so escape &<> in the non-entity segments so
-  //     literal characters can't break HTML parsing (regression guard).
-  const convertEntitiesToHtml = (
-    text: string,
-    entities: EmojiEntity[],
-    escape = false,
-  ): string => {
-    // Walk entities left-to-right, copying the gaps between them verbatim (or
-    // HTML-escaped when `escape`) and inserting a <tg-emoji> tag for each.
-    const asc = [...entities].sort((a, b) => a.offset - b.offset)
-    let out = ""
-    let cursor = 0
-    for (const e of asc) {
-      const gap = text.slice(cursor, e.offset)
-      out += escape ? escapeHtml(gap) : gap
-      const emoji = text.slice(e.offset, e.offset + e.length)
-      out += `<tg-emoji emoji-id="${e.custom_emoji_id}">${emoji}</tg-emoji>`
-      cursor = e.offset + e.length
-    }
-    const tail = text.slice(cursor)
-    out += escape ? escapeHtml(tail) : tail
-    return out
-  }
 
   const checkResponse = async (resp: Response, method: string): Promise<unknown> => {
     if (!resp.ok) {
@@ -902,7 +778,7 @@ if (import.meta.main) {
   // substituting :helper: markers inside text we're about to remove. Line-spec
   // quotes are inserted AFTER this hook (anchored on the token) so the injected
   // <pre> can't flip the userHtml/escape decision below.
-  const prefix = buildPrefix()
+  const prefix = buildPrefix({ aiEmoji: AI_EMOJI, model: MODEL, tmuxWindow })
   const renderText = (stripped: string, fmt: Format): { text: string; format: Format } => {
     const parsedCaption = parseEmojiHelpers(stripped)
     // buildPrefix already rendered the prefix to finished html/plain (its emoji
