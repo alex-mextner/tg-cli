@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { parseArgs } from '../tg';
+import { parseArgs } from '../features/cli/args';
 
 // End-to-end through parseArgs against a real temp filesystem — same pattern
 // as worktree-integration.test.ts. parseArgs is invoked WITHOUT an injected

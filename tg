@@ -1,8 +1,7 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
-import { isAbsolute, join, resolve } from "path"
-import { isNeverAttach } from "./features/auto-attach/denylist"
+import { join, resolve } from "path"
 import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
 import {
   applyFeatureFlags,
@@ -17,11 +16,8 @@ import { applyAutolink, linkifyTicketsCompound } from "./features/autolink-tasks
 import { styleTaskTitle, styleWindowName } from "./features/prefix-style/style"
 import {
   EMBEDDABLE_EMOJI_MAP,
-  UNICODE_EMOJI_MAP,
   MODEL_EMOJI_MAP,
   extractBaseModel,
-  type EmojiEntity,
-  type ParsedText,
 } from "./features/branding/emoji"
 import {
   mergeIntoCache as mergeGhCache,
@@ -44,23 +40,26 @@ import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
 import { buildSendPlan } from "./features/auto-attach/normalize"
-import { parseLineSpec } from "./features/auto-attach/snippet"
-import { transmit, type Transport } from "./features/auto-attach/transmitter"
-import { type SendItem } from "./features/auto-attach/types"
+import { transmit } from "./features/auto-attach/transmitter"
+import { parseArgs, type Format } from "./features/cli/args"
+import { versionOutput } from "./features/cli/version"
 import {
-  buildFileIndex,
-  isRecursiveCandidate,
-  matchFromIndex,
-  type ListDir,
-} from "./features/auto-attach/recursive"
+  convertEntitiesToHtml,
+  detectHtmlTags,
+  escapeHtml,
+  parseEmojiHelpers,
+} from "./features/render/html"
+import { buildPrefix } from "./features/render/prefix"
+import { createTelegramTransport } from "./features/transport/telegram"
 import {
   enumerateWorktreeRoots,
-  looksPathLike,
-  resolveAcrossWorktrees,
   runGitReal,
 } from "./features/auto-attach/worktree"
 
-export const VERSION = "1.6.0"
+// Re-export VERSION from its module so `import { VERSION } from "../tg"` keeps
+// working (tests/ergonomics.test.ts) after the version helpers moved to
+// features/cli/version.ts.
+export { VERSION } from "./features/cli/version"
 
 // --- Config loader ---
 function loadEnv(filePath: string): Record<string, string> {
@@ -80,63 +79,6 @@ function loadEnv(filePath: string): Record<string, string> {
     // file doesn't exist — skip
   }
   return env
-}
-
-// --- Version output (runtime git hash + changelog) ---
-/**
- * Resolve the short git commit hash of the repo containing the tg script.
- * Read at RUNTIME (the tool is run directly via bun, not built), so the hash
- * always reflects the checked-out commit. Never throws: returns "unknown" when
- * git is unavailable or the script lives outside a git repo.
- */
-export function gitShortHash(scriptDir: string): string {
-  try {
-    const proc = Bun.spawnSync(["git", "-C", scriptDir, "rev-parse", "--short", "HEAD"])
-    if (proc.exitCode === 0) {
-      const hash = proc.stdout.toString().trim()
-      if (hash) return hash
-    }
-  } catch {
-    // git missing / not a repo — fall through to "unknown"
-  }
-  return "unknown"
-}
-
-/**
- * Read the latest (top-most) version section of CHANGELOG.md, i.e. everything
- * from the first `## ` heading up to the next `## ` heading. Keeps --version
- * output readable as releases accumulate. Returns "" when the changelog is
- * absent or has no version section. Never throws.
- */
-export function latestChangelogSection(scriptDir: string): string {
-  try {
-    const raw = readFileSync(join(scriptDir, "CHANGELOG.md"), "utf8")
-    const lines = raw.split("\n")
-    const start = lines.findIndex((l) => l.startsWith("## "))
-    if (start === -1) return ""
-    let end = lines.length
-    for (let i = start + 1; i < lines.length; i++) {
-      if (lines[i].startsWith("## ")) {
-        end = i
-        break
-      }
-    }
-    return lines.slice(start, end).join("\n").replace(/\s+$/, "")
-  } catch {
-    // no changelog — degrade gracefully
-    return ""
-  }
-}
-
-/**
- * Compose the full `--version` / `-v` output: a version+hash line, then the
- * latest changelog section (when present). Pure aside from the I/O it delegates
- * to the helpers above, and never throws.
- */
-export function versionOutput(scriptDir: string): string {
-  const head = `tg ${VERSION} (${gitShortHash(scriptDir)})`
-  const changelog = latestChangelogSection(scriptDir)
-  return changelog ? `${head}\n\n${changelog}` : head
 }
 
 // --- Usage ---
@@ -235,340 +177,6 @@ HTML tags supported by Telegram Bot API:
 Only those HTML tags are supported. Escape raw <, >, and & outside tags as
 &lt;, &gt;, and &amp;.
 `
-
-// --- Arg parsing (pure) ---
-export interface ItemLineSpec {
-  // The full original token as written (e.g. "src/a.ts:42-50"), kept so the
-  // quote can be anchored on it in the caption.
-  token: string
-  startLine: number
-  endLine: number
-  col: number | undefined
-}
-
-export interface Item {
-  type: "photo" | "document"
-  path: string
-  // Present only when the path was written with a trailing line-spec
-  // (file.ts:42 / :42-50 / :42:5). Absent otherwise so no-spec parse results
-  // are byte-identical to before (keeps existing toEqual assertions green).
-  lineSpec?: ItemLineSpec
-  // True ONLY for items DETECTED by the auto-attach path scanner (not for
-  // explicit --photo/--file). Marks auto-detected provenance (e.g. the
-  // attach-denylist silently skips a denylisted AUTO path but hard-errors an
-  // explicit one). Absent on explicit items so their existing toEqual
-  // assertions stay byte-identical.
-  auto?: true
-}
-
-export type Format = "plain" | "html"
-
-export type ParseResult =
-  | { action: "help" }
-  | { action: "version" }
-  | { action: "lsEmojiHelpers" }
-  | { action: "detectModel" }
-  | { action: "error"; message: string }
-  | { action: "send"; items: Item[]; caption: string; format: Format }
-
-// Extensions that Telegram's sendPhoto accepts. SVG is intentionally excluded:
-// Telegram rejects SVG as a photo, so an auto-detected .svg path falls back to
-// a document (explicit --photo still honors the user's choice).
-const IMAGE_EXTENSIONS = new Set([
-  "png",
-  "jpg",
-  "jpeg",
-  "gif",
-  "webp",
-  "bmp",
-  "heic",
-  "heif",
-])
-
-function isImagePath(path: string): boolean {
-  const dot = path.lastIndexOf(".")
-  if (dot === -1) return false
-  return IMAGE_EXTENSIONS.has(path.slice(dot + 1).toLowerCase())
-}
-
-// A "real" extension = a dot at basename position >0 with word chars after it.
-// LICENSE, Makefile, tg → none; .env (dot at 0, nothing more) → none either.
-// The auto-attach scanner skips extensionless files: they are usually
-// code-adjacent artifacts the receiver can't preview, and dotfiles tend to
-// hold secrets. Explicit --photo/--file remain a direct instruction.
-function hasRealExtension(path: string): boolean {
-  const base = path.slice(path.lastIndexOf("/") + 1)
-  return /^.+\.[A-Za-z0-9]+$/.test(base)
-}
-
-function expandHome(token: string, home: string): string {
-  if (token === "~") return home
-  if (token.startsWith("~/")) return join(home, token.slice(2))
-  return token
-}
-
-/**
- * Resolve a text token to an existing file path, if it is one.
- * Tries ~-expansion, absolute, and cwd-relative resolution.
- * Returns the absolute path only when it resolves to a real file (not a dir).
- */
-function resolveExistingFile(token: string, cwd: string, home: string): string | null {
-  if (!token) return null
-  const expanded = expandHome(token, home)
-  const candidate = isAbsolute(expanded) ? expanded : resolve(cwd, expanded)
-  try {
-    if (statSync(candidate).isFile()) return candidate
-  } catch {
-    // not a path / no access — treat as ordinary text
-  }
-  return null
-}
-
-/**
- * Parse argv (already sliced past node/script) into an action. Never throws and
- * never calls process.exit: the caller decides what to do with the result.
- *
- * Precedence (the reconciliation point for "unknown dashed → error"):
- *   1. -h/--help and -v/--version win anywhere, before everything else.
- *   2. Info-only flags --ls-emoji-helpers / --detect-model win next.
- *   3. Real flags are matched: --format (with value validation), --photo,
- *      --file (each consuming a path value).
- *   4. ONLY a dashed token that matched none of the above is "unknown" → error.
- * This guarantees every flag main supports is recognized before the
- * unknown-dashed guard can fire, so none of them regress to an error.
- */
-export function parseArgs(
-  args: string[],
-  cwd: string,
-  home: string,
-  autoAttach = true,
-  // Worktree-aware fallback: a memoized thunk returning the priority-ordered
-  // list of git worktree roots to probe when a path-like token fails plain
-  // cwd/~/absolute resolution. Injected so tests stub it (and `main` memoizes
-  // the real `enumerateWorktreeRoots`). Defaults to "no extra roots" — with the
-  // thunk absent, resolution is exactly the old cwd-only behavior.
-  getWorktreeRoots: () => string[] = () => [],
-  // Never-attach denylist (feature `attach-denylist`, ON by default): secret-
-  // looking files (.env family, private keys, credential rc-files, …) are
-  // silently skipped by the auto-scan and a HARD ERROR for explicit flags.
-  attachDenylist = true,
-  // Recursive resolution (feature `recursive-attach`, ON by default): third
-  // fallback after plain and worktree-root joins — search the worktree roots
-  // (or cwd outside a git repo) recursively for the mentioned file (auto-attach
-  // spec §Recursive resolution). The index thunk is injectable for tests;
-  // the default builds one lazy real-fs index per parseArgs call.
-  recursiveAttach = true,
-  getFileIndex?: () => string[],
-): ParseResult {
-  // 1. Help / version win anywhere, before the empty check.
-  for (const a of args) {
-    if (a === "-h" || a === "--help") return { action: "help" }
-  }
-  for (const a of args) {
-    if (a === "-v" || a === "--version") return { action: "version" }
-  }
-
-  // 2. Info-only flags win next, anywhere on the line.
-  for (const a of args) {
-    if (a === "--ls-emoji-helpers") return { action: "lsEmojiHelpers" }
-  }
-  for (const a of args) {
-    if (a === "--detect-model") return { action: "detectModel" }
-  }
-
-  const explicit: Item[] = []
-  const textParts: string[] = []
-  let format: Format = "plain"
-
-  let i = 0
-  while (i < args.length) {
-    const arg = args[i]
-    if (arg === "--format") {
-      const nextArg = args[i + 1]
-      if (!nextArg || nextArg.startsWith("--")) {
-        return { action: "error", message: "--format requires plain or html" }
-      }
-      if (nextArg !== "plain" && nextArg !== "html") {
-        return {
-          action: "error",
-          message: `unsupported format '${nextArg}'. Accepted values: plain, html`,
-        }
-      }
-      format = nextArg
-      i += 2
-      continue
-    }
-    if (arg === "--photo" || arg === "--file") {
-      const nextArg = args[i + 1]
-      // A dashed next token is only consumed as a path when it actually
-      // resolves to an existing file (e.g. `--file -receipt.png`). Otherwise
-      // it is a missing/invalid path → error, matching main's behavior.
-      const dashedButNotAFile =
-        !!nextArg && nextArg.startsWith("-") && resolveExistingFile(nextArg, cwd, home) === null
-      if (!nextArg || dashedButNotAFile) {
-        return { action: "error", message: `${arg} requires a file path argument` }
-      }
-      if (attachDenylist && isNeverAttach(nextArg)) {
-        return {
-          action: "error",
-          message:
-            `refusing to attach '${nextArg}': matches the never-attach denylist (secrets). ` +
-            "Override with --no-feature attach-denylist",
-        }
-      }
-      explicit.push({ type: arg === "--photo" ? "photo" : "document", path: nextArg })
-      i += 2
-      continue
-    }
-    // A standalone dashed token that matched no known flag (and is not a flag
-    // value, since those are consumed above) is an unknown flag → error.
-    if (arg.startsWith("-")) {
-      return { action: "error", message: `unknown flag: ${arg}` }
-    }
-    // Anything else is plain text.
-    textParts.push(arg)
-    i += 1
-  }
-
-  // Auto-detect existing-file paths in the message text. Split the joined text
-  // on whitespace so both `tg /tmp/x.png` and `tg "look /tmp/x.png"` work.
-  const explicitResolved = new Set(
-    explicit
-      .map((it) => resolveExistingFile(it.path, cwd, home))
-      .filter((p): p is string => p !== null),
-  )
-  const autoItems: Item[] = []
-  // CORE CORRECTION (spec §"never excise a path"): a path mentioned in the text
-  // STAYS in the text verbatim. We only DETECT it and attach the file — we never
-  // strip the token from the caption. (The old behavior excised it; that is now
-  // reversed.) Tokenize purely to find file references; the caption is the
-  // original joined text, untouched except for outer-edge trimming.
-  //
-  // Auto-detection is the `auto-attach` FEATURE. When it is OFF, we skip the
-  // scan entirely — only explicit --photo/--file are attached, and any path in
-  // the text stays as plain words (it is never attached).
-  if (autoAttach) {
-    // Worktree-aware resolution (CTO request): when a token fails the plain
-    // cwd/~/absolute resolve, AND it looks path-like, fall back to probing the
-    // git worktree roots in priority order (current → main → branch-matched →
-    // rest). `getWorktreeRoots` is the injected, memoized thunk; the path-like
-    // gate keeps git OUT of the hot path for ordinary prose. This only changes
-    // WHERE a relative path resolves — never the R1–R4 attach rules.
-    const fileExistsAbs = (p: string): boolean => {
-      try {
-        return statSync(p).isFile()
-      } catch {
-        return false
-      }
-    }
-    // Recursive index (feature `recursive-attach`): built lazily, at most once
-    // per parseArgs call, and ONLY when some token actually reaches the third
-    // fallback — ordinary sends never pay for a tree walk.
-    const realListDir: ListDir = (abs) => {
-      try {
-        return readdirSync(abs, { withFileTypes: true }).map((d) => ({
-          name: d.name,
-          isFile: d.isFile(),
-          isDirectory: d.isDirectory(),
-        }))
-      } catch {
-        return null
-      }
-    }
-    let fileIndexCache: string[] | null = null
-    const getIndex =
-      getFileIndex ??
-      ((): string[] => {
-        if (fileIndexCache === null) {
-          const roots = getWorktreeRoots()
-          fileIndexCache = buildFileIndex(roots.length > 0 ? roots : [cwd], realListDir)
-        }
-        return fileIndexCache
-      })
-    const resolveWithWorktrees = (token: string): string | null => {
-      const plain = resolveExistingFile(token, cwd, home)
-      if (plain) return plain
-      if (!looksPathLike(token)) return null
-      const roots = getWorktreeRoots()
-      if (roots.length > 0) {
-        const fromWorktrees = resolveAcrossWorktrees(token, roots, fileExistsAbs)
-        if (fromWorktrees) return fromWorktrees
-      }
-      // Third fallback: recursive search (auto-attach spec §Recursive
-      // resolution). The hit is re-checked against the real fs — the index
-      // may be stale within a long-running process.
-      if (recursiveAttach && isRecursiveCandidate(token)) {
-        const hit = matchFromIndex(token, getIndex())
-        if (hit && fileExistsAbs(hit)) return hit
-      }
-      return null
-    }
-    const segments = textParts.join(" ").split(/(\s+)/)
-    for (let s = 0; s < segments.length; s++) {
-      const isWhitespace = s % 2 === 1
-      const seg = segments[s]
-      if (isWhitespace || !seg) continue
-      // First try a plain existing-file resolve. If that fails, the token may
-      // carry a trailing line-spec (file.ts:42 / :42-50 / :42:5) — strip it and
-      // resolve the base path. The full token stays in the caption either way.
-      // Both resolves go through the worktree-aware fallback.
-      let resolved = resolveWithWorktrees(seg)
-      let spec: ItemLineSpec | undefined
-      if (!resolved) {
-        const ls = parseLineSpec(seg)
-        if (ls) {
-          const baseResolved = resolveWithWorktrees(ls.path)
-          if (baseResolved) {
-            resolved = baseResolved
-            spec = {
-              token: seg,
-              startLine: ls.startLine,
-              endLine: ls.endLine,
-              col: ls.col,
-            }
-          }
-        }
-      }
-      if (!resolved) continue
-      // Extensionless gate: an auto-DETECTED file without a real extension is
-      // never attached (the token stays in the text as plain words).
-      if (!hasRealExtension(resolved)) continue
-      // Never-attach denylist: a secret-looking file mentioned in the text is
-      // never attached (the token stays as plain words).
-      if (attachDenylist && isNeverAttach(resolved)) continue
-      if (explicitResolved.has(resolved)) {
-        // Already attached (explicit --file/--photo or an earlier mention). Don't
-        // attach twice, but if THIS mention carried a line-spec and the existing
-        // item has none, adopt it so `--file x.ts "see x.ts:42"` still renders a
-        // quote. First spec per file wins (a second, different spec is ignored —
-        // documented in docs/specs/auto-attach.md; the marker copy can only mark
-        // one range). Match on the resolved path, not the raw arg string.
-        if (spec) {
-          // Re-resolve via the SAME worktree-aware path so a cross-worktree
-          // file (whose plain resolve is null) still matches its existing item.
-          const existing = [...explicit, ...autoItems].find(
-            (it) => resolveWithWorktrees(it.path) === resolved && !it.lineSpec,
-          )
-          if (existing) existing.lineSpec = spec
-        }
-        continue
-      }
-      explicitResolved.add(resolved) // dedup repeats within the text too
-      const item: Item = { type: isImagePath(resolved) ? "photo" : "document", path: resolved, auto: true }
-      if (spec) item.lineSpec = spec
-      autoItems.push(item)
-    }
-  }
-
-  const items = [...explicit, ...autoItems]
-  // Trim only the outer edges; interior formatting (newlines, alignment) stays.
-  // The path token is intentionally KEPT in the caption (core correction).
-  const caption = textParts.join(" ").replace(/^\s+|\s+$/g, "")
-
-  // Empty invocation (or nothing left after path excision) → help, exit 0.
-  if (items.length === 0 && !caption) return { action: "help" }
-  return { action: "send", items, caption, format }
-}
 
 function decodeTextEscapes(value: string): string {
   return value.replace(/\\([nrt\\])/g, (_match: string, escaped: string) => {
@@ -833,48 +441,6 @@ if (import.meta.main) {
 
   const API = `https://api.telegram.org/bot${BOT_TOKEN}`
 
-  const parseEmojiHelpers = (text: string): ParsedText => {
-    const entities: EmojiEntity[] = []
-    let result = ""
-
-    const regex = /:([a-zA-Z0-9_-]+):/g
-    let match
-    let lastIndex = 0
-
-    while ((match = regex.exec(text)) !== null) {
-      const [fullMatch, name] = match
-      const lower = name.toLowerCase()
-      const emojiId = EMBEDDABLE_EMOJI_MAP[lower]
-      const unicodeEmoji = UNICODE_EMOJI_MAP[lower]
-
-      // Append text before match
-      result += text.slice(lastIndex, match.index)
-
-      if (emojiId) {
-        // Use placeholder emoji for entity
-        const placeholder = unicodeEmoji || "🤖"
-        entities.push({
-          type: "custom_emoji",
-          offset: result.length,
-          length: placeholder.length,
-          custom_emoji_id: emojiId,
-        })
-        result += placeholder
-      } else if (unicodeEmoji) {
-        result += unicodeEmoji
-      } else {
-        result += fullMatch
-      }
-
-      lastIndex = regex.lastIndex
-    }
-
-    // Append remaining text
-    result += text.slice(lastIndex)
-
-    return { text: result, entities }
-  }
-
   // --- Tmux context ---
   // The raw tmux window name (no brackets). buildPrefix wraps it in [] and
   // styles it (item 5: Mathematical Sans-Serif Bold, with a <b> fallback for
@@ -899,55 +465,6 @@ if (import.meta.main) {
   }
 
   const tmuxWindow = getTmuxWindow()
-
-  // --- Build the message prefix (branded emoji + styled [window]) ---
-  // Returns the prefix in two finished forms — `html` (custom emoji →
-  // <tg-emoji>, window name → Mathematical Sans-Serif Bold or an escaped <b>
-  // fallback) and `plain` (unicode only, no tags) — plus `forceHtml`, true when
-  // the html form carries a real tag (custom emoji, or the <b> Cyrillic
-  // fallback) so the whole message MUST be sent as HTML. `present` replaces the
-  // old `prefix.text.length > 0` signal. The emoji tag + styled window are ours,
-  // not user-authored HTML, so renderText keeps the caption's escaping separate.
-  const buildPrefix = (): { html: string; plain: string; present: boolean; forceHtml: boolean } => {
-    let html = ""
-    let plain = ""
-    let forceHtml = false
-
-    if (AI_EMOJI) {
-      // Resolve the branded custom-emoji id (exact key, then substring match).
-      const base = extractBaseModel(MODEL)
-      let emojiId = EMBEDDABLE_EMOJI_MAP[base]
-      if (!emojiId) {
-        for (const [key, id] of Object.entries(EMBEDDABLE_EMOJI_MAP)) {
-          if (base.includes(key)) {
-            emojiId = id
-            break
-          }
-        }
-      }
-      if (emojiId) {
-        html += `<tg-emoji emoji-id="${emojiId}">${AI_EMOJI}</tg-emoji>`
-        forceHtml = true // a custom-emoji tag only renders in HTML mode
-      } else {
-        html += escapeHtml(AI_EMOJI) // no branded id → plain unicode emoji
-      }
-      plain += AI_EMOJI
-    }
-
-    if (tmuxWindow) {
-      if (plain.length > 0) {
-        html += " "
-        plain += " "
-      }
-      const styled = styleWindowName(tmuxWindow)
-      html += `[${styled.html}]`
-      plain += `[${styled.plain}]`
-      if (styled.tag) forceHtml = true // the <b> Cyrillic fallback forces HTML
-    }
-
-    if (!plain && !html) return { html: "", plain: "", present: false, forceHtml: false }
-    return { html: html + "\n", plain: plain + "\n", present: true, forceHtml }
-  }
 
   const { items, caption: rawCaption, format } = parsed
   const caption = decodeTextEscapes(rawCaption)
@@ -1139,63 +656,6 @@ if (import.meta.main) {
   const hasRefs = autolinkRefs.size > 0
   const hasAutolink = hasTickets || hasRefs
 
-  // --- API calls ---
-  const detectHtmlTags = (text: string): boolean => {
-    const htmlPattern = /<(b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|tg-time|code|pre|blockquote)\b/i
-    return htmlPattern.test(text)
-  }
-
-  const parseModeFor = (formatValue: Format, text?: string): "HTML" | undefined => {
-    if (formatValue === "html") return "HTML"
-    if (text && detectHtmlTags(text)) return "HTML"
-    return undefined
-  }
-
-  const escapeHtml = (s: string): string =>
-    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-
-  // Render custom-emoji entities to inline <tg-emoji> tags.
-  //   escape=false → the surrounding text is intentional HTML (user asked for
-  //     --format html or wrote real tags); leave it verbatim.
-  //   escape=true  → we are forcing HTML ONLY to carry the emoji; the
-  //     surrounding text is plain, so escape &<> in the non-entity segments so
-  //     literal characters can't break HTML parsing (regression guard).
-  const convertEntitiesToHtml = (
-    text: string,
-    entities: EmojiEntity[],
-    escape = false,
-  ): string => {
-    // Walk entities left-to-right, copying the gaps between them verbatim (or
-    // HTML-escaped when `escape`) and inserting a <tg-emoji> tag for each.
-    const asc = [...entities].sort((a, b) => a.offset - b.offset)
-    let out = ""
-    let cursor = 0
-    for (const e of asc) {
-      const gap = text.slice(cursor, e.offset)
-      out += escape ? escapeHtml(gap) : gap
-      const emoji = text.slice(e.offset, e.offset + e.length)
-      out += `<tg-emoji emoji-id="${e.custom_emoji_id}">${emoji}</tg-emoji>`
-      cursor = e.offset + e.length
-    }
-    const tail = text.slice(cursor)
-    out += escape ? escapeHtml(tail) : tail
-    return out
-  }
-
-  const checkResponse = async (resp: Response, method: string): Promise<unknown> => {
-    if (!resp.ok) {
-      const body = await resp.text()
-      console.error(`Telegram API error (${method}): ${resp.status} ${body}`)
-      process.exit(1)
-    }
-    const json = (await resp.json()) as { ok: boolean; description?: string; result?: unknown }
-    if (!json.ok) {
-      console.error(`Telegram API error (${method}): ${json.description ?? "unknown error"}`)
-      process.exit(1)
-    }
-    return json.result
-  }
-
   // Record an outbound message_id → this pane so the daemon can route a REPLY to
   // the agent that produced it, and order the unrecognized-reply picker by
   // LRU/MRU (docs/specs/reply-quotes.md). Best-effort, tmux-only; a corrupt or
@@ -1219,46 +679,6 @@ if (import.meta.main) {
       // best-effort: never let route bookkeeping break a send
     }
   }
-  // A Bot API send `result` is a Message (text/photo/document) or an array of
-  // Messages (sendMediaGroup) — record a route for every message id so a reply to
-  // ANY of them (including a media report) routes to this pane (codex review P2).
-  const recordRouteFromResult = (result: unknown): void => {
-    if (Array.isArray(result)) {
-      for (const m of result) recordRouteFromResult(m)
-      return
-    }
-    if (result && typeof result === "object" && typeof (result as { message_id?: unknown }).message_id === "number") {
-      recordRoute((result as { message_id: number }).message_id)
-    }
-  }
-
-  const sendMessage = async (text: string, formatValue: Format, entities: EmojiEntity[]): Promise<void> => {
-    const parseMode = parseModeFor(formatValue, text)
-    let outText = text
-    if (parseMode && entities.length > 0) {
-      outText = convertEntitiesToHtml(text, entities)
-    }
-    const body: Record<string, unknown> = {
-      chat_id: CHAT_ID,
-      text: outText,
-    }
-    if (parseMode) {
-      body.parse_mode = parseMode
-    } else if (entities.length > 0) {
-      body.entities = entities
-    }
-    const resp = await fetch(`${API}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    })
-    recordRouteFromResult(await checkResponse(resp, "sendMessage"))
-  }
-
-  // Per-item photo/document sending now lives in the Transport below (the
-  // transmitter calls those primitives). Custom-emoji entities are pre-rendered
-  // to inline HTML before reaching the transmitter, so the send primitives deal
-  // only in (string, format) — no entity arrays at this layer.
 
   // --- renderText hook: prefix + emoji → inline <tg-emoji> HTML ---
   // Pipeline order (forced, see normalize.ts): decode → extract(R2/R4) → THIS
@@ -1298,7 +718,7 @@ if (import.meta.main) {
   // substituting :helper: markers inside text we're about to remove. Line-spec
   // quotes are inserted AFTER this hook (anchored on the token) so the injected
   // <pre> can't flip the userHtml/escape decision below.
-  const prefix = buildPrefix()
+  const prefix = buildPrefix({ aiEmoji: AI_EMOJI, model: MODEL, tmuxWindow })
   const renderText = (stripped: string, fmt: Format): { text: string; format: Format } => {
     const parsedCaption = parseEmojiHelpers(stripped)
     // buildPrefix already rendered the prefix to finished html/plain (its emoji
@@ -1460,93 +880,10 @@ if (import.meta.main) {
     process.exit(1)
   }
 
-  // --- Transport: the only place that talks to the Telegram API. ---
-  // A SendItem source is either a real path (Bun.file) or in-memory content
-  // (Blob), so R4 fragment files and marker-injected copies never touch disk.
-  // Upload bytes for an item. Text DOCUMENTS with non-ASCII UTF-8 content get
-  // a BOM prepended to the uploaded copy (features/auto-attach/encoding.ts) so
-  // Telegram's preview stops guessing legacy codepages for Cyrillic; the file
-  // on disk is never modified. Photos and big/binary files stream unchanged.
-  const blobFor = (item: SendItem): { body: Blob | ReturnType<typeof Bun.file>; name?: string } => {
-    if (item.source.kind === "memory") {
-      const bytes = new TextEncoder().encode(item.source.content)
-      const processed = item.type === "document" ? maybeAddBom(bytes, item.source.filename) : bytes
-      return { body: new Blob([processed]), name: item.source.filename }
-    }
-    if (item.type === "document") {
-      try {
-        const size = statSync(item.source.path).size
-        if (size > 0 && size <= BOM_MAX_BYTES) {
-          const bytes = new Uint8Array(readFileSync(item.source.path))
-          const processed = maybeAddBom(bytes, item.source.path)
-          if (processed !== bytes) {
-            const name = item.source.path.slice(item.source.path.lastIndexOf("/") + 1)
-            return { body: new Blob([processed]), name }
-          }
-        }
-      } catch {
-        // unreadable here → let Bun.file surface the real error downstream
-      }
-    }
-    return { body: Bun.file(item.source.path) }
-  }
-  const transport: Transport = {
-    sendMessage: (text, fmt) => sendMessage(text, fmt, []),
-    sendPhoto: async (item, cap, fmt) => {
-      const { body, name } = blobFor(item)
-      const form = new FormData()
-      form.append("chat_id", CHAT_ID)
-      if (name) form.append("photo", body, name)
-      else form.append("photo", body)
-      const parseMode = parseModeFor(fmt, cap)
-      if (cap) form.append("caption", cap)
-      if (parseMode) form.append("parse_mode", parseMode)
-      const resp = await fetch(`${API}/sendPhoto`, { method: "POST", body: form })
-      recordRouteFromResult(await checkResponse(resp, "sendPhoto"))
-    },
-    sendDocument: async (item, cap, fmt) => {
-      const { body, name } = blobFor(item)
-      const form = new FormData()
-      form.append("chat_id", CHAT_ID)
-      if (name) form.append("document", body, name)
-      else form.append("document", body)
-      const parseMode = parseModeFor(fmt, cap)
-      if (cap) form.append("caption", cap)
-      if (parseMode) form.append("parse_mode", parseMode)
-      const resp = await fetch(`${API}/sendDocument`, { method: "POST", body: form })
-      recordRouteFromResult(await checkResponse(resp, "sendDocument"))
-    },
-    // Album send (FIX 2): 2..10 same-type items as a single Telegram media
-    // group. Each item is uploaded as a multipart field and referenced from the
-    // `media` JSON via `attach://<field>`. The caption (if any) rides the FIRST
-    // InputMedia item — Telegram shows it as the album caption.
-    sendMediaGroup: async (kind, mediaItems, cap, fmt) => {
-      const form = new FormData()
-      form.append("chat_id", CHAT_ID)
-      const parseMode = parseModeFor(fmt, cap)
-      const media = mediaItems.map((item, i) => {
-        const { body, name } = blobFor(item)
-        const field = `file${i}`
-        // A memory item needs an explicit filename so Telegram keeps the ext;
-        // a disk item is uploaded under a stable field name (its own name is
-        // carried by Bun.file). attach:// binds the JSON entry to the field.
-        if (name) form.append(field, body, name)
-        else form.append(field, body)
-        const entry: Record<string, string> = { type: kind, media: `attach://${field}` }
-        if (i === 0 && cap) {
-          entry.caption = cap
-          if (parseMode) entry.parse_mode = parseMode
-        }
-        return entry
-      })
-      form.append("media", JSON.stringify(media))
-      const resp = await fetch(`${API}/sendMediaGroup`, { method: "POST", body: form })
-      recordRouteFromResult(await checkResponse(resp, "sendMediaGroup"))
-    },
-  }
-
-  // The transmitter applies caption-overflow + the >4096 split + the
-  // photos→text→documents ordering, then calls the transport primitives.
+  // Build the bot-bound transport (api + chat + the route recorder), then hand
+  // it to the transmitter, which applies caption-overflow + the >4096 split +
+  // the photos→text→documents ordering on top of the four send primitives.
+  const transport = createTelegramTransport({ api: API, chatId: CHAT_ID, recordRoute })
   await transmit(plan, transport)
 
   // Generated md→pdf artifacts are uploaded by now — drop their temp dirs so
