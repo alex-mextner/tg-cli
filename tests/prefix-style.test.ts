@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import {
   toSansBold,
-  toBoldScript,
+  toBoldItalic,
   styleWindowName,
   styleTaskTitle,
 } from '../features/prefix-style/style';
@@ -29,18 +29,18 @@ test('sans-bold: a Cyrillic letter forces null (caller falls back)', () => {
   expect(toSansBold('api-бот')).toBeNull();
 });
 
-// --- toBoldScript ---
+// --- toBoldItalic ---
 
-test('bold-script: maps letters, leaves digits verbatim (block has no digits)', () => {
-  const out = toBoldScript('Fix v2')!;
+test('bold-italic: maps letters, leaves digits verbatim (block has no digits)', () => {
+  const out = toBoldItalic('Fix v2')!;
   expect(out).toContain('2'); // digit stays plain
   expect(out).toContain(' ');
   expect(/[a-zA-Z]/.test(out)).toBe(false);
-  expect(out.startsWith('\u{1D4D5}')).toBe(true); // 'F' → 𝓕
+  expect(out.startsWith('\u{1D46D}')).toBe(true); // 'F' → 𝑭
 });
 
-test('bold-script: Cyrillic forces null', () => {
-  expect(toBoldScript('Починить')).toBeNull();
+test('bold-italic: Cyrillic forces null', () => {
+  expect(toBoldItalic('Починить')).toBeNull();
 });
 
 // --- styleWindowName ---
@@ -68,14 +68,14 @@ test('window: ampersand in a Latin name is escaped in html, raw in plain', () =>
 
 // --- styleTaskTitle ---
 
-test('title: Latin → bold-script unicode (escaped)', () => {
+test('title: Latin → bold-italic unicode (escaped)', () => {
   const out = styleTaskTitle('Fix autolink');
-  expect(out).toBe(toBoldScript('Fix autolink'));
+  expect(out).toBe(toBoldItalic('Fix autolink'));
   expect(/[a-zA-Z]/.test(out)).toBe(false);
 });
 
 test('title: Latin with markup chars stays escaped', () => {
-  // '<' has no script glyph → left verbatim by the mapper, then escaped.
+  // '<' has no bold-italic glyph → left verbatim by the mapper, then escaped.
   expect(styleTaskTitle('a<b')).toContain('&lt;');
 });
 

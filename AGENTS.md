@@ -63,7 +63,7 @@ tests can pass fakes.
   `#5-7,9`): body links the written numbers, the bottom block enumerates the full range. Used by
   both autolink features (docs/specs/autolink-compound.md).
 - `features/prefix-style/` — Unicode styling of the outbound prefix: tmux window name → Sans-Serif
-  Bold, single-ticket task title → Bold Script, with `<b>`/`<i>` fallback for Cyrillic
+  Bold, single-ticket task title → Bold Italic, with `<b>`/`<i>` fallback for Cyrillic
   (docs/specs/unicode-prefix-styling.md).
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile
   helpers, the update→action step function (allowlist, staleness, command split, `/agent`

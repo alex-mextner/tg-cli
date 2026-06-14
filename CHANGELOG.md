@@ -3,6 +3,14 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.6.1
+
+- **Task-title styling restyled** — the single-ticket autolink task title now
+  renders in **Mathematical Bold Italic** (`𝑭𝒊𝒙`) instead of the gaudier Bold
+  Script (`𝓕𝓲𝔁`). The whole-token `<i>` fallback for Cyrillic / foreign-letter
+  titles (which the math block can't represent) is unchanged.
+  (`features/prefix-style/`, docs/specs/unicode-prefix-styling.md.)
+
 ## 1.6.0
 
 Agent addressing, reply quotes, prefix styling, and compound autolinks.

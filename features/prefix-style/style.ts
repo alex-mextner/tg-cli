@@ -5,21 +5,21 @@
 //   - the tmux window name inside [] → Mathematical Sans-Serif Bold
 //     (𝗮𝗽𝗶-𝗯𝗼𝘁), "math but no serifs";
 //   - the single-ticket task title appended after [] → Mathematical Bold
-//     Script (𝓕𝓲𝔁 𝓪𝓾𝓽𝓸𝓵𝓲𝗻𝗸), a calligraphic italic.
+//     Italic (𝑭𝒊𝒙 𝒂𝒖𝒕𝒐𝒍𝒊𝒏𝒌), a serif italic.
 //
 // The Mathematical Alphanumeric Symbols blocks only cover ASCII A-Z/a-z (and,
 // for sans-serif, digits). Cyrillic and other non-Latin letters have NO glyph
 // there, so a token that contains one falls back to a real HTML tag (<b>/<i>)
 // instead — exactly the fallback the user asked for. Digits and punctuation
 // never trigger the fallback: they are left verbatim inside an otherwise styled
-// token (Bold Script has no digit glyphs, so "Fix v2" keeps its plain 2).
+// token (Bold Italic has no digit glyphs, so "Fix v2" keeps its plain 2).
 
 // --- Mathematical Alphanumeric block bases ---
 const SANS_BOLD_UPPER = 0x1d5d4; // 'A' → 𝗔
 const SANS_BOLD_LOWER = 0x1d5ee; // 'a' → 𝗮
 const SANS_BOLD_DIGIT = 0x1d7ec; // '0' → 𝟬
-const BOLD_SCRIPT_UPPER = 0x1d4d0; // 'A' → 𝓐
-const BOLD_SCRIPT_LOWER = 0x1d4ea; // 'a' → 𝓪
+const BOLD_ITALIC_UPPER = 0x1d468; // 'A' → 𝑨
+const BOLD_ITALIC_LOWER = 0x1d482; // 'a' → 𝒂
 
 export function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -64,10 +64,10 @@ export function toSansBold(s: string): string | null {
   return styleLatin(s, SANS_BOLD_UPPER, SANS_BOLD_LOWER, SANS_BOLD_DIGIT);
 }
 
-// Mathematical Bold Script (letters only — the block has no digits). null →
+// Mathematical Bold Italic (letters only — the block has no digits). null →
 // has a foreign letter.
-export function toBoldScript(s: string): string | null {
-  return styleLatin(s, BOLD_SCRIPT_UPPER, BOLD_SCRIPT_LOWER);
+export function toBoldItalic(s: string): string | null {
+  return styleLatin(s, BOLD_ITALIC_UPPER, BOLD_ITALIC_LOWER);
 }
 
 export interface StyledToken {
@@ -86,10 +86,11 @@ export function styleWindowName(name: string): StyledToken {
 }
 
 // Style a task TITLE (the autolink single-ticket title shown after []). Returns
-// final HTML (already escaped). Latin → Bold Script unicode; a foreign-letter
-// title → <i>title</i>. Suitable as the `styleTitle` hook of applyAutolink.
+// final HTML (already escaped). Latin → Bold Italic unicode; a title that
+// carries any Cyrillic/foreign letter falls back WHOLE to <i>title</i> (the
+// math block has no Cyrillic). Suitable as the `styleTitle` hook of applyAutolink.
 export function styleTaskTitle(raw: string): string {
-  const uni = toBoldScript(raw);
+  const uni = toBoldItalic(raw);
   if (uni !== null) return escapeHtml(uni);
   return `<i>${escapeHtml(raw)}</i>`;
 }

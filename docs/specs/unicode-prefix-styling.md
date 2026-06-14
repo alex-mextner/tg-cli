@@ -11,8 +11,9 @@ The message prefix `<emoji> [window] <task title>` gets typographic styling:
 - the **tmux window name** inside `[]` → **Mathematical Sans-Serif Bold**
   (`[𝗮𝗽𝗶-𝗯𝗼𝘁]`) — "math but no serifs" (decision 2026-06-12);
 - the **single-ticket task title** appended after `]` (the autolink-tasks
-  first-line title) → **Mathematical Bold Script** (`𝓕𝓲𝔁 𝓪𝓾𝓽𝓸𝓵𝓲𝗻𝗸`), a
-  calligraphic italic.
+  first-line title) → **Mathematical Bold Italic** (`𝑭𝒊𝒙 𝒂𝒖𝒕𝒐𝒍𝒊𝒏𝒌`), a
+  serif italic (decision 2026-06-14: was Bold Script `𝓕𝓲𝔁`, switched because the
+  calligraphic script read as too gaudy; Bold Italic is the restrained weight).
 
 The brackets themselves stay unstyled; the emoji is untouched (branded custom
 emoji as before).
@@ -28,7 +29,7 @@ all, so it falls back to a real HTML tag:
 - task title with a non-Latin letter → `<i>title</i>` (escaped).
 
 Digits and punctuation never trigger the fallback — they are left verbatim inside
-an otherwise-styled token (Bold Script has no digit glyphs, so `Fix v2` keeps its
+an otherwise-styled token (Bold Italic has no digit glyphs, so `Fix v2` keeps its
 plain `2`). The fallback trigger is precisely "contains a Unicode letter that is
 not ASCII `A–Z/a–z`".
 
@@ -36,12 +37,12 @@ not ASCII `A–Z/a–z`".
 
 - `toSansBold(s): string | null` — map ASCII letters+digits to Sans-Serif Bold;
   `null` when `s` has a foreign letter.
-- `toBoldScript(s): string | null` — map ASCII letters to Bold Script (no
+- `toBoldItalic(s): string | null` — map ASCII letters to Bold Italic (no
   digits); `null` on a foreign letter.
 - `styleWindowName(name): { html, plain, tag }` — `html` is escaped (and may be
   `<b>name</b>`), `plain` is the unicode-only form, `tag` is true when `html`
   carries a real tag (forces HTML mode).
-- `styleTaskTitle(raw): string` — final HTML for the title (unicode script
+- `styleTaskTitle(raw): string` — final HTML for the title (unicode bold-italic
   escaped, or `<i>…</i>`). Used as the `styleTitle` hook of `applyAutolink`.
 
 ## Render wiring (`tg`)
