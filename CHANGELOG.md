@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.7.0
+
+Pre-send-photo hook framework + `review --visual` unstyled guard.
+
+- **Pre-send-photo hook point** — `tg` now runs an extensible hook chain
+  (`agents-hooks/v1`) over every outgoing `--photo` before it leaves. Drop a
+  descriptor under `~/.agents/hooks/tg/<id>.pre-send-photo.json` (an executable
+  with a priority / timeout / on-error policy) and it runs against the PNG; a
+  hook can `allow` the send or `block` it with the canonical exit code 10.
+  (`features/hooks/`, `tg hooks list|trust`.)
+- **`review --visual` unstyled guard** — the bundled `review-visual` descriptor
+  pipes the outgoing photo through `review --visual <png> --json --strict` and
+  blocks an unstyled / broken / blank render before it ships. Vision is slow, so
+  the hook runs with a 60s timeout and `on_error: open`: a slow or unavailable
+  vision call NEVER blocks a send — only an explicit rollback verdict does.
+  (`review install-hook tg` substitutes the absolute cmd path.)
+- **Trust by default** — drop-in descriptors LOAD AND RUN with no `tg hooks
+  trust` ceremony on the user's own machine. The legacy TOFU quarantine + SHA
+  pin re-engages only under `AGENTS_HOOKS_TRUST=1` (the rare untrusted-input
+  case); `AGENTS_HOOKS_TRUST=auto` runs under the guard but auto-trusts.
+- **Fail-open, non-breaking** — no descriptors dir ⇒ a single `stat` and a
+  byte-identical send (zero behavior change for existing users). A hook crash,
+  timeout, or malformed output warns and sends anyway; only exit-10 blocks.
+  Every run is recorded to an append-only `audit.jsonl`.
+
 ## 1.6.1
 
 - **Task-title styling restyled** — the single-ticket autolink task title now
