@@ -28,7 +28,6 @@ export interface PrefixParts {
   forceHtml: boolean;
 }
 
-
 export function buildPrefix(opts: {
   aiEmoji: string;
   model: string;
@@ -95,16 +94,20 @@ export function buildPrefix(opts: {
       // per uploaded cell. Telegram REQUIRES the inner (fallback) text of a
       // custom_emoji entity to be exactly one emoji — wrapping a slice of the
       // word ("SWER") is rejected with ENTITY_TEXT_INVALID — so every cell's
-      // inner text is the canonical DOT (a single emoji). The readable WORD then
-      // follows the cells as PLAIN text (outside any entity, so it is always
-      // visible and never rejected). Premium clients render the N pill images
-      // edge-to-edge into the wordmark chip, then the word; non-premium clients
-      // see the dots + word (e.g. "🔵🔵 ANSWER"). The word is also what
-      // copy/paste/search and the html fallback show. The plain form keeps the
-      // readable unicode fallback ("🔵 ANSWER") for the non-HTML / >4096 path.
+      // inner text is the canonical DOT (a single emoji). Premium clients render
+      // the N pill images edge-to-edge into the wordmark chip (which already
+      // SPELLS the word — "ANSWER" etc. is baked into the sticker art), so the
+      // HTML header carries ONLY the pill cells — NO appended plain word.
+      // (CTO 2026-06-14: the first line is the --title text only; the tag is just
+      // the pill badge. A second plain "ANSWER" word next to the pill duplicated
+      // the label and clashed with the styled title, so it was removed.)
+      // Non-premium clients fall back to the per-cell DOT emoji ("🔵🔵🔵") — an
+      // accepted, intentional trade for a clean premium first line. The plain
+      // form keeps the readable unicode fallback ("🔵 ANSWER") for the non-HTML /
+      // >4096 split path, which is the only readable form there.
       const ids = TAG_PILL_IDS[resolved.word];
       const cells = ids.map((id) => `<tg-emoji emoji-id="${id}">${escapeHtml(resolved.dot)}</tg-emoji>`).join('');
-      html += `${sep}${cells} ${escapeHtml(resolved.word)}`;
+      html += `${sep}${cells}`;
       plain += `${sep}${resolved.fallback}`;
       forceHtml = true; // a custom-emoji pill only renders in HTML mode
     } else {
