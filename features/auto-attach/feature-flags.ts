@@ -25,6 +25,11 @@ export const DEFAULT_FEATURES: FeatureMap = {
   'md-as-pdf': true,
   'attach-denylist': true,
   'recursive-attach': true,
+  // pre-send-photo hooks (agents-hooks/v1). ON by default, but it is a TRUE
+  // no-op unless ~/.agents/hooks/tg/ exists (one `stat`), so default-ON costs
+  // nothing on machines with no descriptors. `--no-feature hooks` or
+  // AGENTS_HOOKS=0 hard-bypasses.
+  hooks: true,
 };
 
 // A deliberately tiny YAML reader. We only support the exact shape the spec

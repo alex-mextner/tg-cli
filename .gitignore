@@ -1,3 +1,5 @@
 .env
 .claude/
 .worktrees/
+__pycache__/
+*.pyc
