@@ -8,6 +8,8 @@
 // are ordered by how recently + how often each pane was last messaged — both
 // derived from this same map (no separate usage state).
 
+import { resolve } from 'path';
+
 export interface Route {
   id: number; // Telegram message_id of an outbound message
   paneId: string; // the tmux pane that produced it (`tg`'s TMUX_PANE)
@@ -57,6 +59,30 @@ export function recognizeRoute(routes: Route[], messageId: number): Route | null
     if (routes[i].id === messageId) return routes[i];
   }
   return null;
+}
+
+// The project-identity stamped into a route's `cwd` at SEND time. It must be the
+// SAME quantity the daemon compares against at REPLY time — the origin pane's
+// `pane_current_path` — NOT `process.cwd()`. Agents run `tg` from /tmp, so
+// process.cwd() (e.g. /private/tmp) never equals the pane's path and every reply
+// fell through to the picker (the bug fixed here). Inject the pane-path query so
+// this stays pure & testable; fall back to `fallbackCwd` (process.cwd()) when not
+// in tmux or the query fails — that matches a daemon whose snapshot also can't
+// read the pane, so the conservative picker fallback (04cb6e5) is preserved.
+export function resolveRouteCwd(opts: { queryPanePath: () => string | null; fallbackCwd: string }): string {
+  const panePath = opts.queryPanePath();
+  return panePath && panePath.length > 0 ? panePath : opts.fallbackCwd;
+}
+
+// Does a recognized route still belong to the SAME project as the live pane?
+// Compares the recorded send-path against the pane's current path, both resolved
+// to absolute form. A tmux pane id is reused after kill-pane, so this guard
+// (04cb6e5) stops a stale message_id→%N map from injecting project A's reply into
+// project B's agent. An absent recorded cwd (old route) or absent pane → no match,
+// so the daemon falls through to the picker rather than risk mis-routing.
+export function routeMatchesPane(opts: { recognizedCwd: string | undefined; panePath: string | undefined }): boolean {
+  if (!opts.recognizedCwd || opts.panePath === undefined) return false;
+  return resolve(opts.panePath) === resolve(opts.recognizedCwd);
 }
 
 export interface PaneUsage {

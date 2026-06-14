@@ -129,7 +129,8 @@ test('probe: "No API key configured" → no-auth', () => {
   const probe = probeTickets(['HYP-1'], () => ({
     exitCode: 1,
     stdout: '',
-    stderr: '✗ API request failed: No API key configured\n  Set LINEAR_API_KEY, add api_key to .linear.toml, or run `linear auth login`.',
+    stderr:
+      '✗ API request failed: No API key configured\n  Set LINEAR_API_KEY, add api_key to .linear.toml, or run `linear auth login`.',
   }));
   expect(probe.status).toBe('no-auth');
 });
@@ -206,8 +207,7 @@ const T = (code: string, title = `Title of ${code}`): TicketInfo => ({
   url: `https://linear.app/x/issue/${code}/slug`,
 });
 
-const mapOf = (...tickets: TicketInfo[]): Map<string, TicketInfo> =>
-  new Map(tickets.map((t) => [t.code, t]));
+const mapOf = (...tickets: TicketInfo[]): Map<string, TicketInfo> => new Map(tickets.map((t) => [t.code, t]));
 
 test('linkify: wraps a verified code in an anchor', () => {
   const out = linkifyCodes('done with HYP-576 today', mapOf(T('HYP-576')));
@@ -273,6 +273,25 @@ test('single ticket + prefix line: title appended to the first line', () => {
   const lines = out.split('\n');
   expect(lines[0]).toBe('✳️ [tg-cli] Fix the thing');
   expect(lines[1]).toContain('<a href="https://linear.app/x/issue/HYP-576/slug">HYP-576</a>');
+});
+
+test('single ticket + prefixBoundary: title is inserted right after [window], prose follows', () => {
+  // The prefix now joins the body on the SAME line (ends with a space). With
+  // prefixBoundary the title lands immediately after `]`, not behind the prose.
+  const boundary = '✳️ [tg-cli] ';
+  const out = applyAutolink(`${boundary}shipped HYP-576`, [T('HYP-576', 'Fix the thing')], true, {
+    prefixBoundary: boundary,
+  });
+  expect(out).toBe('✳️ [tg-cli] Fix the thing shipped <a href="https://linear.app/x/issue/HYP-576/slug">HYP-576</a>');
+  expect(out.split('\n').length).toBe(1); // all on one line
+});
+
+test('single ticket + prefixBoundary, code only: title right after [window]', () => {
+  const boundary = '✳️ [tg-cli] ';
+  const out = applyAutolink(`${boundary}HYP-576`, [T('HYP-576', 'Fix the thing')], true, {
+    prefixBoundary: boundary,
+  });
+  expect(out).toBe('✳️ [tg-cli] Fix the thing <a href="https://linear.app/x/issue/HYP-576/slug">HYP-576</a>');
 });
 
 test('single ticket, no prefix: title becomes its own first line', () => {

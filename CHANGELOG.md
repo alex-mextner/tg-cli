@@ -3,6 +3,26 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.7.1
+
+Reply-routing + message-header fixes.
+
+- **Reply routing no longer always opens the picker** — replying in Telegram to a
+  message an agent sent now routes straight to that agent's pane. `tg` recorded
+  the route's project identity as `process.cwd()`, but agents run `tg` from
+  `/tmp`, so it never matched the daemon's check against the pane's
+  `pane_current_path` and every reply fell through to the "choose an agent"
+  picker. `tg` now records the origin pane's `pane_current_path` at send time, so
+  send-time and reply-time compare the same quantity. The pane-id-reuse guard
+  (a reply can't leak into a different project that reused the pane) is preserved.
+  (`recordRoute` in `tg`, `resolveRouteCwd` / `routeMatchesPane` in
+  `features/tg-ctl/routes.ts`.)
+- **Task title / message body on the same line as `[window]`** — the agent
+  header rendered `✳️ [window]` and dropped the task title / message text to line
+  2. The prefix now joins the body with a space, so it reads
+  `✳️ [window] 𝑻𝒂𝒔𝒌 𝒕𝒊𝒕𝒍𝒆` on one line. (`buildPrefix` in
+  `features/render/prefix.ts`.)
+
 ## 1.7.0
 
 Pre-send-photo hook framework + `review --visual` unstyled guard.

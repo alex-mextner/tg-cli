@@ -4,6 +4,8 @@ import {
   appendRoute,
   serializeRoutes,
   recognizeRoute,
+  resolveRouteCwd,
+  routeMatchesPane,
   aggregateUsage,
   orderByLruMru,
   MAX_ROUTES,
@@ -62,4 +64,55 @@ test('orderByLruMru: most recent first, frequency tiebreak, unknown last', () =>
   // input order deliberately scrambled; %unknown has no history
   const ordered = orderByLruMru(['%c', '%unknown', '%a', '%b'], usage);
   expect(ordered).toEqual(['%b', '%c', '%a', '%unknown']);
+});
+
+// --- resolveRouteCwd + routeMatchesPane (reply-routing fix) ---
+//
+// Regression for: replying to an agent message always opened the picker instead
+// of routing to the pane. Root cause = `tg` recorded `process.cwd()` (agents run
+// from /tmp) while the daemon compares against the pane's `pane_current_path`, so
+// `sameProject` was always false. The fix records the pane path at send time, so
+// both sides compare the same quantity.
+
+test('resolveRouteCwd: records the PANE path, not process.cwd() — and the daemon then MATCHES (no picker)', () => {
+  // Agent reality: `tg` invoked from /tmp, but the tmux pane sits in the project.
+  const processCwd = '/private/tmp';
+  const panePath = '/Users/alex/work/my-project';
+
+  const recordedCwd = resolveRouteCwd({ queryPanePath: () => panePath, fallbackCwd: processCwd });
+
+  // The OLD behavior recorded process.cwd() (= /private/tmp). Assert we did NOT.
+  expect(recordedCwd).toBe(panePath);
+  expect(recordedCwd).not.toBe(processCwd);
+
+  // End-to-end: a route stamped with this cwd, recognized on reply, matches the
+  // live pane (whose panePath is the project dir) → routes straight to the pane.
+  const routes = appendRoute([], { id: 42, paneId: '%7', cwd: recordedCwd, ts: 100 });
+  const recognized = recognizeRoute(parseRoutes(serializeRoutes(routes)), 42);
+  expect(recognized).not.toBeNull();
+  expect(routeMatchesPane({ recognizedCwd: recognized!.cwd, panePath })).toBe(true);
+
+  // Proof this would FAIL under the old code: had we recorded process.cwd(), the
+  // same comparison against the pane path would NOT match → picker.
+  expect(routeMatchesPane({ recognizedCwd: processCwd, panePath })).toBe(false);
+});
+
+test('resolveRouteCwd: falls back to process.cwd() when not in tmux / query fails or is empty', () => {
+  expect(resolveRouteCwd({ queryPanePath: () => null, fallbackCwd: '/p' })).toBe('/p');
+  expect(resolveRouteCwd({ queryPanePath: () => '', fallbackCwd: '/p' })).toBe('/p');
+});
+
+test('routeMatchesPane: same path matches even when one side is unresolved/relative', () => {
+  expect(routeMatchesPane({ recognizedCwd: '/a/b', panePath: '/a/b' })).toBe(true);
+  expect(routeMatchesPane({ recognizedCwd: '/a/b/', panePath: '/a/b' })).toBe(true); // trailing slash normalized
+});
+
+test('routeMatchesPane: pane-id reuse by a DIFFERENT project still mismatches (04cb6e5 guard preserved)', () => {
+  // Same %N, but the pane is now in a different project than the recorded route.
+  expect(routeMatchesPane({ recognizedCwd: '/proj-a', panePath: '/proj-b' })).toBe(false);
+});
+
+test('routeMatchesPane: absent recorded cwd (old route) or absent pane → no match (picker fallback)', () => {
+  expect(routeMatchesPane({ recognizedCwd: undefined, panePath: '/a' })).toBe(false);
+  expect(routeMatchesPane({ recognizedCwd: '/a', panePath: undefined })).toBe(false);
 });

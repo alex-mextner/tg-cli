@@ -61,5 +61,11 @@ export function buildPrefix(opts: {
   }
 
   if (!plain && !html) return { html: "", plain: "", present: false, forceHtml: false }
-  return { html: html + "\n", plain: plain + "\n", present: true, forceHtml }
+  // Separate the prefix from the message body with a SPACE, not a newline, so the
+  // first line of the body (a single-ticket task title, or the message prose when
+  // there is no ticket) sits RIGHT AFTER [window] on the same line instead of
+  // dropping to line 2. applyAutolink already appends a single-ticket title to
+  // lines[0]; with a trailing space that line is the whole [window] body, so the
+  // title still lands directly after it.
+  return { html: html + " ", plain: plain + " ", present: true, forceHtml }
 }
