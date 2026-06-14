@@ -168,6 +168,52 @@ test('--title / --tag require a value (a dashed next token is a missing value)',
   });
 });
 
+// --- code-as-pdf flags (--with-original / --no-pdf / --pdf-device) ---
+test('--with-original / --no-pdf / --pdf-device are parsed (not unknown flags)', () => {
+  expect(parseArgs(['--with-original', 'see code'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'see code',
+    format: 'plain',
+    withOriginal: true,
+  });
+  expect(parseArgs(['--no-pdf', 'raw only'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'raw only',
+    format: 'plain',
+    noPdf: true,
+  });
+  expect(parseArgs(['--pdf-device', 'a4', 'mobile'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'mobile',
+    format: 'plain',
+    pdfDevice: 'a4',
+  });
+});
+
+test('--pdf-device requires a value', () => {
+  expect(parseArgs(['--pdf-device'], dir, HOME)).toEqual({
+    action: 'error',
+    message: '--pdf-device requires a value',
+  });
+  expect(parseArgs(['--pdf-device', '--no-pdf'], dir, HOME)).toEqual({
+    action: 'error',
+    message: '--pdf-device requires a value',
+  });
+});
+
+test('a no-code-flag parse result has none of the code-pdf fields (byte-identical)', () => {
+  // Spreading undefined fields must NOT change a plain send object.
+  expect(parseArgs(['hello'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'hello',
+    format: 'plain',
+  });
+});
+
 // --- Regression: main's --format validation errors preserved (NOT changed) ---
 test('--format validation errors are preserved from main', () => {
   expect(parseArgs(['--format'], dir, HOME)).toEqual({

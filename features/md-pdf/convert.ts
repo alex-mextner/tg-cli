@@ -47,11 +47,7 @@ function extOf(name: string): string {
 
 /** Disk-sourced markdown documents are eligible for PDF conversion. */
 export function isConvertibleMd(item: SendItem): boolean {
-  return (
-    item.type === 'document' &&
-    item.source.kind === 'disk' &&
-    MD_EXTENSIONS.has(extOf(item.source.path))
-  );
+  return item.type === 'document' && item.source.kind === 'disk' && MD_EXTENSIONS.has(extOf(item.source.path));
 }
 
 /** report.md → report.pdf (keeps the meaningful basename for the receiver). */
@@ -76,6 +72,10 @@ export interface ConvertDeps {
   // Create a fresh private temp dir and return its absolute path.
   makeTempDir: () => string;
   writeFile: (path: string, content: string) => void;
+  // Read a UTF-8 file's content; throws on failure. Used by the code-pdf pass
+  // (it fences the file content into a markdown code block); md-pdf itself never
+  // calls this — pandoc reads the .md directly — but both share ConvertDeps.
+  readFile: (path: string) => string;
   fileExists: (path: string) => boolean;
   // Size in bytes, or -1 when missing/unreadable (zero-byte PDF = failure).
   fileSize: (path: string) => number;
@@ -126,14 +126,25 @@ export function convertMdToPdf(mdPath: string, deps: ConvertDeps): ConvertOutcom
   const mdDir = mdPath.slice(0, mdPath.lastIndexOf('/')) || '/';
   const pandoc = deps.run(
     [
-      'pandoc', '-f', 'gfm', '-t', 'html5', '--standalone',
+      'pandoc',
+      '-f',
+      'gfm',
+      '-t',
+      'html5',
+      '--standalone',
       // Inline local images/assets as data URIs, resolved against the SOURCE
       // dir — the html lives in a temp dir, so relative `![x](img.png)` would
       // otherwise silently vanish from the PDF (codex review finding).
-      '--embed-resources', '--resource-path', mdDir,
-      '--metadata', `title=${base}`,
-      '--css', cssPath,
-      '-o', htmlPath, mdPath,
+      '--embed-resources',
+      '--resource-path',
+      mdDir,
+      '--metadata',
+      `title=${base}`,
+      '--css',
+      cssPath,
+      '-o',
+      htmlPath,
+      mdPath,
     ],
     10_000,
   );
@@ -144,9 +155,14 @@ export function convertMdToPdf(mdPath: string, deps: ConvertDeps): ConvertOutcom
 
   const chromeRun = deps.run(
     [
-      chrome, '--headless=new', '--disable-gpu', '--no-sandbox',
-      '--no-pdf-header-footer', '--virtual-time-budget=2000',
-      `--print-to-pdf=${pdfPath}`, fileUrl(htmlPath),
+      chrome,
+      '--headless=new',
+      '--disable-gpu',
+      '--no-sandbox',
+      '--no-pdf-header-footer',
+      '--virtual-time-budget=2000',
+      `--print-to-pdf=${pdfPath}`,
+      fileUrl(htmlPath),
     ],
     30_000,
   );

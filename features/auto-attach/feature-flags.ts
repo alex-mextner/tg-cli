@@ -23,6 +23,10 @@ export const DEFAULT_FEATURES: FeatureMap = {
   'autolink-tasks': true,
   'autolink-prs': true,
   'md-as-pdf': true,
+  // code-as-pdf renders attached code/config files (.ts, .json, .yaml, …) to a
+  // mobile, syntax-highlighted PDF; by default ONLY the PDF is sent (the raw
+  // file is dropped — useless on iOS). `--with-original`/`--no-pdf` adjust.
+  'code-as-pdf': true,
   'attach-denylist': true,
   'recursive-attach': true,
   // pre-send-photo hooks (agents-hooks/v1). ON by default, but it is a TRUE
