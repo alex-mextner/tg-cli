@@ -75,6 +75,22 @@ Canonical tags (Russian; case-insensitive; English aliases map to them):
 An unknown tag is not fatal: it soft-renders as a plain \`[TAG]\` badge and a
 stderr note, so a typo never blocks a send.
 
+## Code/config files → mobile PDF (\`--with-original\` / \`--no-pdf\`)
+Attaching a code/config file (\`.ts\`, \`.tsx\`, \`.json\`, \`.yaml\`, \`.toml\`, \`.py\`,
+\`.go\`, \`.rs\`, \`.sql\`, \`Dockerfile\`, …) renders it to a MOBILE,
+syntax-highlighted, soft-wrapped PDF — Telegram iOS previews the raw source
+uselessly, so the PDF is what's actually readable on a phone.
+
+- **Default: ONLY the PDF is sent.** The raw file is NOT attached (it's noise on
+  iOS). This is the right default — just \`tg --file server.ts "look"\`.
+- \`--with-original\` — also attach the raw file alongside the PDF.
+- \`--no-pdf\` — skip the PDF, attach the raw file (the pre-feature behavior).
+- \`--pdf-device <name>\` — page size: \`iphone15pro\` (default), \`iphone15promax\`,
+  \`iphonese\`, \`a4\`. Also \`TG_PDF_DEVICE\` / \`TG_PDF_THEME\` (highlight style).
+
+Markdown (\`.md\`) keeps its own \`.md\`→PDF path; non-code files are unchanged.
+Requires pandoc + Google Chrome; on any failure the raw file is sent unchanged.
+
 Always use \`tg\`, never direct curl to the Telegram API. tmux only.
 `;
 
@@ -84,6 +100,9 @@ const SKILL_BLURB =
   'Label messages with `--tag <ОТВЕТ|РЕШЕНИЕ|ПРОБЛЕМА|ОТЧЁТ>` ' +
   '(aliases ANSWER/DECISION/PROBLEM/REPORT) and set an explicit header line with ' +
   '`--title "..."` (the body is never pulled up). ' +
+  'Attaching a code/config file (.ts/.json/.yaml/.py/…) renders a mobile, ' +
+  'syntax-highlighted PDF and by DEFAULT sends ONLY the PDF (raw file is useless ' +
+  'on iOS); `--with-original` sends both, `--no-pdf` sends the raw file. ' +
   'Use to report results/questions to the user. Never curl Telegram directly.';
 
 const HOOK_MARKER = '# agent-tools-awareness';

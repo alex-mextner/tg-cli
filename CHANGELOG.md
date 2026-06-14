@@ -3,6 +3,39 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.9.2
+
+Code/config files → mobile, syntax-highlighted PDF (and by default ONLY the PDF
+is sent).
+
+- **`code-as-pdf` feature (ON by default).** Attaching a code/config file —
+  `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.json`, `.jsonc`, `.yaml`,
+  `.yml`, `.toml`, `.ini`, `.py`, `.go`, `.rs`, `.rb`, `.php`, `.java`, `.kt`,
+  `.swift`, `.c`, `.cpp`, `.h`, `.cs`, `.sh`, `.bash`, `.zsh`, `.sql`, `.css`,
+  `.scss`, `.less`, `.html`, `.xml`, `.svg`, `.graphql`, `.proto`, `.lua`, `.r`,
+  `.dart`, `Dockerfile`, `Makefile`, `CMakeLists.txt`, … (full map in
+  `features/code-pdf/convert.ts`) — is rendered to a **mobile-sized,
+  syntax-highlighted, soft-wrapped PDF** before sending. Telegram's iOS client
+  previews raw source uselessly; the PDF is the readable artifact on a phone.
+  Pipeline reuses the md-pdf machinery: fence the content in the detected
+  language → pandoc (skylighting highlighting) → headless Chrome
+  `--print-to-pdf` at the phone page size. Long lines **soft-wrap** (CSS
+  `white-space: pre-wrap` + `overflow-wrap: anywhere`) so there is NO horizontal
+  scroll. Monospace, light theme (`tango`), optional line numbers.
+- **BY DEFAULT only the PDF is sent — the raw file is NOT attached.** On iOS the
+  raw `.ts` is noise; the PDF is what you actually read. Two flags adjust:
+    - **`--with-original`** — also attach the raw file alongside the PDF.
+    - **`--no-pdf`** — skip the render and attach the raw file (the prior
+      behavior). Equivalent to `--no-feature code-as-pdf`.
+- **`--pdf-device <name>`** (or `TG_PDF_DEVICE`) — page geometry preset:
+  `iphone15pro` (default, 393pt wide), `iphone15promax`, `iphonese`, `a4`.
+  `TG_PDF_THEME` overrides the pandoc highlight style (default `tango`).
+- Markdown keeps its own `.md`→PDF path (`detectCodeLang` returns null for it);
+  images / `.pdf` / other documents are untouched. On any render failure the raw
+  file is attached unchanged (same fail-open policy as md-as-pdf).
+  (`features/code-pdf/convert.ts`, `features/cli/args.ts`,
+  `features/auto-attach/feature-flags.ts`, `tg`.)
+
 ## 1.9.1
 
 Wider tag pills, hosted under @hyperidebot.

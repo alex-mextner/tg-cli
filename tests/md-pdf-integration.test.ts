@@ -18,6 +18,7 @@ const realDeps: ConvertDeps = {
   },
   makeTempDir: () => mkdtempSync(join(tmpdir(), 'tg-mdpdf-test-')),
   writeFile: (path, content) => writeFileSync(path, content),
+  readFile: (path) => readFileSync(path, 'utf8'),
   fileExists: (path) => existsSync(path),
   fileSize: (path) => {
     try {

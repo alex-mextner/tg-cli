@@ -62,6 +62,14 @@ tests can pass fakes.
 - `features/autolink-refs/` — shared compound-ref parser (ranges/lists like `HYP-100..103/110`,
   `#5-7,9`): body links the written numbers, the bottom block enumerates the full range. Used by
   both autolink features (docs/specs/autolink-compound.md).
+- `features/md-pdf/` — disk-sourced `.md`/`.markdown` attachments → PDF (pandoc + headless Chrome)
+  before upload, because Telegram mangles non-ASCII text previews. Shared `ConvertDeps` / `findChrome`.
+- `features/code-pdf/` — disk-sourced code/config attachments (`.ts`, `.json`, `.yaml`, `Dockerfile`,
+  … per a maintainable extension/filename→highlight-language map) → a **mobile-sized,
+  syntax-highlighted, soft-wrapped** PDF (reuses the md-pdf pipeline; pandoc skylighting + Chrome
+  `--print-to-pdf` at a device page size). **By default ONLY the PDF is sent** (the raw file is
+  useless on iOS); `--with-original` sends both, `--no-pdf` sends the raw file. `--pdf-device` /
+  `TG_PDF_DEVICE` pick the page geometry. `applyCodePdfToPlan` is the pure attach-decision used by `tg`.
 - `features/prefix-style/` — Unicode styling of the outbound prefix: tmux window name → Sans-Serif
   Bold, single-ticket task title → Bold Italic, with `<b>`/`<i>` fallback for Cyrillic
   (docs/specs/unicode-prefix-styling.md).

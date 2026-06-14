@@ -54,6 +54,15 @@ export type ParseResult =
       // Explicit message tag (`--tag`). Rendered as a wordmark pill (custom-emoji
       // cells + readable word): `✳️ [window] 🔵 ANSWER`. Composes with `--title`.
       tag?: string;
+      // code-as-pdf: also attach the raw original file alongside the rendered
+      // PDF (`--with-original`). Default is PDF-only for code/config files.
+      withOriginal?: boolean;
+      // code-as-pdf: skip the PDF render entirely and attach the original file
+      // (`--no-pdf`) — today's behavior. Wins over --with-original.
+      noPdf?: boolean;
+      // code-as-pdf: device preset for the mobile PDF page geometry
+      // (`--pdf-device <name>`, e.g. iphone15pro / a4). Overrides TG_PDF_DEVICE.
+      pdfDevice?: string;
     };
 
 // Extensions that Telegram's sendPhoto accepts. SVG is intentionally excluded:
@@ -157,6 +166,12 @@ export function parseArgs(
   let format: Format = 'plain';
   let title: string | undefined;
   let tag: string | undefined;
+  // Left undefined when the flag is absent so a no-flag parse result stays
+  // byte-identical to before (the test suite asserts the send object with
+  // toEqual and omits unset optional fields — same convention as title/tag).
+  let withOriginal: true | undefined;
+  let noPdf: true | undefined;
+  let pdfDevice: string | undefined;
 
   let i = 0;
   while (i < args.length) {
@@ -194,6 +209,27 @@ export function parseArgs(
         return { action: 'error', message: '--tag requires a value' };
       }
       tag = nextArg;
+      i += 2;
+      continue;
+    }
+    // code-as-pdf flags. `--with-original` and `--no-pdf` are booleans; consume
+    // only themselves. `--pdf-device` consumes a value.
+    if (arg === '--with-original') {
+      withOriginal = true;
+      i += 1;
+      continue;
+    }
+    if (arg === '--no-pdf') {
+      noPdf = true;
+      i += 1;
+      continue;
+    }
+    if (arg === '--pdf-device') {
+      const nextArg = args[i + 1];
+      if (!nextArg || nextArg.startsWith('--')) {
+        return { action: 'error', message: '--pdf-device requires a value' };
+      }
+      pdfDevice = nextArg;
       i += 2;
       continue;
     }
@@ -366,5 +402,5 @@ export function parseArgs(
   // A bare `--title`/`--tag` still sends (a header-only message), so it is NOT
   // an empty invocation.
   if (items.length === 0 && !caption && !title && !tag) return { action: 'help' };
-  return { action: 'send', items, caption, format, title, tag };
+  return { action: 'send', items, caption, format, title, tag, withOriginal, noPdf, pdfDevice };
 }
