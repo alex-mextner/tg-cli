@@ -13,10 +13,10 @@
 // followed by an explicit tag badge and/or an explicit `--title`:
 //   ✳️ [window]                          (no tag, no title)
 //   ✳️ [window] <title>                  (--title only)
-//   ✳️ [window] 🔵 💬 ОТВЕТ              (--tag only)
-//   ✳️ [window] 🔵 💬 ОТВЕТ — <title>    (--tag + --title)
+//   ✳️ [window] 🔵 ANSWER               (--tag only, unicode fallback)
+//   ✳️ [window] <ANSWER pill> — <title> (--tag + --title, real pill ids)
 // The message body NEVER rides this line — only an explicit tag/title appear.
-import { EMBEDDABLE_EMOJI_MAP, extractBaseModel } from '../branding/emoji';
+import { EMBEDDABLE_EMOJI_MAP, extractBaseModel, hasRealPillIds, TAG_PILL_IDS } from '../branding/emoji';
 import { styleTaskTitle, styleWindowName, toBoldItalic } from '../prefix-style/style';
 import { resolveTag } from './tag';
 import { escapeHtml } from './html';
@@ -28,12 +28,40 @@ export interface PrefixParts {
   forceHtml: boolean;
 }
 
+// Split a tag-pill fallback label (e.g. "🔵 ANSWER") into exactly `cells`
+// contiguous chunks whose concatenation === the original. Splitting is by
+// Unicode code point (Array.from), never by UTF-16 unit, so the leading dot
+// emoji (a surrogate pair / multi-codepoint glyph) is never bisected into a
+// broken half. Each chunk becomes the inner text of one <tg-emoji> pill cell;
+// when a client can't render the custom emoji it shows the chunk verbatim, so
+// the row of cells reads as the full readable label exactly once. `cells` is
+// the real cell count (>= 1). If the label is shorter than `cells`, trailing
+// cells fall back to `dot` so every cell still has non-empty inner text (an
+// empty <tg-emoji> is invalid). The single-cell case returns the whole label.
+export function splitForCells(label: string, cells: number, dot: string): string[] {
+  const points = Array.from(label);
+  if (cells <= 1) return [label];
+  const out: string[] = [];
+  let cursor = 0;
+  for (let i = 0; i < cells; i++) {
+    // Distribute the remaining code points across the remaining cells as evenly
+    // as possible (front cells get the extra when it doesn't divide evenly).
+    const remainingCells = cells - i;
+    const remainingPoints = points.length - cursor;
+    const take = Math.ceil(remainingPoints / remainingCells);
+    const chunk = points.slice(cursor, cursor + take).join('');
+    out.push(chunk.length > 0 ? chunk : dot);
+    cursor += take;
+  }
+  return out;
+}
+
 export function buildPrefix(opts: {
   aiEmoji: string;
   model: string;
   tmuxWindow: string;
-  // Explicit message tag (`--tag`). Resolved case-insensitively; English
-  // aliases map to the Russian canonicals. Unknown → a soft `[TAG]` badge.
+  // Explicit message tag (`--tag`). Resolved case-insensitively; Russian
+  // aliases map to the English canonicals. Unknown → a soft `[TAG]` badge.
   tag?: string;
   // Explicit header title (`--title`). The message body is NEVER pulled up
   // here; only this explicit title ever appears on the header line.
@@ -77,13 +105,42 @@ export function buildPrefix(opts: {
   }
 
   // --- Optional tag badge (`--tag`) on the header line, after [window]. ---
+  // Three render paths:
+  //   1. Known tag WITH real, uploaded pill ids → the wordmark pill as N
+  //      <tg-emoji> cells (premium-only; forces HTML). The plain branch keeps
+  //      the unicode fallback so the >4096 splitter / non-HTML path still reads.
+  //   2. Known tag WITHOUT real ids (placeholder set, not yet uploaded) → the
+  //      unicode fallback badge (`🔵 ANSWER`) in BOTH forms. A placeholder id
+  //      must NEVER be emitted inside a <tg-emoji> tag — hasRealPillIds guards
+  //      this, so a broken/empty emoji can never go out.
+  //   3. Unknown tag → a soft `[WORD]` badge (no emoji, no fail) — UNCHANGED.
   if (tag && tag.trim()) {
     const resolved = resolveTag(tag);
     const sep = plain.length > 0 ? ' ' : '';
-    // Known: `🔵 💬 ОТВЕТ`. Unknown: a soft `[WORD]` badge (no emoji, no fail).
-    const badge = resolved.known ? `${resolved.emoji} ${resolved.word}` : `[${resolved.word}]`;
-    html += `${sep}${escapeHtml(badge)}`;
-    plain += `${sep}${badge}`;
+    if (resolved.known && hasRealPillIds(resolved.word)) {
+      // Real pill ids: render each cell as <tg-emoji emoji-id>chunk</tg-emoji>
+      // (a loop of the single model-emoji branch above). The N cells' inner text
+      // chunks are the full unicode fallback ("🔵 ANSWER") SPLIT across the cells
+      // so the underlying text reads as the readable label exactly once — not a
+      // repeated word, and not a row of bare dots. Premium clients render the
+      // pill image and hide this text; everyone else (non-premium, copy/paste,
+      // search) sees the readable "🔵 ANSWER". The plain form keeps the full
+      // badge too. The chunk split is by Unicode code point so the dot emoji is
+      // never bisected.
+      const ids = TAG_PILL_IDS[resolved.word];
+      const chunks = splitForCells(resolved.fallback, ids.length, resolved.dot);
+      const cells = ids.map((id, i) => `<tg-emoji emoji-id="${id}">${escapeHtml(chunks[i])}</tg-emoji>`).join('');
+      html += `${sep}${cells}`;
+      plain += `${sep}${resolved.fallback}`;
+      forceHtml = true; // a custom-emoji pill only renders in HTML mode
+    } else {
+      // Known but placeholder ids / non-premium → unicode fallback badge.
+      // Unknown → bare `[WORD]`. Both render identically in html (escaped) and
+      // plain; no <tg-emoji>, so a placeholder id can never leak out.
+      const badge = resolved.known ? resolved.fallback : `[${resolved.word}]`;
+      html += `${sep}${escapeHtml(badge)}`;
+      plain += `${sep}${badge}`;
+    }
   }
 
   // --- Optional explicit title (`--title`) on the header line. ---

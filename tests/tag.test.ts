@@ -1,53 +1,48 @@
 import { expect, test } from 'bun:test';
-import { resolveTag, TAG_EMOJI } from '../features/render/tag';
+import { resolveTag, CANONICAL_TAGS } from '../features/render/tag';
 
-// --- Canonical Russian tags resolve to their badge + canonical word ---
-test('resolveTag: each canonical Russian tag resolves to its emoji badge', () => {
-  expect(resolveTag('ОТВЕТ')).toEqual({ emoji: '🔵 💬', word: 'ОТВЕТ', known: true });
-  expect(resolveTag('РЕШЕНИЕ')).toEqual({ emoji: '🟠 ⚖️', word: 'РЕШЕНИЕ', known: true });
-  expect(resolveTag('ПРОБЛЕМА')).toEqual({ emoji: '🔴 🚨', word: 'ПРОБЛЕМА', known: true });
-  expect(resolveTag('ОТЧЁТ')).toEqual({ emoji: '🟢 📋', word: 'ОТЧЁТ', known: true });
+// --- Canonical English tags resolve to their fallback badge + canonical word ---
+test('resolveTag: each canonical English tag resolves to its unicode fallback + dot', () => {
+  expect(resolveTag('ANSWER')).toEqual({ fallback: '🔵 ANSWER', dot: '🔵', word: 'ANSWER', known: true });
+  expect(resolveTag('DECISION')).toEqual({ fallback: '🟠 DECISION', dot: '🟠', word: 'DECISION', known: true });
+  expect(resolveTag('PROBLEM')).toEqual({ fallback: '🔴 PROBLEM', dot: '🔴', word: 'PROBLEM', known: true });
+  expect(resolveTag('REPORT')).toEqual({ fallback: '🟢 REPORT', dot: '🟢', word: 'REPORT', known: true });
 });
 
-// --- Case-insensitive ---
-test('resolveTag is case-insensitive for Russian input', () => {
-  expect(resolveTag('ответ').word).toBe('ОТВЕТ');
-  expect(resolveTag('ответ').known).toBe(true);
-  expect(resolveTag('Решение').word).toBe('РЕШЕНИЕ');
+// --- Case-insensitive English input ---
+test('resolveTag is case-insensitive for English input', () => {
+  expect(resolveTag('answer').word).toBe('ANSWER');
+  expect(resolveTag('answer').known).toBe(true);
+  expect(resolveTag('Decision').word).toBe('DECISION');
+  expect(resolveTag('  report  ').word).toBe('REPORT'); // trims surrounding space
 });
 
-// --- English aliases map to the Russian canonicals ---
-test('resolveTag maps English aliases to the Russian canonicals', () => {
-  expect(resolveTag('ANSWER')).toEqual({ emoji: '🔵 💬', word: 'ОТВЕТ', known: true });
-  expect(resolveTag('DECISION')).toEqual({ emoji: '🟠 ⚖️', word: 'РЕШЕНИЕ', known: true });
-  expect(resolveTag('PROBLEM')).toEqual({ emoji: '🔴 🚨', word: 'ПРОБЛЕМА', known: true });
-  expect(resolveTag('REPORT')).toEqual({ emoji: '🟢 📋', word: 'ОТЧЁТ', known: true });
+// --- Russian aliases map to the English canonicals ---
+test('resolveTag maps Russian aliases to the English canonicals', () => {
+  expect(resolveTag('ОТВЕТ')).toEqual({ fallback: '🔵 ANSWER', dot: '🔵', word: 'ANSWER', known: true });
+  expect(resolveTag('РЕШЕНИЕ')).toEqual({ fallback: '🟠 DECISION', dot: '🟠', word: 'DECISION', known: true });
+  expect(resolveTag('ПРОБЛЕМА')).toEqual({ fallback: '🔴 PROBLEM', dot: '🔴', word: 'PROBLEM', known: true });
+  expect(resolveTag('ОТЧЁТ')).toEqual({ fallback: '🟢 REPORT', dot: '🟢', word: 'REPORT', known: true });
 });
 
-test('resolveTag: English aliases are case-insensitive too', () => {
-  expect(resolveTag('answer').word).toBe('ОТВЕТ');
-  expect(resolveTag('Decision').word).toBe('РЕШЕНИЕ');
-  expect(resolveTag('  report  ').word).toBe('ОТЧЁТ'); // trims surrounding space
+test('resolveTag: Russian aliases are case-insensitive too', () => {
+  expect(resolveTag('ответ').word).toBe('ANSWER');
+  expect(resolveTag('Решение').word).toBe('DECISION');
 });
 
 // --- The Ё→Е spelling of ОТЧЁТ is tolerated (agents type both) ---
 test('resolveTag tolerates the ОТЧЕТ (Е, no Ё) spelling', () => {
-  expect(resolveTag('ОТЧЕТ')).toEqual({ emoji: '🟢 📋', word: 'ОТЧЁТ', known: true });
-  expect(resolveTag('отчет').word).toBe('ОТЧЁТ');
+  expect(resolveTag('ОТЧЕТ')).toEqual({ fallback: '🟢 REPORT', dot: '🟢', word: 'REPORT', known: true });
+  expect(resolveTag('отчет').word).toBe('REPORT');
 });
 
 // --- Unknown tag soft-renders (no hard fail) ---
-test('resolveTag: an unknown tag is NOT known, has no emoji, word is uppercased', () => {
-  expect(resolveTag('wat')).toEqual({ emoji: '', word: 'WAT', known: false });
-  expect(resolveTag('FIXME')).toEqual({ emoji: '', word: 'FIXME', known: false });
+test('resolveTag: an unknown tag is NOT known, has no fallback/dot, word is uppercased', () => {
+  expect(resolveTag('wat')).toEqual({ fallback: '', dot: '', word: 'WAT', known: false });
+  expect(resolveTag('FIXME')).toEqual({ fallback: '', dot: '', word: 'FIXME', known: false });
 });
 
-// --- The emoji constant is the single source of truth and editable ---
-test('TAG_EMOJI exposes the default mapping (one editable constant)', () => {
-  expect(TAG_EMOJI).toEqual({
-    ОТВЕТ: '🔵 💬',
-    РЕШЕНИЕ: '🟠 ⚖️',
-    ПРОБЛЕМА: '🔴 🚨',
-    ОТЧЁТ: '🟢 📋',
-  });
+// --- The canonical-tag list is the single source of truth ---
+test('CANONICAL_TAGS lists the four English canonicals', () => {
+  expect([...CANONICAL_TAGS]).toEqual(['ANSWER', 'DECISION', 'PROBLEM', 'REPORT']);
 });

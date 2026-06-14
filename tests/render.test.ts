@@ -6,7 +6,8 @@ import {
   parseEmojiHelpers,
   parseModeFor,
 } from '../features/render/html';
-import { buildPrefix } from '../features/render/prefix';
+import { buildPrefix, splitForCells } from '../features/render/prefix';
+import { TAG_PILL_IDS, TAG_PILL_PLACEHOLDER } from '../features/branding/emoji';
 
 // Focused unit tests for the render modules extracted from the `tg` entrypoint
 // (decomposition Stage 1). These functions were previously only exercised
@@ -166,41 +167,145 @@ test('buildPrefix --title with a Cyrillic title falls back to <i> and forces HTM
 });
 
 // --- buildPrefix: explicit --tag badge ---
-test('buildPrefix --tag renders the canonical emoji badge + word, body below', () => {
-  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ОТВЕТ' });
-  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 💬 ОТВЕТ\n');
+//
+// Default repo state: TAG_PILL_IDS holds PLACEHOLDER ids, so EVERY known tag
+// renders via the unicode fallback (`🔵 ANSWER`). A placeholder id must NEVER
+// leak into a <tg-emoji>. The real-pill-ids path (N <tg-emoji> cells) is tested
+// separately by swapping in real-looking ids and restoring them.
+
+test('buildPrefix --tag (placeholder ids) renders the unicode fallback badge, body below', () => {
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ANSWER' });
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER\n');
+  expect(p.html).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER\n');
+  // Guard: a placeholder must never be emitted inside a <tg-emoji> tag.
+  expect(p.html).not.toContain('<tg-emoji');
+  expect(p.html).not.toContain('PLACEHOLDER');
   expect(p.plain.endsWith('\n')).toBe(true);
 });
 
-test('buildPrefix --tag (English alias, lowercase) resolves to the Russian canonical', () => {
-  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'decision' });
-  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 ⚖️ РЕШЕНИЕ\n');
+test('buildPrefix --tag (Russian alias) resolves to the English canonical fallback', () => {
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'РЕШЕНИЕ' });
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 DECISION\n');
 });
 
-test('buildPrefix --tag + --title compose: badge, word, em-dash, then title', () => {
+test('buildPrefix --tag (English alias, lowercase) resolves to the canonical fallback', () => {
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'decision' });
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 DECISION\n');
+});
+
+test('buildPrefix --tag + --title compose: badge, em-dash, then title', () => {
   const p = buildPrefix({
     aiEmoji: '✳️',
     model: 'no-brand',
     tmuxWindow: 'tg-cli',
-    tag: 'ОТВЕТ',
+    tag: 'ANSWER',
     title: 'Done',
   });
-  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 💬 ОТВЕТ — 𝑫𝒐𝒏𝒆\n');
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER — 𝑫𝒐𝒏𝒆\n');
 });
 
 test('buildPrefix unknown --tag soft-renders as a plain [TAG] badge (no hard fail)', () => {
   const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'wat' });
   expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] [WAT]\n');
+  expect(p.html).not.toContain('<tg-emoji'); // unknown tag never emits a pill
   expect(p.present).toBe(true);
 });
 
-// Exact rendered header for each of the four canonical tags (plain form).
-test('buildPrefix: exact header for each of the four canonical tags', () => {
+// Exact rendered header for each of the four canonical tags (unicode fallback,
+// the default placeholder state).
+test('buildPrefix: exact fallback header for each of the four canonical tags', () => {
   const win = '[𝘁𝗴-𝗰𝗹𝗶]';
   const mk = (tag: string): string =>
     buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag }).plain;
-  expect(mk('ОТВЕТ')).toBe(`✳️ ${win} 🔵 💬 ОТВЕТ\n`);
-  expect(mk('РЕШЕНИЕ')).toBe(`✳️ ${win} 🟠 ⚖️ РЕШЕНИЕ\n`);
-  expect(mk('ПРОБЛЕМА')).toBe(`✳️ ${win} 🔴 🚨 ПРОБЛЕМА\n`);
-  expect(mk('ОТЧЁТ')).toBe(`✳️ ${win} 🟢 📋 ОТЧЁТ\n`);
+  expect(mk('ANSWER')).toBe(`✳️ ${win} 🔵 ANSWER\n`);
+  expect(mk('DECISION')).toBe(`✳️ ${win} 🟠 DECISION\n`);
+  expect(mk('PROBLEM')).toBe(`✳️ ${win} 🔴 PROBLEM\n`);
+  expect(mk('REPORT')).toBe(`✳️ ${win} 🟢 REPORT\n`);
+});
+
+// --- buildPrefix: real pill ids → N <tg-emoji> cells (premium path) ---
+// TAG_PILL_IDS is mutated in-place to real-looking ids (19-digit numerics),
+// then restored, so the live renderer is exercised without a leaky module mock.
+test('buildPrefix --tag with REAL pill ids renders N <tg-emoji> cells and forces HTML', () => {
+  const realIds = ['5300000000000000001', '5300000000000000002'];
+  const saved = TAG_PILL_IDS.ANSWER;
+  TAG_PILL_IDS.ANSWER = [...realIds];
+  try {
+    const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ANSWER' });
+    // N cells (here 2). The fallback label "🔵 ANSWER" is SPLIT across the cells
+    // (by code point) so the underlying text reads as the readable label once.
+    expect(p.html).toBe(
+      '✳️ [𝘁𝗴-𝗰𝗹𝗶] ' +
+        `<tg-emoji emoji-id="${realIds[0]}">🔵 AN</tg-emoji>` +
+        `<tg-emoji emoji-id="${realIds[1]}">SWER</tg-emoji>\n`,
+    );
+    // The concatenation of the cell inner texts === the full readable label.
+    const innerTexts = [...p.html.matchAll(/<tg-emoji emoji-id="\d+">([^<]*)<\/tg-emoji>/g)].map((m) => m[1]);
+    expect(innerTexts.join('')).toBe('🔵 ANSWER');
+    // plain keeps the unicode fallback (non-HTML / >4096 split path).
+    expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER\n');
+    expect(p.forceHtml).toBe(true);
+  } finally {
+    TAG_PILL_IDS.ANSWER = saved;
+  }
+});
+
+test('buildPrefix --tag with a 3-cell real pill renders 3 <tg-emoji> cells in order', () => {
+  const realIds = ['5310000000000000001', '5310000000000000002', '5310000000000000003'];
+  const saved = TAG_PILL_IDS.DECISION;
+  TAG_PILL_IDS.DECISION = [...realIds];
+  try {
+    const p = buildPrefix({ aiEmoji: '', model: '', tmuxWindow: '', tag: 'DECISION' });
+    const cellTags = p.html.match(/<tg-emoji emoji-id="\d+">/g) ?? [];
+    expect(cellTags).toEqual(realIds.map((id) => `<tg-emoji emoji-id="${id}">`));
+    // Inner texts re-stitch to the readable label exactly once.
+    const innerTexts = [...p.html.matchAll(/<tg-emoji emoji-id="\d+">([^<]*)<\/tg-emoji>/g)].map((m) => m[1]);
+    expect(innerTexts.join('')).toBe('🟠 DECISION');
+    expect(p.forceHtml).toBe(true);
+  } finally {
+    TAG_PILL_IDS.DECISION = saved;
+  }
+});
+
+// Guard regression: a partially-filled pill (one placeholder among real ids) is
+// NOT trusted — it falls back to unicode, never a half-broken pill.
+test('buildPrefix --tag does NOT emit a pill when any cell id is still a placeholder', () => {
+  const saved = TAG_PILL_IDS.PROBLEM;
+  TAG_PILL_IDS.PROBLEM = ['5320000000000000001', TAG_PILL_PLACEHOLDER, '5320000000000000003'];
+  try {
+    const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'PROBLEM' });
+    expect(p.html).not.toContain('<tg-emoji');
+    expect(p.html).toContain('🔴 PROBLEM'); // unicode fallback instead
+  } finally {
+    TAG_PILL_IDS.PROBLEM = saved;
+  }
+});
+
+// --- splitForCells: the pill-label distributor ---
+test('splitForCells re-stitches to the original label for every cell count', () => {
+  for (const label of ['🔵 ANSWER', '🟠 DECISION', '🔴 PROBLEM', '🟢 REPORT']) {
+    for (let n = 1; n <= 4; n++) {
+      const chunks = splitForCells(label, n, label.slice(0, 2));
+      expect(chunks).toHaveLength(n);
+      expect(chunks.join('')).toBe(label); // concatenation is lossless
+    }
+  }
+});
+
+test('splitForCells never bisects the leading dot emoji (splits by code point)', () => {
+  // "🔵" is a surrogate pair; the first chunk must contain the WHOLE dot, never
+  // a lone half (which would render as a replacement char).
+  const chunks = splitForCells('🔵 ANSWER', 2, '🔵');
+  expect(chunks[0].startsWith('🔵')).toBe(true);
+  expect([...chunks[0]][0]).toBe('🔵'); // first code point is the intact dot
+  expect(chunks).toEqual(['🔵 AN', 'SWER']);
+});
+
+test('splitForCells with a single cell returns the whole label, and never empties a cell', () => {
+  expect(splitForCells('🔵 ANSWER', 1, '🔵')).toEqual(['🔵 ANSWER']);
+  // More cells than code points → trailing cells fall back to the dot (never an
+  // empty inner text, which would be an invalid <tg-emoji>).
+  const chunks = splitForCells('🔵', 3, '🔵');
+  expect(chunks).toHaveLength(3);
+  expect(chunks.every((c) => c.length > 0)).toBe(true);
 });
