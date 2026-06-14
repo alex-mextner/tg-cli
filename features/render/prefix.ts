@@ -28,33 +28,6 @@ export interface PrefixParts {
   forceHtml: boolean;
 }
 
-// Split a tag-pill fallback label (e.g. "🔵 ANSWER") into exactly `cells`
-// contiguous chunks whose concatenation === the original. Splitting is by
-// Unicode code point (Array.from), never by UTF-16 unit, so the leading dot
-// emoji (a surrogate pair / multi-codepoint glyph) is never bisected into a
-// broken half. Each chunk becomes the inner text of one <tg-emoji> pill cell;
-// when a client can't render the custom emoji it shows the chunk verbatim, so
-// the row of cells reads as the full readable label exactly once. `cells` is
-// the real cell count (>= 1). If the label is shorter than `cells`, trailing
-// cells fall back to `dot` so every cell still has non-empty inner text (an
-// empty <tg-emoji> is invalid). The single-cell case returns the whole label.
-export function splitForCells(label: string, cells: number, dot: string): string[] {
-  const points = Array.from(label);
-  if (cells <= 1) return [label];
-  const out: string[] = [];
-  let cursor = 0;
-  for (let i = 0; i < cells; i++) {
-    // Distribute the remaining code points across the remaining cells as evenly
-    // as possible (front cells get the extra when it doesn't divide evenly).
-    const remainingCells = cells - i;
-    const remainingPoints = points.length - cursor;
-    const take = Math.ceil(remainingPoints / remainingCells);
-    const chunk = points.slice(cursor, cursor + take).join('');
-    out.push(chunk.length > 0 ? chunk : dot);
-    cursor += take;
-  }
-  return out;
-}
 
 export function buildPrefix(opts: {
   aiEmoji: string;
@@ -118,19 +91,20 @@ export function buildPrefix(opts: {
     const resolved = resolveTag(tag);
     const sep = plain.length > 0 ? ' ' : '';
     if (resolved.known && hasRealPillIds(resolved.word)) {
-      // Real pill ids: render each cell as <tg-emoji emoji-id>chunk</tg-emoji>
-      // (a loop of the single model-emoji branch above). The N cells' inner text
-      // chunks are the full unicode fallback ("🔵 ANSWER") SPLIT across the cells
-      // so the underlying text reads as the readable label exactly once — not a
-      // repeated word, and not a row of bare dots. Premium clients render the
-      // pill image and hide this text; everyone else (non-premium, copy/paste,
-      // search) sees the readable "🔵 ANSWER". The plain form keeps the full
-      // badge too. The chunk split is by Unicode code point so the dot emoji is
-      // never bisected.
+      // Real pill ids: render each cell as <tg-emoji emoji-id>🔵</tg-emoji>, one
+      // per uploaded cell. Telegram REQUIRES the inner (fallback) text of a
+      // custom_emoji entity to be exactly one emoji — wrapping a slice of the
+      // word ("SWER") is rejected with ENTITY_TEXT_INVALID — so every cell's
+      // inner text is the canonical DOT (a single emoji). The readable WORD then
+      // follows the cells as PLAIN text (outside any entity, so it is always
+      // visible and never rejected). Premium clients render the N pill images
+      // edge-to-edge into the wordmark chip, then the word; non-premium clients
+      // see the dots + word (e.g. "🔵🔵 ANSWER"). The word is also what
+      // copy/paste/search and the html fallback show. The plain form keeps the
+      // readable unicode fallback ("🔵 ANSWER") for the non-HTML / >4096 path.
       const ids = TAG_PILL_IDS[resolved.word];
-      const chunks = splitForCells(resolved.fallback, ids.length, resolved.dot);
-      const cells = ids.map((id, i) => `<tg-emoji emoji-id="${id}">${escapeHtml(chunks[i])}</tg-emoji>`).join('');
-      html += `${sep}${cells}`;
+      const cells = ids.map((id) => `<tg-emoji emoji-id="${id}">${escapeHtml(resolved.dot)}</tg-emoji>`).join('');
+      html += `${sep}${cells} ${escapeHtml(resolved.word)}`;
       plain += `${sep}${resolved.fallback}`;
       forceHtml = true; // a custom-emoji pill only renders in HTML mode
     } else {
