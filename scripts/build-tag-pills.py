@@ -36,16 +36,18 @@ from PIL import Image
 CELL = 100  # Telegram custom-emoji asset size (matches emoji-icons/mini_*.png)
 
 # --- EDIT HERE — one entry per canonical (English) tag. fill = chip color,
-# cells = how many 100px cells the word needs (6-char -> 2, 7-8 char -> 3).
+# cells = how many 100px cells the word needs. All four canonical tags use 3
+# cells so the rounded caps don't squish the 6-char words (ANSWER / REPORT);
+# the wider chip gives the wordmark breathing room.
 # Colors mirror the unicode TAG_PILL_FALLBACK dots in features/render/tag.ts
 # (blue / amber / red / green). The `key` (lowercased canonical) is the file
 # stem; it must match the keys the wiring loads in TAG_PILL_IDS / the upload
 # script (scripts/create-tag-emoji.ts).
 TAGS: dict[str, dict] = {
-    "answer":   {"fill": "#2F86E0", "word": "ANSWER",   "cells": 2},  # 🔵 ANSWER
+    "answer":   {"fill": "#2F86E0", "word": "ANSWER",   "cells": 3},  # 🔵 ANSWER
     "decision": {"fill": "#E8902B", "word": "DECISION", "cells": 3},  # 🟠 DECISION
     "problem":  {"fill": "#E0473B", "word": "PROBLEM",  "cells": 3},  # 🔴 PROBLEM
-    "report":   {"fill": "#3BA55D", "word": "REPORT",   "cells": 2},  # 🟢 REPORT
+    "report":   {"fill": "#3BA55D", "word": "REPORT",   "cells": 3},  # 🟢 REPORT
 }
 
 

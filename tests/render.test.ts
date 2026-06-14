@@ -179,13 +179,15 @@ test('buildPrefix --tag (real ids) renders the pill in html, unicode fallback in
   const p = buildPrefix({ aiEmoji: '', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ANSWER' });
   // plain keeps the unicode fallback badge (non-HTML / >4096 split path).
   expect(p.plain).toBe('[𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER\n');
-  // html carries the real 2-cell pill (ANSWER has two uploaded cells); each cell
-  // wraps exactly the dot emoji (Telegram rejects non-emoji fallback text), then
-  // the readable WORD follows as plain text so the label is never lost.
+  // html carries the real 3-cell pill (ANSWER widened to three uploaded cells so
+  // the rounded caps don't squish the word); each cell wraps exactly the dot
+  // emoji (Telegram rejects non-emoji fallback text), then the readable WORD
+  // follows as plain text so the label is never lost.
   expect(p.html).toBe(
     '[𝘁𝗴-𝗰𝗹𝗶] ' +
-      '<tg-emoji emoji-id="5294043157963513686">🔵</tg-emoji>' +
-      '<tg-emoji emoji-id="5294469261668951364">🔵</tg-emoji>' +
+      '<tg-emoji emoji-id="5294303944082762041">🔵</tg-emoji>' +
+      '<tg-emoji emoji-id="5294414440706382789">🔵</tg-emoji>' +
+      '<tg-emoji emoji-id="5294185480294808567">🔵</tg-emoji>' +
       ' ANSWER\n',
   );
   expect(p.forceHtml).toBe(true);
@@ -301,10 +303,10 @@ test('buildPrefix --tag does NOT emit a pill when any cell id is still a placeho
 // canonical dot — never a slice of the readable word.
 test('buildPrefix pill cells each wrap exactly the canonical dot emoji (never a word slice)', () => {
   const cases: Array<[string, string, number]> = [
-    ['ANSWER', '🔵', 2],
+    ['ANSWER', '🔵', 3],
     ['DECISION', '🟠', 3],
     ['PROBLEM', '🔴', 3],
-    ['REPORT', '🟢', 2],
+    ['REPORT', '🟢', 3],
   ];
   for (const [tag, dot, cellCount] of cases) {
     const p = buildPrefix({ aiEmoji: '', model: 'no-brand', tmuxWindow: '', tag });

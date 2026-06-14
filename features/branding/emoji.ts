@@ -98,12 +98,14 @@ export const MODEL_EMOJI_MAP: Record<string, string> = {
 // ids below come from uploading that set as a custom_emoji sticker set.
 //
 // The ids below are REAL Telegram custom_emoji_ids, harvested by
-// scripts/create-tag-emoji.ts from the set replytags_by_UltraClaudeCodeBot
-// (https://t.me/addemoji/replytags_by_UltraClaudeCodeBot). IMPORTANT: a bot can
-// only emit a custom_emoji entity whose sticker set IT created — so this set is
-// owned by the SENDING bot (@UltraClaudeCodeBot, the configured TG_BOT_TOKEN),
-// NOT some other bot. Re-run the create script with the sending bot's token if
-// the bot ever changes, then re-wire these ids.
+// scripts/create-tag-emoji.ts from the set replytags_by_hyperidebot
+// (https://t.me/addemoji/replytags_by_hyperidebot), owned by @hyperidebot.
+// NOTE: the SENDING bot (the configured TG_BOT_TOKEN, currently
+// @UltraClaudeCodeBot) does NOT need to own this set — it can emit a
+// custom_emoji entity that references a set owned by a different bot
+// (verified live: sendMessage with these ids returns ok=true through the
+// sending bot). Re-run the create script with @hyperidebot's token and
+// re-wire these ids if the pills are regenerated.
 //
 // The renderer (features/render/prefix.ts) gates on hasRealPillIds(): a tag
 // whose ids are still the literal "PLACEHOLDER" string falls back to the
@@ -115,15 +117,15 @@ export const MODEL_EMOJI_MAP: Record<string, string> = {
 export const TAG_PILL_PLACEHOLDER = "PLACEHOLDER"
 
 export const TAG_PILL_IDS: Record<string, string[]> = {
-  ANSWER: ["5294043157963513686", "5294469261668951364"],                       // answer_0, answer_1
-  DECISION: ["5294457656667314934", "5294461423353634905", "5294048492312896880"], // decision_0..2
-  PROBLEM: ["5294517726079920143", "5294133030154182465", "5294211516386551025"],  // problem_0..2
-  REPORT: ["5294523846408317302", "5294152671039629334"],                       // report_0, report_1
+  ANSWER: ["5294303944082762041", "5294414440706382789", "5294185480294808567"],   // answer_0..2
+  DECISION: ["5294395852087926650", "5294110472985944747", "5294433613440395921"], // decision_0..2
+  PROBLEM: ["5294376430245817725", "5294542383487164540", "5294432754446935044"],  // problem_0..2
+  REPORT: ["5294525981007062296", "5294382683718200108", "5294436190420770975"],   // report_0..2
 }
 
 // The colored DOT per canonical tag (single emoji). Used as the per-cell inner
 // fallback inside each <tg-emoji> pill cell: a non-premium client that cannot
-// load the custom emoji then shows N dots (e.g. two for ANSWER) rather than the
+// load the custom emoji then shows N dots (e.g. three for ANSWER) rather than the
 // full word repeated N times. Mirrors the leading glyph of TAG_PILL_FALLBACK.
 export const TAG_PILL_DOT: Record<string, string> = {
   ANSWER: "🔵",

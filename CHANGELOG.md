@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.9.1
+
+Wider tag pills, hosted under @hyperidebot.
+
+- **ANSWER and REPORT widened to 3 cells.** 1.9.0 sliced the two 6-letter
+  wordmarks into 2 cells each, so the rounded caps squished the text. Both now
+  use 3 cells (matching DECISION / PROBLEM), giving the wordmark breathing room.
+  The generator (`scripts/build-tag-pills.py`) sets all four canonical tags to 3
+  cells; the upload script and render path follow.
+- **Pill set re-created under @hyperidebot.** The custom-emoji set moved from
+  `replytags_by_UltraClaudeCodeBot` to
+  [`replytags_by_hyperidebot`](https://t.me/addemoji/replytags_by_hyperidebot)
+  (12 cells, 3 per tag). The sending bot does NOT need to own the set — it can
+  reference a set owned by a different bot (verified live). The old set was
+  deleted.
+
 ## 1.9.0
 
 Custom-emoji tag pills go live.
