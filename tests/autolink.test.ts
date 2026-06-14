@@ -275,25 +275,6 @@ test('single ticket + prefix line: title appended to the first line', () => {
   expect(lines[1]).toContain('<a href="https://linear.app/x/issue/HYP-576/slug">HYP-576</a>');
 });
 
-test('single ticket + prefixBoundary: title is inserted right after [window], prose follows', () => {
-  // The prefix now joins the body on the SAME line (ends with a space). With
-  // prefixBoundary the title lands immediately after `]`, not behind the prose.
-  const boundary = '✳️ [tg-cli] ';
-  const out = applyAutolink(`${boundary}shipped HYP-576`, [T('HYP-576', 'Fix the thing')], true, {
-    prefixBoundary: boundary,
-  });
-  expect(out).toBe('✳️ [tg-cli] Fix the thing shipped <a href="https://linear.app/x/issue/HYP-576/slug">HYP-576</a>');
-  expect(out.split('\n').length).toBe(1); // all on one line
-});
-
-test('single ticket + prefixBoundary, code only: title right after [window]', () => {
-  const boundary = '✳️ [tg-cli] ';
-  const out = applyAutolink(`${boundary}HYP-576`, [T('HYP-576', 'Fix the thing')], true, {
-    prefixBoundary: boundary,
-  });
-  expect(out).toBe('✳️ [tg-cli] Fix the thing <a href="https://linear.app/x/issue/HYP-576/slug">HYP-576</a>');
-});
-
 test('single ticket, no prefix: title becomes its own first line', () => {
   const out = applyAutolink('shipped HYP-576', [T('HYP-576', 'Fix the thing')], false);
   const lines = out.split('\n');

@@ -115,6 +115,59 @@ test("main's real flags are all recognized (no unknown-flag regression)", () => 
   });
 });
 
+// --- --title / --tag flags (explicit header title + tag badge) ---
+test('--title is parsed as an explicit title; the body is NEVER pulled up', () => {
+  expect(parseArgs(['--title', 'Ship it', 'the body'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'the body',
+    format: 'plain',
+    title: 'Ship it',
+  });
+  // Bare --title with no body still sends (a header-only message).
+  expect(parseArgs(['--title', 'Just a header'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: '',
+    format: 'plain',
+    title: 'Just a header',
+  });
+});
+
+test('--tag is parsed; it composes with --title and with a body', () => {
+  expect(parseArgs(['--tag', 'ОТВЕТ', '--title', 'Done', 'body'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'body',
+    format: 'plain',
+    title: 'Done',
+    tag: 'ОТВЕТ',
+  });
+  // Bare --tag with no body/title still sends.
+  expect(parseArgs(['--tag', 'report'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: '',
+    format: 'plain',
+    tag: 'report',
+  });
+});
+
+test('--title / --tag require a value (a dashed next token is a missing value)', () => {
+  expect(parseArgs(['--title'], dir, HOME)).toEqual({
+    action: 'error',
+    message: '--title requires a value',
+  });
+  expect(parseArgs(['--title', '--tag', 'X'], dir, HOME)).toEqual({
+    action: 'error',
+    message: '--title requires a value',
+  });
+  expect(parseArgs(['--tag'], dir, HOME)).toEqual({
+    action: 'error',
+    message: '--tag requires a value',
+  });
+});
+
 // --- Regression: main's --format validation errors preserved (NOT changed) ---
 test('--format validation errors are preserved from main', () => {
   expect(parseArgs(['--format'], dir, HOME)).toEqual({

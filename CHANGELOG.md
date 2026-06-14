@@ -3,6 +3,35 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.8.0
+
+Header tag/title; revert the body-pull from 1.7.1.
+
+- **The message body is no longer pulled onto the `✳️ [window]` header line.**
+  1.7.1 joined the body's first line onto the header (the prefix ended with a
+  space instead of a newline). That was a mistake: the message text must NOT be
+  pulled up. `buildPrefix` now ends the header with a newline again, so the body
+  always sits BELOW `✳️ [window]` (the pre-1.7.1 behavior). The single-ticket
+  autolink title still renders on the header line (it is a ticket title, not
+  message text), and the 1.7.1 reply-routing fix is untouched.
+  (`features/render/prefix.ts`, `features/autolink-tasks/render.ts`, `tg`.)
+- **`--title <text>`** — set an explicit header title: `✳️ [window] <title>`.
+  ONLY an explicit `--title` ever appears there; the message body is never
+  pulled up. No `--title` → the header is just `✳️ [window]` with the body
+  below. The title is styled Bold Italic (a Cyrillic title falls back to `<i>`).
+- **`--tag <TAG>`** — an emoji badge labeling what the message is. Canonical
+  tags are Russian and case-insensitive; English aliases map to them:
+  ОТВЕТ/ANSWER (🔵 💬), РЕШЕНИЕ/DECISION (🟠 ⚖️), ПРОБЛЕМА/PROBLEM (🔴 🚨),
+  ОТЧЁТ/REPORT (🟢 📋). It composes with `--title`:
+  `✳️ [window] 🔵 💬 ОТВЕТ — <title>`. An unknown tag soft-renders as a plain
+  `[TAG]` badge plus a one-line stderr note (it never blocks a send). The
+  default emoji mapping lives in one editable constant (`TAG_EMOJI` in
+  `features/render/tag.ts`).
+- **Skill advertising** — `tg install-skill` now documents `--tag`/`--title`,
+  the four canonical tags, their English aliases, and their meanings in both the
+  generated `SKILL.md` and the always-on blurb, so agents discover the
+  convention from the skill itself.
+
 ## 1.7.1
 
 Reply-routing + message-header fixes.

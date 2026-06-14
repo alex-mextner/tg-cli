@@ -104,16 +104,16 @@ test('buildPrefix returns the empty/absent prefix when nothing to show', () => {
 
 test('buildPrefix renders a branded model as a <tg-emoji> tag and forces HTML', () => {
   const p = buildPrefix({ aiEmoji: '👐', model: 'codex', tmuxWindow: '' });
-  expect(p.html).toBe('<tg-emoji emoji-id="5273797309195393626">👐</tg-emoji> ');
-  expect(p.plain).toBe('👐 ');
+  expect(p.html).toBe('<tg-emoji emoji-id="5273797309195393626">👐</tg-emoji>\n');
+  expect(p.plain).toBe('👐\n');
   expect(p.present).toBe(true);
   expect(p.forceHtml).toBe(true);
 });
 
 test('buildPrefix without a branded id keeps a plain (escaped) emoji, no forced HTML', () => {
   const p = buildPrefix({ aiEmoji: '🤖', model: 'no-such-model-xyz', tmuxWindow: '' });
-  expect(p.html).toBe('🤖 ');
-  expect(p.plain).toBe('🤖 ');
+  expect(p.html).toBe('🤖\n');
+  expect(p.plain).toBe('🤖\n');
   expect(p.present).toBe(true);
   expect(p.forceHtml).toBe(false);
 });
@@ -122,28 +122,85 @@ test('buildPrefix forces HTML for a Cyrillic window name (the <b> fallback)', ()
   const p = buildPrefix({ aiEmoji: '', model: '', tmuxWindow: 'тест' });
   expect(p.present).toBe(true);
   expect(p.forceHtml).toBe(true);
-  expect(p.html).toBe('[<b>тест</b>] ');
-  expect(p.plain).toBe('[тест] ');
+  expect(p.html).toBe('[<b>тест</b>]\n');
+  expect(p.plain).toBe('[тест]\n');
 });
 
-// The prefix ends with a SPACE (not a newline) so the message body — a styled
-// task title, or plain prose when there is no ticket — sits RIGHT AFTER `[window]`
-// on the SAME line instead of dropping to line 2 (the reported bug). The old
-// behavior ended the prefix with "\n"; these would have failed against it.
-test('buildPrefix separates [window] from the body with a space, not a newline', () => {
+// REGRESSION (CTO 2026-06-14, reverting PR #18): the prefix ends with a NEWLINE,
+// never a space — the message body sits BELOW the header line and is NEVER
+// joined onto `✳️ [window]`. PR #18 changed the trailing "\n" to " " so the
+// body's first line rode up onto the header; the CTO explicitly does NOT want
+// the message text pulled up ("Текст сообщения не надо подтягивать").
+test('buildPrefix ends the header with a newline so the body stays BELOW it', () => {
   const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli' });
-  // Sans-Serif Bold styled window name + a single trailing space, no newline.
-  expect(p.html).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] ');
-  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] ');
-  expect(p.html.includes('\n')).toBe(false);
-  expect(p.plain.includes('\n')).toBe(false);
+  expect(p.html).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶]\n');
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶]\n');
+  expect(p.plain.endsWith('\n')).toBe(true);
 });
 
-test('a plain (no-ticket) message body follows [window] on the SAME line', () => {
+test('the message body is NOT pulled onto the header line', () => {
   const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli' });
-  // renderText composes prefix + body (tg entrypoint). With the space join the
-  // body is on line 1, not line 2.
+  // renderText composes prefix + body (tg entrypoint). The newline join keeps
+  // the body on line 2, never appended to `[window]`.
   const composed = p.plain + 'Handoff received, starting cleanup';
-  expect(composed.split('\n').length).toBe(1);
-  expect(composed).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] Handoff received, starting cleanup');
+  const lines = composed.split('\n');
+  expect(lines.length).toBe(2);
+  expect(lines[0]).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶]'); // header alone, no body text
+  expect(lines[1]).toBe('Handoff received, starting cleanup');
+});
+
+// --- buildPrefix: explicit --title (NEVER the message body) ---
+test('buildPrefix --title puts the explicit title on the header line, body still below', () => {
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', title: 'Ship it' });
+  // Title styled Bold Italic (same as the autolink ticket title); body below.
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 𝑺𝒉𝒊𝒑 𝒊𝒕\n');
+  expect(p.html).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 𝑺𝒉𝒊𝒑 𝒊𝒕\n');
+  expect(p.plain.endsWith('\n')).toBe(true);
+});
+
+test('buildPrefix --title with a Cyrillic title falls back to <i> and forces HTML', () => {
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', title: 'Готово' });
+  expect(p.html).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] <i>Готово</i>\n');
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] Готово\n');
+  expect(p.forceHtml).toBe(true);
+});
+
+// --- buildPrefix: explicit --tag badge ---
+test('buildPrefix --tag renders the canonical emoji badge + word, body below', () => {
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ОТВЕТ' });
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 💬 ОТВЕТ\n');
+  expect(p.plain.endsWith('\n')).toBe(true);
+});
+
+test('buildPrefix --tag (English alias, lowercase) resolves to the Russian canonical', () => {
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'decision' });
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 ⚖️ РЕШЕНИЕ\n');
+});
+
+test('buildPrefix --tag + --title compose: badge, word, em-dash, then title', () => {
+  const p = buildPrefix({
+    aiEmoji: '✳️',
+    model: 'no-brand',
+    tmuxWindow: 'tg-cli',
+    tag: 'ОТВЕТ',
+    title: 'Done',
+  });
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 💬 ОТВЕТ — 𝑫𝒐𝒏𝒆\n');
+});
+
+test('buildPrefix unknown --tag soft-renders as a plain [TAG] badge (no hard fail)', () => {
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'wat' });
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] [WAT]\n');
+  expect(p.present).toBe(true);
+});
+
+// Exact rendered header for each of the four canonical tags (plain form).
+test('buildPrefix: exact header for each of the four canonical tags', () => {
+  const win = '[𝘁𝗴-𝗰𝗹𝗶]';
+  const mk = (tag: string): string =>
+    buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag }).plain;
+  expect(mk('ОТВЕТ')).toBe(`✳️ ${win} 🔵 💬 ОТВЕТ\n`);
+  expect(mk('РЕШЕНИЕ')).toBe(`✳️ ${win} 🟠 ⚖️ РЕШЕНИЕ\n`);
+  expect(mk('ПРОБЛЕМА')).toBe(`✳️ ${win} 🔴 🚨 ПРОБЛЕМА\n`);
+  expect(mk('ОТЧЁТ')).toBe(`✳️ ${win} 🟢 📋 ОТЧЁТ\n`);
 });

@@ -52,6 +52,7 @@ import {
   parseEmojiHelpers,
 } from "./features/render/html"
 import { buildPrefix } from "./features/render/prefix"
+import { resolveTag } from "./features/render/tag"
 import { createTelegramTransport } from "./features/transport/telegram"
 import {
   enumerateWorktreeRoots,
@@ -100,6 +101,16 @@ Options:
   --format plain|html  message format (default: plain)
   --photo <path>       attach an image (repeatable)
   --file <path>        attach a document (repeatable)
+  --title <text>       explicit header title: "✳️ [window] <title>" (the message
+                       body is NEVER pulled onto the header line)
+  --tag <TAG>          emoji badge labeling the message; composes with --title:
+                       "✳️ [window] 🔵 💬 ОТВЕТ — <title>". Tags (case-insensitive,
+                       English aliases map to the Russian canonicals):
+                         ОТВЕТ / ANSWER     🔵 💬  answering a question
+                         РЕШЕНИЕ / DECISION 🟠 ⚖️  a decision to confirm
+                         ПРОБЛЕМА / PROBLEM 🔴 🚨  a blocker / problem
+                         ОТЧЁТ / REPORT     🟢 📋  a status / result report
+                       An unknown tag soft-renders as [TAG] + a stderr note.
   -v, --version        print version and exit
   -h, --help           print this help and exit
 
@@ -485,8 +496,18 @@ if (import.meta.main) {
 
   const tmuxWindow = getTmuxWindow()
 
-  const { items, caption: rawCaption, format } = parsed
+  const { items, caption: rawCaption, format, title, tag } = parsed
   const caption = decodeTextEscapes(rawCaption)
+
+  // An unknown --tag is not fatal: buildPrefix soft-renders it as a plain
+  // `[TAG]` badge. Emit a one-line stderr note here so the caller learns the
+  // tag was not recognized while the message still goes out.
+  if (tag && tag.trim() && !resolveTag(tag).known) {
+    console.error(
+      `tg: unknown tag '${tag.trim()}' — sending it as a plain [${tag.trim().toUpperCase()}] badge. ` +
+        "Known tags: ОТВЕТ, РЕШЕНИЕ, ПРОБЛЕМА, ОТЧЁТ (aliases ANSWER/DECISION/PROBLEM/REPORT).",
+    )
+  }
 
   // --- autolink-tasks: detect ticket codes, verify them via the linear CLI ---
   // (docs/specs/autolink-tasks.md). One `linear api` spawn per send, and only
@@ -758,7 +779,7 @@ if (import.meta.main) {
   // substituting :helper: markers inside text we're about to remove. Line-spec
   // quotes are inserted AFTER this hook (anchored on the token) so the injected
   // <pre> can't flip the userHtml/escape decision below.
-  const prefix = buildPrefix({ aiEmoji: AI_EMOJI, model: MODEL, tmuxWindow })
+  const prefix = buildPrefix({ aiEmoji: AI_EMOJI, model: MODEL, tmuxWindow, tag, title })
   const renderText = (stripped: string, fmt: Format): { text: string; format: Format } => {
     const parsedCaption = parseEmojiHelpers(stripped)
     // buildPrefix already rendered the prefix to finished html/plain (its emoji
@@ -863,9 +884,6 @@ if (import.meta.main) {
         issues,
         prs,
         styleTitle: styleTaskTitle,
-        // Insert the single-ticket title right after `[window] ` (the prefix now
-        // joins the body on the same line) so it lands immediately after `]`.
-        prefixBoundary: prefix.present ? prefix.html : undefined,
       }),
       format: "html",
     }
