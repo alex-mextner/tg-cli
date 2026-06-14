@@ -16,5 +16,15 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: Install dependencies
         run: bun install
+      - name: Install pandoc + Chrome (md-pdf integration test)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+          # Google Chrome is preinstalled on ubuntu-latest (/usr/bin/google-chrome,
+          # which findChrome() probes); install it only if a future image drops it.
+          command -v google-chrome >/dev/null || {
+            wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+          }
       - name: Test
         run: bun test
