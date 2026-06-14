@@ -3,6 +3,27 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.9.0
+
+Custom-emoji tag pills go live.
+
+- **`--tag` now renders a real custom-emoji wordmark PILL.** 1.8.0 shipped the
+  `--tag` plumbing with PLACEHOLDER pill ids, so every tag fell back to the
+  unicode badge (`🔵 ANSWER`). This release uploads the pill sticker set
+  (`replytags_by_UltraClaudeCodeBot`, https://t.me/addemoji/replytags_by_UltraClaudeCodeBot)
+  and wires the real `custom_emoji_id`s into `TAG_PILL_IDS`. Premium clients now
+  see the wordmark chip; everyone else sees the unicode fallback. The four pills
+  (🔵 ANSWER / 🟠 DECISION / 🔴 PROBLEM / 🟢 REPORT) are sliced into 2–3 cells
+  each. (`features/branding/emoji.ts`, `scripts/create-tag-emoji.ts`.)
+- **Fix: pill cells wrap a single emoji, not a slice of the word.** Telegram
+  rejects a `custom_emoji` entity whose fallback text is not exactly one emoji
+  with `ENTITY_TEXT_INVALID`. The renderer now emits one `<tg-emoji>` per cell
+  wrapping the canonical dot (`🔵`), and appends the readable WORD as plain text
+  after the cells (`<pill cells> ANSWER`) so the label is never lost — premium
+  clients see the pill image + word, non-premium see `🔵🔵 ANSWER`. The dead
+  `splitForCells` word-distributor (the discarded slice approach) is removed.
+  (`features/render/prefix.ts`.)
+
 ## 1.8.0
 
 Header tag/title; revert the body-pull from 1.7.1.

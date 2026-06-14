@@ -13,10 +13,10 @@
 // followed by an explicit tag badge and/or an explicit `--title`:
 //   ✳️ [window]                          (no tag, no title)
 //   ✳️ [window] <title>                  (--title only)
-//   ✳️ [window] 🔵 💬 ОТВЕТ              (--tag only)
-//   ✳️ [window] 🔵 💬 ОТВЕТ — <title>    (--tag + --title)
+//   ✳️ [window] 🔵 ANSWER               (--tag only, unicode fallback)
+//   ✳️ [window] <ANSWER pill> — <title> (--tag + --title, real pill ids)
 // The message body NEVER rides this line — only an explicit tag/title appear.
-import { EMBEDDABLE_EMOJI_MAP, extractBaseModel } from '../branding/emoji';
+import { EMBEDDABLE_EMOJI_MAP, extractBaseModel, hasRealPillIds, TAG_PILL_IDS } from '../branding/emoji';
 import { styleTaskTitle, styleWindowName, toBoldItalic } from '../prefix-style/style';
 import { resolveTag } from './tag';
 import { escapeHtml } from './html';
@@ -28,12 +28,13 @@ export interface PrefixParts {
   forceHtml: boolean;
 }
 
+
 export function buildPrefix(opts: {
   aiEmoji: string;
   model: string;
   tmuxWindow: string;
-  // Explicit message tag (`--tag`). Resolved case-insensitively; English
-  // aliases map to the Russian canonicals. Unknown → a soft `[TAG]` badge.
+  // Explicit message tag (`--tag`). Resolved case-insensitively; Russian
+  // aliases map to the English canonicals. Unknown → a soft `[TAG]` badge.
   tag?: string;
   // Explicit header title (`--title`). The message body is NEVER pulled up
   // here; only this explicit title ever appears on the header line.
@@ -77,13 +78,43 @@ export function buildPrefix(opts: {
   }
 
   // --- Optional tag badge (`--tag`) on the header line, after [window]. ---
+  // Three render paths:
+  //   1. Known tag WITH real, uploaded pill ids → the wordmark pill as N
+  //      <tg-emoji> cells (premium-only; forces HTML). The plain branch keeps
+  //      the unicode fallback so the >4096 splitter / non-HTML path still reads.
+  //   2. Known tag WITHOUT real ids (placeholder set, not yet uploaded) → the
+  //      unicode fallback badge (`🔵 ANSWER`) in BOTH forms. A placeholder id
+  //      must NEVER be emitted inside a <tg-emoji> tag — hasRealPillIds guards
+  //      this, so a broken/empty emoji can never go out.
+  //   3. Unknown tag → a soft `[WORD]` badge (no emoji, no fail) — UNCHANGED.
   if (tag && tag.trim()) {
     const resolved = resolveTag(tag);
     const sep = plain.length > 0 ? ' ' : '';
-    // Known: `🔵 💬 ОТВЕТ`. Unknown: a soft `[WORD]` badge (no emoji, no fail).
-    const badge = resolved.known ? `${resolved.emoji} ${resolved.word}` : `[${resolved.word}]`;
-    html += `${sep}${escapeHtml(badge)}`;
-    plain += `${sep}${badge}`;
+    if (resolved.known && hasRealPillIds(resolved.word)) {
+      // Real pill ids: render each cell as <tg-emoji emoji-id>🔵</tg-emoji>, one
+      // per uploaded cell. Telegram REQUIRES the inner (fallback) text of a
+      // custom_emoji entity to be exactly one emoji — wrapping a slice of the
+      // word ("SWER") is rejected with ENTITY_TEXT_INVALID — so every cell's
+      // inner text is the canonical DOT (a single emoji). The readable WORD then
+      // follows the cells as PLAIN text (outside any entity, so it is always
+      // visible and never rejected). Premium clients render the N pill images
+      // edge-to-edge into the wordmark chip, then the word; non-premium clients
+      // see the dots + word (e.g. "🔵🔵 ANSWER"). The word is also what
+      // copy/paste/search and the html fallback show. The plain form keeps the
+      // readable unicode fallback ("🔵 ANSWER") for the non-HTML / >4096 path.
+      const ids = TAG_PILL_IDS[resolved.word];
+      const cells = ids.map((id) => `<tg-emoji emoji-id="${id}">${escapeHtml(resolved.dot)}</tg-emoji>`).join('');
+      html += `${sep}${cells} ${escapeHtml(resolved.word)}`;
+      plain += `${sep}${resolved.fallback}`;
+      forceHtml = true; // a custom-emoji pill only renders in HTML mode
+    } else {
+      // Known but placeholder ids / non-premium → unicode fallback badge.
+      // Unknown → bare `[WORD]`. Both render identically in html (escaped) and
+      // plain; no <tg-emoji>, so a placeholder id can never leak out.
+      const badge = resolved.known ? resolved.fallback : `[${resolved.word}]`;
+      html += `${sep}${escapeHtml(badge)}`;
+      plain += `${sep}${badge}`;
+    }
   }
 
   // --- Optional explicit title (`--title`) on the header line. ---

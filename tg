@@ -103,13 +103,15 @@ Options:
   --file <path>        attach a document (repeatable)
   --title <text>       explicit header title: "✳️ [window] <title>" (the message
                        body is NEVER pulled onto the header line)
-  --tag <TAG>          emoji badge labeling the message; composes with --title:
-                       "✳️ [window] 🔵 💬 ОТВЕТ — <title>". Tags (case-insensitive,
-                       English aliases map to the Russian canonicals):
-                         ОТВЕТ / ANSWER     🔵 💬  answering a question
-                         РЕШЕНИЕ / DECISION 🟠 ⚖️  a decision to confirm
-                         ПРОБЛЕМА / PROBLEM 🔴 🚨  a blocker / problem
-                         ОТЧЁТ / REPORT     🟢 📋  a status / result report
+  --tag <TAG>          wordmark pill labeling the message; composes with --title:
+                       "✳️ [window] 🔵 ANSWER — <title>". Premium clients show the
+                       custom-emoji pill; everyone else sees the unicode fallback
+                       below. Tags (case-insensitive, Russian aliases map to the
+                       English canonicals):
+                         ANSWER   / ОТВЕТ     🔵 ANSWER    answering a question
+                         DECISION / РЕШЕНИЕ   🟠 DECISION  a decision to confirm
+                         PROBLEM  / ПРОБЛЕМА  🔴 PROBLEM   a blocker / problem
+                         REPORT   / ОТЧЁТ     🟢 REPORT    a status / result report
                        An unknown tag soft-renders as [TAG] + a stderr note.
   -v, --version        print version and exit
   -h, --help           print this help and exit
@@ -505,7 +507,7 @@ if (import.meta.main) {
   if (tag && tag.trim() && !resolveTag(tag).known) {
     console.error(
       `tg: unknown tag '${tag.trim()}' — sending it as a plain [${tag.trim().toUpperCase()}] badge. ` +
-        "Known tags: ОТВЕТ, РЕШЕНИЕ, ПРОБЛЕМА, ОТЧЁТ (aliases ANSWER/DECISION/PROBLEM/REPORT).",
+        "Known tags: ANSWER, DECISION, PROBLEM, REPORT (aliases ОТВЕТ/РЕШЕНИЕ/ПРОБЛЕМА/ОТЧЁТ).",
     )
   }
 

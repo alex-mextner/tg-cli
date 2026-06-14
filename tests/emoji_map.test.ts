@@ -72,7 +72,7 @@ async function parseEmojiMap(): Promise<Record<string, string>> {
   }
   const lines = match[1].split('\n')
   for (const line of lines) {
-    const keyMatch = line.match(/(\w+):\s*"(\d+)",/)
+    const keyMatch = line.match(/(\w+):\s*["\x27](\d+)["\x27],/)
     if (keyMatch) {
       map[keyMatch[1]] = keyMatch[2]
     }

@@ -7,6 +7,7 @@ import {
   parseModeFor,
 } from '../features/render/html';
 import { buildPrefix } from '../features/render/prefix';
+import { TAG_PILL_IDS, TAG_PILL_PLACEHOLDER } from '../features/branding/emoji';
 
 // Focused unit tests for the render modules extracted from the `tg` entrypoint
 // (decomposition Stage 1). These functions were previously only exercised
@@ -166,41 +167,151 @@ test('buildPrefix --title with a Cyrillic title falls back to <i> and forces HTM
 });
 
 // --- buildPrefix: explicit --tag badge ---
-test('buildPrefix --tag renders the canonical emoji badge + word, body below', () => {
-  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ОТВЕТ' });
-  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 💬 ОТВЕТ\n');
+//
+// Default repo state: TAG_PILL_IDS now holds REAL uploaded custom-emoji ids
+// (set replytags_by_hyperidebot), so every known canonical tag renders its
+// wordmark pill as N <tg-emoji> cells in the HTML form, while the plain form
+// keeps the unicode fallback (`🔵 ANSWER`) for non-HTML / >4096 split paths.
+// A placeholder id must NEVER leak into a <tg-emoji>; the half-placeholder
+// guard path is tested separately by injecting a placeholder and restoring.
+
+test('buildPrefix --tag (real ids) renders the pill in html, unicode fallback in plain', () => {
+  const p = buildPrefix({ aiEmoji: '', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ANSWER' });
+  // plain keeps the unicode fallback badge (non-HTML / >4096 split path).
+  expect(p.plain).toBe('[𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER\n');
+  // html carries the real 2-cell pill (ANSWER has two uploaded cells); each cell
+  // wraps exactly the dot emoji (Telegram rejects non-emoji fallback text), then
+  // the readable WORD follows as plain text so the label is never lost.
+  expect(p.html).toBe(
+    '[𝘁𝗴-𝗰𝗹𝗶] ' +
+      '<tg-emoji emoji-id="5294043157963513686">🔵</tg-emoji>' +
+      '<tg-emoji emoji-id="5294469261668951364">🔵</tg-emoji>' +
+      ' ANSWER\n',
+  );
+  expect(p.forceHtml).toBe(true);
+  // Guard: a placeholder string must never appear inside a <tg-emoji> tag.
+  expect(p.html).not.toContain('PLACEHOLDER');
   expect(p.plain.endsWith('\n')).toBe(true);
 });
 
-test('buildPrefix --tag (English alias, lowercase) resolves to the Russian canonical', () => {
-  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'decision' });
-  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 ⚖️ РЕШЕНИЕ\n');
+test('buildPrefix --tag (Russian alias) resolves to the English canonical fallback', () => {
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'РЕШЕНИЕ' });
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 DECISION\n');
 });
 
-test('buildPrefix --tag + --title compose: badge, word, em-dash, then title', () => {
+test('buildPrefix --tag (English alias, lowercase) resolves to the canonical fallback', () => {
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'decision' });
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 DECISION\n');
+});
+
+test('buildPrefix --tag + --title compose: badge, em-dash, then title', () => {
   const p = buildPrefix({
     aiEmoji: '✳️',
     model: 'no-brand',
     tmuxWindow: 'tg-cli',
-    tag: 'ОТВЕТ',
+    tag: 'ANSWER',
     title: 'Done',
   });
-  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 💬 ОТВЕТ — 𝑫𝒐𝒏𝒆\n');
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER — 𝑫𝒐𝒏𝒆\n');
 });
 
 test('buildPrefix unknown --tag soft-renders as a plain [TAG] badge (no hard fail)', () => {
   const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'wat' });
   expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] [WAT]\n');
+  expect(p.html).not.toContain('<tg-emoji'); // unknown tag never emits a pill
   expect(p.present).toBe(true);
 });
 
-// Exact rendered header for each of the four canonical tags (plain form).
-test('buildPrefix: exact header for each of the four canonical tags', () => {
+// Exact rendered header for each of the four canonical tags (the PLAIN form,
+// which always keeps the unicode fallback regardless of whether real pill ids
+// are wired — the html form carries the <tg-emoji> pill, asserted elsewhere).
+test('buildPrefix: exact fallback header for each of the four canonical tags', () => {
   const win = '[𝘁𝗴-𝗰𝗹𝗶]';
   const mk = (tag: string): string =>
     buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag }).plain;
-  expect(mk('ОТВЕТ')).toBe(`✳️ ${win} 🔵 💬 ОТВЕТ\n`);
-  expect(mk('РЕШЕНИЕ')).toBe(`✳️ ${win} 🟠 ⚖️ РЕШЕНИЕ\n`);
-  expect(mk('ПРОБЛЕМА')).toBe(`✳️ ${win} 🔴 🚨 ПРОБЛЕМА\n`);
-  expect(mk('ОТЧЁТ')).toBe(`✳️ ${win} 🟢 📋 ОТЧЁТ\n`);
+  expect(mk('ANSWER')).toBe(`✳️ ${win} 🔵 ANSWER\n`);
+  expect(mk('DECISION')).toBe(`✳️ ${win} 🟠 DECISION\n`);
+  expect(mk('PROBLEM')).toBe(`✳️ ${win} 🔴 PROBLEM\n`);
+  expect(mk('REPORT')).toBe(`✳️ ${win} 🟢 REPORT\n`);
+});
+
+// --- buildPrefix: real pill ids → N <tg-emoji> cells (premium path) ---
+// TAG_PILL_IDS is mutated in-place to real-looking ids (19-digit numerics),
+// then restored, so the live renderer is exercised without a leaky module mock.
+// Each cell wraps exactly the canonical dot emoji — Telegram rejects a
+// custom_emoji entity whose fallback text is not a single emoji.
+test('buildPrefix --tag with REAL pill ids renders N <tg-emoji> dot cells and forces HTML', () => {
+  const realIds = ['5300000000000000001', '5300000000000000002'];
+  const saved = TAG_PILL_IDS.ANSWER;
+  TAG_PILL_IDS.ANSWER = [...realIds];
+  try {
+    const p = buildPrefix({ aiEmoji: '', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ANSWER' });
+    // N cells (here 2), each wrapping the lone dot emoji, then the readable word.
+    expect(p.html).toBe(
+      '[𝘁𝗴-𝗰𝗹𝗶] ' +
+        `<tg-emoji emoji-id="${realIds[0]}">🔵</tg-emoji>` +
+        `<tg-emoji emoji-id="${realIds[1]}">🔵</tg-emoji>` +
+        ' ANSWER\n',
+    );
+    // Every cell's inner text is exactly the dot — never a slice of the word.
+    const innerTexts = [...p.html.matchAll(/<tg-emoji emoji-id="\d+">([^<]*)<\/tg-emoji>/g)].map((m) => m[1]);
+    expect(innerTexts).toEqual(['🔵', '🔵']);
+    // plain keeps the readable unicode fallback (non-HTML / >4096 split path).
+    expect(p.plain).toBe('[𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER\n');
+    expect(p.forceHtml).toBe(true);
+  } finally {
+    TAG_PILL_IDS.ANSWER = saved;
+  }
+});
+
+test('buildPrefix --tag with a 3-cell real pill renders 3 <tg-emoji> dot cells in order', () => {
+  const realIds = ['5310000000000000001', '5310000000000000002', '5310000000000000003'];
+  const saved = TAG_PILL_IDS.DECISION;
+  TAG_PILL_IDS.DECISION = [...realIds];
+  try {
+    const p = buildPrefix({ aiEmoji: '', model: '', tmuxWindow: '', tag: 'DECISION' });
+    const cellTags = p.html.match(/<tg-emoji emoji-id="\d+">/g) ?? [];
+    expect(cellTags).toEqual(realIds.map((id) => `<tg-emoji emoji-id="${id}">`));
+    // Every cell wraps exactly the dot emoji (3 cells → 🟠🟠🟠).
+    const innerTexts = [...p.html.matchAll(/<tg-emoji emoji-id="\d+">([^<]*)<\/tg-emoji>/g)].map((m) => m[1]);
+    expect(innerTexts).toEqual(['🟠', '🟠', '🟠']);
+    expect(p.forceHtml).toBe(true);
+  } finally {
+    TAG_PILL_IDS.DECISION = saved;
+  }
+});
+
+// Guard regression: a partially-filled pill (one placeholder among real ids) is
+// NOT trusted — it falls back to unicode, never a half-broken pill.
+test('buildPrefix --tag does NOT emit a pill when any cell id is still a placeholder', () => {
+  const saved = TAG_PILL_IDS.PROBLEM;
+  TAG_PILL_IDS.PROBLEM = ['5320000000000000001', TAG_PILL_PLACEHOLDER, '5320000000000000003'];
+  try {
+    const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'PROBLEM' });
+    expect(p.html).not.toContain('<tg-emoji');
+    expect(p.html).toContain('🔴 PROBLEM'); // unicode fallback instead
+  } finally {
+    TAG_PILL_IDS.PROBLEM = saved;
+  }
+});
+
+// --- pill cell inner text MUST be a single dot emoji ---
+// Telegram rejects a custom_emoji entity whose fallback text is not exactly one
+// emoji (ENTITY_TEXT_INVALID), so every <tg-emoji> pill cell's inner text is the
+// canonical dot — never a slice of the readable word.
+test('buildPrefix pill cells each wrap exactly the canonical dot emoji (never a word slice)', () => {
+  const cases: Array<[string, string, number]> = [
+    ['ANSWER', '🔵', 2],
+    ['DECISION', '🟠', 3],
+    ['PROBLEM', '🔴', 3],
+    ['REPORT', '🟢', 2],
+  ];
+  for (const [tag, dot, cellCount] of cases) {
+    const p = buildPrefix({ aiEmoji: '', model: 'no-brand', tmuxWindow: '', tag });
+    const inner = [...p.html.matchAll(/<tg-emoji emoji-id="\d+">([^<]*)<\/tg-emoji>/g)].map((m) => m[1]);
+    expect(inner).toHaveLength(cellCount); // one cell per uploaded sticker
+    expect(inner.every((t) => t === dot)).toBe(true); // every cell's inner text is the lone dot
+    // No cell wraps plain letters (which Telegram would reject).
+    expect(p.html).not.toMatch(/<tg-emoji emoji-id="\d+">[^<]*[A-Za-z][^<]*<\/tg-emoji>/);
+  }
 });

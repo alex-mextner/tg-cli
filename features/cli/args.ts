@@ -51,8 +51,8 @@ export type ParseResult =
       // Explicit header title (`--title`). Appears on the `✳️ [window]` line as
       // `✳️ [window] <title>`. The message body is NEVER pulled up here.
       title?: string;
-      // Explicit message tag (`--tag`). Rendered as an emoji badge before the
-      // tag word: `✳️ [window] 🔵 💬 ОТВЕТ`. Composes with `--title`.
+      // Explicit message tag (`--tag`). Rendered as a wordmark pill (custom-emoji
+      // cells + readable word): `✳️ [window] 🔵 ANSWER`. Composes with `--title`.
       tag?: string;
     };
 
