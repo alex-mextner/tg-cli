@@ -27,7 +27,7 @@ test('render modules observe a post-import mutation of the shared emoji map', ()
     expect(parsed.entities[0].custom_emoji_id).toBe(fakeId);
 
     const p = buildPrefix({ aiEmoji: '🤖', model: key, tmuxWindow: '' });
-    expect(p.html).toBe(`<tg-emoji emoji-id="${fakeId}">🤖</tg-emoji> `);
+    expect(p.html).toBe(`<tg-emoji emoji-id="${fakeId}">🤖</tg-emoji>\n`);
     expect(p.forceHtml).toBe(true);
   } finally {
     delete EMBEDDABLE_EMOJI_MAP[key];

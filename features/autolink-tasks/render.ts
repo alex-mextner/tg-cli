@@ -110,14 +110,6 @@ export interface AutolinkExtras {
   // Script). Takes the RAW title, returns final HTML. Defaults to plain
   // escapeHtml so callers without styling keep the historical behavior.
   styleTitle?: (raw: string) => string;
-  // The rendered prefix (`✳️ [window] `) when it is joined to the body on the
-  // SAME line (the prefix now ends with a space, not a newline). When the body's
-  // first line starts with this exact string, the single-ticket title is inserted
-  // right AFTER the prefix (between `[window] ` and the body prose) so it sits
-  // immediately after `]` per the spec — not at the end of the first line behind
-  // any prose. Absent / non-matching → the legacy end-of-first-line append (used
-  // by tests that pass a `\n`-separated prefix body and by callers without it).
-  prefixBoundary?: string;
   // Override the ticket-code body linkify (item 7: compound ranges/lists).
   // Defaults to the legacy single-code linkifyCodes so existing callers are
   // unchanged. Receives the rendered body, returns it with tickets linked.
@@ -158,15 +150,7 @@ export function applyAutolink(
     const title = (extras.styleTitle ?? escapeHtml)(tickets[0].title);
     if (hasPrefixLine) {
       const lines = out.split('\n');
-      const boundary = extras.prefixBoundary;
-      if (boundary && lines[0].startsWith(boundary)) {
-        // Insert the title right after `[window] ` so it lands immediately after
-        // `]` (spec), with any same-line prose following the title.
-        const rest = lines[0].slice(boundary.length);
-        lines[0] = rest.length > 0 ? `${boundary}${title} ${rest}` : `${boundary}${title}`;
-      } else {
-        lines[0] = `${lines[0]} ${title}`;
-      }
+      lines[0] = `${lines[0]} ${title}`;
       out = lines.join('\n');
     } else {
       out = `${title}\n${out}`;
