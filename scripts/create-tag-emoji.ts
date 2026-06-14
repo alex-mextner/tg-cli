@@ -34,10 +34,10 @@ import { join } from 'path';
 // emoji_list entry (a colored dot mirroring the pill fill; non-premium clients
 // show this).
 const TAG_PILLS: Record<string, { stem: string; cells: number; emoji: string }> = {
-  ANSWER: { stem: 'answer', cells: 2, emoji: '🔵' },
+  ANSWER: { stem: 'answer', cells: 3, emoji: '🔵' },
   DECISION: { stem: 'decision', cells: 3, emoji: '🟠' },
   PROBLEM: { stem: 'problem', cells: 3, emoji: '🔴' },
-  REPORT: { stem: 'report', cells: 2, emoji: '🟢' },
+  REPORT: { stem: 'report', cells: 3, emoji: '🟢' },
 };
 
 const SET_NAME = 'replytags';
