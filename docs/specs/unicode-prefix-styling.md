@@ -16,7 +16,12 @@ The message prefix `<emoji> [window] <task title>` gets typographic styling:
   calligraphic script read as too gaudy; Bold Italic is the restrained weight).
 
 The brackets themselves stay unstyled; the emoji is untouched (branded custom
-emoji as before).
+emoji as before). `buildPrefix` joins the prefix to the message body with a
+**space, not a newline**, so the body's first line — the single-ticket task
+title, or the message prose when there is no ticket — sits on the SAME line right
+after `[window]` (decision 2026-06-14: was dropping to line 2). For a single
+ticket the title is inserted immediately after `[window] ` via
+`applyAutolink`'s `prefixBoundary`, ahead of any same-line prose.
 
 ## Why a fallback is mandatory
 

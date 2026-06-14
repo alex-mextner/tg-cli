@@ -36,7 +36,7 @@ import {
 } from "./features/tg-ctl/questions"
 import { claudeHooksInstalled, withClaudeHooks } from "./features/tg-ctl/hook-install"
 import { normalizeHookPayload, type HookEnv } from "./features/tg-ctl/hook-normalize"
-import { aggregateUsage, orderByLruMru, parseRoutes, recognizeRoute } from "./features/tg-ctl/routes"
+import { aggregateUsage, orderByLruMru, parseRoutes, recognizeRoute, routeMatchesPane } from "./features/tg-ctl/routes"
 import { stepUpdates } from "./features/tg-ctl/updates"
 import type {
   Action,
@@ -1025,11 +1025,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // SAME project: a tmux pane id is reused after kill-pane, so a stale
       // message_id→%N map could otherwise inject a reply into a DIFFERENT
       // project's agent — leaking project A's reply into project B (review
-      // --brainstorm finding). Validate cwd; on mismatch (or no recorded cwd for
-      // an old route) fall through to the picker rather than risk mis-routing.
-      const sameProject = recognized.cwd
-        ? pane !== undefined && resolve(pane.panePath) === resolve(recognized.cwd)
-        : false
+      // --brainstorm finding). routeMatchesPane validates the recorded send-path
+      // (now the origin pane's path — see tg recordRoute) against the live pane's
+      // path; on mismatch (or no recorded cwd for an old route) fall through to
+      // the picker rather than risk mis-routing.
+      const sameProject = routeMatchesPane({ recognizedCwd: recognized.cwd, panePath: pane?.panePath })
       if (pane && sameProject && findAgentInPane(pane, procs)) return injectVerbatim(recognized.paneId)
       // recognized pane gone / reused / unverifiable → fall through to the picker
     }

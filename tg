@@ -34,7 +34,7 @@ import {
 } from "./features/autolink-tasks/state"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { botIdFromToken, ctlPaths } from "./features/tg-ctl/lock"
-import { appendRoute, parseRoutes, serializeRoutes } from "./features/tg-ctl/routes"
+import { appendRoute, parseRoutes, resolveRouteCwd, serializeRoutes } from "./features/tg-ctl/routes"
 import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
@@ -683,6 +683,27 @@ if (import.meta.main) {
   const ROUTES_PATH = TMUX_PANE
     ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).routes
     : null
+  // The origin pane's tmux pane_current_path — the SAME quantity the daemon
+  // reads (pane.panePath) when validating a reply. Recording this instead of
+  // process.cwd() is the routing fix: agents run `tg` from /tmp, so process.cwd()
+  // never matched the pane's project dir and every reply hit the picker. Returns
+  // null when not in tmux / the query fails, so resolveRouteCwd degrades to cwd.
+  const queryPanePath = (): string | null => {
+    if (!TMUX_PANE) return null
+    try {
+      const result = Bun.spawnSync(
+        ["tmux", "display-message", "-p", "-t", TMUX_PANE, "#{pane_current_path}"],
+        { stdout: "pipe", stderr: "pipe" },
+      )
+      if (result.exitCode === 0) {
+        const path = new TextDecoder().decode(result.stdout).trim()
+        if (path) return path
+      }
+    } catch {
+      // tmux missing / pane gone — fall back to process.cwd() in resolveRouteCwd
+    }
+    return null
+  }
   const recordRoute = (messageId: number): void => {
     if (!ROUTES_PATH || !TMUX_PANE) return
     try {
@@ -690,7 +711,7 @@ if (import.meta.main) {
       const next = appendRoute(existing, {
         id: messageId,
         paneId: TMUX_PANE,
-        cwd: process.cwd(),
+        cwd: resolveRouteCwd({ queryPanePath, fallbackCwd: process.cwd() }),
         ts: Math.floor(Date.now() / 1000),
       })
       writeFileSync(ROUTES_PATH, serializeRoutes(next))
@@ -842,6 +863,9 @@ if (import.meta.main) {
         issues,
         prs,
         styleTitle: styleTaskTitle,
+        // Insert the single-ticket title right after `[window] ` (the prefix now
+        // joins the body on the same line) so it lands immediately after `]`.
+        prefixBoundary: prefix.present ? prefix.html : undefined,
       }),
       format: "html",
     }
