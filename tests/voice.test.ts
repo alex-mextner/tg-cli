@@ -4,6 +4,7 @@ import {
   buildFfmpegArgv,
   buildWhisperCppArgv,
   cleanTranscript,
+  formatVoiceTranscript,
   DEFAULT_VOICE,
   decideOnboarding,
   isVoiceConfigured,
@@ -181,6 +182,12 @@ test('cleanTranscript strips whisper.cpp bracket/paren noise', () => {
   expect(cleanTranscript('[BLANK_AUDIO]')).toBe('');
   expect(cleanTranscript('hello [silence] world')).toBe('hello world');
   expect(cleanTranscript('(music) привет')).toBe('привет');
+});
+
+test('formatVoiceTranscript wraps the transcript as a 🎤 quote', () => {
+  expect(formatVoiceTranscript('add a retry to the loader')).toBe('🎤 «add a retry to the loader»');
+  // trims surrounding whitespace before quoting
+  expect(formatVoiceTranscript('  привет  ')).toBe('🎤 «привет»');
 });
 
 test('cleanTranscript strips faster-whisper banners + timestamp prefixes, joins segments', () => {

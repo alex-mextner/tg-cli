@@ -3,6 +3,14 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.9.5
+
+- **Voice transcripts now inject as a 🎤-marked quote.** An inbound voice note's
+  transcription is wrapped `🎤 «…»` (mirroring the `↩ «…»` reply anchor) before it
+  reaches the agent pane, so the agent — and a human glancing at the pane — can tell
+  it is machine-transcribed speech (which may carry recognition errors), not text
+  typed verbatim. Both the reply and standalone routes apply it.
+
 ## 1.9.4
 
 Inbound voice messages → text (local Whisper STT). Talk instead of type.
