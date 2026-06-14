@@ -79,8 +79,20 @@ tests can pass fakes.
   walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`),
   `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons),
   `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker), `hook-normalize.ts`
-  (raw harness hook payload → ButtonRequest), and `hook-install.ts` (idempotent q→buttons hook
-  merge for `tg-ctl install-hooks`). Shared shapes in `types.ts`.
+  (raw harness hook payload → ButtonRequest), `hook-install.ts` (idempotent q→buttons hook
+  merge for `tg-ctl install-hooks`), and `voice.ts` (inbound VOICE→text: `voice:` config block
+  parse/resolve/upsert, ffmpeg + whisper argv builders, transcript cleaning, and the onboarding
+  decision). `voice-probe.ts` is the ONE impure module here — it scans `~/xp` for an existing
+  Whisper install (whisper.cpp binary + ggml model, or a faster-whisper venv) and checks for
+  `ffmpeg`, handing a pure `WhisperProbe` to `decideOnboarding`. Shared shapes in `types.ts`.
+
+- **Inbound voice (STT):** a Telegram voice/audio note → `transcribe-voice` action (updates.ts).
+  The daemon downloads the OGG, transcodes to WAV 16 kHz mono via `ffmpeg`, runs the configured
+  local Whisper, cleans the transcript, then routes it through the SAME path a typed message uses
+  (reply-route with the quote anchor when the note is a reply, else inject into the discovered
+  pane). An unconfigured note triggers a guided onboarding reply — never a silent drop. Configure
+  with `tg voice setup` (→ `tg-ctl voice-setup`), which probes `~/xp` and persists the `voice:`
+  block. Whisper/ffmpeg/network spawns are all timeout-guarded.
 
 ### Feature Flags
 

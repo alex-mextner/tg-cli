@@ -3,6 +3,39 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.9.4
+
+Inbound voice messages → text (local Whisper STT). Talk instead of type.
+
+- **A Telegram VOICE note now becomes agent input.** When you send a voice note
+  to the bot, the `tg-ctl` daemon downloads the OGG/OPUS, transcodes it to WAV
+  16 kHz mono with `ffmpeg`, runs a local Whisper, cleans the transcript, and
+  injects the resulting text into the SAME agent pane a typed message would
+  reach — reusing the existing reply-routing (a voice note sent as a reply
+  carries the same quote anchor and routes to the replied-to origin pane). Audio
+  notes take the same path. Transcription runs through an ASYNC (non-blocking)
+  spawn, so the daemon's poll loop and q→buttons hook server stay responsive
+  while Whisper works.
+- **Whisper is discovered, not bundled.** `tg voice setup` (or the auto-prompt
+  on the first unconfigured voice note) probes the host — `~/xp/whisper.cpp`
+  first, then conventional clone locations and `PATH` — finds the built
+  `whisper-cli` binary and a real `ggml-*.bin` model (preferring multilingual
+  large/medium over English-only over the test fixtures), checks for `ffmpeg`,
+  and persists the runner/binary/model/language into `config.yaml`. faster-whisper
+  (an import-verified project `.venv`) is supported as a fallback runner.
+- **First-use onboarding, never a silent drop.** A voice note that arrives before
+  Whisper is configured triggers a guided reply: it points at an existing `~/xp`
+  install when present, or tells you to build whisper.cpp + download a model (or
+  install `ffmpeg`), then run `tg voice setup`. Once a working install is found
+  on the fly it is persisted so the next note transcribes without re-prompting.
+  Download / transcribe / persist failures are caught and reported — a note is
+  never lost after the at-most-once offset advances.
+- **Config:** a new top-level `voice:` block in `~/.config/tg-cli/config.yaml`
+  (`enabled`, `runner`, `bin_path`, `model_path`, `language` — default language
+  `auto`, covering ru + en). No secrets are written — only binary/model paths.
+  Reloaded per note, so `tg voice setup` takes effect without a daemon restart;
+  an explicit `enabled: false` is honored as the opt-out.
+
 ## 1.9.3
 
 Cleaner tag header + emoji tooling reads its bot token from config.

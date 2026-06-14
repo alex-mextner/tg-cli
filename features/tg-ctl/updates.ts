@@ -40,19 +40,24 @@ function fmtQuoteTimeUtc(unixSec: number): string {
 // ellipsis (item 3: «… начало сообщения и многоточие …»).
 const QUOTE_HEAD_MAX = 60;
 
-// Build the injected text for a REPLY (items 2, 3). The agent sees which message
-// is being answered — `↩ «[date time] <quote>…»` — followed by the wrapped reply.
-// The quoted content is the user's PARTIAL selection when present (item 2),
-// otherwise the beginning of the replied-to message (item 3).
-export function buildReplyInject(m: TgMessage, name: string, opts: StepOpts): string {
+// The quote anchor for a REPLY (items 2, 3): `↩ «[date time] <quote>…»`. The
+// quoted content is the user's PARTIAL selection when present (item 2),
+// otherwise the beginning of the replied-to message (item 3). Shared by text
+// replies and voice-note replies so both anchor identically.
+export function buildReplyAnchor(m: TgMessage, opts: StepOpts): string {
   const rtm = m.reply_to_message;
-  const original = ((rtm?.text ?? rtm?.caption) ?? '').replace(/\s+/g, ' ').trim();
+  const original = (rtm?.text ?? rtm?.caption ?? '').replace(/\s+/g, ' ').trim();
   const selected = m.quote?.text?.replace(/\s+/g, ' ').trim();
   const body = selected || original;
   const head = body.length > QUOTE_HEAD_MAX ? `${body.slice(0, QUOTE_HEAD_MAX)}…` : `${body}…`;
   const when = rtm ? (opts.fmtTime ?? fmtQuoteTimeUtc)(rtm.date) : '';
-  const anchor = `↩ «[${when}] ${head}»`;
-  return `${anchor}\n${opts.wrap(name, m.text ?? '')}`;
+  return `↩ «[${when}] ${head}»`;
+}
+
+// Build the injected text for a REPLY (items 2, 3). The agent sees which message
+// is being answered — the quote anchor — followed by the wrapped reply.
+export function buildReplyInject(m: TgMessage, name: string, opts: StepOpts): string {
+  return `${buildReplyAnchor(m, opts)}\n${opts.wrap(name, m.text ?? '')}`;
 }
 
 export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
@@ -125,9 +130,10 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
               from: name,
             }
           : textAction(m.text, name, opts);
-    } else if (m.photo?.length) action = photoAction(u.update_id, m, name);
+    } else if (m.voice ?? m.audio) action = voiceAction(u.update_id, m, name, opts);
+    else if (m.photo?.length) action = photoAction(u.update_id, m, name);
     else if (m.document) action = documentAction(u.update_id, m, name);
-    // Anything else (sticker, voice, …) → advance silently.
+    // Anything else (sticker, …) → advance silently.
     if (action) {
       actions.push(action);
       // Delivery receipt (👀 reaction) follows every action that represents
@@ -184,6 +190,29 @@ function photoAction(updateId: number, m: TgMessage, name: string): Action {
     caption: m.caption,
     from: name,
   };
+}
+
+// A voice/audio note → transcribe-voice. The OGG is downloaded under a
+// daemon-chosen name (<update_id>.ogg — never the remote basename, spec §5.2),
+// then the entrypoint transcodes + transcribes + routes. A note that is itself a
+// reply carries the same quote anchor a typed reply would (items 2,3) so the
+// transcript routes to the replied-to origin pane. Over-20MB notes can't be
+// fetched by a bot → too-large reply, same as photo/document.
+function voiceAction(updateId: number, m: TgMessage, name: string, opts: StepOpts): Action {
+  const v = (m.voice ?? m.audio)!;
+  if ((v.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: 'reply', text: TOO_LARGE_REPLY };
+  const action: Extract<Action, { kind: 'transcribe-voice' }> = {
+    kind: 'transcribe-voice',
+    fileId: v.file_id,
+    suggestedName: `${updateId}.ogg`,
+    fileSize: v.file_size,
+    from: name,
+  };
+  if (m.reply_to_message) {
+    action.replyToMessageId = m.reply_to_message.message_id;
+    action.replyAnchor = buildReplyAnchor(m, opts);
+  }
+  return action;
 }
 
 function documentAction(updateId: number, m: TgMessage, name: string): Action {

@@ -12,7 +12,7 @@
 // (`run`) takes the flock as its FIRST action and exits 0 when another
 // instance already owns the bot.
 
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { join, resolve } from "path"
 import {
@@ -38,6 +38,21 @@ import { claudeHooksInstalled, withClaudeHooks } from "./features/tg-ctl/hook-in
 import { normalizeHookPayload, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { aggregateUsage, orderByLruMru, parseRoutes, recognizeRoute, routeMatchesPane } from "./features/tg-ctl/routes"
 import { stepUpdates } from "./features/tg-ctl/updates"
+import {
+  buildFasterWhisperArgv,
+  buildFfmpegArgv,
+  buildWhisperCppArgv,
+  cleanTranscript,
+  FASTER_WHISPER_FALLBACK_SCRIPT,
+  decideOnboarding,
+  isVoiceConfigured,
+  onboardingMessage,
+  parseVoiceConfig,
+  resolveVoiceConfig,
+  upsertVoiceBlock,
+  type VoiceConfig,
+} from "./features/tg-ctl/voice"
+import { probeWhisper } from "./features/tg-ctl/voice-probe"
 import type {
   Action,
   AgentKind,
@@ -58,10 +73,11 @@ export const USAGE = `Usage:
   tg-ctl stop
   tg-ctl status
   tg-ctl install-hooks   # wire q→buttons: agent questions → Telegram buttons
+  tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
   tg-ctl run    # internal: the daemon process itself
 
 Credentials: <config dir>/.env (TG_BOT_TOKEN, TG_CHAT_ID).
-Config:      <config dir>/config.yaml, top-level control: block.
+Config:      <config dir>/config.yaml, top-level control: + voice: blocks.
 Env:         TG_CTL_CONFIG_DIR (default ~/.config/tg-cli),
              TG_API_BASE (default https://api.telegram.org).
 `
@@ -142,6 +158,7 @@ interface Ctx {
   configDir: string
   paths: CtlPaths
   cfg: ControlConfig
+  voice: VoiceConfig
   token: string
   chatId: number
   apiBase: string
@@ -331,6 +348,165 @@ async function executeInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | {
     }
   }
   return { ok: true }
+}
+
+// --- voice transcription (inbound STT) ---
+
+// Configured AND the on-disk artefacts still exist. The config gate
+// (isVoiceConfigured) is cheap; this adds the filesystem check the step function
+// can't do (it is pure). A deleted model/binary falls back to onboarding instead
+// of downloading the note and failing deep inside the runner.
+function voiceReady(ctx: Ctx): boolean {
+  if (!isVoiceConfigured(ctx.voice)) return false
+  if (!existsSync(ctx.voice.binPath)) return false
+  // whisper.cpp model is always a path → must exist. faster-whisper model is
+  // EITHER a bare size token ('large-v3' — downloaded on demand, no path check)
+  // OR a local CT2 directory path; a path-shaped value (contains a slash) must
+  // exist on disk, else a stale/moved model would pass the gate and fail in
+  // Python after the note was already downloaded.
+  if (ctx.voice.runner === "whisper.cpp") {
+    if (!existsSync(ctx.voice.modelPath)) return false
+  } else if (ctx.voice.modelPath.includes("/")) {
+    if (!existsSync(ctx.voice.modelPath)) return false
+  }
+  return true
+}
+
+// Spawn a binary ASYNCHRONOUSLY (Bun.spawn, not spawnSync) with a timeout +
+// pipes, NEVER throwing. Async is the key: ffmpeg/whisper can take many seconds,
+// and spawnSync would BLOCK the daemon's single event loop — freezing the
+// Telegram poll loop AND the Unix hook server (q→buttons) until the child exits.
+// `await proc.exited` yields the loop so hooks and other control messages keep
+// flowing during a long transcription. The timeout kills the child (and so the
+// awaited promise resolves) instead of wedging. A missing executable makes
+// Bun.spawn throw ENOENT, which — uncaught — would bubble to the poll loop AFTER
+// the offset was persisted and silently lose the note; caught here → exit 127.
+async function spawnGuarded(
+  argv: string[],
+  timeoutMs: number,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  let child: ReturnType<typeof Bun.spawn> | undefined
+  try {
+    child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe" })
+    const proc = child
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      proc.kill("SIGKILL")
+    }, timeoutMs)
+    try {
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ])
+      await proc.exited
+      if (timedOut) return { exitCode: 124, stdout, stderr: `${stderr}\ntimed out after ${timeoutMs}ms` }
+      return { exitCode: proc.exitCode ?? 1, stdout, stderr }
+    } finally {
+      clearTimeout(timer)
+    }
+  } catch (err) {
+    return { exitCode: 127, stdout: "", stderr: `spawn ${argv[0]} failed: ${err}` }
+  }
+}
+
+// Spawn ffmpeg (OGG→WAV 16k mono) then the configured Whisper, returning the
+// cleaned transcript or null on failure. Both spawns are ASYNC (event loop stays
+// free for hooks/poll during a long transcription), timeout-guarded so a stuck
+// binary can't wedge the loop, and exception-guarded so a MISSING binary returns
+// null (not an uncaught throw). The WAV is written next to the OGG.
+async function runTranscription(ctx: Ctx, oggPath: string): Promise<string | null> {
+  const wavPath = oggPath.replace(/\.[^.]+$/, "") + ".wav"
+  const ff = await spawnGuarded(buildFfmpegArgv(oggPath, wavPath), 60_000)
+  if (ff.exitCode !== 0 || !existsSync(wavPath)) {
+    log(`ffmpeg failed: ${ff.stderr.trim()}`)
+    return null
+  }
+
+  const argv =
+    ctx.voice.runner === "whisper.cpp"
+      ? buildWhisperCppArgv(ctx.voice, wavPath)
+      : buildFasterWhisperArgv(ctx.voice.binPath, fasterWhisperScriptPath(ctx), ctx.voice, wavPath)
+
+  const proc = await spawnGuarded(argv, 300_000)
+  try {
+    unlinkSync(wavPath)
+  } catch {
+    // best-effort cleanup
+  }
+  if (proc.exitCode !== 0) {
+    log(`whisper failed (${ctx.voice.runner}): ${proc.stderr.trim()}`)
+    return null
+  }
+  return cleanTranscript(proc.stdout)
+}
+
+// The faster-whisper runner script: the configured project's own transcriber
+// when it ships one (my_faster_whisper.py / transcribe.py), else a generated
+// fallback written into the config dir. `main.py` is intentionally NOT trusted
+// as a transcriber — uv-init projects ship a "Hello world" main.py that would
+// silently produce no text. Resolved at transcription time (not stored) so a
+// moved project is tolerated. The fallback is written once and reused.
+function fasterWhisperScriptPath(ctx: Ctx): string {
+  // binPath is <project>/.venv/bin/python → project root is three dirs up.
+  const projectRoot = resolve(ctx.voice.binPath, "..", "..", "..")
+  for (const name of ["my_faster_whisper.py", "transcribe.py"]) {
+    const candidate = join(projectRoot, name)
+    if (existsSync(candidate)) return candidate
+  }
+  // No project transcriber → write (once) the self-contained fallback.
+  const fallback = join(ctx.configDir, "tg-faster-whisper.py")
+  if (!existsSync(fallback)) {
+    try {
+      mkdirSync(ctx.configDir, { recursive: true })
+      writeFileSync(fallback, FASTER_WHISPER_FALLBACK_SCRIPT)
+    } catch (err) {
+      log(`faster-whisper fallback script write failed: ${err}`)
+    }
+  }
+  return fallback
+}
+
+// Persist the resolved voice config into <configDir>/config.yaml, replacing any
+// existing `voice:` block (or appending one). No secrets here — only
+// binary/model paths + language. The config dir is created first (a fresh
+// machine running `tg voice setup` before anything else has no ~/.config/tg-cli
+// yet). Returns whether the write landed so the caller can avoid claiming
+// "configured" on a swallowed ENOENT.
+function persistVoiceConfigToDir(configDir: string, cfg: VoiceConfig): boolean {
+  try {
+    mkdirSync(configDir, { recursive: true })
+    const path = join(configDir, "config.yaml")
+    const existing = readFileOrNull(path) ?? ""
+    writeFileSync(path, upsertVoiceBlock(existing, cfg))
+    return true
+  } catch (err) {
+    log(`voice config persist failed: ${err}`)
+    return false
+  }
+}
+
+// `tg-ctl voice-setup` (invoked by `tg voice setup`): probe the host, decide,
+// persist when ready, and print the human guidance to stdout so the CLI relays
+// it. Never sends to Telegram — this is the interactive local path. Takes only
+// what it needs (no bot token / chatId — the gate is bypassed for this command).
+// Returns true on success (config written, or guidance shown for a not-ready
+// host), false ONLY when a ready install could not be persisted — the caller
+// exits non-zero in that case so scripts/agents don't mistake a failed write for
+// a successful setup.
+function runVoiceSetup(args: { configDir: string; home: string; language: string }): boolean {
+  const verdict = decideOnboarding(probeWhisper(args.home), args.language)
+  if (verdict.kind === "ready") {
+    if (!persistVoiceConfigToDir(args.configDir, verdict.cfg)) {
+      console.error(
+        `Found a local Whisper (${verdict.cfg.runner}, ${verdict.cfg.modelPath}) but could not write ` +
+          `${join(args.configDir, "config.yaml")}. Fix the permissions and re-run \`tg voice setup\`.`,
+      )
+      return false
+    }
+  }
+  console.log(onboardingMessage(verdict))
+  return true
 }
 
 // Shared by `tg-ctl status` (CLI) and the /status command (TG reply). Works
@@ -1059,35 +1235,130 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
+  // getFile → /file/ download into ~/.cache/tg-cli/inbound under the daemon-
+  // chosen name (never the Telegram basename, spec §5.2). Returns the local path
+  // or null (already logged + replied). Shared by media + voice download. The
+  // WHOLE body is exception-guarded: a getFile timeout, a non-JSON body, a
+  // download read error or a disk-write failure THROWS otherwise, and since the
+  // poll loop persists the offset BEFORE acting, an uncaught throw loses the note
+  // permanently with no reply. Catch → "media download failed" → null.
+  const downloadFileToCache = async (fileId: string, suggestedName: string): Promise<string | null> => {
+    try {
+      const fileResp = await fetch(`${api(ctx)}/getFile?file_id=${encodeURIComponent(fileId)}`, {
+        signal: AbortSignal.timeout(30_000),
+      })
+      const fileJson = (await fileResp.json()) as { ok: boolean; result?: { file_path?: string } }
+      const remotePath = fileJson.ok ? fileJson.result?.file_path : undefined
+      if (!remotePath) {
+        log(`getFile failed for ${fileId}`)
+        await sendMessage(ctx, "media download failed")
+        return null
+      }
+      const dataResp = await fetch(`${ctx.apiBase}/file/bot${ctx.token}/${remotePath}`, {
+        signal: AbortSignal.timeout(120_000),
+      })
+      if (!dataResp.ok) {
+        log(`file download failed: HTTP ${dataResp.status}`)
+        await sendMessage(ctx, "media download failed")
+        return null
+      }
+      const dir = join(ctx.home, ".cache", "tg-cli", "inbound")
+      mkdirSync(dir, { recursive: true })
+      const dest = join(dir, suggestedName)
+      writeFileSync(dest, new Uint8Array(await dataResp.arrayBuffer()))
+      return dest
+    } catch (err) {
+      log(`media download error for ${fileId}: ${err}`)
+      await sendMessage(ctx, "media download failed")
+      return null
+    }
+  }
+
   const downloadMedia = async (action: Extract<Action, { kind: "download-media" }>): Promise<boolean> => {
-    // getFile resolves the file_id to a server path; the bytes come from the
-    // /file/ endpoint. The local name is ALWAYS the daemon-chosen
-    // suggestedName — never the Telegram-supplied basename (spec §5.2).
-    const fileResp = await fetch(`${api(ctx)}/getFile?file_id=${encodeURIComponent(action.fileId)}`, {
-      signal: AbortSignal.timeout(30_000),
-    })
-    const fileJson = (await fileResp.json()) as { ok: boolean; result?: { file_path?: string } }
-    const remotePath = fileJson.ok ? fileJson.result?.file_path : undefined
-    if (!remotePath) {
-      log(`getFile failed for ${action.fileId}`)
-      await sendMessage(ctx, "media download failed")
-      return false
-    }
-    const dataResp = await fetch(`${ctx.apiBase}/file/bot${ctx.token}/${remotePath}`, {
-      signal: AbortSignal.timeout(120_000),
-    })
-    if (!dataResp.ok) {
-      log(`file download failed: HTTP ${dataResp.status}`)
-      await sendMessage(ctx, "media download failed")
-      return false
-    }
-    const dir = join(ctx.home, ".cache", "tg-cli", "inbound")
-    mkdirSync(dir, { recursive: true })
-    const dest = join(dir, action.suggestedName)
-    writeFileSync(dest, new Uint8Array(await dataResp.arrayBuffer()))
+    const dest = await downloadFileToCache(action.fileId, action.suggestedName)
+    if (dest === null) return false
     const noun = action.mediaKind === "photo" ? "photo" : "file"
     const msg = `sent ${noun}: ${dest}` + (action.caption ? `\n${action.caption}` : "")
     const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, msg)
+    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped)
+  }
+
+  // Voice note → text (inbound STT). Unconfigured? Walk the user through setup
+  // instead of dropping it (the CTO's "если не настроено — бот проводит через
+  // настройку"). Otherwise: download OGG → ffmpeg WAV 16k mono → local Whisper →
+  // clean → route EXACTLY like a typed message (reply-route when it was a reply,
+  // else inject into the discovered pane). The 👀 ack still fires via the step's
+  // trailing ack action when this returns true.
+  const transcribeVoice = async (action: Extract<Action, { kind: "transcribe-voice" }>): Promise<boolean> => {
+    // Reload the voice config from disk EVERY note: a `tg voice setup` run while
+    // this daemon was already up must take effect without a restart. The parsed
+    // PARTIAL is kept too, to tell "explicitly disabled" from "not configured".
+    const rawYaml = readFileOrNull(join(ctx.configDir, "config.yaml")) ?? ""
+    const voicePartial = parseVoiceConfig(rawYaml)
+    ctx.voice = resolveVoiceConfig(voicePartial)
+
+    // Master switch: an explicit `voice.enabled: false` means OFF — drop the
+    // note silently (no onboarding, no re-enable). The documented opt-out must
+    // survive a discoverable Whisper still being on the box.
+    if (voicePartial.enabled === false) {
+      log("voice note ignored — voice.enabled: false")
+      return false
+    }
+
+    if (!voiceReady(ctx)) {
+      // Not yet configured → auto-onboarding reply. No ack (the reply IS the
+      // signal); returning false marks the action unhandled for the ack gate.
+      const verdict = decideOnboarding(probeWhisper(ctx.home), ctx.voice.language)
+      if (verdict.kind === "ready") {
+        // We discovered a working install on the fly — persist it so the NEXT
+        // voice note transcribes without re-prompting. But only CLAIM success if
+        // the write actually landed: a read-only config.yaml would otherwise tell
+        // the user "configured" while the next note loops back to onboarding.
+        if (persistVoiceConfigToDir(ctx.configDir, verdict.cfg)) {
+          ctx.voice = verdict.cfg
+          await sendMessage(ctx, onboardingMessage(verdict))
+        } else {
+          await sendMessage(
+            ctx,
+            `🎙️ Found a local Whisper (${verdict.cfg.runner}, ${verdict.cfg.modelPath}) but could not save ` +
+              `the config. Fix write permissions on ${join(ctx.configDir, "config.yaml")} and resend, or run \`tg voice setup\`.`,
+          )
+        }
+      } else {
+        await sendMessage(ctx, onboardingMessage(verdict))
+      }
+      return false
+    }
+
+    const dest = await downloadFileToCache(action.fileId, action.suggestedName)
+    if (dest === null) return false
+
+    const text = await runTranscription(ctx, dest)
+    if (text === null) {
+      await sendMessage(ctx, "voice transcription failed — see daemon log")
+      return false
+    }
+    if (text.trim() === "") {
+      await sendMessage(ctx, "voice note had no recognizable speech")
+      return false
+    }
+
+    // Route exactly like a typed message: a reply note carries the quote anchor
+    // and goes through the SAME reply-route path; a standalone note injects like
+    // plain text into the discovered pane.
+    if (action.replyToMessageId !== undefined) {
+      const injectText = `${action.replyAnchor ?? ""}\n${wrapInbound(ctx.cfg.injectWrap, action.from, text)}`.replace(
+        /^\n/,
+        "",
+      )
+      return handleReplyRoute({
+        kind: "reply-route",
+        replyToMessageId: action.replyToMessageId,
+        injectText,
+        from: action.from,
+      })
+    }
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, text)
     return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped)
   }
 
@@ -1200,6 +1471,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       case "download-media":
         return downloadMedia(action)
+      case "transcribe-voice":
+        return transcribeVoice(action)
       case "ack":
         if (lastWasDeferred) {
           lastWasDeferred = false
@@ -1300,7 +1573,7 @@ if (import.meta.main) {
     console.log(USAGE)
     process.exit(0)
   }
-  if (!cmd || !["start", "run", "stop", "status", "ask", "install-hooks"].includes(cmd)) {
+  if (!cmd || !["start", "run", "stop", "status", "ask", "install-hooks", "voice-setup"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -1316,6 +1589,15 @@ if (import.meta.main) {
   const fileEnv = loadEnv(join(configDir, ".env"))
   const env = { ...fileEnv, ...process.env }
 
+  // voice-setup is a LOCAL probe + config write — no Telegram I/O, so it runs
+  // before the bot-token gate (a user may set up voice before configuring creds).
+  if (cmd === "voice-setup") {
+    const configYaml = readFileOrNull(join(configDir, "config.yaml")) ?? ""
+    const voiceCfg = resolveVoiceConfig(parseVoiceConfig(configYaml))
+    const ok = runVoiceSetup({ configDir, home, language: voiceCfg.language })
+    process.exit(ok ? 0 : 1)
+  }
+
   const token = env.TG_BOT_TOKEN ?? ""
   const botId = botIdFromToken(token)
   if (cmd === "ask" && (!botId || !env.TG_CHAT_ID)) {
@@ -1326,12 +1608,15 @@ if (import.meta.main) {
     process.exit(1)
   }
 
-  const cfg = resolveControlConfig(parseControlConfig(readFileOrNull(join(configDir, "config.yaml")) ?? ""))
+  const configYaml = readFileOrNull(join(configDir, "config.yaml")) ?? ""
+  const cfg = resolveControlConfig(parseControlConfig(configYaml))
+  const voice = resolveVoiceConfig(parseVoiceConfig(configYaml))
 
   const ctx: Ctx = {
     configDir,
     paths: ctlPaths(configDir, botId),
     cfg,
+    voice,
     token,
     chatId: Number(env.TG_CHAT_ID),
     apiBase: env.TG_API_BASE || "https://api.telegram.org",
