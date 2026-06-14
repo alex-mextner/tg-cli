@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, chmodS
 import { homedir } from 'os';
 import { dirname, join } from 'path';
 import { validateDescriptor } from './runner';
-import { toolHooksDir, trustFile, untrustedGuardActive } from './run-photo-hooks';
+import { toolHooksDir, trustFile, trustAutoActive, untrustedGuardActive } from './run-photo-hooks';
 import { DEFAULT_ON_ERROR, invocationDigest, type HookDescriptor, type TrustPin, type TrustStore } from './types';
 
 export interface HooksCliDeps {
@@ -83,26 +83,33 @@ export function computeTrustPin(
 // Render a `hooks list` table line for one descriptor. `guard` reflects whether
 // the AGENTS_HOOKS_TRUST=1 untrusted-input guard is active: when off (the
 // default) every present-executable descriptor is trusted-by-default; the pin
-// columns only matter under the guard.
+// columns only matter under the guard. `auto` reflects AGENTS_HOOKS_TRUST=auto:
+// the guard is active but pins are bypassed at runtime, so present hooks run
+// unpinned — the list must say "trusted (auto)", not "quarantined", or the
+// status output contradicts what a real send actually does.
 export function formatList(
   descriptors: { descriptor: HookDescriptor; file: string }[],
   trust: TrustStore,
   sha256: (path: string) => string | null,
   sha256Str: (s: string) => string,
   guard = false,
+  auto = false,
 ): string {
   if (descriptors.length === 0) return 'No tg hooks installed (~/.agents/hooks/tg/ is empty).';
-  const header = guard
-    ? 'tg hooks (AGENTS_HOOKS_TRUST=1 — TOFU quarantine active):'
-    : 'tg hooks (trust-by-default — all present hooks run):';
+  const header = !guard
+    ? 'tg hooks (trust-by-default — all present hooks run):'
+    : auto
+      ? 'tg hooks (AGENTS_HOOKS_TRUST=auto — pins bypassed, all present hooks run):'
+      : 'tg hooks (AGENTS_HOOKS_TRUST=1 — TOFU quarantine active):';
   const lines = [header];
   for (const { descriptor: d } of descriptors) {
     const sha = sha256(d.cmd);
-    const invSha = sha256Str(invocationDigest(d.cmd, d.args));
+    const invSha = sha256Str(invocationDigest(d.cmd, d.args, d.timeout_ms));
     const pin = trust[`${d.id}.${d.point}`];
     let status: string;
     if (sha === null) status = 'MISSING-CMD';
     else if (!guard) status = 'trusted (default)';
+    else if (auto) status = 'trusted (auto)';
     else if (!pin) status = 'untrusted (quarantined)';
     else if (pin.cmd_sha256 !== sha || pin.invocation_sha256 !== invSha) status = 'CHANGED (re-trust)';
     else status = `trusted (on_error=${pin.on_error})`;
@@ -113,11 +120,11 @@ export function formatList(
 
 // --- subcommand handlers (pure-ish: I/O via deps) --------------------------
 
-export function cmdList(deps: HooksCliDeps, home: string, guard = false): number {
+export function cmdList(deps: HooksCliDeps, home: string, guard = false, auto = false): number {
   const dir = toolHooksDir(home);
   const descriptors = loadAllDescriptors(deps, dir);
   const trust = readTrust(deps, home);
-  deps.log(formatList(descriptors, trust, deps.sha256, deps.sha256Str, guard));
+  deps.log(formatList(descriptors, trust, deps.sha256, deps.sha256Str, guard, auto));
   return 0;
 }
 
@@ -153,7 +160,7 @@ export function cmdTrust(
       deps.errlog(`Hook '${d.id}' → ${d.point} points at a missing executable (${d.cmd}); not pinned.`);
       continue;
     }
-    const invSha = deps.sha256Str(invocationDigest(d.cmd, d.args));
+    const invSha = deps.sha256Str(invocationDigest(d.cmd, d.args, d.timeout_ms));
     const { key, pin } = computeTrustPin(d, sha, invSha, override);
     trust[key] = pin;
     deps.log(`Trusted ${d.id} → ${d.point} (on_error=${pin.on_error}).`);
@@ -194,11 +201,6 @@ function readTrust(deps: Pick<HooksCliDeps, 'readFile'>, home: string): TrustSto
   }
 }
 
-const HOOKS_USAGE = `Usage (hooks are trust-by-default — they run with no trust step):
-  tg hooks list                       list installed tg hooks + trust status
-  tg hooks trust <id> [open|closed]   no-op unless AGENTS_HOOKS_TRUST=1; then pins the sha
-  tg hooks untrust <id>               remove a hook's trust pin (only relevant under the guard)`;
-
 // Parse + dispatch `tg hooks <sub> ...`. Returns an exit code, or null if argv
 // is not a hooks subcommand (so the caller falls through to the send path). The
 // AGENTS_HOOKS_TRUST=1 guard (off by default) flips `trust`/`list` from no-op /
@@ -207,8 +209,9 @@ export function runHooksCli(args: string[], home = homedir(), env: NodeJS.Proces
   if (args[0] !== 'hooks') return null;
   const deps = realDeps(home);
   const guard = untrustedGuardActive(env);
+  const auto = trustAutoActive(env);
   const sub = args[1];
-  if (sub === 'list' || sub === undefined) return cmdList(deps, home, guard);
+  if (sub === 'list' || sub === undefined) return cmdList(deps, home, guard, auto);
   if (sub === 'trust') {
     const id = args[2];
     if (!id) {
@@ -236,8 +239,13 @@ export function runHooksCli(args: string[], home = homedir(), env: NodeJS.Proces
     }
     return cmdUntrust(deps, home, id);
   }
-  deps.errlog(HOOKS_USAGE);
-  return 2;
+  // UNRECOGNIZED subcommand (`tg hooks are flaky`, `tg hooks foo`). This is NOT a
+  // hooks command — it is an ordinary message that happens to start with the word
+  // "hooks". Return null so the caller falls through to the normal send path; a
+  // typo'd real subcommand would just be sent as a message, which is the safe,
+  // non-stealing behaviour (the prior surface sent "hooks ..." messages verbatim).
+  // Only the bare `tg hooks` and the three real subcommands above are intercepted.
+  return null;
 }
 
 function realDeps(home: string): HooksCliDeps {

@@ -173,8 +173,47 @@ test('untrust matches the id EXACTLY (does not remove a dotted sibling)', () => 
   expect(trust['review.visual.pre-send-photo']).toBeDefined();
 });
 
-test('unknown subcommand prints usage (exit 2)', () => {
+test('unknown subcommand returns null (falls through to send — never steals a message)', () => {
+  // `tg hooks frobnicate` is NOT a hooks command — it is an ordinary message that
+  // starts with the word "hooks". It must fall through to the send path (null),
+  // not be intercepted with a usage error, or `tg hooks are flaky` regresses.
   const code = runHooksCli(['hooks', 'frobnicate'], home, NO_GUARD);
-  expect(code).toBe(2);
-  expect(errs.join('\n')).toContain('Usage');
+  expect(code).toBeNull();
+  expect(errs.join('\n')).toBe('');
+});
+
+test('multi-word message starting with "hooks" falls through to send (HYP regression)', () => {
+  // The reported P1: `tg hooks are flaky` previously sent a message; the hooks
+  // dispatcher must not swallow it. Only list/trust/untrust (and bare `tg hooks`)
+  // are real subcommands.
+  expect(runHooksCli(['hooks', 'are', 'flaky'], home, NO_GUARD)).toBeNull();
+  expect(runHooksCli(['hooks', 'is', 'down'], home, GUARD)).toBeNull();
+});
+
+test('bare `tg hooks` still lists (discoverability), does not fall through', () => {
+  const code = runHooksCli(['hooks'], home, NO_GUARD);
+  expect(code).toBe(0);
+});
+
+// --- AGENTS_HOOKS_TRUST=auto: list reports the real (running) state -----------
+
+test('hooks list under AGENTS_HOOKS_TRUST=auto reports trusted (auto), not quarantined', () => {
+  const { path } = writeExe('h.sh');
+  writeDescriptor('review-visual', path);
+  const AUTO = { AGENTS_HOOKS_TRUST: 'auto' } as NodeJS.ProcessEnv;
+  const code = runHooksCli(['hooks', 'list'], home, AUTO);
+  expect(code).toBe(0);
+  const out = logs.join('\n');
+  expect(out).toContain('trusted (auto)');
+  expect(out).not.toContain('quarantined');
+});
+
+test('hooks list tolerates a non-normalized AGENTS_HOOKS_TRUST value (` AUTO `)', () => {
+  const { path } = writeExe('h.sh');
+  writeDescriptor('review-visual', path);
+  const AUTO = { AGENTS_HOOKS_TRUST: ' AUTO ' } as NodeJS.ProcessEnv;
+  const code = runHooksCli(['hooks', 'list'], home, AUTO);
+  expect(code).toBe(0);
+  // guard is active (normalized) AND auto is recognized → trusted (auto), not quarantined.
+  expect(logs.join('\n')).toContain('trusted (auto)');
 });

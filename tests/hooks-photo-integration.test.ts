@@ -12,6 +12,7 @@ import {
   trustFile,
   auditFile,
 } from '../features/hooks/run-photo-hooks';
+import { invocationDigest } from '../features/hooks/types';
 
 // Each test builds an isolated fake $HOME with ~/.agents/hooks/ underneath.
 let home: string;
@@ -58,7 +59,10 @@ function sha256Str(s: string): string {
 // (the "changed executable" test). args is undefined in these tests.
 function pinTrust(id: string, cmd: string, onError: 'open' | 'closed', cmdShaOverride?: string): void {
   const cmdSha = cmdShaOverride ?? createHash('sha256').update(readFileSync(cmd)).digest('hex');
-  const invocationSha = sha256Str([cmd].join('\0'));
+  // Mirror the runner's real digest (cmd + args + timeout). These descriptors set
+  // no args / no timeout_ms, so pass undefined for both — exactly what the runner
+  // does for them.
+  const invocationSha = sha256Str(invocationDigest(cmd, undefined, undefined));
   const t = {
     [`${id}.pre-send-photo`]: {
       cmd_sha256: cmdSha,
@@ -210,7 +214,7 @@ test('AGENTS_HOOKS_TRUST=1: changing descriptor ARGS (same cmd bytes) re-quarant
     JSON.stringify({
       'block.pre-send-photo': {
         cmd_sha256: cmdSha,
-        invocation_sha256: sha256Str([cmd, '--safe'].join('\0')),
+        invocation_sha256: sha256Str(invocationDigest(cmd, ['--safe'], undefined)),
         point: 'pre-send-photo',
         on_error: 'open',
       },

@@ -74,10 +74,12 @@ export interface LoadedDescriptor {
 // invocation_sha256 + on_error so neither a one-byte descriptor edit
 // ("closed"→"open") NOR an invocation swap can silently change what runs:
 //   - cmd_sha256:        the executable's bytes (catches a swapped binary).
-//   - invocation_sha256: a digest of cmd + args (catches a descriptor that
-//     keeps `cmd` = an interpreter like `python3` but repoints `args` at a
-//     different script, or drops `--strict`). Without this, a trusted
-//     interpreter is a universal-execution primitive.
+//   - invocation_sha256: a digest of cmd + args + timeout_ms (catches a
+//     descriptor that keeps `cmd` = an interpreter like `python3` but repoints
+//     `args` at a different script, or drops `--strict`, OR lowers `timeout_ms`
+//     so a fail-open gate is forced to time out and allow). Without this, a
+//     trusted interpreter is a universal-execution primitive and a trusted gate
+//     is defeatable by a one-field timeout edit that survives the pin.
 //   - on_error:          authoritative failure policy (the descriptor only proposes).
 export interface TrustPin {
   cmd_sha256: string;
@@ -86,11 +88,16 @@ export interface TrustPin {
   on_error: OnError;
 }
 
-// Digest the FULL invocation (cmd + args) so a descriptor edit that changes what
-// actually runs requires re-trust even when the executable bytes are unchanged.
-export function invocationDigest(cmd: string, args: string[] | undefined): string {
-  // A NUL separator can't appear in argv, so this is unambiguous.
-  return [cmd, ...(args ?? [])].join('\0');
+// Digest the FULL invocation (cmd + args + timeout) so a descriptor edit that
+// changes what actually runs — or how long it is allowed to run — requires
+// re-trust even when the executable bytes are unchanged. The timeout matters
+// because a fail-open gate forced to time out becomes an allow: lowering
+// timeout_ms under the guard must re-quarantine, exactly like an args swap.
+export function invocationDigest(cmd: string, args: string[] | undefined, timeoutMs?: number): string {
+  // A NUL separator can't appear in argv, so this is unambiguous. timeout_ms is
+  // appended in a separate field so an undefined timeout (use the default) and an
+  // explicit one are distinguishable from any argv token.
+  return [cmd, ...(args ?? []), `\0timeout=${timeoutMs ?? ''}`].join('\0');
 }
 
 export type TrustStore = Record<string, TrustPin>;

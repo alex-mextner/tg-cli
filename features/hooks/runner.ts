@@ -214,7 +214,7 @@ export function runHooks(
 
   for (const { descriptor: d } of ordered) {
     const currentSha = deps.sha256(d.cmd);
-    const currentInvocationSha = deps.sha256Str(invocationDigest(d.cmd, d.args));
+    const currentInvocationSha = deps.sha256Str(invocationDigest(d.cmd, d.args, d.timeout_ms));
     const { state, pinnedOnError } = resolveTrust(d, currentSha, currentInvocationSha, deps);
 
     // One canonical event id per firing: the SAME id the hook sees on stdin is

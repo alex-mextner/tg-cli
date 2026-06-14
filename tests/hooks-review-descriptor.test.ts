@@ -4,6 +4,7 @@ import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { runPreSendPhotoHooks, toolHooksDir, trustFile } from '../features/hooks/run-photo-hooks';
+import { invocationDigest } from '../features/hooks/types';
 
 // End-to-end through the REAL review-side Python executable
 // (features/hooks/review-descriptor/pre_send_photo.py), with `review` itself
@@ -58,8 +59,12 @@ function installDescriptorTrusted(): void {
     }),
   );
   const sha = createHash('sha256').update(readFileSync(PY_HOOK)).digest('hex');
-  // invocation digest = sha256(cmd join '\0' args); no args here.
-  const invSha = createHash('sha256').update([PY_HOOK].join('\0'), 'utf8').digest('hex');
+  // Invocation digest must mirror the runner: cmd + args + timeout_ms. The
+  // descriptor sets timeout_ms: 60000 and no args, so pin the same — otherwise
+  // under AGENTS_HOOKS_TRUST=1 the pin reports HOOK CHANGED and quarantines.
+  const invSha = createHash('sha256')
+    .update(invocationDigest(PY_HOOK, undefined, 60000), 'utf8')
+    .digest('hex');
   writeFileSync(
     trustFile(home),
     JSON.stringify({

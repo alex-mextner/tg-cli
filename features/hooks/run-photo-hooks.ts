@@ -48,6 +48,15 @@ export function untrustedGuardActive(env: NodeJS.ProcessEnv): boolean {
   return v === '1' || v === 'true' || v === 'yes' || v === 'on' || v === 'auto';
 }
 
+// AGENTS_HOOKS_TRUST=auto: under the guard, pins are bypassed (the batch/agent
+// escape hatch). Parsed with the SAME trim+lowercase as the guard check so a
+// value like `AUTO` or ` auto ` that activates the guard ALSO auto-trusts —
+// otherwise it would be guard-active but not auto-trusted, silently quarantining
+// every hook.
+export function trustAutoActive(env: NodeJS.ProcessEnv): boolean {
+  return (env.AGENTS_HOOKS_TRUST ?? '').trim().toLowerCase() === 'auto';
+}
+
 // THE non-breaking guard. The tg seam calls this first; if it returns false the
 // send path is byte-for-byte today's behaviour (one `stat`, nothing else).
 // AGENTS_HOOKS=0 hard-bypasses everything.
@@ -185,7 +194,7 @@ export function buildRunnerDeps(env: NodeJS.ProcessEnv, home = homedir()): Runne
     // opt-in AGENTS_HOOKS_TRUST=1 guard. AGENTS_HOOKS_TRUST=auto (the legacy
     // batch escape) also implies the guard is in play — it just auto-trusts.
     untrustedGuard: untrustedGuardActive(env),
-    trustAuto: env.AGENTS_HOOKS_TRUST === 'auto',
+    trustAuto: trustAutoActive(env),
     sha256: sha256OfFile,
     sha256Str: sha256OfString,
     // Bind the caller's env so the hook subprocess resolves cmd/PATH against the

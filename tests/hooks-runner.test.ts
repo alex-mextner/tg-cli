@@ -8,7 +8,14 @@ import {
   type RunnerDeps,
   type SpawnResult,
 } from '../features/hooks/runner';
-import { HOOK_API, type HookDescriptor, type HookEvent, type LoadedDescriptor } from '../features/hooks/types';
+import {
+  HOOK_API,
+  invocationDigest,
+  type HookDescriptor,
+  type HookEvent,
+  type LoadedDescriptor,
+} from '../features/hooks/types';
+import { trustAutoActive, untrustedGuardActive } from '../features/hooks/run-photo-hooks';
 
 // --- helpers ---------------------------------------------------------------
 
@@ -398,4 +405,62 @@ test('validateDescriptor rejects an id/point with shell metacharacters', () => {
 test('validateDescriptor rejects non-string args entries', () => {
   expect(validateDescriptor({ id: 'x', point: 'p', cmd: '/c', args: ['ok', 3] }).ok).toBe(false);
   expect(validateDescriptor({ id: 'x', point: 'p', cmd: '/c', args: ['--strict'] }).ok).toBe(true);
+});
+
+// --- invocation digest: cmd + args + timeout -------------------------------
+
+test('invocationDigest differs when timeout_ms changes (a lowered timeout re-quarantines)', () => {
+  // A trusted fail-open gate forced to time out becomes an allow; the pin must
+  // notice a timeout edit just like an args swap, so the digest must change.
+  const base = invocationDigest('/c', ['--strict'], 60000);
+  const lowered = invocationDigest('/c', ['--strict'], 1);
+  expect(lowered).not.toBe(base);
+});
+
+test('invocationDigest: undefined timeout is stable and distinct from any explicit one', () => {
+  expect(invocationDigest('/c', ['--strict'])).toBe(invocationDigest('/c', ['--strict'], undefined));
+  expect(invocationDigest('/c', ['--strict'])).not.toBe(invocationDigest('/c', ['--strict'], 0));
+});
+
+test('invocationDigest still catches an args repoint (unchanged behaviour)', () => {
+  expect(invocationDigest('/python3', ['a.py'], 5000)).not.toBe(invocationDigest('/python3', ['b.py'], 5000));
+});
+
+test('resolveTrust (guard ON): a timeout edit re-quarantines a previously trusted hook', () => {
+  // Pin made for the 60s descriptor; the descriptor now requests 1ms. cmd sha is
+  // unchanged ('SHA') but the invocation digest no longer matches → re-trust.
+  const sha256Str = (s: string): string => s; // identity so digests compare by value
+  const pinnedInv = sha256Str(invocationDigest('/bin/hook', ['--strict'], 60000));
+  const currentInv = sha256Str(invocationDigest('/bin/hook', ['--strict'], 1));
+  const trust = {
+    'h.pre-send-photo': {
+      cmd_sha256: 'SHA',
+      invocation_sha256: pinnedInv,
+      point: 'pre-send-photo',
+      on_error: 'open' as const,
+    },
+  };
+  const r = resolveTrust(desc({ args: ['--strict'], timeout_ms: 1 }), 'SHA', currentInv, {
+    trust,
+    trustAuto: false,
+    untrustedGuard: true,
+  });
+  expect(r.state).toBe('quarantined-changed');
+});
+
+// --- AGENTS_HOOKS_TRUST parsing: guard and auto use the SAME normalization ---
+
+test('trustAutoActive normalizes (trim + lowercase) like the guard check', () => {
+  for (const v of ['auto', 'AUTO', ' auto ', 'Auto']) {
+    expect(untrustedGuardActive({ AGENTS_HOOKS_TRUST: v } as NodeJS.ProcessEnv)).toBe(true);
+    expect(trustAutoActive({ AGENTS_HOOKS_TRUST: v } as NodeJS.ProcessEnv)).toBe(true);
+  }
+});
+
+test('trustAutoActive is false for the guarded-but-not-auto values', () => {
+  for (const v of ['1', 'true', 'on', 'yes']) {
+    expect(untrustedGuardActive({ AGENTS_HOOKS_TRUST: v } as NodeJS.ProcessEnv)).toBe(true);
+    expect(trustAutoActive({ AGENTS_HOOKS_TRUST: v } as NodeJS.ProcessEnv)).toBe(false);
+  }
+  expect(trustAutoActive({} as NodeJS.ProcessEnv)).toBe(false);
 });

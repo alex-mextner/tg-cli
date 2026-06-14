@@ -803,6 +803,13 @@ if (import.meta.main) {
       // ...process.env }` built in main()), so AGENTS_HOOKS=0 /
       // AGENTS_HOOKS_TRUST=auto / API keys set in ~/.config/tg-cli/.env are
       // honored and forwarded to the hook subprocess.
+      // NOTE on `caption`: this is the RAW parsed caption, BEFORE the autolink /
+      // line-spec transforms below mutate plan.textMessages[0]. The gate sits
+      // here (not after those mutations) to keep the non-breaking seam in one
+      // clean place and gate on the IMAGE — the shipped `review --visual` hook
+      // judges the screenshot and ignores caption. A future hook that needs the
+      // FINAL rendered caption should read the image, not args.caption (which is
+      // best-effort pre-transform text).
       const gate = gatePhotos(diskPhotoPaths, { caption, chatId: CHAT_ID }, env)
       if (gate.blocked) {
         console.error(
