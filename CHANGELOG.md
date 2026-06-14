@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.9.3
+
+Cleaner tag header + emoji tooling reads its bot token from config.
+
+- **No more duplicate tag word on the header line.** A `--tag` with real pill ids
+  now renders ONLY the wordmark pill cells in the HTML header — the appended
+  plain tag word (e.g. a second "ANSWER" next to the pill) is gone. The wordmark
+  is already baked into the sticker art, so the duplicate was redundant and (when
+  combined with `--title`) clashed with the styled title. The first line is now
+  the `--title` text (styled) only; the tag is just the pill badge. Non-premium
+  viewers fall back to the per-cell colored dots — an accepted trade for a clean
+  premium first line. The `plain` form (non-HTML / >4096 split) keeps the
+  readable unicode fallback (`🔵 ANSWER`). Unknown tags still soft-render as
+  `[WORD]`. (`features/render/prefix.ts`.)
+- **Emoji-set scripts read their bot token from config, decoupled from the
+  sender.** `scripts/create-tag-emoji.ts` and `scripts/create-ai-emoji-set.ts`
+  now read `TG_EMOJI_BOT_TOKEN` (the dedicated emoji-owning bot) from
+  `~/.config/tg-cli/.env`, falling back to `TG_BOT_TOKEN` only when unset; owner
+  id is `TG_OWNER_ID` then `TG_CHAT_ID`. They use the shared config loader
+  (`features/config/env.ts`, extracted from the `tg` entrypoint) so the config
+  `.env` → process.env precedence applies and a token set only in config works
+  with no transient shell export. The token is never printed.
+  (`features/config/env.ts`, `scripts/create-tag-emoji.ts`,
+  `scripts/create-ai-emoji-set.ts`, `tg`.)
+
 ## 1.9.2
 
 Code/config files → mobile, syntax-highlighted PDF (and by default ONLY the PDF

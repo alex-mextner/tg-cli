@@ -179,17 +179,19 @@ test('buildPrefix --tag (real ids) renders the pill in html, unicode fallback in
   const p = buildPrefix({ aiEmoji: '', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ANSWER' });
   // plain keeps the unicode fallback badge (non-HTML / >4096 split path).
   expect(p.plain).toBe('[𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER\n');
-  // html carries the real 3-cell pill (ANSWER widened to three uploaded cells so
-  // the rounded caps don't squish the word); each cell wraps exactly the dot
-  // emoji (Telegram rejects non-emoji fallback text), then the readable WORD
-  // follows as plain text so the label is never lost.
+  // html carries ONLY the real 3-cell pill (ANSWER widened to three uploaded
+  // cells so the rounded caps don't squish the word); each cell wraps exactly
+  // the dot emoji (Telegram rejects non-emoji fallback text). The wordmark is
+  // baked into the sticker art — NO plain "ANSWER" word is appended (CTO
+  // 2026-06-14: first line = --title only, the tag is just the pill badge).
   expect(p.html).toBe(
     '[𝘁𝗴-𝗰𝗹𝗶] ' +
       '<tg-emoji emoji-id="5294303944082762041">🔵</tg-emoji>' +
       '<tg-emoji emoji-id="5294414440706382789">🔵</tg-emoji>' +
-      '<tg-emoji emoji-id="5294185480294808567">🔵</tg-emoji>' +
-      ' ANSWER\n',
+      '<tg-emoji emoji-id="5294185480294808567">🔵</tg-emoji>\n',
   );
+  // The duplicate plain tag word is GONE: the pill is the only ANSWER label.
+  expect(p.html).not.toContain('ANSWER');
   expect(p.forceHtml).toBe(true);
   // Guard: a placeholder string must never appear inside a <tg-emoji> tag.
   expect(p.html).not.toContain('PLACEHOLDER');
@@ -215,6 +217,65 @@ test('buildPrefix --tag + --title compose: badge, em-dash, then title', () => {
     title: 'Done',
   });
   expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER — 𝑫𝒐𝒏𝒆\n');
+  // HTML first line: emoji (plain — model 'no-brand' has no branded id),
+  // [window], the pill cells (NO plain word), ` — `, then the Bold-Italic styled
+  // title. The only readable label is the pill; the title carries its own
+  // styling — never the bare tag word.
+  expect(p.html).toBe(
+    '✳️ [𝘁𝗴-𝗰𝗹𝗶] ' +
+      '<tg-emoji emoji-id="5294303944082762041">🔵</tg-emoji>' +
+      '<tg-emoji emoji-id="5294414440706382789">🔵</tg-emoji>' +
+      '<tg-emoji emoji-id="5294185480294808567">🔵</tg-emoji>' +
+      ' — 𝑫𝒐𝒏𝒆\n',
+  );
+  // The duplicate plain "ANSWER" word is gone — only the styled title is text.
+  expect(p.html).not.toContain('ANSWER');
+});
+
+// The CTO's exact complaint case: `--tag ОТВЕТ --title "X"`. The first line must
+// be the styled --title text only; the tag is the pill badge. NO duplicate plain
+// "ANSWER"/"ОТВЕТ" word anywhere, and the title keeps its Bold-Italic styling.
+test('buildPrefix --tag ОТВЕТ --title "X": pill + styled title, no duplicate tag word', () => {
+  const p = buildPrefix({
+    aiEmoji: '✳️',
+    model: 'no-brand',
+    tmuxWindow: 'tg-cli',
+    tag: 'ОТВЕТ',
+    title: 'X',
+  });
+  expect(p.html).toBe(
+    '✳️ [𝘁𝗴-𝗰𝗹𝗶] ' +
+      '<tg-emoji emoji-id="5294303944082762041">🔵</tg-emoji>' +
+      '<tg-emoji emoji-id="5294414440706382789">🔵</tg-emoji>' +
+      '<tg-emoji emoji-id="5294185480294808567">🔵</tg-emoji>' +
+      ' — 𝑿\n',
+  );
+  // No second plain tag word, English OR Russian, anywhere on the line.
+  expect(p.html).not.toContain('ANSWER');
+  expect(p.html).not.toContain('ОТВЕТ');
+  // The title IS styled (Bold-Italic 𝑿), not bare ASCII 'X'.
+  expect(p.html).toContain('𝑿');
+  expect(p.forceHtml).toBe(true);
+});
+
+// All four canonical tags WITH --title: html first line is pill cells + ` — ` +
+// styled title, and NO duplicate plain tag word for ANY of them.
+test('buildPrefix: each canonical --tag + --title drops the plain word, keeps styled title', () => {
+  const cases: Array<[string, string]> = [
+    ['ANSWER', 'ANSWER'],
+    ['DECISION', 'DECISION'],
+    ['PROBLEM', 'PROBLEM'],
+    ['REPORT', 'REPORT'],
+  ];
+  for (const [tag, word] of cases) {
+    const p = buildPrefix({ aiEmoji: '', model: 'no-brand', tmuxWindow: 'tg-cli', tag, title: 'Hello' });
+    // pill cells present, em-dash, styled title — and no plain wordmark.
+    expect(p.html).toContain('<tg-emoji');
+    expect(p.html).toContain(' — ');
+    expect(p.html).toContain('𝑯𝒆𝒍𝒍𝒐'); // Bold-Italic styled title survives
+    expect(p.html).not.toContain(word); // the duplicate plain tag word is gone
+    expect(p.html.endsWith('\n')).toBe(true);
+  }
 });
 
 test('buildPrefix unknown --tag soft-renders as a plain [TAG] badge (no hard fail)', () => {
@@ -248,13 +309,14 @@ test('buildPrefix --tag with REAL pill ids renders N <tg-emoji> dot cells and fo
   TAG_PILL_IDS.ANSWER = [...realIds];
   try {
     const p = buildPrefix({ aiEmoji: '', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ANSWER' });
-    // N cells (here 2), each wrapping the lone dot emoji, then the readable word.
+    // N cells (here 2), each wrapping the lone dot emoji — and NOTHING after:
+    // the wordmark is baked into the sticker art, no plain word is appended.
     expect(p.html).toBe(
       '[𝘁𝗴-𝗰𝗹𝗶] ' +
         `<tg-emoji emoji-id="${realIds[0]}">🔵</tg-emoji>` +
-        `<tg-emoji emoji-id="${realIds[1]}">🔵</tg-emoji>` +
-        ' ANSWER\n',
+        `<tg-emoji emoji-id="${realIds[1]}">🔵</tg-emoji>\n`,
     );
+    expect(p.html).not.toContain('ANSWER'); // no duplicate plain tag word
     // Every cell's inner text is exactly the dot — never a slice of the word.
     const innerTexts = [...p.html.matchAll(/<tg-emoji emoji-id="\d+">([^<]*)<\/tg-emoji>/g)].map((m) => m[1]);
     expect(innerTexts).toEqual(['🔵', '🔵']);
