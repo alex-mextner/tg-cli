@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.9.6
+
+Three formatting/reply additions.
+
+- **Threaded replies (`--reply-to <message_id>`).** Pass an inbound Telegram
+  `message_id` and the outbound message threads UNDER it (`reply_to_message_id`
+  on `sendMessage`), so an answer visibly attaches to the message it answers.
+  Only the FIRST message of a >4096 split is threaded. The `tg-ctl` daemon now
+  surfaces the inbound id in the injected wrap — `[TG from Alex #1234] …` — so
+  the agent reading its pane knows the id to reply to. The id IS Telegram's own
+  per-chat sequential `message_id` (no parallel id scheme invented). The
+  **ANSWER / ОТВЕТ** tag now REQUIRES `--reply-to` (answering means answering a
+  specific message); a clear error fires if it is missing. The other tags are
+  unchanged.
+- **`tg --table`.** Reads delimited rows from STDIN (TSV, or `a | b` per line),
+  auto-sizes columns, draws box borders, HTML-escapes cells, and sends an
+  aligned monospace table wrapped in `<pre>` — Telegram has no native HTML
+  tables, a padded `<pre>` is the only way. Composes with `--tag`/`--title`;
+  argv text becomes a heading above the table. Cells with double-width glyphs
+  (emoji/CJK) trigger a one-line alignment warning but still send.
+- **`tg --format-help`.** Prints a concise, copy-pasteable reference for what
+  Telegram message formatting actually supports (the HTML-tag allowlist, the
+  four HTML entities, the `<pre>` table pattern, the `--tag`/`--title` badge) so
+  agents stop guessing. Referenced from `tg --help`.
+
 ## 1.9.5
 
 - **Voice transcripts now inject as a 🎤-marked quote.** An inbound voice note's

@@ -23,7 +23,10 @@ export interface StepOpts {
   chatId: number;
   nowSec: number;
   currentOffset: number; // returned as newOffset when the batch is empty
-  wrap: (name: string, msg: string) => string;
+  // Wrap an inbound message for injection. `messageId` is the inbound Telegram
+  // message_id; the wrap surfaces it as `#<id>` so the agent can reply with
+  // `tg --reply-to <id>` (threaded replies). Omitted where no id applies.
+  wrap: (name: string, msg: string, messageId?: number) => string;
   // Format a reply's quote-anchor timestamp (item 3). Injected so the daemon
   // can use local time while tests stay deterministic; defaults to UTC.
   fmtTime?: (unixSec: number) => string;
@@ -55,9 +58,11 @@ export function buildReplyAnchor(m: TgMessage, opts: StepOpts): string {
 }
 
 // Build the injected text for a REPLY (items 2, 3). The agent sees which message
-// is being answered — the quote anchor — followed by the wrapped reply.
+// is being answered — the quote anchor — followed by the wrapped reply. The wrap
+// carries THIS reply's own message_id (`#<id>`) so the agent can in turn thread
+// its answer under the reply with `tg --reply-to <id>`.
 export function buildReplyInject(m: TgMessage, name: string, opts: StepOpts): string {
-  return `${buildReplyAnchor(m, opts)}\n${opts.wrap(name, m.text ?? '')}`;
+  return `${buildReplyAnchor(m, opts)}\n${opts.wrap(name, m.text ?? '', m.message_id)}`;
 }
 
 export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
@@ -129,7 +134,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
               injectText: buildReplyInject(m, name, opts),
               from: name,
             }
-          : textAction(m.text, name, opts);
+          : textAction(m.text, name, opts, m.message_id);
     } else if (m.voice ?? m.audio) action = voiceAction(u.update_id, m, name, opts);
     else if (m.photo?.length) action = photoAction(u.update_id, m, name);
     else if (m.document) action = documentAction(u.update_id, m, name);
@@ -157,7 +162,7 @@ function senderAllowed(sender: number | undefined, opts: StepOpts): boolean {
 // Command-vs-prompt split (spec §13). Verbs match on the first whitespace
 // token; unknown slash commands pass through VERBATIM so the harness
 // interprets its own (/compact, /clear, …) — no wrap on those.
-function textAction(text: string, name: string, opts: StepOpts): Action {
+function textAction(text: string, name: string, opts: StepOpts, messageId: number): Action {
   if (text.startsWith('/')) {
     const verb = text.split(/\s+/, 1)[0];
     const cmd = verb.replace(/@\w+$/, ''); // tolerate /cmd@botname in groups
@@ -170,7 +175,9 @@ function textAction(text: string, name: string, opts: StepOpts): Action {
     }
     return { kind: 'inject-text', text };
   }
-  return { kind: 'inject-text', text: opts.wrap(name, text) };
+  // A plain inbound message: surface its message_id in the wrap so the agent can
+  // thread its answer with `tg --reply-to <id>` (threaded replies).
+  return { kind: 'inject-text', text: opts.wrap(name, text, messageId) };
 }
 
 function photoAction(updateId: number, m: TgMessage, name: string): Action {
@@ -189,6 +196,7 @@ function photoAction(updateId: number, m: TgMessage, name: string): Action {
     fileSize: best.file_size,
     caption: m.caption,
     from: name,
+    messageId: m.message_id,
   };
 }
 
@@ -207,6 +215,7 @@ function voiceAction(updateId: number, m: TgMessage, name: string, opts: StepOpt
     suggestedName: `${updateId}.ogg`,
     fileSize: v.file_size,
     from: name,
+    messageId: m.message_id,
   };
   if (m.reply_to_message) {
     action.replyToMessageId = m.reply_to_message.message_id;
@@ -226,6 +235,7 @@ function documentAction(updateId: number, m: TgMessage, name: string): Action {
     fileSize: doc.file_size,
     caption: m.caption,
     from: name,
+    messageId: m.message_id,
   };
 }
 

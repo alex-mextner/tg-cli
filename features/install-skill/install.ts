@@ -47,7 +47,9 @@ tg "text message"
 tg --format html "<b>Title</b>\\nbody"
 tg --file report.pdf "caption"
 tg --photo image.png "caption"
-tg --tag ОТВЕТ --title "Short headline" "the full body below the header"
+tg --reply-to 1234 --tag ОТВЕТ "answer that threads under message 1234"
+printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
+tg --format-help                                    # what formatting is supported
 \`\`\`
 
 ## When to use
@@ -76,6 +78,33 @@ Canonical tags (Russian; case-insensitive; English aliases map to them):
 
 An unknown tag is not fatal: it soft-renders as a plain \`[TAG]\` badge and a
 stderr note, so a typo never blocks a send.
+
+## Threaded replies (\`--reply-to <message_id>\`)
+To answer a SPECIFIC inbound message and have your reply thread under it in
+Telegram, pass its message_id: \`tg --reply-to <id> "answer"\` (sets
+\`reply_to_message_id\`). The \`tg-ctl\` daemon surfaces the inbound id in the
+injected wrap — \`[TG from Alex #1234] …\` — so the id to reply to is right there
+in your pane. The id is Telegram's own per-chat message_id; nothing to compute.
+
+The **ANSWER / ОТВЕТ** tag REQUIRES \`--reply-to\` (answering means answering a
+specific message); without it \`tg\` errors with a clear message. The other tags
+do not require it.
+
+## Tables (\`tg --table\`)
+Telegram has NO native HTML tables — a padded \`<pre>\` monospace block is the
+only way to align columns. \`tg --table\` reads delimited rows from STDIN (TSV, or
+\`a | b\` per line), auto-sizes columns, box-draws borders, HTML-escapes cells,
+and sends the result. Composes with \`--tag\`/\`--title\`; argv text becomes a
+heading above the table. Keep cells ASCII/Cyrillic — double-width emoji/CJK push
+columns out of alignment (\`tg\` warns when it sees them).
+\`\`\`
+printf 'task\\tstatus\\nship\\tdone\\nreview\\twip' | tg --table
+\`\`\`
+
+## Formatting reference (\`tg --format-help\`)
+\`tg --format-help\` prints exactly which HTML tags and entities Telegram supports
+(and which it does NOT — no \`<table>\`, no \`<br>\`), the \`<pre>\` table pattern, and
+the \`--tag\`/\`--title\` badge. Run it instead of guessing at markup.
 
 ## Code/config files → mobile PDF (\`--with-original\` / \`--no-pdf\`)
 Attaching a code/config file (\`.ts\`, \`.tsx\`, \`.json\`, \`.yaml\`, \`.toml\`, \`.py\`,
@@ -117,6 +146,11 @@ const SKILL_BLURB =
   'Label messages with `--tag <ОТВЕТ|РЕШЕНИЕ|ПРОБЛЕМА|ОТЧЁТ>` ' +
   '(aliases ANSWER/DECISION/PROBLEM/REPORT) and set an explicit header line with ' +
   '`--title "..."` (the body is never pulled up). ' +
+  'Reply UNDER a specific inbound message with `--reply-to <message_id>` (the id ' +
+  'shows up in the injected `[TG from … #<id>]` wrap); the ANSWER/ОТВЕТ tag ' +
+  'requires it. Render an aligned monospace `<pre>` table from STDIN rows with ' +
+  '`tg --table` (Telegram has no real tables). `tg --format-help` lists every ' +
+  'supported HTML tag/entity. ' +
   'Attaching a code/config file (.ts/.json/.yaml/.py/…) renders a mobile, ' +
   'syntax-highlighted PDF and by DEFAULT sends ONLY the PDF (raw file is useless ' +
   'on iOS); `--with-original` sends both, `--no-pdf` sends the raw file. ' +

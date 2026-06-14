@@ -1,17 +1,11 @@
 import { expect, test } from 'bun:test';
-import {
-  wrapInbound,
-  buildTextInjectPlan,
-  buildKeyInjectPlan,
-} from '../features/tg-ctl/inject';
+import { wrapInbound, buildTextInjectPlan, buildKeyInjectPlan } from '../features/tg-ctl/inject';
 import type { InjectStep } from '../features/tg-ctl/types';
 
 // --- wrapInbound: {name}/{msg} template substitution ---
 
 test('wrapInbound substitutes {name} and {msg}', () => {
-  expect(wrapInbound('[TG from {name}] {msg} — reply via tg', 'alex', 'hi')).toBe(
-    '[TG from alex] hi — reply via tg',
-  );
+  expect(wrapInbound('[TG from {name}] {msg} — reply via tg', 'alex', 'hi')).toBe('[TG from alex] hi — reply via tg');
 });
 
 test('wrapInbound substitutes ALL occurrences of each placeholder', () => {
@@ -25,10 +19,41 @@ test('wrapInbound leaves templates without placeholders untouched', () => {
 test('wrapInbound does not re-substitute placeholders inside values', () => {
   // Single pass over the TEMPLATE only — a "{name}" living inside the user's
   // message must come out literal, not expanded again.
-  expect(wrapInbound('{name}: {msg}', 'x', 'msg has {name} inside')).toBe(
-    'x: msg has {name} inside',
-  );
+  expect(wrapInbound('{name}: {msg}', 'x', 'msg has {name} inside')).toBe('x: msg has {name} inside');
   expect(wrapInbound('{name}: {msg}', '{msg}', 'm')).toBe('{msg}: m');
+});
+
+// --- {id} placeholder: the inbound message_id surfaced for `tg --reply-to` ---
+
+test('wrapInbound substitutes {id} with #<messageId> when an id is given', () => {
+  expect(wrapInbound('[TG from {name} {id}] {msg} — reply via tg', 'Alex', 'hi', 1234)).toBe(
+    '[TG from Alex #1234] hi — reply via tg',
+  );
+});
+
+test('wrapInbound collapses the ` {id}` segment cleanly when no id is given', () => {
+  // A /agent route or media item has no inbound id → the marker drops and the
+  // space stranded before the closing bracket is cleaned up.
+  expect(wrapInbound('[TG from {name} {id}] {msg} — reply via tg', 'Alex', 'hi')).toBe(
+    '[TG from Alex] hi — reply via tg',
+  );
+});
+
+test('wrapInbound with id leaves a template that has no {id} untouched (back-compat)', () => {
+  expect(wrapInbound('[TG from {name}] {msg} — reply via tg', 'Alex', 'hi', 5)).toBe(
+    '[TG from Alex] hi — reply via tg',
+  );
+});
+
+test('the no-id {id} cleanup NEVER mangles the user message (codex regression)', () => {
+  // The cleanup must act on the TEMPLATE around {id}, not on the substituted
+  // output — a {msg} with double spaces or a ` : ` ratio comes through verbatim.
+  const T = '[TG from {name} {id}] {msg} — reply via tg';
+  expect(wrapInbound(T, 'Alex', 'keep  two spaces and ratio 1 : 2')).toBe(
+    '[TG from Alex] keep  two spaces and ratio 1 : 2 — reply via tg',
+  );
+  // And the user name with trailing-relevant spacing in the message is intact.
+  expect(wrapInbound('{name} {id} {msg}', 'Alex', 'a  b')).toBe('Alex a  b');
 });
 
 // --- buildTextInjectPlan: single-line ---
@@ -44,10 +69,7 @@ test('single-line text → verify-pane, literal send-keys, sleep, Enter', () => 
 
 test('single-line send-keys uses -l (literal mode, special-char safe)', () => {
   const plan = buildTextInjectPlan('%1', 'rm -rf; echo "q"');
-  const send = plan.find(
-    (s): s is Extract<InjectStep, { kind: 'tmux' }> =>
-      s.kind === 'tmux' && s.argv.includes('-l'),
-  );
+  const send = plan.find((s): s is Extract<InjectStep, { kind: 'tmux' }> => s.kind === 'tmux' && s.argv.includes('-l'));
   expect(send).toBeDefined();
   expect(send!.argv).toEqual(['tmux', 'send-keys', '-t', '%1', '-l', 'rm -rf; echo "q"']);
   expect(send!.stdin).toBeUndefined();

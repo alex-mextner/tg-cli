@@ -1280,7 +1280,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (dest === null) return false
     const noun = action.mediaKind === "photo" ? "photo" : "file"
     const msg = `sent ${noun}: ${dest}` + (action.caption ? `\n${action.caption}` : "")
-    const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, msg)
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, msg, action.messageId)
     return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped)
   }
 
@@ -1350,10 +1350,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // reply-route path; a standalone note injects into the discovered pane.
     const quoted = formatVoiceTranscript(text)
     if (action.replyToMessageId !== undefined) {
-      const injectText = `${action.replyAnchor ?? ""}\n${wrapInbound(ctx.cfg.injectWrap, action.from, quoted)}`.replace(
-        /^\n/,
-        "",
-      )
+      const injectText = `${action.replyAnchor ?? ""}\n${wrapInbound(
+        ctx.cfg.injectWrap,
+        action.from,
+        quoted,
+        action.messageId,
+      )}`.replace(/^\n/, "")
       return handleReplyRoute({
         kind: "reply-route",
         replyToMessageId: action.replyToMessageId,
@@ -1361,7 +1363,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         from: action.from,
       })
     }
-    const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, quoted)
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, quoted, action.messageId)
     return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped)
   }
 
@@ -1538,7 +1540,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         chatId: ctx.chatId,
         nowSec: Math.floor(Date.now() / 1000),
         currentOffset: offset,
-        wrap: (name, msg) => wrapInbound(ctx.cfg.injectWrap, name, msg),
+        wrap: (name, msg, messageId) => wrapInbound(ctx.cfg.injectWrap, name, msg, messageId),
         // Local-time quote anchor for replies (item 3); pure module defaults to UTC.
         fmtTime: (s) => {
           const d = new Date(s * 1000)

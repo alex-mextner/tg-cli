@@ -8,11 +8,29 @@
 
 import type { InjectStep } from './types';
 
-// {name}/{msg} substitution in a single pass over the TEMPLATE only, so
+// {name}/{msg}/{id} substitution in a single pass over the TEMPLATE only, so
 // placeholder-looking text inside the substituted values is never expanded
 // (replacement output is not rescanned).
-export function wrapInbound(template: string, name: string, msg: string): string {
-  return template.replace(/\{name\}|\{msg\}/g, (m) => (m === '{name}' ? name : msg));
+//
+// `{id}` carries the inbound Telegram message_id so the agent reading its pane
+// knows the id to pass to `tg --reply-to <id>` (threaded replies). It renders as
+// `#<id>` (the `#` is part of the substitution, NOT the template). When no id is
+// available (a /agent route, a media item, …) the `{id}` placeholder is removed
+// from the TEMPLATE along with one adjacent space BEFORE substitution, so the
+// wrap reads naturally (`[TG from {name} {id}]` → `[TG from {name}]`). Doing the
+// cleanup on the template — never on the substituted output — is what keeps the
+// user's message intact: a `{msg}` containing double spaces or a ` : ` ratio
+// must come through verbatim and must NOT be collapsed (codex review finding).
+export function wrapInbound(template: string, name: string, msg: string, messageId?: number): string {
+  // No id → strip the `{id}` token (and one neighbouring space) from the
+  // template first; with an id, substitute it as `#<id>` in place.
+  const prepared =
+    messageId === undefined ? template.replace(/ ?\{id\} ?/g, (m) => (/^ .* $/.test(m) ? ' ' : '')) : template;
+  return prepared.replace(/\{name\}|\{msg\}|\{id\}/g, (m) => {
+    if (m === '{name}') return name;
+    if (m === '{msg}') return msg;
+    return messageId !== undefined ? `#${messageId}` : '';
+  });
 }
 
 export interface TextInjectOpts {
@@ -20,11 +38,7 @@ export interface TextInjectOpts {
   gapMs?: number; // pre-Enter gap (default 500ms — competitor-source-proven pacing)
 }
 
-export function buildTextInjectPlan(
-  paneId: string,
-  text: string,
-  opts: TextInjectOpts = {},
-): InjectStep[] {
+export function buildTextInjectPlan(paneId: string, text: string, opts: TextInjectOpts = {}): InjectStep[] {
   const steps: InjectStep[] = [{ kind: 'verify-pane', paneId }];
 
   if (opts.escapePrelude) {
