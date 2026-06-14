@@ -25,6 +25,11 @@ export interface TelegramCtx {
   // state and injects this recorder. Called once per returned message id so a
   // reply to any sent message routes back to this pane.
   recordRoute: (messageId: number) => void
+  // Threaded reply target (`--reply-to <message_id>`). When set, the FIRST
+  // outbound sendMessage carries reply_to_message_id so it threads UNDER that
+  // inbound Telegram message. Only the first message is threaded — a >4096
+  // split's continuation chunks must not each re-reply to the same anchor.
+  replyToMessageId?: number
 }
 
 // Exit-on-error response check, shared by every send. A non-2xx response or an
@@ -77,7 +82,11 @@ function blobFor(item: SendItem): { body: Blob | ReturnType<typeof Bun.file>; na
 // recordRouteFromResult so a reply to any sent message (including each item of
 // a media group) routes back to the producing pane.
 export function createTelegramTransport(ctx: TelegramCtx): Transport {
-  const { api, chatId, recordRoute } = ctx
+  const { api, chatId, recordRoute, replyToMessageId } = ctx
+  // A reply threads under ONE anchor: consume the target on the first
+  // sendMessage so split-continuation chunks (and any later sends) do not each
+  // re-reply to the same inbound message.
+  let pendingReplyTo = replyToMessageId
 
   // A Bot API send `result` is a Message (text/photo/document) or an array of
   // Messages (sendMediaGroup) — record a route for every message id so a reply
@@ -106,6 +115,12 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
       body.parse_mode = parseMode
     } else if (entities.length > 0) {
       body.entities = entities
+    }
+    // Thread the FIRST message under the reply target, then clear it so
+    // continuation chunks aren't all re-replied to the same anchor.
+    if (pendingReplyTo !== undefined) {
+      body.reply_to_message_id = pendingReplyTo
+      pendingReplyTo = undefined
     }
     const resp = await fetch(`${api}/sendMessage`, {
       method: "POST",

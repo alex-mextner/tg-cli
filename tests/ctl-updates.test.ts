@@ -162,6 +162,32 @@ test('unsupported message kind (no text/photo/document) is silent', () => {
   expect(r.newOffset).toBe(10);
 });
 
+// --- inbound message_id is forwarded to the wrap (threaded replies) ---
+
+test('a plain text message forwards its message_id to the wrap (for tg --reply-to)', () => {
+  // A wrap that renders the id proves textAction passes m.message_id through.
+  const wrapWithId = (name: string, msg: string, messageId?: number) =>
+    `[TG from ${name}${messageId !== undefined ? ` #${messageId}` : ''}] ${msg}`;
+  const opts = { ...makeOpts(), wrap: wrapWithId };
+  const r = stepUpdates([upd(4321, { text: 'do the thing' })], opts);
+  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #4321] do the thing' });
+});
+
+test('the default injectWrap template renders the inbound id as #<id>', () => {
+  // Using the SHIPPED template + the real wrapInbound binding the daemon uses.
+  const r = stepUpdates([upd(77, { text: 'hi' })], makeOpts());
+  // makeOpts' wrap ignores the id, so assert via a real-template wrap instead:
+  const realWrap = (name: string, msg: string, messageId?: number) =>
+    DEFAULT_CONTROL.injectWrap
+      .replace('{name}', name)
+      .replace('{msg}', msg)
+      .replace('{id}', messageId !== undefined ? `#${messageId}` : '');
+  const r2 = stepUpdates([upd(77, { text: 'hi' })], { ...makeOpts(), wrap: realWrap });
+  expect(r2.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #77] hi — reply via tg' });
+  // r is just exercising the default path doesn't throw.
+  expect(r.actions.length).toBeGreaterThan(0);
+});
+
 // --- sender allowlist (spec §9: from.id, not chat id) ---
 
 test('sender matching chatId is allowed', () => {
@@ -307,6 +333,7 @@ test('photo picks the LARGEST file_size, names it <update_id>.jpg', () => {
       fileSize: 50_000,
       caption: 'look at this',
       from: 'Alex',
+      messageId: 77,
     },
     { kind: 'ack', messageId: 77 },
   ]);
@@ -340,6 +367,7 @@ test('document name = <update_id>.<sanitized ext>, NEVER the Telegram basename',
       fileSize: 1234,
       caption: 'q2',
       from: 'Alex',
+      messageId: 88,
     },
     { kind: 'ack', messageId: 88 },
   ]);
@@ -388,6 +416,7 @@ test('voice note → transcribe-voice with daemon-chosen <update_id>.ogg name, t
       suggestedName: '42.ogg',
       fileSize: 5000,
       from: 'Alex',
+      messageId: 42,
     },
     { kind: 'ack', messageId: 42 },
   ]);

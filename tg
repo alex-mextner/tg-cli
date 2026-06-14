@@ -55,6 +55,8 @@ import {
 } from "./features/render/html"
 import { buildPrefix } from "./features/render/prefix"
 import { resolveTag } from "./features/render/tag"
+import { toTablePre } from "./features/render/table"
+import { formatHelp } from "./features/render/format-help"
 import { createTelegramTransport } from "./features/transport/telegram"
 import {
   enumerateWorktreeRoots,
@@ -81,8 +83,11 @@ export const USAGE = `Usage:
   tg [--format plain|html] --file a.pdf --file b.pdf
   tg [--format plain|html] --photo a.png --file doc.pdf "caption"
   tg "see /abs/path/shot.png"   # existing file paths in text are auto-attached
+  tg --reply-to 1234 --tag ОТВЕТ "answer"  # thread under inbound message 1234
+  printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
   tg voice setup                # configure inbound voice→text (local Whisper STT)
   tg --ls-emoji-helpers
+  tg --format-help              # what Telegram message formatting supports
 
 Options:
   --format plain|html  message format (default: plain)
@@ -107,6 +112,20 @@ Options:
                          PROBLEM  / ПРОБЛЕМА  🔴 PROBLEM   a blocker / problem
                          REPORT   / ОТЧЁТ     🟢 REPORT    a status / result report
                        An unknown tag soft-renders as [TAG] + a stderr note.
+  --reply-to <id>      thread the outbound message UNDER an inbound Telegram
+                       message (sets reply_to_message_id). The id is the inbound
+                       message's Telegram message_id — the tg-ctl daemon surfaces
+                       it in the injected wrap as "[TG from Alex #<id>]". The
+                       ANSWER (ОТВЕТ) tag REQUIRES this: answering means
+                       answering a SPECIFIC message.
+  --table              read delimited rows from STDIN (TSV, or "a | b" per line),
+                       render an aligned monospace table wrapped in <pre>, and
+                       send it. Telegram has no native HTML tables; a padded
+                       <pre> is the only way. Composes with --tag/--title; any
+                       argv text becomes a heading above the table. Keep cells
+                       ASCII/Cyrillic (double-width emoji/CJK misalign columns).
+  --format-help        print the Telegram message-formatting reference (which
+                       HTML tags / entities are supported) and exit.
   -v, --version        print version and exit
   -h, --help           print this help and exit
 
@@ -315,6 +334,10 @@ if (import.meta.main) {
   }
   if (parsed.action === "version") {
     console.log(versionOutput(import.meta.dir))
+    process.exit(0)
+  }
+  if (parsed.action === "formatHelp") {
+    console.log(formatHelp())
     process.exit(0)
   }
   if (parsed.action === "error") {
@@ -526,8 +549,43 @@ if (import.meta.main) {
 
   const tmuxWindow = getTmuxWindow()
 
-  const { items, caption: rawCaption, format, title, tag, withOriginal, noPdf, pdfDevice } = parsed
-  const caption = decodeTextEscapes(rawCaption)
+  const { items, caption: rawCaption, format, title, tag, withOriginal, noPdf, pdfDevice, replyTo, table } = parsed
+
+  // `tg --table`: read delimited rows from stdin, render an aligned <pre>
+  // monospace table (Telegram has no native HTML tables), and use it as the
+  // message body. Any argv text becomes a heading ABOVE the table; the table
+  // forces HTML format so the <pre> renders. Double-width glyphs (emoji/CJK) in
+  // a cell can push columns out of alignment — warn but still send.
+  let caption: string
+  let effectiveFormat: Format = format
+  if (table) {
+    const stdinRaw = await Bun.stdin.text()
+    if (stdinRaw.trim() === "") {
+      console.error(
+        "Error: --table reads rows from stdin but got none. " +
+          "Pipe TSV or `a | b` lines, e.g.  printf 'task\\tstatus\\nship\\tdone' | tg --table",
+      )
+      process.exit(1)
+    }
+    const rendered = toTablePre(stdinRaw)
+    if (rendered.hasWide) {
+      console.error(
+        "tg: --table: a cell contains a double-width glyph (emoji/CJK) — columns may not align " +
+          "in the monospace block. Keep cells ASCII/Cyrillic for clean alignment.",
+      )
+    }
+    // The table is HTML (a <pre> block), so the whole message goes out as HTML.
+    // The argv heading is plain user text — escape it UNLESS the user explicitly
+    // asked for --format html (then they own their own markup). Without this a
+    // heading like "size < 10" would break HTML parsing once the <pre> forces
+    // HTML mode on the combined caption.
+    const rawHeading = decodeTextEscapes(rawCaption)
+    const heading = format === "html" ? rawHeading : escapeHtml(rawHeading)
+    caption = heading ? `${heading}\n${rendered.html}` : rendered.html
+    effectiveFormat = "html"
+  } else {
+    caption = decodeTextEscapes(rawCaption)
+  }
 
   // An unknown --tag is not fatal: buildPrefix soft-renders it as a plain
   // `[TAG]` badge. Emit a one-line stderr note here so the caller learns the
@@ -849,7 +907,7 @@ if (import.meta.main) {
     .filter((f): f is { path: string; content: string } => f !== null)
 
   // --- Build the SendPlan (normalization layer: R2/R3/R4 + render) ---
-  const plan = buildSendPlan(items, caption, format, { fileContents, renderText })
+  const plan = buildSendPlan(items, caption, effectiveFormat, { fileContents, renderText })
 
   // --- pre-send-photo hooks (agents-hooks/v1). NON-BREAKING SEAM. ---
   // Guarded by ONE `stat ~/.agents/hooks/tg/` (hooksActive). With no descriptors
@@ -1056,10 +1114,17 @@ if (import.meta.main) {
     process.exit(1)
   }
 
-  // Build the bot-bound transport (api + chat + the route recorder), then hand
-  // it to the transmitter, which applies caption-overflow + the >4096 split +
-  // the photos→text→documents ordering on top of the four send primitives.
-  const transport = createTelegramTransport({ api: API, chatId: CHAT_ID, recordRoute })
+  // Build the bot-bound transport (api + chat + the route recorder + an
+  // optional --reply-to anchor), then hand it to the transmitter, which applies
+  // caption-overflow + the >4096 split + the photos→text→documents ordering on
+  // top of the four send primitives. replyTo threads the first outbound message
+  // under the referenced inbound Telegram message_id (Feature: threaded replies).
+  const transport = createTelegramTransport({
+    api: API,
+    chatId: CHAT_ID,
+    recordRoute,
+    replyToMessageId: replyTo,
+  })
   await transmit(plan, transport)
 
   // Generated code→pdf / md→pdf artifacts are uploaded by now — drop their temp

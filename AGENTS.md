@@ -40,7 +40,11 @@ After creating a worktree:
 
 Two single-file entrypoints at the repo root contain only thin wiring (real spawns, file
 I/O, fetch, signals, `bun:ffi`):
-- `tg` — outbound one-shot sender.
+- `tg` — outbound one-shot sender. Notable flags: `--tag`/`--title` (header badge),
+  `--reply-to <message_id>` (thread the message UNDER an inbound one via
+  `reply_to_message_id`; the ANSWER/ОТВЕТ tag requires it), `--table` (render STDIN rows —
+  TSV or `a | b` — as an aligned monospace `<pre>` table; Telegram has no native tables),
+  `--format-help` (print the supported-HTML reference).
 - `tg-ctl` — inbound control daemon (`start`/`run`/`stop`/`status`): singleton via real
   `flock(2)` over `bun:ffi`, Telegram `getUpdates` long-poll, tmux pane injection.
   Spec: `docs/specs/2026-06-10-tg-ctl-control-design.md` (§16 = shipped v1 scope).
@@ -73,6 +77,12 @@ tests can pass fakes.
 - `features/prefix-style/` — Unicode styling of the outbound prefix: tmux window name → Sans-Serif
   Bold, single-ticket task title → Bold Italic, with `<b>`/`<i>` fallback for Cyrillic
   (docs/specs/unicode-prefix-styling.md).
+- `features/render/` — pure outbound-render helpers used by `tg`: `html.ts` (escape, tag detection,
+  parse-mode, emoji-entity → `<tg-emoji>`), `prefix.ts` (the `✳️ [window]` header + tag/title
+  badge), `tag.ts` (the ANSWER/DECISION/PROBLEM/REPORT tag set + Russian aliases), `table.ts`
+  (`--table`: delimited STDIN rows → an aligned, box-drawn, HTML-escaped monospace `<pre>` table —
+  alignment is computed on raw cells so escaping never skews columns), and `format-help.ts`
+  (`--format-help`: the supported-HTML reference).
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile
   helpers, the update→action step function (allowlist, staleness, command split, `/agent`
   routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree
@@ -93,6 +103,15 @@ tests can pass fakes.
   pane). An unconfigured note triggers a guided onboarding reply — never a silent drop. Configure
   with `tg voice setup` (→ `tg-ctl voice-setup`), which probes `~/xp` and persists the `voice:`
   block. Whisper/ffmpeg/network spawns are all timeout-guarded.
+
+- **Threaded replies:** the injected wrap (`injectWrap` in `DEFAULT_CONTROL`,
+  `[TG from {name} {id}] {msg} — reply via tg`) now carries the inbound Telegram `message_id`
+  via the `{id}` placeholder (rendered `#<id>`; collapses cleanly when no id applies, e.g. an
+  `/agent` route). The agent passes that id to `tg --reply-to <id>`, which sets
+  `reply_to_message_id` on the FIRST outbound `sendMessage` so the answer threads under the
+  message it answers. The id IS Telegram's own per-chat sequential `message_id` — no parallel id
+  scheme. `wrapInbound` takes an optional `messageId`; `stepUpdates`/`buildReplyInject` forward
+  `m.message_id`; the `download-media` / `transcribe-voice` actions carry it too.
 
 ### Feature Flags
 

@@ -135,13 +135,15 @@ test('--title is parsed as an explicit title; the body is NEVER pulled up', () =
 });
 
 test('--tag is parsed; it composes with --title and with a body', () => {
-  expect(parseArgs(['--tag', 'ОТВЕТ', '--title', 'Done', 'body'], dir, HOME)).toEqual({
+  // A non-ANSWER tag composes freely. (ANSWER/ОТВЕТ now REQUIRES --reply-to —
+  // covered in reply-table-args.test.ts — so this case uses РЕШЕНИЕ/DECISION.)
+  expect(parseArgs(['--tag', 'РЕШЕНИЕ', '--title', 'Done', 'body'], dir, HOME)).toEqual({
     action: 'send',
     items: [],
     caption: 'body',
     format: 'plain',
     title: 'Done',
-    tag: 'ОТВЕТ',
+    tag: 'РЕШЕНИЕ',
   });
   // Bare --tag with no body/title still sends.
   expect(parseArgs(['--tag', 'report'], dir, HOME)).toEqual({

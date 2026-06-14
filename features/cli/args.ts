@@ -10,6 +10,7 @@ import { isNeverAttach } from '../auto-attach/denylist';
 import { parseLineSpec } from '../auto-attach/snippet';
 import { buildFileIndex, isRecursiveCandidate, matchFromIndex, type ListDir } from '../auto-attach/recursive';
 import { looksPathLike, resolveAcrossWorktrees } from '../auto-attach/worktree';
+import { resolveTag } from '../render/tag';
 
 export interface ItemLineSpec {
   // The full original token as written (e.g. "src/a.ts:42-50"), kept so the
@@ -42,6 +43,7 @@ export type ParseResult =
   | { action: 'version' }
   | { action: 'lsEmojiHelpers' }
   | { action: 'detectModel' }
+  | { action: 'formatHelp' }
   | { action: 'error'; message: string }
   | {
       action: 'send';
@@ -63,6 +65,16 @@ export type ParseResult =
       // code-as-pdf: device preset for the mobile PDF page geometry
       // (`--pdf-device <name>`, e.g. iphone15pro / a4). Overrides TG_PDF_DEVICE.
       pdfDevice?: string;
+      // Threaded reply (`--reply-to <message_id>`): sets reply_to_message_id on
+      // the outbound sendMessage so it threads UNDER that inbound Telegram
+      // message. The id is Telegram's own per-chat sequential message_id (the
+      // daemon surfaces it in the injected wrap as `#<id>`). Absent when the flag
+      // is not given (keeps no-flag send results byte-identical).
+      replyTo?: number;
+      // `tg --table`: read delimited rows from stdin, render an aligned <pre>
+      // monospace table, and send it (composes with --tag/--title). The flag is
+      // a boolean; the rows come from stdin, not argv. Absent when not given.
+      table?: true;
     };
 
 // Extensions that Telegram's sendPhoto accepts. SVG is intentionally excluded:
@@ -160,6 +172,9 @@ export function parseArgs(
   for (const a of args) {
     if (a === '--detect-model') return { action: 'detectModel' };
   }
+  for (const a of args) {
+    if (a === '--format-help') return { action: 'formatHelp' };
+  }
 
   const explicit: Item[] = [];
   const textParts: string[] = [];
@@ -172,6 +187,8 @@ export function parseArgs(
   let withOriginal: true | undefined;
   let noPdf: true | undefined;
   let pdfDevice: string | undefined;
+  let replyTo: number | undefined;
+  let table: true | undefined;
 
   let i = 0;
   while (i < args.length) {
@@ -231,6 +248,30 @@ export function parseArgs(
       }
       pdfDevice = nextArg;
       i += 2;
+      continue;
+    }
+    // Threaded reply: `--reply-to <message_id>`. The value must be a positive
+    // integer (Telegram's own per-chat message_id); anything else is a clear
+    // error rather than a silently-dropped reply.
+    if (arg === '--reply-to') {
+      const nextArg = args[i + 1];
+      if (!nextArg || nextArg.startsWith('--')) {
+        return { action: 'error', message: '--reply-to requires a message id' };
+      }
+      if (!/^[1-9][0-9]*$/.test(nextArg)) {
+        return {
+          action: 'error',
+          message: `--reply-to expects a positive message id, got '${nextArg}'`,
+        };
+      }
+      replyTo = Number(nextArg);
+      i += 2;
+      continue;
+    }
+    // `--table` is a boolean — the rows are read from stdin by the entrypoint.
+    if (arg === '--table') {
+      table = true;
+      i += 1;
       continue;
     }
     if (arg === '--photo' || arg === '--file') {
@@ -398,9 +439,39 @@ export function parseArgs(
   // The path token is intentionally KEPT in the caption (core correction).
   const caption = textParts.join(' ').replace(/^\s+|\s+$/g, '');
 
+  // The ANSWER tag means "I am answering THIS specific message", so it requires
+  // a reply target. Without `--reply-to` the CTO's `--tag ОТВЕТ` had no thread
+  // to attach to and read as a reply that wasn't one — make it an actionable
+  // error. Only ANSWER is gated; the other tags label a message without
+  // claiming to answer a particular one. Resolve the tag case-insensitively so
+  // ОТВЕТ / answer / ANSWER all gate identically (resolveTag handles aliases).
+  if (tag && replyTo === undefined && resolveTag(tag).word === 'ANSWER') {
+    return {
+      action: 'error',
+      message:
+        "--tag ANSWER (ОТВЕТ) means you're answering a specific message — it requires --reply-to <message_id>. " +
+        'Use the id from the inbound `[TG from … #<id>]` wrap, or pick a different tag.',
+    };
+  }
+
   // Empty invocation (or nothing left after path excision) → help, exit 0.
-  // A bare `--title`/`--tag` still sends (a header-only message), so it is NOT
-  // an empty invocation.
-  if (items.length === 0 && !caption && !title && !tag) return { action: 'help' };
-  return { action: 'send', items, caption, format, title, tag, withOriginal, noPdf, pdfDevice };
+  // A bare `--title`/`--tag`/`--table`/`--reply-to` still sends (a header-only
+  // or table or reply message), so none of those is an empty invocation. The
+  // `--table` body arrives on stdin, read by the entrypoint after parsing.
+  if (items.length === 0 && !caption && !title && !tag && !table && replyTo === undefined) {
+    return { action: 'help' };
+  }
+  return {
+    action: 'send',
+    items,
+    caption,
+    format,
+    title,
+    tag,
+    withOriginal,
+    noPdf,
+    pdfDevice,
+    replyTo,
+    table,
+  };
 }
