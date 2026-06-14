@@ -251,6 +251,16 @@ export function cleanTranscript(raw: string): string {
   return lines.join(' ').replace(BRACKET_NOISE_RE, ' ').replace(PAREN_NOISE_RE, ' ').replace(/\s+/g, ' ').trim();
 }
 
+// Present a transcript as a 🎤-marked quote before it is injected into the agent pane,
+// mirroring the `↩ «…»` reply-anchor style. The 🎤 + guillemets tell the agent (and a
+// human glancing at the pane) that this is MACHINE-TRANSCRIBED speech — it may carry
+// recognition errors and is not text the user typed verbatim — so it is never mistaken
+// for a literal instruction string. Pure; the entrypoint wraps the cleaned transcript
+// with this before handing it to wrapInbound/the inject plan.
+export function formatVoiceTranscript(text: string): string {
+  return `🎤 «${text.trim()}»`;
+}
+
 // --- onboarding discovery (pure: given probe inputs, decide the verdict) ---
 
 // What the entrypoint/CLI finds when probing the host for a Whisper install.

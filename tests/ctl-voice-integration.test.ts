@@ -249,11 +249,12 @@ test('configured voice note → downloaded, transcribed, transcript injected int
   const saved = join(cfgDir, '.cache', 'tg-cli', 'inbound', '200.ogg');
   expect(readFileSync(saved, 'utf8')).toBe('OGGOPUSBYTES');
 
-  // The CLEANED transcript (noise stripped, trimmed) was injected verbatim into
-  // the agent pane via tmux send-keys -l — proving voice routes like typed text.
+  // The CLEANED transcript (noise stripped, trimmed) was injected into the agent pane
+  // as a 🎤-marked quote — proving voice routes like typed text but is visibly tagged
+  // as transcribed speech.
   const tmuxCalls = readFileSync(tmuxLog, 'utf8');
   expect(tmuxCalls).toContain('list-panes'); // discovery ran through the shim
-  expect(tmuxCalls).toContain(`[TG from Alex] ${TRANSCRIPT}`);
+  expect(tmuxCalls).toContain(`[TG from Alex] 🎤 «${TRANSCRIPT}»`);
   // The whisper noise marker must NOT survive into the injected text.
   expect(tmuxCalls).not.toContain('BLANK_AUDIO');
 
@@ -375,7 +376,7 @@ test('voice config written AFTER the daemon started is reloaded per note (no res
 
   // The transcript was injected even though the daemon booted unconfigured —
   // proving the per-note config reload picked up the mid-run `tg voice setup`.
-  expect(readFileSync(tmuxLog, 'utf8')).toContain(`[TG from Alex] ${TRANSCRIPT}`);
+  expect(readFileSync(tmuxLog, 'utf8')).toContain(`[TG from Alex] 🎤 «${TRANSCRIPT}»`);
   expect(state.fetchedFileId).toBe('voice-xyz');
 
   daemon.kill('SIGTERM');
@@ -481,7 +482,7 @@ test('daemon stays responsive (socket accepts) DURING a slow transcription — a
     if (readFileSync(tmuxLog, 'utf8').includes(TRANSCRIPT)) break;
     await Bun.sleep(100);
   }
-  expect(readFileSync(tmuxLog, 'utf8')).toContain(`[TG from Alex] ${TRANSCRIPT}`);
+  expect(readFileSync(tmuxLog, 'utf8')).toContain(`[TG from Alex] 🎤 «${TRANSCRIPT}»`);
 
   daemon.kill('SIGTERM');
   await Promise.race([daemon.exited, Bun.sleep(4000)]);

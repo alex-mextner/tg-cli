@@ -43,6 +43,7 @@ import {
   buildFfmpegArgv,
   buildWhisperCppArgv,
   cleanTranscript,
+  formatVoiceTranscript,
   FASTER_WHISPER_FALLBACK_SCRIPT,
   decideOnboarding,
   isVoiceConfigured,
@@ -1343,11 +1344,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
 
-    // Route exactly like a typed message: a reply note carries the quote anchor
-    // and goes through the SAME reply-route path; a standalone note injects like
-    // plain text into the discovered pane.
+    // Route exactly like a typed message, but present the transcript as a 🎤-marked
+    // quote (formatVoiceTranscript) so the agent can tell it's transcribed speech, not
+    // typed text: a reply note carries the quote anchor and goes through the SAME
+    // reply-route path; a standalone note injects into the discovered pane.
+    const quoted = formatVoiceTranscript(text)
     if (action.replyToMessageId !== undefined) {
-      const injectText = `${action.replyAnchor ?? ""}\n${wrapInbound(ctx.cfg.injectWrap, action.from, text)}`.replace(
+      const injectText = `${action.replyAnchor ?? ""}\n${wrapInbound(ctx.cfg.injectWrap, action.from, quoted)}`.replace(
         /^\n/,
         "",
       )
@@ -1358,7 +1361,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         from: action.from,
       })
     }
-    const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, text)
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, quoted)
     return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped)
   }
 
