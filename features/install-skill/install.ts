@@ -28,7 +28,9 @@ description: >-
   file/photo, push a status / finding / question to their phone, or format an HTML
   report — e.g. \`tg "done"\`, \`tg --file out.pdf "caption"\`. Agents push status &
   questions; the user replies back; questions and permission prompts can become
-  tappable inline buttons (tmux). Always prefer this over direct curl to the
+  tappable inline buttons (tmux). The user can also reply by VOICE: a voice note
+  is transcribed by a local Whisper (\`tg voice setup\`) and injected into the
+  agent exactly like a typed reply. Always prefer this over direct curl to the
   Telegram API.
 metadata:
   author: alex-mextner
@@ -91,6 +93,21 @@ uselessly, so the PDF is what's actually readable on a phone.
 Markdown (\`.md\`) keeps its own \`.md\`→PDF path; non-code files are unchanged.
 Requires pandoc + Google Chrome; on any failure the raw file is sent unchanged.
 
+## Voice input (inbound STT — talk instead of type)
+The user can answer the agent by sending a Telegram VOICE note instead of typing.
+The \`tg-ctl\` daemon downloads the audio, transcodes it with \`ffmpeg\`, runs a
+local Whisper (whisper.cpp or faster-whisper), and injects the transcript into
+the agent's pane — routed exactly like a typed reply (a voice note sent as a
+reply keeps the quote anchor and reaches the replied-to origin pane).
+
+- \`tg voice setup\` — discover a local Whisper (\`~/xp\` first) + a model, check
+  for \`ffmpeg\`, and persist the config. Run once.
+- If a voice note arrives before voice is configured, the bot replies with a
+  guided setup flow instead of dropping it.
+- Config lives in the \`voice:\` block of \`~/.config/tg-cli/config.yaml\`
+  (\`enabled\`, \`runner\`, \`bin_path\`, \`model_path\`, \`language\` — default
+  \`auto\`, covering ru + en).
+
 Always use \`tg\`, never direct curl to the Telegram API. tmux only.
 `;
 
@@ -103,6 +120,8 @@ const SKILL_BLURB =
   'Attaching a code/config file (.ts/.json/.yaml/.py/…) renders a mobile, ' +
   'syntax-highlighted PDF and by DEFAULT sends ONLY the PDF (raw file is useless ' +
   'on iOS); `--with-original` sends both, `--no-pdf` sends the raw file. ' +
+  'The user can reply by VOICE — a voice note is transcribed by a local Whisper ' +
+  '(`tg voice setup`) and injected like a typed reply. ' +
   'Use to report results/questions to the user. Never curl Telegram directly.';
 
 const HOOK_MARKER = '# agent-tools-awareness';

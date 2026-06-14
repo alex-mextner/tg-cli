@@ -48,6 +48,15 @@ export interface TgDocument {
   file_size?: number;
 }
 
+// A Telegram VOICE note (OGG/OPUS) or an audio note. Both carry a file_id we
+// resolve via getFile, then download → ffmpeg → Whisper → text (inbound STT).
+export interface TgVoice {
+  file_id: string;
+  duration?: number; // seconds
+  mime_type?: string; // usually audio/ogg
+  file_size?: number;
+}
+
 // The user's partial selection when replying (Bot API 7.0+): the substring of
 // the replied-to message they highlighted. Forwarded verbatim into the agent.
 export interface TgTextQuote {
@@ -63,6 +72,8 @@ export interface TgMessage {
   caption?: string;
   photo?: TgPhotoSize[];
   document?: TgDocument;
+  voice?: TgVoice; // a voice note (OGG/OPUS) — transcribed to text inbound
+  audio?: TgVoice; // an audio file/note — same transcribe path as voice
   reply_to_message?: TgMessage; // the message this one replies to (items 2,3)
   quote?: TgTextQuote; // the user's partial-quote selection from it (item 2)
 }
@@ -133,6 +144,24 @@ export type Action =
       fileSize?: number;
       caption?: string;
       from: string; // display name for the wrap
+    }
+  // A voice/audio note: download the OGG, ffmpeg→WAV, run local Whisper, then
+  // route the transcript EXACTLY like a typed message — wrapped + acked. When
+  // the note is a reply (replyToMessageId set) it routes through the same
+  // reply-route path a typed reply uses (origin-pane recognition + quote
+  // anchor); otherwise it injects into the discovered pane like plain text. The
+  // entrypoint, not the step function, knows whether Whisper is configured: an
+  // unconfigured note becomes an onboarding reply there, never a silent drop.
+  | {
+      kind: 'transcribe-voice';
+      fileId: string;
+      suggestedName: string; // daemon-chosen: <update_id>.ogg
+      fileSize?: number;
+      from: string; // display name for the wrap
+      // Set when the voice note itself is a reply: route via reply-route with
+      // this quote anchor prepended (built from the replied-to message).
+      replyToMessageId?: number;
+      replyAnchor?: string;
     };
 
 export interface StepResult {

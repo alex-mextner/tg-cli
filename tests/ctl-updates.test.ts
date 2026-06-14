@@ -1,11 +1,6 @@
 import { expect, test } from 'bun:test';
 import { stepUpdates } from '../features/tg-ctl/updates';
-import {
-  DEFAULT_CONTROL,
-  type ControlConfig,
-  type TgMessage,
-  type TgUpdate,
-} from '../features/tg-ctl/types';
+import { DEFAULT_CONTROL, type ControlConfig, type TgMessage, type TgUpdate } from '../features/tg-ctl/types';
 
 const CHAT_ID = 1000;
 const NOW = 1_750_000_000; // unix seconds, arbitrary
@@ -151,7 +146,13 @@ test('callback_query actions are prioritized before slower message actions in th
     makeOpts(),
   );
   expect(r.actions.map((a) => a.kind)).toEqual(['answer-question', 'download-media', 'ack']);
-  expect(r.actions[0]).toEqual({ kind: 'answer-question', callbackQueryId: 'cb1', requestId: 'q_123', value: 'o1', messageId: 50 });
+  expect(r.actions[0]).toEqual({
+    kind: 'answer-question',
+    callbackQueryId: 'cb1',
+    requestId: 'q_123',
+    value: 'o1',
+    messageId: 50,
+  });
   expect(r.newOffset).toBe(9);
 });
 
@@ -221,7 +222,7 @@ test('stale command is counted stale, never executed', () => {
   expect(r.skippedStale).toBe(1);
 });
 
-test("stale message from a disallowed sender does not inflate the stale count", () => {
+test('stale message from a disallowed sender does not inflate the stale count', () => {
   const r = stepUpdates([upd(1, { text: 'x', date: NOW - 9999, from: { id: 666 } })], makeOpts());
   expect(r.skippedStale).toBe(0);
   expect(r.newOffset).toBe(2);
@@ -295,7 +296,7 @@ test('photo picks the LARGEST file_size, names it <update_id>.jpg', () => {
         caption: 'look at this',
       }),
     ],
-    makeOpts()
+    makeOpts(),
   );
   expect(r.actions).toEqual([
     {
@@ -317,10 +318,7 @@ test('photo renditions without file_size → last entry wins (Telegram is size-a
 });
 
 test('photo over 20MB → reply instead of download', () => {
-  const r = stepUpdates(
-    [upd(5, { photo: [{ file_id: 'huge', file_size: 20 * 1024 * 1024 + 1 }] })],
-    makeOpts()
-  );
+  const r = stepUpdates([upd(5, { photo: [{ file_id: 'huge', file_size: 20 * 1024 * 1024 + 1 }] })], makeOpts());
   expect(r.actions).toHaveLength(1);
   expect(r.actions[0].kind).toBe('reply');
   expect((r.actions[0] as { kind: 'reply'; text: string }).text).toContain('file too large');
@@ -331,7 +329,7 @@ test('photo over 20MB → reply instead of download', () => {
 test('document name = <update_id>.<sanitized ext>, NEVER the Telegram basename', () => {
   const r = stepUpdates(
     [upd(88, { document: { file_id: 'doc1', file_name: 'Quarterly Report.PDF', file_size: 1234 }, caption: 'q2' })],
-    makeOpts()
+    makeOpts(),
   );
   expect(r.actions).toEqual([
     {
@@ -362,10 +360,7 @@ test('document extension defaults to bin: missing file_name, no dot, junk ext', 
 });
 
 test('document ext is sanitized to lowercase alphanumerics', () => {
-  const r = stepUpdates(
-    [upd(4, { document: { file_id: 'x', file_name: 'archive.tar.gz' } })],
-    makeOpts()
-  );
+  const r = stepUpdates([upd(4, { document: { file_id: 'x', file_name: 'archive.tar.gz' } })], makeOpts());
   expect(r.actions[0]).toMatchObject({ suggestedName: '4.gz' });
 });
 
@@ -377,6 +372,65 @@ test('document over 20MB → reply; exactly 20MB still downloads (strict >)', ()
 
   const at = stepUpdates([upd(1, { document: { file_id: 'x', file_size: limit } })], makeOpts());
   expect(at.actions[0].kind).toBe('download-media');
+});
+
+// --- voice inbound (inbound STT: transcribe-voice action) ---
+
+test('voice note → transcribe-voice with daemon-chosen <update_id>.ogg name, then ack', () => {
+  const r = stepUpdates(
+    [upd(42, { voice: { file_id: 'voice-abc', duration: 3, mime_type: 'audio/ogg', file_size: 5000 } })],
+    makeOpts(),
+  );
+  expect(r.actions).toEqual([
+    {
+      kind: 'transcribe-voice',
+      fileId: 'voice-abc',
+      suggestedName: '42.ogg',
+      fileSize: 5000,
+      from: 'Alex',
+    },
+    { kind: 'ack', messageId: 42 },
+  ]);
+});
+
+test('audio note routes through the same transcribe-voice path as voice', () => {
+  const r = stepUpdates([upd(7, { audio: { file_id: 'aud', file_size: 100 } })], makeOpts());
+  expect(r.actions[0]).toMatchObject({ kind: 'transcribe-voice', fileId: 'aud', suggestedName: '7.ogg' });
+});
+
+test('a voice note that is itself a reply carries the quote anchor for reply-routing', () => {
+  const r = stepUpdates(
+    [
+      upd(9, {
+        voice: { file_id: 'v', file_size: 10 },
+        reply_to_message: {
+          message_id: 3,
+          chat: { id: CHAT_ID },
+          date: NOW,
+          text: 'what is the plan for the migration',
+        },
+      }),
+    ],
+    makeOpts(),
+  );
+  const a = r.actions[0] as Extract<(typeof r.actions)[number], { kind: 'transcribe-voice' }>;
+  expect(a.kind).toBe('transcribe-voice');
+  expect(a.replyToMessageId).toBe(3);
+  expect(a.replyAnchor).toContain('↩');
+  expect(a.replyAnchor).toContain('what is the plan');
+});
+
+test('voice over 20MB → too-large reply instead of transcribe', () => {
+  const r = stepUpdates([upd(1, { voice: { file_id: 'huge', file_size: 20 * 1024 * 1024 + 1 } })], makeOpts());
+  expect(r.actions).toHaveLength(1);
+  expect(r.actions[0].kind).toBe('reply');
+  expect((r.actions[0] as { kind: 'reply'; text: string }).text).toContain('file too large');
+});
+
+test('voice from a disallowed sender is dropped entirely', () => {
+  const r = stepUpdates([upd(1, { voice: { file_id: 'v' }, from: { id: 666 } })], makeOpts());
+  expect(r.actions).toEqual([]);
+  expect(r.newOffset).toBe(2);
 });
 
 // --- batch combinations ---
@@ -406,9 +460,6 @@ test('batch: ordered actions, stale counted, intruder dropped, offset correct', 
 // --- delivery receipts (👀 reaction, spec §10) ---
 
 test('a pure error reply (too-large) earns NO ack — the reply IS the failure signal', () => {
-  const r = stepUpdates(
-    [upd(5, { photo: [{ file_id: 'huge', file_size: 21 * 1024 * 1024 }] })],
-    makeOpts()
-  );
+  const r = stepUpdates([upd(5, { photo: [{ file_id: 'huge', file_size: 21 * 1024 * 1024 }] })], makeOpts());
   expect(r.actions).toEqual([{ kind: 'reply', text: 'file too large for Bot API (>20 MB)' }]);
 });

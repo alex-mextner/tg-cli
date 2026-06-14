@@ -81,6 +81,7 @@ export const USAGE = `Usage:
   tg [--format plain|html] --file a.pdf --file b.pdf
   tg [--format plain|html] --photo a.png --file doc.pdf "caption"
   tg "see /abs/path/shot.png"   # existing file paths in text are auto-attached
+  tg voice setup                # configure inbound voice→text (local Whisper STT)
   tg --ls-emoji-helpers
 
 Options:
@@ -236,6 +237,25 @@ if (import.meta.main) {
     }
     const code = runHooksCli(rawArgs, home, hooksEnv)
     if (code !== null) process.exit(code)
+  }
+
+  // `tg voice setup` — (re)configure inbound voice transcription (STT). Probes
+  // the host for an existing local Whisper (~/xp first), persists the discovered
+  // runner/model/language into config.yaml, and prints the guidance. Delegated
+  // to `tg-ctl voice-setup` so the probe + persist logic lives in ONE place.
+  // EXACT match only: bare `tg voice` (1 token) or `tg voice setup` (2 tokens).
+  // A longer first arg like `tg voice setup is done` is an ordinary message and
+  // must still send — hence the length guard, not just `rawArgs[1] === "setup"`.
+  if (
+    rawArgs[0] === "voice" &&
+    (rawArgs.length === 1 || (rawArgs.length === 2 && rawArgs[1] === "setup"))
+  ) {
+    const result = Bun.spawnSync([join(import.meta.dir, "tg-ctl"), "voice-setup"], {
+      stdout: "inherit",
+      stderr: "inherit",
+      timeout: 60_000,
+    })
+    process.exit(result.exitCode ?? 1)
   }
 
   // Resolve feature flags FIRST: pull --feature/--no-feature out of argv, load
