@@ -24,18 +24,6 @@ Credentials: `~/.config/tg-cli/.env` — must contain `TG_BOT_TOKEN` and `TG_CHA
 
 ---
 
-## Worktree Trap (Lesson Learned 2026-06-10)
-
-Claude Code's `EnterWorktree` bases new worktrees on `origin/main` (default `worktree.baseRef:
-fresh`), **not** on the current HEAD. If feature work is stacked on unmerged branches, a fresh
-worktree silently gives you a stale codebase (e.g. missing `features/`).
-
-After creating a worktree:
-1. Verify the base: `git log --oneline -1` and `ls features/`.
-2. If stale, run `git reset --hard <intended base branch>` before writing any code.
-
----
-
 ## Architecture
 
 Two single-file entrypoints at the repo root contain only thin wiring (real spawns, file
@@ -168,7 +156,6 @@ touching any feature.
   (findings appear at the end of output after thinking/exec noise — use `tail -80`).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in
   `CHANGELOG.md`. A test asserts this — do not forget it.
-- **Commit messages**: conventional-commit style, e.g. `feat(autolink-tasks): ...`.
 
 ---
 
