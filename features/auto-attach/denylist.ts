@@ -31,6 +31,11 @@ export const NEVER_ATTACH_PATTERNS: RegExp[] = [
   /^client_secret.*\.json$/i,
   // kubernetes access config
   /^kubeconfig$/i,
+  // tg-ctl daemon state: the message history is a full conversation transcript
+  // (`tg replies` source) and the routes map leaks pane→project layout. Neither
+  // should ever ride a Telegram attach, even when named explicitly.
+  /^tg-ctl\..*\.history\.jsonl$/i,
+  /^tg-ctl\..*\.routes\.json$/i,
 ];
 
 /** True when the file's BASENAME matches any never-attach pattern. */

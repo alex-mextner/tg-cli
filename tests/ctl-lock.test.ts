@@ -1,11 +1,5 @@
 import { expect, test } from 'bun:test';
-import {
-  ctlPaths,
-  botIdFromToken,
-  readPidFile,
-  pidStatus,
-  shouldAutoStart,
-} from '../features/tg-ctl/lock';
+import { ctlPaths, botIdFromToken, readPidFile, pidStatus, shouldAutoStart } from '../features/tg-ctl/lock';
 import { DEFAULT_CONTROL, type ControlConfig } from '../features/tg-ctl/types';
 
 const cfg = (over: Partial<ControlConfig> = {}): ControlConfig => ({
@@ -22,6 +16,8 @@ test('ctlPaths builds lock/pid/offset/registration/socket/log under configDir', 
   expect(p.registration).toBe('/home/u/.config/tg-cli/tg-ctl.123456.registration.json');
   expect(p.socket).toBe('/home/u/.config/tg-cli/tg-ctl.123456.sock');
   expect(p.log).toBe('/home/u/.config/tg-cli/tg-ctl.123456.log');
+  expect(p.routes).toBe('/home/u/.config/tg-cli/tg-ctl.123456.routes.json');
+  expect(p.history).toBe('/home/u/.config/tg-cli/tg-ctl.123456.history.jsonl');
 });
 
 test('ctlPaths tolerates a trailing slash in configDir', () => {
@@ -83,9 +79,7 @@ test('pidStatus is stale when the pidfile exists but the process is gone', () =>
 
 // --- shouldAutoStart: gate is TMUX + enabled, NOTHING else (spec §7) ---
 test('shouldAutoStart fires inside tmux with control enabled', () => {
-  expect(shouldAutoStart({ TMUX: '/tmp/tmux-501/default,123,0' }, cfg({ enabled: true }))).toBe(
-    true,
-  );
+  expect(shouldAutoStart({ TMUX: '/tmp/tmux-501/default,123,0' }, cfg({ enabled: true }))).toBe(true);
 });
 
 test('shouldAutoStart is false without TMUX or with empty TMUX', () => {
@@ -94,9 +88,7 @@ test('shouldAutoStart is false without TMUX or with empty TMUX', () => {
 });
 
 test('shouldAutoStart is false when control is disabled', () => {
-  expect(shouldAutoStart({ TMUX: '/tmp/tmux-501/default,123,0' }, cfg({ enabled: false }))).toBe(
-    false,
-  );
+  expect(shouldAutoStart({ TMUX: '/tmp/tmux-501/default,123,0' }, cfg({ enabled: false }))).toBe(false);
 });
 
 // Spec §7 explicitly mandates NO TTY check: the agent calls tg through a piped

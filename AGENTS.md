@@ -101,6 +101,35 @@ tests can pass fakes.
   decision). `voice-probe.ts` is the ONE impure module here — it scans `~/xp` for an existing
   Whisper install (whisper.cpp binary + ggml model, or a faster-whisper venv) and checks for
   `ffmpeg`, handing a pure `WhisperProbe` to `decideOnboarding`. Shared shapes in `types.ts`.
+- `features/replies/` — the `tg replies` subcommand (message recall). All PURE except `cli.ts`,
+  which is effectful-via-DI like `features/hooks/cli.ts` (the I/O — history read, `$TMUX_PANE`
+  detection, stdout — is injected as `RepliesCliDeps`, so the orchestration is unit-tested without
+  disk/tmux). `history.ts` (the `HistoryRecord` type + JSONL parse/serialize/append/trim, plus
+  `appendRecordsToBlob` — the whole read-append-trim as one pure string transform the entrypoints
+  wrap with readFile/writeFile), `args.ts` (`tg replies [user|agent|all] [list|find <q>]` + flags),
+  `select.ts` (direction + pane filters, substring/regex search, the select pipeline, line + JSON
+  formatters), `inbound.ts` (raw `getUpdates` batch → `user` history records, mirroring
+  `stepUpdates`' allowlist + staleness), `outbound.ts` (which text to log for a send — body or a
+  `[photo]`/`[document]` placeholder).
+
+- **Message history & recall (`tg replies`, v1.11.0):** an append-only JSONL log at
+  `tg-ctl.<botid>.history.jsonl` (path added to `CtlPaths`, next to `routes`) records one
+  `{ts, message_id, direction, from, text, pane}` object per line. TWO writers, both best-effort
+  (a corrupt/unwritable log NEVER breaks a send or an inject, exactly like `routes`): the `tg-ctl`
+  poll loop appends every inbound message it processes (stamped with the routed target pane), and
+  `tg` appends one `agent` record per send (stamped with `$TMUX_PANE`, the first sent message id).
+  The file is trimmed to its last ~5000 lines on each write. `tg replies` defaults to the CURRENT
+  pane's session + `user` direction ("recall what the user wrote"); `--all-sessions`/`--session`
+  override scope, `--json` is machine-readable, `find`/`--regex` search. Exact-match leading token
+  in `tg` dispatch (like `hooks`/`voice`), so `tg "replies ..."` as a plain message still sends.
+  - **Reply pane accuracy:** a text/voice reply is stamped with its recognized ORIGIN pane (the
+    same pane reply-route delivers it to); a photo/document reply or a `/agent <window> …` routing
+    command is stamped with the DEFAULT discovered pane (those route elsewhere, but they are media
+    receipts / routing directives, not conversational content — acceptable for recall).
+  - **Known limitation (matches `routes`):** both writers do read-modify-write rather than a true
+    `O_APPEND`, so a daemon-inbound write racing a concurrent agent-outbound write could lose a
+    record. The daemon is the single inbound writer and outbound writes are short; a file lock is
+    out of scope for a best-effort, bounded log (same posture as the `routes` map).
 
 - **Inbound voice (STT):** a Telegram voice/audio note → `transcribe-voice` action (updates.ts).
   The daemon downloads the OGG, transcodes to WAV 16 kHz mono via `ffmpeg`, runs the configured

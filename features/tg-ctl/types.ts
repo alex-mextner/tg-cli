@@ -230,4 +230,5 @@ export interface CtlPaths {
   socket: string;
   log: string;
   routes: string; // message_id→pane map for reply recognition + LRU/MRU picker
+  history: string; // append-only JSONL message log for `tg replies` recall
 }

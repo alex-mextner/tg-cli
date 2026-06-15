@@ -19,6 +19,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     socket: join(configDir, `${base}.sock`),
     log: join(configDir, `${base}.log`),
     routes: join(configDir, `${base}.routes.json`),
+    history: join(configDir, `${base}.history.jsonl`),
   };
 }
 
@@ -44,10 +45,7 @@ export function readPidFile(content: string | null): number | null {
 
 // The pidfile is purely informational (spec §6) — the flock is the real
 // singleton. 'stale' means the file exists but kill -0 says the process died.
-export function pidStatus(
-  pid: number | null,
-  kill0: (pid: number) => boolean,
-): 'running' | 'stale' | 'absent' {
+export function pidStatus(pid: number | null, kill0: (pid: number) => boolean): 'running' | 'stale' | 'absent' {
   if (pid === null) return 'absent';
   return kill0(pid) ? 'running' : 'stale';
 }
