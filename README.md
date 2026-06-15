@@ -258,7 +258,7 @@ Every other Telegram + AI-agent tool is a **remote terminal**: it mirrors the fu
 
 Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 
-- **[review-cli](https://github.com/alex-mextner/review-cli)** — multi-model read-only code review
+- **[review-cli](https://github.com/alex-mextner/review-cli)** — agentic, priority-ordered failover multi-model code-review board (brainstorm/quorum, spec-web, dashboard)
 - **[rig-cli](https://github.com/alex-mextner/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
 - **[agent-tools](https://github.com/alex-mextner/agent-tools)** — the shared umbrella: portable agent skills, git/agent hooks, CI gates, and the `agenttools_log` lib that the other CLIs consume
 - **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
