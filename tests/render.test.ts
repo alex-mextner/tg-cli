@@ -181,14 +181,16 @@ test('buildPrefix --tag (real ids) renders the pill in html, unicode fallback in
   expect(p.plain).toBe('[𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER\n');
   // html carries ONLY the real 3-cell pill (ANSWER widened to three uploaded
   // cells so the rounded caps don't squish the word); each cell wraps exactly
-  // the dot emoji (Telegram rejects non-emoji fallback text). The wordmark is
-  // baked into the sticker art — NO plain "ANSWER" word is appended (CTO
+  // one emoji (Telegram rejects non-emoji fallback text). Per-cell dots are
+  // [color, ▫️, ▫️] — cell0 keeps the tag's color, the rest go neutral so a push
+  // notification shows ONE colored dot + neutrals (CTO 2026-06-15). The wordmark
+  // is baked into the sticker art — NO plain "ANSWER" word is appended (CTO
   // 2026-06-14: first line = --title only, the tag is just the pill badge).
   expect(p.html).toBe(
     '[𝘁𝗴-𝗰𝗹𝗶] ' +
       '<tg-emoji emoji-id="5294303944082762041">🔵</tg-emoji>' +
-      '<tg-emoji emoji-id="5294414440706382789">🔵</tg-emoji>' +
-      '<tg-emoji emoji-id="5294185480294808567">🔵</tg-emoji>\n',
+      '<tg-emoji emoji-id="5294414440706382789">▫️</tg-emoji>' +
+      '<tg-emoji emoji-id="5294185480294808567">▫️</tg-emoji>\n',
   );
   // The duplicate plain tag word is GONE: the pill is the only ANSWER label.
   expect(p.html).not.toContain('ANSWER');
@@ -224,8 +226,8 @@ test('buildPrefix --tag + --title compose: badge, em-dash, then title', () => {
   expect(p.html).toBe(
     '✳️ [𝘁𝗴-𝗰𝗹𝗶] ' +
       '<tg-emoji emoji-id="5294303944082762041">🔵</tg-emoji>' +
-      '<tg-emoji emoji-id="5294414440706382789">🔵</tg-emoji>' +
-      '<tg-emoji emoji-id="5294185480294808567">🔵</tg-emoji>' +
+      '<tg-emoji emoji-id="5294414440706382789">▫️</tg-emoji>' +
+      '<tg-emoji emoji-id="5294185480294808567">▫️</tg-emoji>' +
       ' — 𝑫𝒐𝒏𝒆\n',
   );
   // The duplicate plain "ANSWER" word is gone — only the styled title is text.
@@ -246,8 +248,8 @@ test('buildPrefix --tag ОТВЕТ --title "X": pill + styled title, no duplicat
   expect(p.html).toBe(
     '✳️ [𝘁𝗴-𝗰𝗹𝗶] ' +
       '<tg-emoji emoji-id="5294303944082762041">🔵</tg-emoji>' +
-      '<tg-emoji emoji-id="5294414440706382789">🔵</tg-emoji>' +
-      '<tg-emoji emoji-id="5294185480294808567">🔵</tg-emoji>' +
+      '<tg-emoji emoji-id="5294414440706382789">▫️</tg-emoji>' +
+      '<tg-emoji emoji-id="5294185480294808567">▫️</tg-emoji>' +
       ' — 𝑿\n',
   );
   // No second plain tag word, English OR Russian, anywhere on the line.
@@ -309,17 +311,17 @@ test('buildPrefix --tag with REAL pill ids renders N <tg-emoji> dot cells and fo
   TAG_PILL_IDS.ANSWER = [...realIds];
   try {
     const p = buildPrefix({ aiEmoji: '', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'ANSWER' });
-    // N cells (here 2), each wrapping the lone dot emoji — and NOTHING after:
-    // the wordmark is baked into the sticker art, no plain word is appended.
+    // N cells (here 2): cell0 = colored dot, the rest neutral ▫️ — and NOTHING
+    // after: the wordmark is baked into the sticker art, no plain word appended.
     expect(p.html).toBe(
       '[𝘁𝗴-𝗰𝗹𝗶] ' +
         `<tg-emoji emoji-id="${realIds[0]}">🔵</tg-emoji>` +
-        `<tg-emoji emoji-id="${realIds[1]}">🔵</tg-emoji>\n`,
+        `<tg-emoji emoji-id="${realIds[1]}">▫️</tg-emoji>\n`,
     );
     expect(p.html).not.toContain('ANSWER'); // no duplicate plain tag word
-    // Every cell's inner text is exactly the dot — never a slice of the word.
+    // Each cell's inner text is a single emoji — cell0 colored, the rest neutral.
     const innerTexts = [...p.html.matchAll(/<tg-emoji emoji-id="\d+">([^<]*)<\/tg-emoji>/g)].map((m) => m[1]);
-    expect(innerTexts).toEqual(['🔵', '🔵']);
+    expect(innerTexts).toEqual(['🔵', '▫️']);
     // plain keeps the readable unicode fallback (non-HTML / >4096 split path).
     expect(p.plain).toBe('[𝘁𝗴-𝗰𝗹𝗶] 🔵 ANSWER\n');
     expect(p.forceHtml).toBe(true);
@@ -336,9 +338,9 @@ test('buildPrefix --tag with a 3-cell real pill renders 3 <tg-emoji> dot cells i
     const p = buildPrefix({ aiEmoji: '', model: '', tmuxWindow: '', tag: 'DECISION' });
     const cellTags = p.html.match(/<tg-emoji emoji-id="\d+">/g) ?? [];
     expect(cellTags).toEqual(realIds.map((id) => `<tg-emoji emoji-id="${id}">`));
-    // Every cell wraps exactly the dot emoji (3 cells → 🟠🟠🟠).
+    // 3 cells → cell0 colored, the rest neutral (🟠▫️▫️).
     const innerTexts = [...p.html.matchAll(/<tg-emoji emoji-id="\d+">([^<]*)<\/tg-emoji>/g)].map((m) => m[1]);
-    expect(innerTexts).toEqual(['🟠', '🟠', '🟠']);
+    expect(innerTexts).toEqual(['🟠', '▫️', '▫️']);
     expect(p.forceHtml).toBe(true);
   } finally {
     TAG_PILL_IDS.DECISION = saved;
@@ -359,22 +361,25 @@ test('buildPrefix --tag does NOT emit a pill when any cell id is still a placeho
   }
 });
 
-// --- pill cell inner text MUST be a single dot emoji ---
+// --- pill cell inner text MUST be a single emoji, [color, ▫️, ▫️] per cell ---
 // Telegram rejects a custom_emoji entity whose fallback text is not exactly one
-// emoji (ENTITY_TEXT_INVALID), so every <tg-emoji> pill cell's inner text is the
-// canonical dot — never a slice of the readable word.
-test('buildPrefix pill cells each wrap exactly the canonical dot emoji (never a word slice)', () => {
+// emoji (ENTITY_TEXT_INVALID), so every <tg-emoji> pill cell's inner text is a
+// single dot — never a slice of the readable word. Per-cell layout is
+// [colored cell0, neutral ▫️ for the rest] so a push notification shows one
+// colored dot identifying the tag + quiet neutrals (CTO 2026-06-15).
+test('buildPrefix pill cells each wrap one emoji: [color, ▫️, …] (never a word slice)', () => {
   const cases: Array<[string, string, number]> = [
     ['ANSWER', '🔵', 3],
     ['DECISION', '🟠', 3],
     ['PROBLEM', '🔴', 3],
     ['REPORT', '🟢', 3],
   ];
-  for (const [tag, dot, cellCount] of cases) {
+  for (const [tag, color, cellCount] of cases) {
     const p = buildPrefix({ aiEmoji: '', model: 'no-brand', tmuxWindow: '', tag });
     const inner = [...p.html.matchAll(/<tg-emoji emoji-id="\d+">([^<]*)<\/tg-emoji>/g)].map((m) => m[1]);
     expect(inner).toHaveLength(cellCount); // one cell per uploaded sticker
-    expect(inner.every((t) => t === dot)).toBe(true); // every cell's inner text is the lone dot
+    const expected = [color, ...Array.from({ length: cellCount - 1 }, () => '▫️')];
+    expect(inner).toEqual(expected); // cell0 colored, the rest neutral
     // No cell wraps plain letters (which Telegram would reject).
     expect(p.html).not.toMatch(/<tg-emoji emoji-id="\d+">[^<]*[A-Za-z][^<]*<\/tg-emoji>/);
   }

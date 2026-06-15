@@ -90,23 +90,26 @@ export function buildPrefix(opts: {
     const resolved = resolveTag(tag);
     const sep = plain.length > 0 ? ' ' : '';
     if (resolved.known && hasRealPillIds(resolved.word)) {
-      // Real pill ids: render each cell as <tg-emoji emoji-id>🔵</tg-emoji>, one
+      // Real pill ids: render each cell as <tg-emoji emoji-id>DOT</tg-emoji>, one
       // per uploaded cell. Telegram REQUIRES the inner (fallback) text of a
       // custom_emoji entity to be exactly one emoji — wrapping a slice of the
-      // word ("SWER") is rejected with ENTITY_TEXT_INVALID — so every cell's
-      // inner text is the canonical DOT (a single emoji). Premium clients render
-      // the N pill images edge-to-edge into the wordmark chip (which already
-      // SPELLS the word — "ANSWER" etc. is baked into the sticker art), so the
-      // HTML header carries ONLY the pill cells — NO appended plain word.
-      // (CTO 2026-06-14: the first line is the --title text only; the tag is just
-      // the pill badge. A second plain "ANSWER" word next to the pill duplicated
-      // the label and clashed with the styled title, so it was removed.)
-      // Non-premium clients fall back to the per-cell DOT emoji ("🔵🔵🔵") — an
-      // accepted, intentional trade for a clean premium first line. The plain
-      // form keeps the readable unicode fallback ("🔵 ANSWER") for the non-HTML /
+      // word ("SWER") is rejected with ENTITY_TEXT_INVALID — and that inner text
+      // MUST equal the cell's Telegram-side alt (emoji_list) or Telegram drops
+      // the entity. So each cell wraps ITS OWN per-cell dot (resolved.cellDots):
+      // cell 0 = the tag's colored dot, cells 1..n-1 = the neutral square. A push
+      // notification (rendered by the OS, which can't load the pill image) then
+      // shows ONE colored dot + neutrals (e.g. `🔵▫️▫️`) — the color identifies
+      // the tag, the rest stay quiet — instead of N loud identical color dots.
+      // (CTO 2026-06-15.) Premium clients render the N pill images edge-to-edge
+      // into the wordmark chip (which already SPELLS the word — baked into the
+      // sticker art), so the HTML header carries ONLY the pill cells — NO appended
+      // plain word (CTO 2026-06-14: first line = --title only). The plain form
+      // keeps the readable unicode fallback ("🔵 ANSWER") for the non-HTML /
       // >4096 split path, which is the only readable form there.
       const ids = TAG_PILL_IDS[resolved.word];
-      const cells = ids.map((id) => `<tg-emoji emoji-id="${id}">${escapeHtml(resolved.dot)}</tg-emoji>`).join('');
+      const cells = ids
+        .map((id, i) => `<tg-emoji emoji-id="${id}">${escapeHtml(resolved.cellDots[i] ?? resolved.dot)}</tg-emoji>`)
+        .join('');
       html += `${sep}${cells}`;
       plain += `${sep}${resolved.fallback}`;
       forceHtml = true; // a custom-emoji pill only renders in HTML mode

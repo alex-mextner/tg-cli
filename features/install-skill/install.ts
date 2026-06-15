@@ -79,6 +79,12 @@ Canonical tags (Russian; case-insensitive; English aliases map to them):
 An unknown tag is not fatal: it soft-renders as a plain \`[TAG]\` badge and a
 stderr note, so a typo never blocks a send.
 
+In a PUSH NOTIFICATION (rendered by the OS, which can't load the pill image) the
+badge shows as \`<color>▫️▫️\` — ONE colored dot identifies the tag
+(🔵 answer / 🟠 decision / 🔴 problem / 🟢 report), the rest are neutral squares.
+The tag word is not in the badge (any text after the dots is your \`--title\`/body).
+In-app, premium clients still see the full wordmark pill.
+
 ## Threaded replies (\`--reply-to <message_id>\`)
 To answer a SPECIFIC inbound message and have your reply thread under it in
 Telegram, pass its message_id: \`tg --reply-to <id> "answer"\` (sets
