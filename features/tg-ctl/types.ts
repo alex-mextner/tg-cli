@@ -27,7 +27,7 @@ export const DEFAULT_CONTROL: ControlConfig = {
   // it to `tg --reply-to <id>` to thread its answer under this exact message.
   // When no id is available (a /agent route, a media item) `{id}` collapses with
   // its leading space (see wrapInbound), so the wrap stays `[TG from {name}] …`.
-  injectWrap: '[TG from {name} {id}] {msg} — reply via tg',
+  injectWrap: '[TG from {name} {id}] {msg}',
   stalenessSec: 300,
   idleExitMin: 30,
   allowedSenders: [],

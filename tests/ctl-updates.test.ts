@@ -183,7 +183,7 @@ test('the default injectWrap template renders the inbound id as #<id>', () => {
       .replace('{msg}', msg)
       .replace('{id}', messageId !== undefined ? `#${messageId}` : '');
   const r2 = stepUpdates([upd(77, { text: 'hi' })], { ...makeOpts(), wrap: realWrap });
-  expect(r2.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #77] hi — reply via tg' });
+  expect(r2.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #77] hi' });
   // r is just exercising the default path doesn't throw.
   expect(r.actions.length).toBeGreaterThan(0);
 });
