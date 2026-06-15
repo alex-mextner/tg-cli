@@ -1,5 +1,6 @@
 .env
-.claude/
+.claude/*
+!.claude/settings.json
 .worktrees/
 __pycache__/
 *.pyc
