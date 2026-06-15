@@ -45,10 +45,11 @@ Push reports and files to Telegram; the user can reply back (tmux).
 \`\`\`
 tg "text message"
 tg --format html "<b>Title</b>\\nbody"
+tg --format html "<h2>Heading</h2><table><tr><td>a</td><td>b</td></tr></table>"  # native rich table
 tg --file report.pdf "caption"
 tg --photo image.png "caption"
 tg --reply-to 1234 --tag ОТВЕТ "answer that threads under message 1234"
-printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
+printf 'task\\tstatus\\nship\\tdone' | tg --table   # plain monospace <pre> fallback
 tg --format-help                                    # what formatting is supported
 \`\`\`
 
@@ -96,21 +97,39 @@ The **ANSWER / ОТВЕТ** tag REQUIRES \`--reply-to\` (answering means answeri
 specific message); without it \`tg\` errors with a clear message. The other tags
 do not require it.
 
-## Tables (\`tg --table\`)
-Telegram has NO native HTML tables — a padded \`<pre>\` monospace block is the
-only way to align columns. \`tg --table\` reads delimited rows from STDIN (TSV, or
-\`a | b\` per line), auto-sizes columns, box-draws borders, HTML-escapes cells,
-and sends the result. Composes with \`--tag\`/\`--title\`; argv text becomes a
-heading above the table. Keep cells ASCII/Cyrillic — double-width emoji/CJK push
-columns out of alignment (\`tg\` warns when it sees them).
+## Rich messages — tables, headings, lists, formulas (\`--format html\`, auto-routed)
+\`--format html\` has TWO tiers, chosen AUTOMATICALLY by the tags in your body —
+ONE flag, no \`--rich\`:
+- **Basic** tags only (b/i/u/s/code/pre/a/blockquote/tg-emoji/tg-time/spoiler) →
+  normal message (\`sendMessage\`).
+- Any **rich** tag → a native Telegram **Rich Message** (\`sendRichMessage\`):
+  real bordered tables (\`<table>\`/\`<tr>\`/\`<td>\`, \`align\`/\`colspan\`/\`<caption>\`),
+  headings (\`<h1>\`..\`<h6>\`), lists (\`<ul>\`/\`<ol>\`/\`<li>\`), dividers (\`<hr>\`),
+  collapsible \`<details>\`, and LaTeX formulas (\`<tg-math>\` inline / \`<tg-math-block>\`).
+\`\`\`
+tg --format html '<table bordered><tr><th>task</th><th>status</th></tr><tr><td>ship</td><td align="center">done</td></tr></table>'
+tg --format html '<h2>Plan</h2><ul><li>step one</li><li>step two</li></ul><tg-math-block>E = mc^2</tg-math-block>'
+\`\`\`
+\`--tag\`/\`--title\`/\`--reply-to\` compose with rich. Rich limits: ≤ 32768 chars,
+≤ 500 blocks, ≤ 16 nesting levels, ≤ 50 media, ≤ 20 table columns (\`tg\` errors
+clearly if you exceed them).
+
+## Plain table fallback (\`tg --table\`)
+For a quick aligned grid WITHOUT authoring HTML, \`tg --table\` reads delimited rows
+from STDIN (TSV, or \`a | b\` per line), auto-sizes columns, box-draws borders,
+HTML-escapes cells, and sends a monospace \`<pre>\` block — the plain fallback. A
+REAL bordered table comes from \`--format html\` with \`<table>\` (above). Composes
+with \`--tag\`/\`--title\`; argv text becomes a heading above the table. Keep cells
+ASCII/Cyrillic — double-width emoji/CJK push columns out of alignment.
 \`\`\`
 printf 'task\\tstatus\\nship\\tdone\\nreview\\twip' | tg --table
 \`\`\`
 
 ## Formatting reference (\`tg --format-help\`)
-\`tg --format-help\` prints exactly which HTML tags and entities Telegram supports
-(and which it does NOT — no \`<table>\`, no \`<br>\`), the \`<pre>\` table pattern, and
-the \`--tag\`/\`--title\` badge. Run it instead of guessing at markup.
+\`tg --format-help\` prints the supported HTML tags and entities — the BASIC tier
+plus the RICH tier (tables, headings, lists, formulas) auto-sent through the same
+\`--format html\` — with a \`<table>\` example and the rich limits. Run it instead of
+guessing at markup.
 
 ## Code/config files → mobile PDF (\`--with-original\` / \`--no-pdf\`)
 Attaching a code/config file (\`.ts\`, \`.tsx\`, \`.json\`, \`.yaml\`, \`.toml\`, \`.py\`,
@@ -154,9 +173,11 @@ const SKILL_BLURB =
   '`--title "..."` (the body is never pulled up). ' +
   'Reply UNDER a specific inbound message with `--reply-to <message_id>` (the id ' +
   'shows up in the injected `[TG from … #<id>]` wrap); the ANSWER/ОТВЕТ tag ' +
-  'requires it. Render an aligned monospace `<pre>` table from STDIN rows with ' +
-  '`tg --table` (Telegram has no real tables). `tg --format-help` lists every ' +
-  'supported HTML tag/entity. ' +
+  'requires it. `--format html` auto-sends a native Rich Message (tables, ' +
+  'headings, lists, LaTeX formulas) when the body has a rich tag like `<table>`/' +
+  '`<h1>`/`<ul>` — same flag, tg routes by content. `tg --table` is the plain ' +
+  'monospace `<pre>` fallback grid. `tg --format-help` lists every supported ' +
+  'HTML tag/entity (basic + rich tiers). ' +
   'Attaching a code/config file (.ts/.json/.yaml/.py/…) renders a mobile, ' +
   'syntax-highlighted PDF and by DEFAULT sends ONLY the PDF (raw file is useless ' +
   'on iOS); `--with-original` sends both, `--no-pdf` sends the raw file. ' +

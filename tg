@@ -120,9 +120,10 @@ Options:
                        answering a SPECIFIC message.
   --table              read delimited rows from STDIN (TSV, or "a | b" per line),
                        render an aligned monospace table wrapped in <pre>, and
-                       send it. Telegram has no native HTML tables; a padded
-                       <pre> is the only way. Composes with --tag/--title; any
-                       argv text becomes a heading above the table. Keep cells
+                       send it. The plain FALLBACK grid; a REAL native bordered
+                       table comes from --format html with <table> (auto-sent
+                       as a Rich Message). Composes with --tag/--title; any argv
+                       text becomes a heading above the table. Keep cells
                        ASCII/Cyrillic (double-width emoji/CJK misalign columns).
   --format-help        print the Telegram message-formatting reference (which
                        HTML tags / entities are supported) and exit.

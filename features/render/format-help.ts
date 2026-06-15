@@ -1,18 +1,30 @@
 // --- Formatting reference (`tg --format-help`) ---
 //
 // A concise, copy-pasteable reference for what Telegram message formatting
-// ACTUALLY supports, so agents stop guessing. Grounded in the June 2026 Bot API:
-// a fixed HTML-tag allowlist, only four HTML entities, NO <table>, NO <br>.
+// ACTUALLY supports, so agents stop guessing. Grounded in the June 2026 Bot API
+// (10.1, which added Rich Messages): `--format html` has TWO tiers, chosen
+// automatically by what tags the body contains —
+//   1. BASIC: only the small inline allowlist (b/i/u/s/code/pre/a/blockquote/
+//      tg-emoji/tg-time/spoiler) → sent via sendMessage (parse_mode=HTML).
+//   2. RICH: the body includes a rich-only tag (<table>, <h1>..<h6>, lists,
+//      <hr>, <details>, LaTeX formulas, media) → the SAME `--format html`
+//      auto-sends a native Rich Message (sendRichMessage) with real bordered
+//      tables, headings, lists and rendered formulas.
+// ONE flag (`--format html`); tg routes by content. No --rich flag exists.
 //
 // Pure: FORMAT_HELP is a constant string; formatHelp() returns it so the
 // entrypoint stays symmetric with the other --*-help / info actions.
 
-export const FORMAT_HELP = `tg / Telegram message formatting (Bot API, June 2026)
+export const FORMAT_HELP = `tg / Telegram message formatting (Bot API 10.1, June 2026)
 
-Send HTML with --format html. Only this tag allowlist is supported; everything
-else is stripped or rejected by Telegram.
+Send HTML with --format html. tg picks the send method AUTOMATICALLY from the
+tags you use — there is ONE flag, no --rich:
 
-Supported HTML tags (with examples):
+  • BASIC tags only  → normal message (sendMessage, parse_mode=HTML).
+  • Any RICH tag      → native Rich Message (sendRichMessage): real bordered
+    tables, headings, lists, dividers, collapsible details, LaTeX formulas.
+
+BASIC tags (inline; these alone keep the normal send path):
   <b>bold</b>            / <strong>bold</strong>
   <i>italic</i>          / <em>italic</em>
   <u>underline</u>       / <ins>underline</ins>
@@ -24,32 +36,56 @@ Supported HTML tags (with examples):
   <blockquote>quoted</blockquote>
   <blockquote expandable>long quote, collapsed by default</blockquote>
   <span class="tg-spoiler">hidden</span>  / <tg-spoiler>hidden</tg-spoiler>
-  <tg-emoji emoji-id="5368324170671202286">👍</tg-emoji>   (premium custom emoji)
+  <tg-emoji emoji-id="5368324170671202286">👍</tg-emoji>   (premium custom emoji;
+    must wrap EXACTLY ONE emoji or Telegram rejects the message)
 
-HTML entities — ONLY these four are recognized. Escape raw chars in your text:
-  &lt;  for <      &gt;  for >      &amp;  for &      &quot;  for "
-There are NO other named entities (&nbsp;, &copy;, … are sent literally).
+RICH tags (any ONE of these auto-routes the SAME --format html to a Rich Message):
+  <h1>Heading</h1> … <h6>…</h6>     headings
+  <p>paragraph</p>  <hr/>           paragraphs, dividers
+  <ul><li>item</li></ul>            unordered / ordered lists
+  <ol><li>item</li></ol>
+  <table> … </table>                NATIVE bordered tables (see example below)
+  <details><summary>t</summary>…</details>   collapsible block
+  <footer>…</footer>  <aside>pull quote</aside>
+  <mark>…</mark>  <sub>x</sub>  <sup>2</sup>
+  <tg-math>x^2 + y^2</tg-math>      inline LaTeX formula
+  <tg-math-block>E = mc^2</tg-math-block>   block LaTeX formula
+  <img src="https://…"/> <video …> <audio …>   media blocks (HTTP/HTTPS only)
 
-NOT supported (common mistakes):
-  <table>, <tr>, <td>   — Telegram has NO tables. Use a monospace <pre> instead:
-                          run \`tg --table\` (reads TSV / \`a | b\` rows from stdin,
-                          auto-sizes columns, box-draws borders, wraps in <pre>).
-  <br>                  — line breaks are real newlines (\\n), not a tag.
-  <h1>…<h6>, <ul>/<li>, <p>, <div>, style/color attributes — all unsupported.
-  <tg-emoji> must wrap EXACTLY ONE emoji as its inner text, or Telegram rejects
-  the whole message (ENTITY_TEXT_INVALID).
+Native table example (auto-sends a Rich Message):
+  tg --format html '<table bordered striped>
+  <tr><th>task</th><th>status</th></tr>
+  <tr><td>ship</td><td align="center">done</td></tr>
+  </table>'
+  Cell align: align="left|center|right", valign="top|middle|bottom";
+  colspan / rowspan supported; <caption> for a table title.
 
-The <pre> "table" pattern:
-  Wrap a padEnd-aligned, box-drawn monospace block in <pre>. \`tg --table\` does
-  this for you — pipe rows in:
+HTML entities (tier-specific) — all NUMERIC entities work in both tiers. Named:
+  BASIC send:  only &lt; < · &gt; > · &amp; & · &quot; "  (no others — a
+               &nbsp; / &hellip; / &mdash; in a basic message is sent literally).
+  RICH send:   the four above PLUS &apos; ' · &nbsp; · &hellip; · &mdash;
+               &ndash; · &lsquo; · &rsquo; · &ldquo; · &rdquo;.
+  Escape raw < > & in your text either way.
+
+Rich Message limits (sendRichMessage):
+  ≤ 32768 chars · ≤ 500 blocks (incl. list items / table rows / nested) ·
+  ≤ 16 nesting levels · ≤ 50 media attachments · ≤ 20 table columns.
+  tg pre-flights these and errors clearly before sending if you exceed them.
+
+Plain fallback table (--table):
+  \`tg --table\` renders a padEnd-aligned, box-drawn MONOSPACE table wrapped in
+  <pre> — the plain fallback when you want a quick aligned grid without authoring
+  HTML. A REAL bordered table comes from --format html with <table>.
     printf 'task\\tstatus\\nship\\tdone\\nreview\\twip' | tg --table
 
-Header badge (--tag / --title):
-  --title "<text>"   explicit headline on the \`✳️ [window]\` line.
+Header badge (--tag / --title), composes with BOTH basic and rich sends:
+  --title "<text>"   explicit headline on the \`✳️ [window]\` line (renders as the
+                     header line above a rich body too).
   --tag <TAG>        a labeling pill: ANSWER/DECISION/PROBLEM/REPORT
                      (aliases ОТВЕТ/РЕШЕНИЕ/ПРОБЛЕМА/ОТЧЁТ). Composes with --title.
   --reply-to <id>    thread the message under an inbound Telegram message
-                     (sets reply_to_message_id). ANSWER tag REQUIRES this.
+                     (sendMessage: reply_to_message_id; sendRichMessage:
+                     reply_parameters). ANSWER tag REQUIRES this.
 `;
 
 export function formatHelp(): string {

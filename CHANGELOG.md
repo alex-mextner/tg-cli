@@ -3,6 +3,37 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.10.0
+
+Native Telegram **Rich Messages** (tables, headings, lists, LaTeX formulas),
+folded into the EXISTING `--format html` path — no new flag, no new `--format`
+value.
+
+- **Rich messages via `--format html` (auto-routed).** Bot API 10.1 (June 2026)
+  added `sendRichMessage`, which renders a much larger HTML tag set than the
+  basic `parse_mode=HTML` path: native bordered tables (`<table>`/`<tr>`/`<td>`
+  with `align`/`valign`/`colspan`/`rowspan`/`<caption>`), headings (`<h1>`..
+  `<h6>`), lists (`<ul>`/`<ol>`/`<li>`), dividers (`<hr>`), paragraphs (`<p>`),
+  collapsible `<details>`, pull quotes (`<aside>`), footers, and LaTeX formulas
+  (`<tg-math>` inline / `<tg-math-block>` block). `tg` now decides by CONTENT:
+  HTML using only the basic inline tags (b/i/u/s/code/pre/a/blockquote/tg-emoji/
+  tg-time/spoiler) sends as before (`sendMessage`); HTML containing any rich-only
+  tag auto-sends a Rich Message (`sendRichMessage` with `rich_message.html`).
+  ONE flag (`--format html`); the tool routes on what's inside.
+- A rich body is sent **whole** — never 4096-split (splitting a `<table>` would
+  corrupt it; rich has a 32768-char budget) and never used as a media caption.
+- `--tag` / `--title` / `--reply-to` compose with rich messages: the branded
+  header line (custom-emoji tag pill + styled title — all basic tags valid inside
+  a rich body) sits above the rich content; threading uses `reply_parameters`
+  (sendRichMessage has no `reply_to_message_id` field).
+- **Rich limits pre-flighted locally** (≤ 32768 chars, ≤ 500 blocks, ≤ 16
+  nesting levels, ≤ 50 media, ≤ 20 table columns) so an oversize body fails with
+  a clear `tg:` error instead of an opaque API 400.
+- **`tg --format-help` corrected.** It no longer claims "Telegram has NO tables".
+  It now documents the BASIC vs RICH tiers, the rich tag set, a `<table>`
+  example, and the rich limits. The monospace `tg --table` (`<pre>`) stays as the
+  plain fallback grid.
+
 ## 1.9.7
 
 Tag-badge notification clarity.

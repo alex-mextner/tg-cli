@@ -22,20 +22,41 @@ test('lists the supported HTML tags with examples', () => {
   }
 });
 
-test('documents the four HTML entities and that no others exist', () => {
+test('documents the recognized HTML entities tier-specifically', () => {
+  // Basic send: only the four. Rich send: the expanded set. The help must make
+  // the distinction (basic does NOT accept &nbsp; etc.).
   expect(FORMAT_HELP).toContain('&lt;');
   expect(FORMAT_HELP).toContain('&gt;');
   expect(FORMAT_HELP).toContain('&amp;');
   expect(FORMAT_HELP).toContain('&quot;');
+  expect(FORMAT_HELP).toMatch(/BASIC/);
+  expect(FORMAT_HELP).toContain('&nbsp;');
 });
 
-test('states what is NOT supported: tables and <br>', () => {
-  expect(FORMAT_HELP).toContain('<table>');
-  expect(FORMAT_HELP).toContain('<br>');
-  expect(FORMAT_HELP).toMatch(/NO tables|no native HTML tables|has NO tables/i);
+test('documents native tables via rich --format html (NOT "no tables")', () => {
+  // Bot API 10.1 added Rich Messages: <table> in --format html IS supported and
+  // auto-routes to a native bordered table. The old "Telegram has NO tables"
+  // claim must be gone.
+  expect(FORMAT_HELP).toContain('<table');
+  expect(FORMAT_HELP).not.toMatch(/NO tables|no native HTML tables|has NO tables/i);
+  expect(FORMAT_HELP).toMatch(/Rich Message|rich message/);
 });
 
-test('points at the <pre> table pattern and --table', () => {
+test('explains that --format html auto-routes rich tags to a Rich Message', () => {
+  expect(FORMAT_HELP).toMatch(/sendRichMessage/);
+  // A rich tag set is listed: headings + lists + formulas.
+  expect(FORMAT_HELP).toContain('<h1>');
+  expect(FORMAT_HELP).toContain('<ul>');
+  expect(FORMAT_HELP).toMatch(/tg-math/);
+});
+
+test('documents the rich-message limits', () => {
+  expect(FORMAT_HELP).toContain('32768');
+  expect(FORMAT_HELP).toMatch(/500 blocks/);
+  expect(FORMAT_HELP).toMatch(/20 table columns/);
+});
+
+test('keeps the <pre> monospace --table fallback', () => {
   expect(FORMAT_HELP).toContain('<pre>');
   expect(FORMAT_HELP).toContain('--table');
 });
