@@ -161,6 +161,9 @@ reply keeps the quote anchor and reaches the replied-to origin pane).
 - Config lives in the \`voice:\` block of \`~/.config/tg-cli/config.yaml\`
   (\`enabled\`, \`runner\`, \`bin_path\`, \`model_path\`, \`language\` — default
   \`auto\`, covering ru + en).
+- Inbound media downloads (voice / photo / doc) retry with backoff on a
+  transient network blip (3 attempts, jittered ~300ms→2.7s) before giving up,
+  so a momentary hiccup no longer silently drops the message.
 
 Always use \`tg\`, never direct curl to the Telegram API. tmux only.
 `;

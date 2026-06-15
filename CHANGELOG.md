@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.10.1
+
+Inbound media downloads no longer drop a message on a transient network blip.
+
+- **Retry-with-backoff on inbound media download (`tg-ctl`).** The control
+  daemon's `downloadFileToCache` did a single `getFile` fetch and a single
+  file-bytes fetch; ANY transient failure on either — a dropped connection, a
+  5xx, a timeout — logged "media download failed", returned null, and (because
+  the poll offset was already persisted) silently lost the inbound voice note /
+  photo / doc forever. Both network steps now run under a bounded
+  retry-with-backoff (`features/tg-ctl/retry.ts`): 3 attempts with jittered
+  exponential backoff (~300ms → 900ms → 2.7s), retrying on a thrown network
+  error / abort / timeout or a non-2xx HTTP response. A permanent Telegram-level
+  error (HTTP 200 with `{ok:false}`) is left alone, not retried. The success
+  path and the caller contract are unchanged — it still returns the cached path
+  or null — and each retry plus the final give-up is logged with the step name
+  and attempt count.
+
 ## 1.10.0
 
 Native Telegram **Rich Messages** (tables, headings, lists, LaTeX formulas),

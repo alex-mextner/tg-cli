@@ -36,6 +36,7 @@ import {
 } from "./features/tg-ctl/questions"
 import { claudeHooksInstalled, withClaudeHooks } from "./features/tg-ctl/hook-install"
 import { normalizeHookPayload, type HookEnv } from "./features/tg-ctl/hook-normalize"
+import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import { aggregateUsage, orderByLruMru, parseRoutes, recognizeRoute, routeMatchesPane } from "./features/tg-ctl/routes"
 import { stepUpdates } from "./features/tg-ctl/updates"
 import {
@@ -1244,10 +1245,25 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // poll loop persists the offset BEFORE acting, an uncaught throw loses the note
   // permanently with no reply. Catch → "media download failed" → null.
   const downloadFileToCache = async (fileId: string, suggestedName: string): Promise<string | null> => {
+    // Log each retry of a network step with its label, the file id, and the
+    // attempt count — shared by both steps so the message format stays in sync.
+    const retryLog = (step: string) => (i: RetryInfo) =>
+      log(`${step} retry ${i.attempt}/${i.maxAttempts} for ${fileId} in ${i.delayMs}ms`)
     try {
-      const fileResp = await fetch(`${api(ctx)}/getFile?file_id=${encodeURIComponent(fileId)}`, {
-        signal: AbortSignal.timeout(30_000),
-      })
+      // BOTH network steps run under bounded retry-with-backoff (default 3
+      // attempts, ~300ms→900ms→2.7s jittered) so a single transient blip —
+      // dropped connection, 5xx, timeout — no longer silently loses the inbound
+      // note. Worst case wall time per step ≈ maxAttempts·timeout + backoffs
+      // (getFile ~30s/try, file bytes ~120s/try). retryFetch only retries a
+      // thrown error / non-2xx HTTP; a 200-with-{ok:false} getFile body is a
+      // PERMANENT Telegram error (e.g. file gone) and is handled below, not
+      // retried — same for a final non-2xx from either step, which is returned
+      // for the local `!resp.ok` checks rather than thrown.
+      const getFile = () =>
+        fetch(`${api(ctx)}/getFile?file_id=${encodeURIComponent(fileId)}`, {
+          signal: AbortSignal.timeout(30_000),
+        })
+      const fileResp = await retryFetch(getFile, { onRetry: retryLog("getFile") })
       const fileJson = (await fileResp.json()) as { ok: boolean; result?: { file_path?: string } }
       const remotePath = fileJson.ok ? fileJson.result?.file_path : undefined
       if (!remotePath) {
@@ -1255,11 +1271,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         await sendMessage(ctx, "media download failed")
         return null
       }
-      const dataResp = await fetch(`${ctx.apiBase}/file/bot${ctx.token}/${remotePath}`, {
-        signal: AbortSignal.timeout(120_000),
-      })
+      const fetchBytes = () =>
+        fetch(`${ctx.apiBase}/file/bot${ctx.token}/${remotePath}`, {
+          signal: AbortSignal.timeout(120_000),
+        })
+      const dataResp = await retryFetch(fetchBytes, { onRetry: retryLog("file download") })
       if (!dataResp.ok) {
-        log(`file download failed: HTTP ${dataResp.status}`)
+        log(`file download failed: HTTP ${dataResp.status} for ${fileId} after retries`)
         await sendMessage(ctx, "media download failed")
         return null
       }
