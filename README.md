@@ -162,6 +162,47 @@ control:
 
 > **One bot token per machine.** Telegram allows a single `getUpdates` consumer per token. Outbound `tg` is unaffected.
 
+### Recalling messages (`tg replies`, v1.11.0)
+
+`tg replies` lets an agent (or you) quickly recall what was sent over Telegram —
+with timestamps and `#message-ids` — without scrolling the pane.
+
+```
+tg replies [user|agent|all] [list | find <query>] [flags]
+```
+
+By default it shows the messages **you** sent in **this tmux session**, oldest
+first:
+
+```
+$ tg replies
+[2026-06-15 10:42] #4821 deploy the canary and watch error rates
+[2026-06-15 10:58] #4827 roll it back, latency spiked
+```
+
+- **Direction** (1st positional, default `user`): `user` (what you sent),
+  `agent` (what the agent sent via `tg`), or `all` (both, prefixed `←` you /
+  `→` agent).
+- **Action** (2nd positional, default `list`): `list`, or `find <query>` for a
+  case-insensitive substring search (`--regex` for a regular expression).
+- **Scope** defaults to the current pane's session; `--all-sessions` searches
+  everywhere, `--session <paneId>` targets one pane.
+- `-n/--limit N` (default 20), `--full` (no truncation), `--json` (a
+  machine-readable array: `ts` ms, `id`, `direction`, `from`, `text`, `pane`),
+  `--help`.
+
+```
+tg replies all                  # the full back-and-forth in this session
+tg replies user find deploy     # your messages mentioning "deploy"
+tg replies agent --all-sessions # everything the agent has sent, anywhere
+tg replies --json -n 5          # the last 5, as JSON
+```
+
+History is an append-only `~/.config/tg-cli/tg-ctl.<botid>.history.jsonl` (one
+JSON object per line, trimmed to the last ~5000 messages). The `tg-ctl` daemon
+records inbound messages; `tg` records its own outbound. Both writers are
+best-effort and never block a send or an inject.
+
 ---
 
 ## Agent branding

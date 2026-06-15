@@ -38,6 +38,8 @@ import { claudeHooksInstalled, withClaudeHooks } from "./features/tg-ctl/hook-in
 import { normalizeHookPayload, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import { aggregateUsage, orderByLruMru, parseRoutes, recognizeRoute, routeMatchesPane } from "./features/tg-ctl/routes"
+import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
+import { inboundHistoryRecords } from "./features/replies/inbound"
 import { stepUpdates } from "./features/tg-ctl/updates"
 import {
   buildFasterWhisperArgv,
@@ -66,6 +68,7 @@ import type {
   ProcInfo,
   Registration,
   TargetPane,
+  TgMessage,
   TgUpdate,
 } from "./features/tg-ctl/types"
 
@@ -177,6 +180,21 @@ function readFileOrNull(path: string): string | null {
     return readFileSync(path, "utf8")
   } catch {
     return null
+  }
+}
+
+// Append history records to the JSONL log, trimmed to the bound. BEST-EFFORT:
+// the recall log is purely informational (like routes), so a read/write error
+// must never break the inbound inject path. Shared by the poll loop's inbound
+// writer; the `tg` entrypoint has the mirror for outbound.
+function appendHistory(path: string, records: HistoryRecord[]): void {
+  if (records.length === 0) return
+  try {
+    // 0o600: the log is a conversation transcript — owner-only, like the socket.
+    writeFileSync(path, appendRecordsToBlob(readFileOrNull(path), records), { mode: 0o600 })
+    chmodSync(path, 0o600) // enforce on a pre-existing, looser-perm file too
+  } catch {
+    // best-effort: never let history bookkeeping break an inject
   }
 }
 
@@ -1577,6 +1595,54 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (step.skippedStale > 0) {
         await sendMessage(ctx, `skipped ${step.skippedStale} stale messages`)
       }
+
+      // Persist inbound history for `tg replies` recall — every message the CTO
+      // sent in this batch. Best-effort, off the inject path: a read/write error
+      // here never blocks delivery. Stale + rejected senders are filtered the
+      // same way stepUpdates does (inboundHistoryRecords). Only when the batch
+      // carried messages — an empty 50s long-poll skips the walk.
+      //
+      // Pane stamping must match where the message ACTUALLY routes, else a reply
+      // (which routes to its recognized ORIGIN pane, not the default target) would
+      // be logged under the wrong pane and vanish from that pane's scoped recall.
+      // `resolvePane` mirrors handleReplyRoute's recognition: a reply whose
+      // replied-to id is in the routes map AND still maps to a live same-project
+      // agent pane is stamped with that pane; everything else uses the default
+      // discovered target.
+      if (json.result.length > 0) {
+        const found = discover()
+        const targetPane = found.ok ? found.target.pane.paneId : null
+        const histRoutes = parseRoutes(readFileOrNull(ctx.paths.routes))
+        const resolvePane = (m: TgMessage): string | null => {
+          const replyId = m.reply_to_message?.message_id
+          if (replyId === undefined) return null
+          // ONLY the kinds that actually reply-route (updates.ts): a text reply
+          // whose body is NOT a /command, or a voice/audio reply. A photo/document
+          // reply becomes download-media and injects into the DEFAULT target, so
+          // origin-stamping it would disagree with delivery — leave it default.
+          const isRoutedReply =
+            (m.text !== undefined && !m.text.startsWith("/")) || m.voice !== undefined || m.audio !== undefined
+          if (!isRoutedReply) return null
+          const recognized = recognizeRoute(histRoutes, replyId)
+          if (!recognized) return null
+          const { panes, procs } = snapshot()
+          const pane = panes.find((p) => p.paneId === recognized.paneId)
+          const sameProject = routeMatchesPane({ recognizedCwd: recognized.cwd, panePath: pane?.panePath })
+          return pane && sameProject && findAgentInPane(pane, procs) ? recognized.paneId : null
+        }
+        appendHistory(
+          ctx.paths.history,
+          inboundHistoryRecords(json.result, {
+            chatId: ctx.chatId,
+            allowedSenders: ctx.cfg.allowedSenders,
+            pane: targetPane,
+            nowSec: Math.floor(Date.now() / 1000),
+            stalenessSec: ctx.cfg.stalenessSec,
+            resolvePane,
+          }),
+        )
+      }
+
       for (const action of step.actions) {
         lastActionOk = await executeAction(action)
       }

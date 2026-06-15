@@ -3,6 +3,35 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.11.0
+
+`tg replies` — recall what was sent over Telegram, so an agent can quickly
+remember what the user asked without scrolling its own pane.
+
+- **New subcommand `tg replies [user|agent|all] [list | find <query>]`.**
+  - Direction (1st positional, default `user`): `user` = inbound messages the
+    user sent, `agent` = outbound messages the agent sent via `tg`, `all` = both
+    (prefixed `←` user / `→` agent).
+  - Action (2nd positional, default `list`): `list` shows recent messages
+    oldest→newest; `find <query>` is a case-insensitive substring search
+    (`--regex` for a regular expression).
+  - Line format: `[YYYY-MM-DD HH:MM] #<id> <text>` (local time, Telegram
+    message id). Long text truncates to ~200 chars unless `--full`.
+  - **Default scope = the current tmux session/pane.** The pane is detected from
+    `$TMUX_PANE`; `--all-sessions` drops the scope, `--session <paneId>` targets
+    a specific pane. `-n/--limit N` (default 20), `--json` (machine-readable
+    array: ts ms, id, direction, from, text, pane), and `--help` round it out.
+- **Append-only history log.** A new `tg-ctl.<botid>.history.jsonl` (next to the
+  daemon's `routes` map, under `~/.config/tg-cli`) records one JSON object per
+  line: `{ts, message_id, direction, from, text, pane}`. The `tg-ctl` daemon
+  writes inbound messages (stamped with the routed pane); `tg` writes outbound
+  messages (stamped with `$TMUX_PANE`). Both writers are best-effort — a corrupt
+  or unwritable log never breaks a send or an inject — and the file is trimmed to
+  its last ~5000 lines on write.
+- Pure logic (`features/replies/`: arg parsing, JSONL parse/append/trim,
+  direction + pane filters, substring/regex search, line + JSON formatters)
+  stays out of the effectful entrypoints, mirroring the `tg-ctl` module split.
+
 ## 1.10.1
 
 Inbound media downloads no longer drop a message on a transient network blip.

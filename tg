@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join, resolve } from "path"
 import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
@@ -36,6 +36,9 @@ import {
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { botIdFromToken, ctlPaths } from "./features/tg-ctl/lock"
 import { appendRoute, parseRoutes, resolveRouteCwd, serializeRoutes } from "./features/tg-ctl/routes"
+import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
+import { outboundHistoryText } from "./features/replies/outbound"
+import { runReplies } from "./features/replies/cli"
 import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
@@ -276,6 +279,47 @@ if (import.meta.main) {
       timeout: 60_000,
     })
     process.exit(result.exitCode ?? 1)
+  }
+
+  // `tg replies ...` — recall what was sent over Telegram (the CTO's "вспомнить
+  // что писал пользователь"). Reads the daemon's append-only history.jsonl,
+  // defaults to THIS tmux pane's session + inbound (user) messages. Exact-match
+  // leading token only, so `tg "replies ..."` as a plain message still sends.
+  // Returns null when argv is not a replies subcommand → fall through to send.
+  if (rawArgs[0] === "replies") {
+    // Resolve the bot id from the SAME config dir whose history we read, so an
+    // alternate TG_CTL_CONFIG_DIR can't mix a home-`.env` token with a different
+    // dir's history file. process.env still wins over the dir's `.env`.
+    const configDir = process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")
+    const repliesEnv = {
+      ...loadEnv(join(configDir, ".env")),
+      ...process.env,
+    }
+    const botToken = repliesEnv.TG_BOT_TOKEN ?? ""
+    const historyPath = ctlPaths(configDir, botIdFromToken(botToken)).history
+    const detectRepliesPane = (): string | null => {
+      const pane = process.env.TMUX_PANE
+      return pane && pane.length > 0 ? pane : null
+    }
+    const code = runReplies(rawArgs, {
+      readHistory: () => {
+        try {
+          return readFileSync(historyPath, "utf8")
+        } catch {
+          return null
+        }
+      },
+      detectPane: detectRepliesPane,
+      // Local time (Europe/Belgrade for the CTO) — matches the daemon's wrap.
+      fmtTime: (unixSec: number) => {
+        const d = new Date(unixSec * 1000)
+        const p = (n: number): string => String(n).padStart(2, "0")
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+      },
+      log: (m) => console.log(m),
+      errlog: (m) => console.error(m),
+    })
+    if (code !== null) process.exit(code)
   }
 
   // Resolve feature flags FIRST: pull --feature/--no-feature out of argv, load
@@ -814,7 +858,11 @@ if (import.meta.main) {
     }
     return null
   }
+  // The FIRST outbound message id of THIS send (a multi-chunk / media send is
+  // ONE logical message for recall — see recordOutboundHistory below).
+  let firstOutboundId: number | null = null
   const recordRoute = (messageId: number): void => {
+    if (firstOutboundId === null) firstOutboundId = messageId
     if (!ROUTES_PATH || !TMUX_PANE) return
     try {
       const existing = parseRoutes(existsSync(ROUTES_PATH) ? readFileSync(ROUTES_PATH, "utf8") : null)
@@ -827,6 +875,40 @@ if (import.meta.main) {
       writeFileSync(ROUTES_PATH, serializeRoutes(next))
     } catch {
       // best-effort: never let route bookkeeping break a send
+    }
+  }
+
+  // Append ONE `agent` history record for this send so `tg replies` can recall
+  // what the agent sent (mirror of the daemon's inbound writer). Best-effort:
+  // tmux-only, swallow-all — history bookkeeping must never break a send. The
+  // text is the message body (or a [photo]/[document] placeholder for a media-
+  // only send); `firstOutboundId` is the FIRST sent message id (null if no send
+  // reported one). Called AFTER transmit so the id is known.
+  const HISTORY_PATH = TMUX_PANE
+    ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).history
+    : null
+  const recordOutboundHistory = (body: string): void => {
+    if (!HISTORY_PATH || !TMUX_PANE) return
+    const text = outboundHistoryText(body, { photos: plan.photos.length, documents: plan.documents.length })
+    if (text === null) return
+    try {
+      const rec: HistoryRecord = {
+        ts: Math.floor(Date.now() / 1000),
+        message_id: firstOutboundId,
+        direction: "agent",
+        from: "agent",
+        text,
+        pane: TMUX_PANE,
+      }
+      // 0o600: the log is a conversation transcript — owner-only, like the daemon socket.
+      writeFileSync(
+        HISTORY_PATH,
+        appendRecordsToBlob(existsSync(HISTORY_PATH) ? readFileSync(HISTORY_PATH, "utf8") : null, [rec]),
+        { mode: 0o600 },
+      )
+      chmodSync(HISTORY_PATH, 0o600) // enforce on a pre-existing, looser-perm file too
+    } catch {
+      // best-effort: never let history bookkeeping break a send
     }
   }
 
@@ -1127,6 +1209,12 @@ if (import.meta.main) {
     replyToMessageId: replyTo,
   })
   await transmit(plan, transport)
+
+  // Outbound history for `tg replies` recall — one `agent` record per send,
+  // stamped with the first sent message id (now known). The body is the raw
+  // user-typed message (caption), so recall shows what the agent meant to say,
+  // not the branded envelope. Best-effort; never blocks the (already-sent) send.
+  recordOutboundHistory(caption)
 
   // Generated code→pdf / md→pdf artifacts are uploaded by now — drop their temp
   // dirs so repeated reports don't pile up in the OS tmp (codex review finding).
