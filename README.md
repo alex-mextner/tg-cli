@@ -183,9 +183,9 @@ control:
 <img src="emoji-icons/mini_ollama.png" width="16" height="16" align="top" alt="Ollama" /> <b>Ollama</b><br/>
 <img src="emoji-icons/mini_hyperide.png" width="16" height="16" align="top" alt="HyperIDE" /> <b>HyperIDE</b><br/>
 
-`opencode` is branded by the **model it runs** inside, falling back to a 📁 folder icon when the model can't be determined.
+Branding follows the **model**, not the harness: a harness that runs an identifiable model is branded with that model's icon (so an opencode or router session shows whichever model it's driving — DeepSeek, Kimi, etc.). When no model can be determined, branding falls back to a 📁 folder icon. This is why the table above is keyed by model, not by tool.
 
-**v1.5.1 fix:** a background `ollama` daemon no longer mislabels a Codex session — env-var signals from the agent take priority over `pgrep` fallbacks.
+**Detection precedence.** Explicit signals from the agent's environment (`TG_AI_MODEL`, then per-harness env vars) always take priority over `pgrep` process-tree fallbacks — so a stray background daemon (e.g. an `ollama` server running for unrelated reasons) can never shadow the real agent. Override anytime with `TG_AI_MODEL`.
 
 Override if needed:
 ```bash
@@ -226,7 +226,12 @@ See [docs/custom-emoji-system.md](docs/custom-emoji-system.md) for the full spec
 
 ## How tg compares
 
-Every other Telegram + AI-agent tool is a **remote terminal**: it mirrors the full session and you drive it from chat — the same shape as Claude Code's own first-party Remote Control (`/rc`). `tg` inverts that. The **agent curates** what is worth sending; it works for **any** agent in tmux (not just Claude); and inbound control is a thin, optional layer — not a full mirror.
+tg differs on three independent axes, which the tables below score separately:
+- **Direction** — outbound-first (the agent *curates* what's worth sending) vs. inbound-first (a chat-driven remote terminal mirroring the session). Most tools are the latter; tg is the former.
+- **Agent coverage** — any agent in tmux vs. Claude-only.
+- **Control depth** — a thin, optional inbound layer (poke-back) vs. a full session mirror.
+
+tg sits at outbound-first / any-agent / thin-inbound; the "remote terminal" tools cluster at inbound-first / Claude-only / full-mirror — but the axes are independent, which is why each column is scored on its own.
 
 ### Philosophy
 
