@@ -23,6 +23,9 @@ test('HTML caption: raw length > 1024 but VISIBLE <= 1024 still rides as caption
     sendMediaGroup: async () => {
       calls.push({ method: 'sendMediaGroup' });
     },
+    sendRich: async () => {
+      calls.push({ method: 'sendRich' });
+    },
   };
   // 1000 visible chars wrapped in a tag → raw length > 1024 but visible 1000.
   const text = '<b>' + 'x'.repeat(1000) + '</b>';
@@ -52,6 +55,9 @@ function fakeTransport() {
     },
     sendMediaGroup: async (kind, items, caption, format) => {
       calls.push({ method: 'sendMediaGroup', args: { kind, items, caption, format } });
+    },
+    sendRich: async (html) => {
+      calls.push({ method: 'sendRich', args: { html } });
     },
   };
   return { t, calls };
@@ -250,4 +256,80 @@ test('photos + text + documents: text rides photo caption (short), docs follow',
   expect(calls.map((c) => c.method)).toEqual(['sendPhoto', 'sendDocument']);
   expect(calls[0].args.caption).toBe('cap');
   expect(calls[1].args.caption).toBeUndefined();
+});
+
+// --- rich-message routing (Bot API sendRichMessage) ------------------------
+
+test('rich HTML body (table) routes to sendRich, NOT sendMessage', async () => {
+  const { t, calls } = fakeTransport();
+  const html = '<h1>Report</h1><table><tr><td>a</td></tr></table>';
+  await transmit(plan({ textMessages: [{ text: html, format: 'html' }] }), t);
+  expect(calls.length).toBe(1);
+  expect(calls[0].method).toBe('sendRich');
+  expect(calls[0].args.html).toBe(html);
+});
+
+test('basic HTML body (only <b>) routes to sendMessage, NOT sendRich', async () => {
+  const { t, calls } = fakeTransport();
+  const html = '<b>bold</b> plain report';
+  await transmit(plan({ textMessages: [{ text: html, format: 'html' }] }), t);
+  expect(calls.length).toBe(1);
+  expect(calls[0].method).toBe('sendMessage');
+});
+
+test('a rich body is sent WHOLE (never 4096-split)', async () => {
+  const { t, calls } = fakeTransport();
+  // A rich body well over 4096 chars but under the 500-block / 32768-char rich
+  // limits: 50 list items of ~100-char text = >5000 chars, 51 blocks. A plain
+  // sendMessage would 4096-split it; sendRich sends it as one call.
+  const items = `<li>${'word '.repeat(20)}</li>`.repeat(50);
+  const html = '<ul>' + items + '</ul>';
+  expect(html.length).toBeGreaterThan(4096);
+  await transmit(plan({ textMessages: [{ text: html, format: 'html' }] }), t);
+  expect(calls.length).toBe(1);
+  expect(calls[0].method).toBe('sendRich');
+});
+
+test('a rich body never rides as a media caption', async () => {
+  const { t, calls } = fakeTransport();
+  // Short rich HTML (< 1024 visible) alongside a photo: a basic short caption
+  // would ride the photo, but a rich body must be its own sendRich message.
+  const html = '<table><tr><td>x</td></tr></table>';
+  await transmit(plan({ photos: [photo('/a.png')], textMessages: [{ text: html, format: 'html' }] }), t);
+  const methods = calls.map((c) => c.method);
+  expect(methods).toContain('sendRich');
+  expect(methods).toContain('sendPhoto');
+  // The photo went out caption-less (the rich body did not ride it).
+  const photoCall = calls.find((c) => c.method === 'sendPhoto')!;
+  expect(photoCall.args.caption).toBeUndefined();
+});
+
+test('an in-document-link <a href="#..."> body routes to sendRich', async () => {
+  const { t, calls } = fakeTransport();
+  const html = 'jump to <a href="#chapter-2">chapter 2</a>';
+  await transmit(plan({ textMessages: [{ text: html, format: 'html' }] }), t);
+  expect(calls.length).toBe(1);
+  expect(calls[0].method).toBe('sendRich');
+});
+
+test('invalid rich HTML + a photo: NOTHING is sent (preflight before media)', async () => {
+  const { t, calls } = fakeTransport();
+  const origExit = process.exit;
+  let exitCode: number | undefined;
+  process.exit = ((code?: number) => {
+    exitCode = code ?? 0;
+    throw new Error('__exit__');
+  }) as typeof process.exit;
+  try {
+    // 21 columns → over the 20-column limit. The photo must NOT be sent.
+    const overWide = '<table><tr>' + '<td>c</td>'.repeat(21) + '</tr></table>';
+    await expect(
+      transmit(plan({ photos: [photo('/a.png')], textMessages: [{ text: overWide, format: 'html' }] }), t),
+    ).rejects.toThrow('__exit__');
+    expect(exitCode).toBe(1);
+    // No send of any kind happened — the photo did not go out orphaned.
+    expect(calls).toHaveLength(0);
+  } finally {
+    process.exit = origExit;
+  }
 });

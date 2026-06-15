@@ -7,7 +7,7 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
-export const VERSION = '1.9.7';
+export const VERSION = '1.10.0';
 
 /**
  * Resolve the short git commit hash of the repo containing the tg script.

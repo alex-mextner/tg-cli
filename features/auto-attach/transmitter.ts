@@ -13,11 +13,18 @@
 // feature is OFF, because they are not part of the feature — they are correct
 // behavior for any send.
 
+import { isRichHtml, normalizeRichHtml, validateRichHtml } from '../render/rich';
 import { splitMessage } from './split';
 import { CAPTION_LIMIT, MESSAGE_LIMIT, type Format, type SendItem, type SendPlan } from './types';
 
 export interface Transport {
   sendMessage(text: string, format: Format): Promise<void>;
+  // Rich message send (Bot API sendRichMessage with rich_message.html). Used for
+  // HTML bodies that contain rich-only tags (tables/headings/lists/formulas).
+  // Unlike sendMessage, a rich body is sent WHOLE — it is never 4096-split (rich
+  // has a 32768 budget and a split would corrupt a <table>/<details>) and never
+  // rides as a media caption.
+  sendRich(html: string): Promise<void>;
   sendPhoto(item: SendItem, caption: string | undefined, format: Format): Promise<void>;
   sendDocument(item: SendItem, caption: string | undefined, format: Format): Promise<void>;
   // Album send (spec §Ordering / FIX 2): 2..10 same-type items as a single
@@ -56,11 +63,21 @@ export function visibleLength(text: string, format: Format): number {
 function captionCandidate(plan: SendPlan): { text: string; format: Format } | null {
   if (plan.textMessages.length !== 1) return null;
   const m = plan.textMessages[0];
+  // A rich HTML body (table/heading/list/formula) is sent via sendRichMessage,
+  // which is NOT a media caption — never let it ride as one.
+  if (m.format === 'html' && isRichHtml(m.text)) return null;
   if (visibleLength(m.text, m.format) > CAPTION_LIMIT) return null;
   return m;
 }
 
 async function sendText(text: string, format: Format, t: Transport): Promise<void> {
+  // Rich HTML (table/heading/list/formula tags) goes out WHOLE via
+  // sendRichMessage — never 4096-split (a split would corrupt a <table>) and
+  // never balanced like basic HTML.
+  if (format === 'html' && isRichHtml(text)) {
+    await t.sendRich(text);
+    return;
+  }
   // Pass the format so plain messages skip HTML tag-balancing (otherwise a long
   // plain message containing pseudo-tags like `a<b>c` would be corrupted).
   for (const chunk of splitMessage(text, MESSAGE_LIMIT, format)) {
@@ -103,6 +120,21 @@ async function sendMediaSection(
 }
 
 export async function transmit(plan: SendPlan, t: Transport): Promise<void> {
+  // PREFLIGHT rich text BEFORE any send. The sandwich sends photos first, so a
+  // rich body that fails limit-validation inside sendRich (which exits the
+  // process) would otherwise leave an orphaned photo already on the wire. Catch
+  // it here, before the first media send, so an invalid rich report sends
+  // NOTHING. Uses the same validateRichHtml (post-normalize) as the transport.
+  for (const m of plan.textMessages) {
+    if (m.format === 'html' && isRichHtml(m.text)) {
+      const check = validateRichHtml(normalizeRichHtml(m.text));
+      if (!check.ok) {
+        console.error(`tg: ${check.error}`);
+        process.exit(1);
+      }
+    }
+  }
+
   const hasMedia = plan.photos.length > 0 || plan.documents.length > 0;
   const riding = hasMedia ? captionCandidate(plan) : null;
   // The text becomes a media caption only when it's a ride candidate. Otherwise

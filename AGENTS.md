@@ -40,11 +40,15 @@ After creating a worktree:
 
 Two single-file entrypoints at the repo root contain only thin wiring (real spawns, file
 I/O, fetch, signals, `bun:ffi`):
-- `tg` — outbound one-shot sender. Notable flags: `--tag`/`--title` (header badge),
-  `--reply-to <message_id>` (thread the message UNDER an inbound one via
-  `reply_to_message_id`; the ANSWER/ОТВЕТ tag requires it), `--table` (render STDIN rows —
-  TSV or `a | b` — as an aligned monospace `<pre>` table; Telegram has no native tables),
-  `--format-help` (print the supported-HTML reference).
+- `tg` — outbound one-shot sender. Notable flags: `--format html` (HTML send; auto-routes
+  to a native **Rich Message** — `sendRichMessage` — when the body contains a rich-only tag
+  like `<table>`/`<h1>`/`<ul>`/`<hr>`/`<details>`/`<tg-math>`, otherwise normal `sendMessage`;
+  see "Rich messages" below), `--tag`/`--title` (header badge; compose with rich),
+  `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
+  on sendMessage, `reply_parameters` on sendRichMessage; the ANSWER/ОТВЕТ tag requires it),
+  `--table` (render STDIN rows — TSV or `a | b` — as an aligned monospace `<pre>` table; the
+  PLAIN fallback grid — a real bordered table comes from `--format html` with `<table>`),
+  `--format-help` (print the supported-HTML reference, basic + rich tiers).
 - `tg-ctl` — inbound control daemon (`start`/`run`/`stop`/`status`): singleton via real
   `flock(2)` over `bun:ffi`, Telegram `getUpdates` long-poll, tmux pane injection.
   Spec: `docs/specs/2026-06-10-tg-ctl-control-design.md` (§16 = shipped v1 scope).
@@ -78,11 +82,13 @@ tests can pass fakes.
   Bold, single-ticket task title → Bold Italic, with `<b>`/`<i>` fallback for Cyrillic
   (docs/specs/unicode-prefix-styling.md).
 - `features/render/` — pure outbound-render helpers used by `tg`: `html.ts` (escape, tag detection,
-  parse-mode, emoji-entity → `<tg-emoji>`), `prefix.ts` (the `✳️ [window]` header + tag/title
+  parse-mode, emoji-entity → `<tg-emoji>`), `rich.ts` (Rich Message detection + limit validation —
+  `isRichHtml` flags rich-only tags so a body routes to `sendRichMessage`, `validateRichHtml`
+  pre-flights the documented limits), `prefix.ts` (the `✳️ [window]` header + tag/title
   badge), `tag.ts` (the ANSWER/DECISION/PROBLEM/REPORT tag set + Russian aliases), `table.ts`
   (`--table`: delimited STDIN rows → an aligned, box-drawn, HTML-escaped monospace `<pre>` table —
   alignment is computed on raw cells so escaping never skews columns), and `format-help.ts`
-  (`--format-help`: the supported-HTML reference).
+  (`--format-help`: the supported-HTML reference, basic + rich tiers).
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile
   helpers, the update→action step function (allowlist, staleness, command split, `/agent`
   routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree
@@ -146,6 +152,23 @@ test.
 **Message size limits** — Telegram caption limit is 1024 visible chars; message limit is 4096.
 The transmitter layer in `features/auto-attach/` handles overflow and splitting automatically.
 Never duplicate that logic in feature modules.
+
+**Rich messages (`--format html`, auto-routed)** — Bot API 10.1 (June 2026) added
+`sendRichMessage`, which renders a much larger HTML tag set than the basic `parse_mode=HTML`
+path: native tables (`<table>`/`<tr>`/`<td>`, `align`/`valign`/`colspan`/`rowspan`/`<caption>`),
+headings (`<h1>`..`<h6>`), lists (`<ul>`/`<ol>`/`<li>`), dividers (`<hr>`), paragraphs (`<p>`),
+collapsible `<details>`, pull quotes (`<aside>`), footers, and LaTeX formulas (`<tg-math>` /
+`<tg-math-block>`). There is **no new flag and no new `--format` value** — rich goes THROUGH
+the existing `--format html`. `tg` decides by CONTENT (`isRichHtml` in `features/render/rich.ts`):
+a body using only the basic inline tags (b/i/u/s/code/pre/a/blockquote/tg-emoji/tg-time/spoiler)
+sends via `sendMessage` as before; a body containing any rich-only tag sends via
+`sendRichMessage` with `rich_message.html` (NOT a parse_mode — `InputRichMessage` takes exactly
+one of `html`/`markdown`). A rich body is sent WHOLE (never 4096-split — that would corrupt a
+`<table>`; rich has a 32768-char budget — and never used as a media caption). `--tag`/`--title`
+compose (the branded header uses only basic tags, valid inside a rich body); `--reply-to`
+threads via `reply_parameters`. Rich limits (≤ 32768 chars, ≤ 500 blocks, ≤ 16 nesting levels,
+≤ 50 media, ≤ 20 table columns) are pre-flighted in `validateRichHtml` before the send. The
+monospace `tg --table` (`<pre>`) stays as the plain fallback grid.
 
 **linear CLI** — `autolink-tasks` uses schpet/linear-cli.
 - Install: `brew install schpet/tap/linear` (NOT `brew install linear` — that installs the
