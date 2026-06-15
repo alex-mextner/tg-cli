@@ -3,6 +3,27 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.9.7
+
+Tag-badge notification clarity.
+
+- **Tag pill fallback dots are now `[color, neutral, neutral]`.** Each `--tag`
+  badge (ANSWER/DECISION/PROBLEM/REPORT) is a wordmark pill made of N custom-emoji
+  CELLS. In a push notification — rendered by the OS, which can't load the
+  custom-emoji image — each cell shows its fallback dot in place of the image.
+  Previously every cell fell back to the SAME color dot, so the badge appeared as
+  `🔵🔵🔵` (three loud identical dots). Now only the FIRST cell keeps the tag's
+  colored dot and the rest fall back to a neutral white square (`▫️`), so the
+  badge appears as `🔵▫️▫️`: one colored dot tells you WHICH tag by color (🔵
+  answer / 🟠 decision / 🔴 problem / 🟢 report), the rest stay quiet. (The tag
+  WORD is not part of the badge — the HTML header carries only the pill cells; any
+  text after the dots in a notification is the `--title`/body, not the tag word.)
+  The in-app pill IMAGE is unchanged (premium clients still see the full
+  wordmark); only the per-cell fallback alt changes. The live sticker-set alts
+  were synced to match (`scripts/sync-tag-pill-alts.ts`), so the rendered
+  `<tg-emoji>` inner text still equals each cell's Telegram-side alt (required or
+  Telegram drops the entity).
+
 ## 1.9.6
 
 Three formatting/reply additions.

@@ -34,19 +34,26 @@
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { resolveConfigEnv } from '../features/config/env';
+import { cellDotsFor, TAG_PILL_DOT } from '../features/branding/emoji';
 
 // MUST stay in sync with the TAGS dict in build-tag-pills.py, TAG_PILL_IDS in
 // features/branding/emoji.ts, and the TAG_ALIASES canonicals in
 // features/render/tag.ts. Key = canonical (English) tag word; `cells` = how
 // many 100px cells the pill was sliced into; `stem` = the file stem (lowercase).
-// `emoji` = the unicode glyph attached to each cell as the custom emoji's
-// emoji_list entry (a colored dot mirroring the pill fill; non-premium clients
-// show this).
-const TAG_PILLS: Record<string, { stem: string; cells: number; emoji: string }> = {
-  ANSWER: { stem: 'answer', cells: 3, emoji: '🔵' },
-  DECISION: { stem: 'decision', cells: 3, emoji: '🟠' },
-  PROBLEM: { stem: 'problem', cells: 3, emoji: '🔴' },
-  REPORT: { stem: 'report', cells: 3, emoji: '🟢' },
+//
+// Each cell's emoji_list (the alt shown in a push notification, where the OS
+// can't load the pill image) is the PER-CELL dot — cell 0 = the tag's colored
+// dot (TAG_PILL_DOT), cells 1..n-1 = the neutral square (▫️) — built from THIS
+// script's own `cells` count (cellDotsFor(color, pill.cells)), so a fresh upload
+// is correct even if its cell count differs from the live TAG_PILL_IDS length.
+// A notification badge then reads "🔵▫️▫️" — one colored dot identifies the tag,
+// the rest stay neutral — matching scripts/sync-tag-pill-alts.ts (which syncs the
+// live set) and the renderer (features/render/prefix.ts).
+const TAG_PILLS: Record<string, { stem: string; cells: number }> = {
+  ANSWER: { stem: 'answer', cells: 3 },
+  DECISION: { stem: 'decision', cells: 3 },
+  PROBLEM: { stem: 'problem', cells: 3 },
+  REPORT: { stem: 'report', cells: 3 },
 };
 
 const SET_NAME = 'replytags';
@@ -85,12 +92,15 @@ interface CellEntry {
 function buildCellEntries(): CellEntry[] {
   const entries: CellEntry[] = [];
   for (const [tag, pill] of Object.entries(TAG_PILLS)) {
+    // Per-cell alts [color, ▫️, …] derived from THIS script's own cell count, so
+    // a fresh upload can't drift from the live TAG_PILL_IDS length.
+    const cellDots = cellDotsFor(TAG_PILL_DOT[tag] ?? '🔵', pill.cells);
     for (let i = 0; i < pill.cells; i++) {
       entries.push({
         tag,
         idx: i,
         file: join(IMAGE_DIR, `${pill.stem}_${i}.png`),
-        emoji: pill.emoji,
+        emoji: cellDots[i] ?? cellDots[0],
       });
     }
   }

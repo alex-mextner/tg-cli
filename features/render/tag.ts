@@ -14,7 +14,7 @@
 // it soft-renders as a plain `[TAG]` badge (uppercased) and a stderr note, so a
 // typo never blocks a send.
 
-import { TAG_PILL_DOT, TAG_PILL_FALLBACK } from '../branding/emoji';
+import { TAG_PILL_DOT, TAG_PILL_FALLBACK, tagPillCellDots } from '../branding/emoji';
 
 // The four canonical (English) tag words. This is the canonical order the pill
 // set, the fallback map, and the upload script all key on.
@@ -46,9 +46,16 @@ export interface ResolvedTag {
   // This is what non-premium viewers (and any viewer while the pill ids are
   // still placeholders) see.
   fallback: string;
-  // The colored DOT alone (e.g. "🔵"), used as the per-cell inner fallback of a
-  // real <tg-emoji> pill cell. Empty for an unknown tag.
+  // The colored DOT alone (e.g. "🔵"), the tag's identifying glyph: the leading
+  // glyph of `fallback` and the FIRST pill cell's inner fallback. Empty for an
+  // unknown tag.
   dot: string;
+  // The per-CELL inner fallbacks for the real <tg-emoji> pill, in cell order:
+  // cell 0 = the colored `dot`, cells 1..n-1 = the neutral square (`▫️`). So a
+  // push notification shows one colored dot + neutrals (e.g. `🔵▫️▫️`) instead of
+  // N identical color dots. Empty for an unknown tag. Each entry MUST equal that
+  // cell's Telegram-side alt (emoji_list) or Telegram drops the entity.
+  cellDots: string[];
   // The canonical (English) tag WORD. For a known tag this is one of
   // ANSWER/DECISION/PROBLEM/REPORT; for an unknown tag it is the uppercased raw
   // input (and `known` is false).
@@ -72,9 +79,10 @@ export function resolveTag(raw: string): ResolvedTag {
     return {
       fallback: TAG_PILL_FALLBACK[canonical],
       dot: TAG_PILL_DOT[canonical],
+      cellDots: tagPillCellDots(canonical),
       word: canonical,
       known: true,
     };
   }
-  return { fallback: '', dot: '', word: key, known: false };
+  return { fallback: '', dot: '', cellDots: [], word: key, known: false };
 }

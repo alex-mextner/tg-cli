@@ -123,15 +123,40 @@ export const TAG_PILL_IDS: Record<string, string[]> = {
   REPORT: ["5294525981007062296", "5294382683718200108", "5294436190420770975"],   // report_0..2
 }
 
-// The colored DOT per canonical tag (single emoji). Used as the per-cell inner
-// fallback inside each <tg-emoji> pill cell: a non-premium client that cannot
-// load the custom emoji then shows N dots (e.g. three for ANSWER) rather than the
-// full word repeated N times. Mirrors the leading glyph of TAG_PILL_FALLBACK.
+// The colored DOT per canonical tag (single emoji). The leading glyph of
+// TAG_PILL_FALLBACK and the FIRST pill cell's per-cell fallback (see
+// tagPillCellDots). Each color tells you WHICH tag at a glance.
 export const TAG_PILL_DOT: Record<string, string> = {
   ANSWER: "🔵",
   DECISION: "🟠",
   PROBLEM: "🔴",
   REPORT: "🟢",
+}
+
+// The neutral dot used for every pill cell AFTER the first one. A quiet
+// white-square so a push notification (rendered by the OS, not Telegram — it
+// can't load the custom-emoji image) shows ONE colored dot + N-1 neutrals
+// (e.g. "🔵▫️▫️") instead of N loud identical color dots.
+// (CTO 2026-06-15: color cell0 identifies the tag, the rest stay neutral.)
+export const TAG_PILL_NEUTRAL_DOT = "▫️"
+
+// Build a pill's per-cell dot list for an EXPLICIT cell count: cell 0 = the
+// colored dot, cells 1..n-1 = the neutral square. Pure (no TAG_PILL_IDS lookup),
+// so the upload script can pass its own generated cell count without drifting
+// from the live ids.
+export function cellDotsFor(colorDot: string, cellCount: number): string[] {
+  if (!colorDot || cellCount <= 0) return []
+  return [colorDot, ...Array.from({ length: cellCount - 1 }, () => TAG_PILL_NEUTRAL_DOT)]
+}
+
+// The per-CELL inner fallback for each canonical tag's pill: cell 0 keeps the
+// tag's colored dot, cells 1..n-1 are the neutral square. The cell count comes
+// from TAG_PILL_IDS (the uploaded set's cell layout), so this stays in lockstep
+// with the real sticker cells. The inner text of each <tg-emoji> cell MUST equal
+// that cell's Telegram-side alt (emoji_list) or Telegram drops the entity, so
+// the alts on the live set are kept in sync (scripts/sync-tag-pill-alts.ts).
+export function tagPillCellDots(canonicalTag: string): string[] {
+  return cellDotsFor(TAG_PILL_DOT[canonicalTag] ?? "", TAG_PILL_IDS[canonicalTag]?.length ?? 0)
 }
 
 // Unicode fallback shown to non-premium viewers and whenever the pill ids are
