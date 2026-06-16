@@ -48,7 +48,7 @@ tg --format html "<b>Title</b>\\nbody"
 tg --format html "<h2>Heading</h2><table><tr><td>a</td><td>b</td></tr></table>"  # native rich table
 tg --file report.pdf "caption"
 tg --photo image.png "caption"
-tg --reply-to 1234 --tag ОТВЕТ "answer that threads under message 1234"
+tg --reply-to 1234 --tag answer "answer that threads under message 1234"
 printf 'task\\tstatus\\nship\\tdone' | tg --table   # plain monospace <pre> fallback
 tg --format-help                                    # what formatting is supported
 \`\`\`
@@ -65,20 +65,22 @@ content on the header line:
 
 - \`--title <text>\` — an explicit headline shown as \`✳️ [window] <title>\`.
   ONLY this explicit title ever appears there; the message body is never used.
-- \`--tag <TAG>\` — an emoji badge labeling what the message IS. Composes with
-  \`--title\`: \`✳️ [window] 🔵 💬 ОТВЕТ — <title>\`.
+- \`--tag <tag>\` — an emoji badge labeling what the message IS. Composes with
+  \`--title\`: \`✳️ [window] 🔵 ANSWER — <title>\`.
 
-Canonical tags (Russian; case-insensitive; English aliases map to them):
+Tags are LOWERCASE ENGLISH ONLY — \`answer\` / \`decision\` / \`problem\` / \`report\`.
+The badge (the unicode fallback non-premium clients see) is a colored dot + the
+English word:
 
-| Tag | Alias | Badge | Use it for |
-|-----|-------|-------|------------|
-| ОТВЕТ | ANSWER | 🔵 💬 | answering the user's question |
-| РЕШЕНИЕ | DECISION | 🟠 ⚖️ | a decision you need the user to make / confirm |
-| ПРОБЛЕМА | PROBLEM | 🔴 🚨 | a blocker / problem report |
-| ОТЧЁТ | REPORT | 🟢 📋 | a status / result report |
+| Tag | Badge | Use it for |
+|-----|-------|------------|
+| answer | 🔵 ANSWER | answering the user's question |
+| decision | 🟠 DECISION | a decision you need the user to make / confirm |
+| problem | 🔴 PROBLEM | a blocker / problem report |
+| report | 🟢 REPORT | a status / result report |
 
-An unknown tag is not fatal: it soft-renders as a plain \`[TAG]\` badge and a
-stderr note, so a typo never blocks a send.
+Uppercase (\`ANSWER\`), Cyrillic (\`ОТВЕТ\`), and unknown tags are REJECTED with a
+clear error and a non-zero exit — use a lowercase-english tag from the table.
 
 In a PUSH NOTIFICATION (rendered by the OS, which can't load the pill image) the
 badge shows as \`<color>▫️▫️\` — ONE colored dot identifies the tag
@@ -93,7 +95,7 @@ Telegram, pass its message_id: \`tg --reply-to <id> "answer"\` (sets
 injected wrap — \`[TG from Alex #1234] …\` — so the id to reply to is right there
 in your pane. The id is Telegram's own per-chat message_id; nothing to compute.
 
-The **ANSWER / ОТВЕТ** tag REQUIRES \`--reply-to\` (answering means answering a
+The **answer** tag REQUIRES \`--reply-to\` (answering means answering a
 specific message); without it \`tg\` errors with a clear message. The other tags
 do not require it.
 
@@ -171,11 +173,11 @@ Always use \`tg\`, never direct curl to the Telegram API. tmux only.
 const SKILL_BLURB =
   '`tg` — send Telegram messages/files/reports: `tg "msg"`, ' +
   '`tg --format html "..."`, `tg --file f.pdf "cap"`, `tg --photo p.png`. ' +
-  'Label messages with `--tag <ОТВЕТ|РЕШЕНИЕ|ПРОБЛЕМА|ОТЧЁТ>` ' +
-  '(aliases ANSWER/DECISION/PROBLEM/REPORT) and set an explicit header line with ' +
+  'Label messages with `--tag <answer|decision|problem|report>` ' +
+  '(lowercase english only) and set an explicit header line with ' +
   '`--title "..."` (the body is never pulled up). ' +
   'Reply UNDER a specific inbound message with `--reply-to <message_id>` (the id ' +
-  'shows up in the injected `[TG from … #<id>]` wrap); the ANSWER/ОТВЕТ tag ' +
+  'shows up in the injected `[TG from … #<id>]` wrap); the answer tag ' +
   'requires it. `--format html` auto-sends a native Rich Message (tables, ' +
   'headings, lists, LaTeX formulas) when the body has a rich tag like `<table>`/' +
   '`<h1>`/`<ul>` — same flag, tg routes by content. `tg --table` is the plain ' +

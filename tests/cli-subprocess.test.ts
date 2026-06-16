@@ -34,12 +34,46 @@ test('--help references --format-help, --table and --reply-to', () => {
   expect(out).toContain('--reply-to');
 });
 
-test('--tag ANSWER without --reply-to errors before the credential gate', () => {
-  const proc = run(['--tag', 'ANSWER', 'an answer']);
+test('--help piped (non-TTY) is PLAIN — no ANSI color codes leak into the output', () => {
+  // Color is gated on an interactive stdout; a captured subprocess pipe is not a
+  // TTY, so the help must be plain text (no `\x1b[` escapes) even though an
+  // interactive `tg --help` colorizes it.
+  const proc = run(['--help']);
+  const out = proc.stdout.toString();
+  expect(proc.exitCode).toBe(0);
+  expect(out).not.toContain('\x1b[');
+  // The advertised tags are lowercase-english only (anchor on stable tokens,
+  // not the exact help wording).
+  expect(out).toMatch(/lowercase[\s-]?english/i);
+  expect(out).toContain('--tag');
+  expect(out).toContain('answer');
+});
+
+test('--tag answer without --reply-to errors before the credential gate', () => {
+  const proc = run(['--tag', 'answer', 'an answer']);
   const err = proc.stderr.toString();
   expect(proc.exitCode).not.toBe(0);
   expect(err).toContain('--reply-to');
   // It must NOT be the missing-credentials error — the parse error fires first.
+  expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+test('--tag with an uppercase tag is rejected (lowercase-english only) before the credential gate', () => {
+  const proc = run(['--tag', 'ANSWER', '--reply-to', '1', 'an answer']);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).not.toBe(0);
+  expect(err).toContain("invalid --tag 'ANSWER'");
+  expect(err).toContain('lowercase english');
+  expect(err).toContain('Use one of: answer, decision, problem, report');
+  expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+test('--tag with a Cyrillic tag is rejected (lowercase-english only)', () => {
+  const proc = run(['--tag', 'ОТВЕТ', 'a message']);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).not.toBe(0);
+  expect(err).toContain("invalid --tag 'ОТВЕТ'");
+  expect(err).toContain('lowercase english');
   expect(err).not.toContain('TG_BOT_TOKEN');
 });
 

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { installSkill } from '../features/install-skill/install';
+import { TAG_PILL_FALLBACK } from '../features/branding/emoji';
 
 // installSkill() resolves everything from os.homedir(), which honors $HOME on
 // posix — so we point HOME at a throwaway dir and assert on what it writes.
@@ -38,22 +39,30 @@ test('SKILL.md and the blurb advertise --tag / --title and the four canonical ta
   // Flags are documented.
   expect(skill).toContain('--tag');
   expect(skill).toContain('--title');
-  // All four canonical Russian tags + their English aliases + their meanings.
-  for (const tag of ['ОТВЕТ', 'РЕШЕНИЕ', 'ПРОБЛЕМА', 'ОТЧЁТ']) {
+  // The four lowercase-english canonical tags (the ONLY accepted form). No
+  // Cyrillic aliases anymore.
+  for (const tag of ['answer', 'decision', 'problem', 'report']) {
     expect(skill).toContain(tag);
   }
-  for (const alias of ['ANSWER', 'DECISION', 'PROBLEM', 'REPORT']) {
-    expect(skill).toContain(alias);
+  for (const cyrillic of ['ОТВЕТ', 'РЕШЕНИЕ', 'ПРОБЛЕМА', 'ОТЧЁТ']) {
+    expect(skill).not.toContain(`--tag ${cyrillic}`);
+  }
+  // The badge column matches the ACTUAL unicode fallback (colored dot + word),
+  // not a stale decorative glyph — so the installed agent docs stay in sync with
+  // what tg renders.
+  for (const fallback of Object.values(TAG_PILL_FALLBACK)) {
+    expect(skill).toContain(fallback); // e.g. "🔵 ANSWER"
   }
   // The body-is-never-pulled-up contract is stated.
   expect(skill.toLowerCase()).toContain('body');
   // The always-on blurb also mentions the flags + tags (agents that only see
-  // the blurb still discover the convention).
+  // the blurb still discover the convention) — lowercase-english only.
   const blurb = readFileSync(join(TH, '.agents/skills/.blurbs/tg.md'), 'utf8');
   expect(blurb).toContain('--tag');
   expect(blurb).toContain('--title');
-  expect(blurb).toContain('ОТВЕТ');
-  expect(blurb).toContain('ОТЧЁТ');
+  expect(blurb).toContain('answer');
+  expect(blurb).toContain('report');
+  expect(blurb).not.toContain('ОТВЕТ');
 });
 
 test('blurb in CLAUDE.md is idempotent and preserves existing content', () => {
