@@ -49,9 +49,13 @@ test('colorizeHelp colors the real USAGE: headers + the documented flags', () =>
 
 test('colorizeHelp colors the real format-help reference: a header + an option flag', () => {
   const out = colorizeHelp(formatHelp(), true);
-  // A real section header (format-help has "BASIC tags …:" style headers ending
-  // in ':') is bold-cyan, and the --tag/--reply-to options are green.
-  expect(out).toMatch(new RegExp(`${BOLD.replace('[', '\\[')}${CYAN.replace('[', '\\[')}[^\\n]*:`));
+  // At least one section header (a line ending in ':') is wrapped bold-cyan.
+  // Find a colored header by its literal BOLD+CYAN prefix + a RESET later on the
+  // same line; we don't hardcode the header text (format-help wording can shift).
+  const headerStart = `${BOLD}${CYAN}`;
+  const coloredHeader = out.split('\n').find((line) => line.startsWith(headerStart) && line.includes(`:${RESET}`));
+  expect(coloredHeader).toBeDefined();
+  // The --tag / --reply-to / --title options are green.
   expect(out).toMatch(/\x1b\[32m--(tag|reply-to|title)/);
   // The plain content survives.
   expect(out).toContain('--format html');
