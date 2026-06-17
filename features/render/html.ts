@@ -18,6 +18,38 @@ export function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }
 
+// Strip HTML tags for VISIBLE-length / text-content purposes (not a security
+// sanitizer — output is never re-inserted into a page). One pass over the
+// string removes every `<...>` tag AND any trailing TAG-LIKE fragment that was
+// cut off before its closing `>` (e.g. a truncated `<script` or `</div`). A
+// naive `/<[^>]+>/g` leaves that dangling fragment behind, which both
+// over-counts text length and is what CodeQL flags as incomplete multi-
+// character sanitization. The trailing branch only fires on `<` immediately
+// followed by a tag-name start (letter), `/`, or `!` — so a lone literal `<`
+// inside ordinary text (e.g. `a < b`) is preserved and not greedily eaten to
+// end-of-string. Single pass, deterministic.
+export function stripHtmlTags(s: string): string {
+  return s.replace(/<[^>]*>|<[/!A-Za-z][^>]*$/g, "")
+}
+
+// Decode the small set of HTML entities `tg` itself emits (via escapeHtml plus
+// the documented quote/apostrophe forms), in a SINGLE pass. Decoding `&amp;`
+// first and `&lt;` second — the obvious chained-replace — double-unescapes
+// `&amp;lt;` into `<` (CodeQL js/double-escaping). A single regex with a lookup
+// table consumes each entity exactly once, left to right, so no replacement can
+// feed the next one. Unknown entities are left verbatim.
+const HTML_ENTITIES: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+  "&apos;": "'",
+}
+export function decodeHtmlEntities(s: string): string {
+  return s.replace(/&(?:amp|lt|gt|quot|apos|#39);/g, (m) => HTML_ENTITIES[m] ?? m)
+}
+
 export function detectHtmlTags(text: string): boolean {
   const htmlPattern = /<(b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|tg-time|code|pre|blockquote)\b/i
   return htmlPattern.test(text)
