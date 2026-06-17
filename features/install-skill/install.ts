@@ -11,6 +11,21 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, join } from 'path';
+import { escapeRegExp } from '../util/regex';
+
+// Read a UTF-8 file, returning undefined when it does not exist (ENOENT) and
+// re-throwing any other error. Replaces an `existsSync(p) ? readFileSync(p) : …`
+// pair: that check-then-read on the same path is a TOCTOU race (js/file-system-
+// race) because the file can vanish or be swapped between the two syscalls. A
+// single read that catches ENOENT is atomic — there is no window to race.
+function readTextIfExists(path: string): string | undefined {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw e;
+  }
+}
 
 // Prefer $HOME (what `tg` itself uses) over os.homedir(), which under Bun reads
 // getpwuid and ignores $HOME — so this stays consistent and unit-testable.
@@ -203,16 +218,12 @@ function detected(cmd: string, ...dirs: string[]): boolean {
   return dirs.some((d) => existsSync(d.startsWith('~/') ? join(home, d.slice(2)) : d));
 }
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function appendMarked(path: string, tool: string, blurb: string): void {
   mkdirSync(dirname(path), { recursive: true });
   const start = `<!-- skill:${tool} -->`;
   const end = `<!-- /skill:${tool} -->`;
-  let existing = existsSync(path) ? readFileSync(path, 'utf8') : '';
-  const re = new RegExp(escapeRegex(start) + '[\\s\\S]*?' + escapeRegex(end) + '\\n?', 'g');
+  let existing = readTextIfExists(path) ?? '';
+  const re = new RegExp(escapeRegExp(start) + '[\\s\\S]*?' + escapeRegExp(end) + '\\n?', 'g');
   existing = existing.replace(re, '');
   const block = `${start}\n${blurb}\n${end}\n`;
   writeFileSync(path, existing.trim() ? existing.replace(/\s+$/, '') + '\n\n' + block : block);
@@ -223,9 +234,14 @@ function appendMarked(path: string, tool: string, blurb: string): void {
 function ensureSessionStartHook(home: string): boolean {
   const settingsPath = join(home, '.claude', 'settings.json');
   if (!existsSync(join(home, '.claude'))) return false;
+  // Read the existing settings ONCE into memory, then parse from and back up
+  // from that same in-memory copy. A separate existsSync()/readFileSync() per
+  // use would re-stat the path each time, racing with concurrent writers
+  // (js/file-system-race); a single read snapshots the bytes we then act on.
+  const original = readTextIfExists(settingsPath);
   let data: any;
   try {
-    data = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf8')) : {};
+    data = original !== undefined ? JSON.parse(original) : {};
   } catch {
     return false; // don't clobber a file we can't parse
   }
@@ -244,7 +260,10 @@ function ensureSessionStartHook(home: string): boolean {
     }
   }
   sessionStart.push({ hooks: [{ type: 'command', command: HOOK_COMMAND }] });
-  if (existsSync(settingsPath)) writeFileSync(settingsPath + '.bak', readFileSync(settingsPath));
+  // Back up the snapshot we already read (not a fresh read of the path) before
+  // overwriting, so the .bak is exactly what we parsed and there is no second
+  // check-then-read race.
+  if (original !== undefined) writeFileSync(settingsPath + '.bak', original);
   writeFileSync(settingsPath, JSON.stringify(data, null, 2) + '\n');
   return true;
 }
