@@ -17,6 +17,9 @@
 // text messages go rich vs. plain, and that a rich message is NOT 4096-split
 // and never rides as a media caption) lives in the transmitter.
 
+import { stripHtmlTags } from './html';
+import { escapeRegExp } from '../util/regex';
+
 // Rich-ONLY tags: present in the rich-html-style allowlist but NOT in the basic
 // sendMessage allowlist (features/render/html.ts detectHtmlTags). Seeing any of
 // these in an HTML body means the message must go via sendRichMessage. The
@@ -84,7 +87,7 @@ const RICH_TAG_RE = new RegExp(
   '</?(?:' +
     [...RICH_ONLY_TAGS]
       .sort((a, b) => b.length - a.length)
-      .map((t) => t.replace(/[-]/g, '\\-'))
+      .map((t) => escapeRegExp(t))
       .join('|') +
     ')(?=[\\s/>]|$)',
   'i',
@@ -210,6 +213,12 @@ const VOID_TAGS = new Set(['img', 'hr', 'br', 'input', 'tg-map', 'tg-emoji']);
 // left as-is.
 const NAMED_ENTITY_RE = /&(?:lt|gt|amp|quot|apos|nbsp|hellip|mdash|ndash|lsquo|rsquo|ldquo|rdquo);/g;
 const NUMERIC_ENTITY_RE = /&#(?:[0-9]+|x[0-9a-fA-F]+);/g;
+// NOT a js/double-escaping chain (unlike the decode this PR replaced elsewhere):
+// both replaces map an entity to the SAME placeholder `￼`, which contains no `&`,
+// so the second pass can never re-process the first's output. The two patterns
+// also match disjoint sets (named vs `&#…;` numeric). It collapses entities for a
+// CHARACTER-COUNT budget only — it must not be turned into decodeHtmlEntities,
+// which decodes to real chars and would change the count.
 function decodeEntitiesForCount(s: string): string {
   return s.replace(NAMED_ENTITY_RE, '￼').replace(NUMERIC_ENTITY_RE, '￼');
 }
@@ -241,7 +250,7 @@ export function validateRichHtml(html: string): RichValidation {
   const altText = (html.match(/\balt\s*=\s*"([^"]*)"|alt\s*=\s*'([^']*)'/gi) ?? [])
     .map((a) => a.replace(/^[^=]*=\s*["']?/, '').replace(/["']$/, ''))
     .join('');
-  const text = decodeEntitiesForCount(html.replace(/<[^>]+>/g, '') + altText);
+  const text = decodeEntitiesForCount(stripHtmlTags(html) + altText);
   const chars = [...text].length;
   if (chars > RICH_LIMITS.maxChars) {
     return {

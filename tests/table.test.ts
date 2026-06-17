@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { decodeHtmlEntities } from '../features/render/html';
 import { escapeCell, hasWideGlyph, parseTableRows, renderTable, toTablePre } from '../features/render/table';
 
 // --- parseTableRows ---
@@ -121,7 +122,9 @@ test('toTablePre alignment is computed on RAW cells (escaping does not skew colu
   const body = html.replace(/^<pre>/, '').replace(/<\/pre>$/, '');
   const lines = body.split('\n');
   // The data row, with `&` un-escaped back, must be the same width as the border.
-  const unescaped = lines.map((l) => l.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'));
+  // Single-pass decode (decodeHtmlEntities) instead of chained replaces, which
+  // double-unescape `&amp;lt;` (js/double-escaping).
+  const unescaped = lines.map((l) => decodeHtmlEntities(l));
   const widths = new Set(unescaped.map((l) => [...l].length));
   expect(widths.size).toBe(1);
 });

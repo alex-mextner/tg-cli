@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { buildKeyInjectPlan, buildTextInjectPlan } from '../features/tg-ctl/inject';
 import type { InjectStep } from '../features/tg-ctl/types';
 
@@ -12,6 +12,44 @@ import type { InjectStep } from '../features/tg-ctl/types';
 // use it for assertions.
 
 const SOCKET = `tgctl-test-${process.pid}`;
+
+// The on-disk path tmux uses for a `-L <label>` server: `$TMUX_TMPDIR | /tmp`
+// + `/tmux-<uid>/<label>`. `kill-server` ends the server PROCESS but on macOS
+// does NOT unlink this socket file — that gap leaked ~185 `tgctl-test-*` /
+// `rigtest-*` sockets into /tmp/tmux-501/ and once starved the dev's tmux
+// server. afterAll unlinks it explicitly.
+//
+// This MUST mirror tmux's own candidate selection or afterAll deletes the wrong
+// path and the leak persists. Verified against tmux 3.5a (make_label): the base
+// is `$TMUX_TMPDIR` when set, ELSE `/tmp`. tmux does NOT require it to be
+// absolute — a RELATIVE TMUX_TMPDIR is resolved against cwd and honored (a
+// `tgctl-test-*` socket really lands there). It only falls back to `/tmp` when
+// the chosen directory is unusable (e.g. an absolute but MISSING TMUX_TMPDIR:
+// tmux can't create `tmux-<uid>` under a missing parent, so it uses /tmp).
+//
+// We deliberately make the path absolute (resolve) but do NOT realpath it: tmux
+// builds the socket path from TMUX_TMPDIR as given, so canonicalizing symlinks
+// here would diverge from where tmux actually creates the socket (e.g. a
+// symlinked TMUX_TMPDIR) and afterAll would unlink the wrong path. statSync
+// follows the symlink for the existence/dir check without rewriting the path.
+function tmuxTmpBase(): string {
+  const raw = (process.env.TMUX_TMPDIR || '').trim();
+  if (!raw) return '/tmp';
+  // Resolve relative paths against cwd (tmux honors a relative TMUX_TMPDIR);
+  // keep the path otherwise as-given so it matches tmux's own socket location.
+  const resolved = resolve(raw);
+  try {
+    return statSync(resolved).isDirectory() ? resolved : '/tmp';
+  } catch {
+    return '/tmp'; // missing / unreadable TMUX_TMPDIR → tmux uses /tmp
+  }
+}
+
+function socketPathFor(label: string): string {
+  return join(tmuxTmpBase(), `tmux-${process.getuid?.() ?? 0}`, label);
+}
+
+const SOCKET_PATH = socketPathFor(SOCKET);
 
 // Env without TMUX: tmux refuses new-session from inside another tmux
 // ("sessions should be nested with care") even on a different socket.
@@ -101,7 +139,13 @@ async function newStubPane(name: string): Promise<string> {
 }
 
 afterAll(() => {
+  // Kill the throwaway server AND unlink its socket file. kill-server ends the
+  // process but leaks the socket inode on macOS — unlink it so nothing piles up
+  // under /tmp/tmux-<uid>/. Both steps best-effort: a server that never started
+  // still needs the (possibly absent) socket file cleaned, and rmSync must not
+  // throw on a missing path.
   if (tmuxAvailable) tmux(['kill-server']); // throwaway socket only
+  rmSync(SOCKET_PATH, { force: true });
 });
 
 test.skipIf(!tmuxAvailable)('single-line plan lands as exactly one submission', async () => {
@@ -134,3 +178,32 @@ test.skipIf(!tmuxAvailable)('Escape verb produces no submission', async () => {
   await Bun.sleep(400); // give a wrong submission time to surface
   expect(gotLines(capture(paneId))).toEqual([]);
 }, 15_000);
+
+// REGRESSION: a throwaway `-L` server must leave NO socket file behind after
+// teardown. `kill-server` alone leaks the socket inode on macOS; ~185 of those
+// accumulated in /tmp/tmux-501/ and once starved the dev's tmux server. This
+// drives the SAME kill+unlink the afterAll uses, on its own socket, and asserts
+// the file is gone (not just the process).
+test.skipIf(!tmuxAvailable)('teardown leaves no leaked tmux socket file', () => {
+  const leakSocket = `tgctl-test-leakcheck-${process.pid}`;
+  const leakPath = socketPathFor(leakSocket);
+  const t = (args: string[]) =>
+    Bun.spawnSync(['tmux', '-L', leakSocket, ...args], {
+      stdout: 'ignore',
+      stderr: 'ignore',
+      env: tmuxEnv,
+    });
+  try {
+    expect(t(['new-session', '-d', '-s', 'probe', 'tail -f /dev/null']).exitCode).toBe(0);
+    expect(existsSync(leakPath)).toBe(true); // server created its socket
+
+    // the exact teardown the afterAll performs
+    t(['kill-server']);
+    rmSync(leakPath, { force: true });
+
+    expect(existsSync(leakPath)).toBe(false); // the leak this fixes
+  } finally {
+    t(['kill-server']);
+    rmSync(leakPath, { force: true });
+  }
+});
