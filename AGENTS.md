@@ -90,7 +90,10 @@ tests can pass fakes.
   `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons),
   `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker), `hook-normalize.ts`
   (raw harness hook payload → ButtonRequest), `hook-install.ts` (idempotent q→buttons hook
-  merge for `tg-ctl install-hooks`), and `voice.ts` (inbound VOICE→text: `voice:` config block
+  merge for `tg-ctl install-hooks`), `defer.ts` (defer-while-waiting queue model: inbound text is
+  QUEUED per-pane while that pane has an open question and flushed on answer, so it is never pasted
+  into the prompt — `driveFlush` re-checks the pane before EACH paste so a follow-up question
+  re-defers the untouched tail), and `voice.ts` (inbound VOICE→text: `voice:` config block
   parse/resolve/upsert, ffmpeg + whisper argv builders, transcript cleaning, and the onboarding
   decision). `voice-probe.ts` is the ONE impure module here — it scans `~/xp` for an existing
   Whisper install (whisper.cpp binary + ggml model, or a faster-whisper venv) and checks for

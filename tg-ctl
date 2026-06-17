@@ -22,6 +22,7 @@ import {
   type AgentCandidate,
 } from "./features/tg-ctl/agent-match"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
+import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
 import { findAgentInPane, parsePaneList, parseProcList, pickTargetPane } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
 import { botIdFromToken, ctlPaths, pidStatus, readPidFile } from "./features/tg-ctl/lock"
@@ -726,7 +727,12 @@ function hookMatchesRegistration(ctx: Ctx, req: ButtonRequest): boolean {
   return registrationAllowsHook(readRegistration(ctx.paths), req, resolve)
 }
 
-function startHookServer(ctx: Ctx, pending: Map<string, PendingButton>, activeKeys: Set<string>): Server | null {
+function startHookServer(
+  ctx: Ctx,
+  pending: Map<string, PendingButton>,
+  activeKeys: Set<string>,
+  onAbandon: (paneId: string) => void,
+): Server | null {
   try {
     try {
       unlinkSync(ctx.paths.socket)
@@ -745,7 +751,7 @@ function startHookServer(ctx: Ctx, pending: Map<string, PendingButton>, activeKe
         }
         const line = raw.slice(0, newline).trim()
         raw = raw.slice(newline + 1)
-        void handleHookSocketLine(ctx, pending, activeKeys, socket, line)
+        void handleHookSocketLine(ctx, pending, activeKeys, onAbandon, socket, line)
       })
     })
     server.on("error", (err) => {
@@ -769,6 +775,11 @@ async function handleHookSocketLine(
   ctx: Ctx,
   pending: Map<string, PendingButton>,
   activeKeys: Set<string>,
+  // Called when a forwarded question is removed WITHOUT a Telegram answer
+  // (timeout, hook socket close, send failure). The daemon drops that pane's
+  // deferred backlog so it can't resurface, stale + out of order, on a LATER
+  // unrelated question's answer (review finding).
+  onAbandon: (paneId: string) => void,
   socket: Socket,
   line: string,
 ): Promise<void> {
@@ -813,6 +824,7 @@ async function handleHookSocketLine(
     if (pending.get(pendingKey) !== entry) return
     pending.delete(pendingKey)
     activeKeys.delete(pendingKey)
+    if (entry.req.paneId) onAbandon(entry.req.paneId)
     if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, "expired — answer in terminal")
     else entry.finalText = "expired — answer in terminal"
     socket.end("null\n")
@@ -827,6 +839,7 @@ async function handleHookSocketLine(
     clearTimeout(entry.timer)
     pending.delete(pendingKey)
     activeKeys.delete(pendingKey)
+    if (entry.req.paneId) onAbandon(entry.req.paneId)
     if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, "expired — answer in terminal")
     else entry.finalText = "expired — answer in terminal"
   })
@@ -838,6 +851,7 @@ async function handleHookSocketLine(
       pending.delete(pendingKey)
       activeKeys.delete(pendingKey)
       clearTimeout(entry.timer)
+      if (entry.req.paneId) onAbandon(entry.req.paneId)
       if (!socketClosed) socket.end("null\n")
     }
     return
@@ -962,31 +976,212 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   let agentTokenSeq = 0
   // Inbound queued behind an agent's outstanding question (defer-while-waiting):
   // pane → already-wrapped texts, flushed when the question is answered. The
-  // flag tells the trailing `ack` to mark the source message ⏳ instead of 👀.
-  const deferredByPane = new Map<string, string[]>()
+  // flag tells the trailing `ack` to mark the source message with DEFER_REACTION
+  // (✍️ "noted, queued") instead of 👀.
+  const deferred = new DeferQueues()
+  // Panes with an in-flight flushDeferred. While a flush drains a pane, its queue
+  // is momentarily empty (taken out per round), so deferred.has() alone would let
+  // a live message inject AHEAD of items still being flushed. This flag keeps new
+  // inbound deferring for the whole flush, preserving strict FIFO; the drain
+  // loop's next round picks up whatever was enqueued meanwhile.
+  const flushingPanes = new Set<string>()
+  // Panes whose forwarded question was abandoned (timeout / socket close / send
+  // failure, no terminal answer) WHILE a flush was draining that pane. The flush
+  // loop owns the queue here, so onQuestionAbandoned cannot drop it directly; it
+  // records the pane and the drain loop dead-letters the residual queue instead of
+  // pasting it into the still-open prompt (codex P2 — concurrent-flush resurface).
+  const abandonedDuringFlush = new Set<string>()
   let lastWasDeferred = false
   const paneHasPendingQuestion = (paneId: string): boolean => {
     for (const pb of pendingButtons.values()) if (pb.req.paneId && pb.req.paneId === paneId) return true
     return false
   }
+  // A live inbound message defers behind an OPEN question OR an in-flight flush
+  // (which sets flushingPanes for its whole duration, incl. the 800ms settle and
+  // every inter-paste gap). Those two cover every window where injecting now would
+  // either hit an open prompt or jump ahead of older queued items.
+  //
+  // It deliberately does NOT defer merely because the queue is non-empty: a queue
+  // can outlive its question (the Telegram prompt expires / its hook socket closes
+  // WITHOUT a terminal answer — the agent is still blocked locally, so we must not
+  // flush, but no future answer will arrive to drain it either). Treating a
+  // non-empty queue as "defer" would then wedge EVERY later message to that pane
+  // forever (review finding). FIFO during a real flush is preserved by
+  // flushingPanes; a question (live or expired-in-terminal) is preserved by
+  // paneHasPendingQuestion while the prompt is open.
+  const shouldDeferInbound = (paneId: string): boolean =>
+    paneHasPendingQuestion(paneId) || flushingPanes.has(paneId)
   // Enqueue only — the caller sets lastWasDeferred when this came from a MESSAGE
   // action (which earns a ⏳ ack); a button-callback defer edits its prompt
   // instead and must NOT leak the flag onto the next message's ack.
   const enqueueDeferred = (paneId: string, wrappedText: string): void => {
-    const q = deferredByPane.get(paneId)
-    if (q) q.push(wrappedText)
-    else deferredByPane.set(paneId, [wrappedText])
+    deferred.enqueue(paneId, wrappedText)
   }
-  const flushDeferred = async (paneId: string): Promise<void> => {
-    const queue = deferredByPane.get(paneId)
-    if (!queue?.length) return
-    deferredByPane.delete(paneId)
-    // Let the agent consume the just-delivered answer before the next paste.
-    await Bun.sleep(800)
-    for (const text of queue) {
+  const injectDeferredOne = async (paneId: string, text: string): Promise<boolean> => {
+    // Must NEVER throw: a throw here rejects driveFlush, which (a) loses the
+    // already-taken batch and (b) becomes an unhandled rejection in the
+    // fire-and-forget flushDeferred call. executeInjectSteps normally returns
+    // {ok:false} on tmux errors, but a spawn/exception could still escape — treat
+    // any throw as a failed paste (drop + log), exactly like {ok:false}.
+    try {
       const res = await executeInjectSteps(buildTextInjectPlan(paneId, text))
       if (!res.ok) log(`deferred flush into ${paneId} failed: ${res.error}`)
+      return res.ok
+    } catch (err) {
+      log(`deferred flush into ${paneId} threw: ${err}`)
+      return false
     }
+  }
+  // Tell the user a pane's deferred backlog was dropped without reaching the agent
+  // (its question was abandoned before an answer). Declared above flushDeferred so
+  // the latter can reference it (via deadLetterAbandoned) without a TDZ hazard.
+  // User-facing dead-letter notice (no-op when nothing was queued — no ping if
+  // there's nothing to resend). Callers own the daemon.log record so the resolution
+  // is always traced even at count 0; this only handles the Telegram side.
+  const notifyDeadLettered = (paneId: string, count: number): void => {
+    if (count === 0) return
+    // Guard the fire-and-forget send: this is a safety-critical notice (the user's
+    // only signal that messages were dropped), so a transport failure must at least
+    // hit the daemon log rather than vanish silently (review finding). NOTE: like
+    // every void-send in this daemon, an in-flight send can still be cut off by a
+    // shutdown right after a dead-letter — a pre-existing outbound-durability gap,
+    // not introduced here.
+    sendMessage(
+      ctx,
+      `⚠️ the question expired before it was answered — ${count} queued message(s) were NOT delivered. Resend them.`,
+    ).catch((err) => log(`failed to notify dead-letter on ${paneId}: ${err}`))
+  }
+  const flushDeferred = async (paneId: string): Promise<void> => {
+    if (!deferred.has(paneId)) return
+    // Re-entrancy guard: two answers for the same pane could both reach here (the
+    // action loop awaits each, but flushDeferred is fire-and-forget). The flag
+    // also routes new inbound into the queue for the whole flush (FIFO).
+    if (flushingPanes.has(paneId)) return
+    flushingPanes.add(paneId)
+    // The flag is cleared in the finally below, and onQuestionAbandoned only sets
+    // it while flushingPanes holds this pane — which the re-entrancy guard above
+    // makes mutually exclusive with a second concurrent flush — so it is always
+    // clean on entry; no defensive clear is needed here.
+    //
+    // Dead-letter the orphaned backlog for a pane whose abandoned question has no
+    // answer coming. `tail` is the slice driveFlush already removed from the live
+    // queue (via the round's take()); `deferred.drop()` returns whatever else is
+    // still queued. They are disjoint — take() emptied the pane entry at the start
+    // of the round, so anything drop() returns was enqueued after it — so the sum
+    // is the exact count of messages that never reached the agent.
+    const deadLetterAbandoned = (tail: readonly string[]): void => {
+      const dropped = deferred.drop(paneId)
+      const count = tail.length + dropped.length
+      // Always log the resolution (even a zero-count one) so daemon.log records
+      // that the abandonment flag was seen and handled — distinguishing "flagged
+      // and resolved" from "never flagged" (review finding). The user-facing notice
+      // (notifyDeadLettered) stays count-gated: nothing to resend means no ping.
+      log(`flush on ${paneId} dead-lettered ${count} orphaned message(s) (abandoned, no answer coming)`)
+      notifyDeadLettered(paneId, count)
+    }
+    try {
+      // Let the agent consume the just-delivered answer before the first paste.
+      await Bun.sleep(800)
+      // Drain in rounds: each round takes the current queue and feeds it to
+      // driveFlush (which re-checks paneHasPendingQuestion before EVERY paste).
+      // A round can leave a tail three ways: a NEW question opened (re-defer it —
+      // it flushes when that question is answered); a question was ABANDONED
+      // mid-flush (dead-letter the residual — no answer is coming, see codex P2);
+      // or fresh messages were enqueued DURING the round (drain them next round,
+      // while the pane stays free — otherwise they'd sit until the next unrelated
+      // question). Inject FAILURES do NOT re-defer: there may be no future question
+      // to flush them, so they are logged + dropped rather than wedging the queue
+      // forever (review finding).
+      // Resolve a mid-flush abandonment. The queue is keyed by PANE, not question,
+      // so when a question is abandoned we cannot tell its orphaned messages from
+      // those of ANOTHER question still live on the same pane. Gate strictly on
+      // pane-idle (codex P2: "dead-letter once no question is pending"):
+      //   - a question is STILL pending → a live prompt owns the queue; re-defer
+      //     the residual so its answer flushes it. Dropping here would lose that
+      //     live question's legitimately-queued messages (review finding #1).
+      //   - no question pending → the messages are truly orphaned (no answer is
+      //     coming); dead-letter them rather than paste into the still-open prompt.
+      // `tail` is driveFlush's untouched slice (already removed from the queue). The
+      // pending read and the redefer/drop that follows run in ONE synchronous tick
+      // (no await between), so no inbound can interleave and be misrouted.
+      const resolveAbandonment = (tail: readonly string[]): void => {
+        if (paneHasPendingQuestion(paneId)) {
+          deferred.redefer(paneId, [...tail])
+          log(`deferred flush into ${paneId} paused — ${tail.length} item(s) re-queued (abandon raced a new question)`)
+        } else {
+          deadLetterAbandoned(tail)
+        }
+      }
+      for (;;) {
+        // A question abandoned exactly at a round boundary (after driveFlush
+        // returned, before this take) leaves no tail to hand back, but the queue
+        // still must not be pasted — resolve it (dead-letter if idle, re-defer if a
+        // new question is now pending) and stop.
+        if (abandonedDuringFlush.has(paneId)) {
+          resolveAbandonment([])
+          return
+        }
+        const queue = deferred.take(paneId)
+        if (queue.length === 0) return
+        const outcome = await driveFlush(
+          queue,
+          () => paneHasPendingQuestion(paneId),
+          (text) => injectDeferredOne(paneId, text),
+          () => abandonedDuringFlush.has(paneId),
+        )
+        if (outcome.abandoned.length > 0 || abandonedDuringFlush.has(paneId)) {
+          resolveAbandonment(outcome.abandoned)
+          return
+        }
+        if (outcome.reDeferred.length > 0) {
+          deferred.redefer(paneId, outcome.reDeferred)
+          log(`deferred flush into ${paneId} paused — ${outcome.reDeferred.length} item(s) re-queued behind a new question`)
+          return
+        }
+        // Stop if a question is now open (its answer re-triggers the flush) or the
+        // queue is empty; else loop to drain anything enqueued during this round.
+        if (paneHasPendingQuestion(paneId) || !deferred.has(paneId)) return
+      }
+    } finally {
+      flushingPanes.delete(paneId)
+      abandonedDuringFlush.delete(paneId)
+    }
+  }
+  // A forwarded question was removed WITHOUT a Telegram answer (timeout / hook
+  // socket close / send failure). The agent's local prompt is still open, so we
+  // must NOT flush — but we must also not leave the pane's backlog to resurface,
+  // stale and out of order, when some LATER unrelated question on this pane is
+  // answered. Dead-letter it and tell the user (the messages never landed).
+  //
+  // The queue is keyed by PANE, not by question, so it may hold items that belong
+  // to a DIFFERENT outstanding handler on the same pane. Drop ONLY when the pane
+  // is otherwise idle: skip if a flush is in flight (it owns + will deliver the
+  // queue) or another question is still pending (its answer will flush). Dropping
+  // in either case would lose another handler's messages (review finding).
+  const onQuestionAbandoned = (paneId: string): void => {
+    // A flush is draining this pane: it owns the queue (taken out per round), so
+    // dropping here would race the loop and could lose nothing OR the wrong items.
+    // Record the pane instead — the drain loop checks the flag and dead-letters the
+    // residual once it sees no pending question, rather than pasting those orphaned
+    // messages into the still-open terminal prompt (codex P2 concurrent-flush race).
+    if (flushingPanes.has(paneId)) {
+      abandonedDuringFlush.add(paneId)
+      // Timestamp the abandonment itself: the flush resolves it later (re-defer or
+      // dead-letter), but logging here makes the event visible in daemon.log for
+      // post-incident review even if the resolution path is quiet (review finding).
+      log(`question abandoned on ${paneId} mid-flush — flagged for the drain loop`)
+      return
+    }
+    // Another question is still pending on this pane: its answer will flush the
+    // queue legitimately, so leave it (the queue is keyed by PANE, not question).
+    if (paneHasPendingQuestion(paneId)) return
+    // Pane is idle and no flush owns the queue: drop the orphaned backlog now. The
+    // pending check above and this drop run in the SAME synchronous tick (no await
+    // between), so no inbound for a freshly-opened question can interleave and be
+    // dropped by mistake — the daemon's inbound handling is event-loop callbacks.
+    const droppedCount = deferred.drop(paneId).length
+    log(`question abandoned on ${paneId} (idle) — dead-lettered ${droppedCount} queued message(s)`)
+    notifyDeadLettered(paneId, droppedCount)
   }
   let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
@@ -1004,7 +1199,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   process.on("SIGTERM", () => cleanExit(0))
   process.on("SIGINT", () => cleanExit(0))
 
-  hookServer = startHookServer(ctx, pendingButtons, activeButtonKeys)
+  hookServer = startHookServer(ctx, pendingButtons, activeButtonKeys, onQuestionAbandoned)
 
   if (ctx.cfg.transport === "channel") {
     log("transport 'channel' is reserved for v1.2+ — falling back to tmux")
@@ -1045,9 +1240,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     const paneId = found.target.pane.paneId
-    // Defer a text message behind the pane's outstanding question (⏳); control
-    // verbs (Escape, no deferText) always go through to interrupt it.
-    if (deferText !== undefined && paneHasPendingQuestion(paneId)) {
+    // Defer a text message behind the pane's outstanding question OR an existing
+    // backlog (⏳); control verbs (Escape, no deferText) always go through to
+    // interrupt it.
+    if (deferText !== undefined && shouldDeferInbound(paneId)) {
       enqueueDeferred(paneId, deferText)
       lastWasDeferred = true
       return true
@@ -1069,7 +1265,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     msg: string,
   ): Promise<{ ok: boolean; error?: string; deferred?: boolean }> => {
     const wrapped = wrapInbound(ctx.cfg.injectWrap, from, msg)
-    if (paneHasPendingQuestion(paneId)) {
+    if (shouldDeferInbound(paneId)) {
       enqueueDeferred(paneId, wrapped)
       return { ok: true, deferred: true }
     }
@@ -1173,7 +1369,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // callback edits its own prompt, so it must NOT set lastWasDeferred.
     let res: { ok: boolean; error?: string; deferred?: boolean }
     if (pending.prewrapped) {
-      if (paneHasPendingQuestion(target.paneId)) {
+      if (shouldDeferInbound(target.paneId)) {
         enqueueDeferred(target.paneId, pending.message)
         res = { ok: true, deferred: true }
       } else {
@@ -1201,7 +1397,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const routes = parseRoutes(readFileOrNull(ctx.paths.routes))
     const recognized = recognizeRoute(routes, action.replyToMessageId)
     const injectVerbatim = async (paneId: string): Promise<boolean> => {
-      if (paneHasPendingQuestion(paneId)) {
+      if (shouldDeferInbound(paneId)) {
         enqueueDeferred(paneId, action.injectText)
         lastWasDeferred = true
         return true
@@ -1473,7 +1669,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         void answerCallbackQuery(ctx, action.callbackQueryId, "answered")
         if (pending.messageId !== null) void editMessageText(ctx, pending.messageId, finalText)
         // The agent is unblocked → deliver anything queued behind this question.
-        if (pending.req.paneId) void flushDeferred(pending.req.paneId)
+        // Fire-and-forget, but guard the promise: an error here must never become
+        // an unhandled rejection that takes down the daemon.
+        if (pending.req.paneId) {
+          flushDeferred(pending.req.paneId).catch((err) => log(`flushDeferred error: ${err}`))
+        }
         return true
       }
       case "status":
