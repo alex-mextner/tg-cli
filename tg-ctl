@@ -14,13 +14,23 @@
 
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
-import { join, resolve } from "path"
+import { dirname, join, resolve } from "path"
 import {
   buildAgentSelectMessage,
   groupBySession,
   matchWindows,
   type AgentCandidate,
 } from "./features/tg-ctl/agent-match"
+import {
+  LAUNCHD_LABEL,
+  SYSTEMD_UNIT,
+  autostartKind,
+  autostartUnitPath,
+  buildDisablePlan,
+  buildEnablePlan,
+  type AutostartCommand,
+  type AutostartEnv,
+} from "./features/tg-ctl/autostart"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
 import { findAgentInPane, parsePaneList, parseProcList, pickTargetPane } from "./features/tg-ctl/discover"
@@ -77,12 +87,23 @@ import type {
 
 export const USAGE = `Usage:
   tg-ctl start [--pane %N] [--cwd PATH] [--session NAME]
-  tg-ctl ask    # internal: hook client, reads a ButtonRequest JSON from stdin
-  tg-ctl stop
-  tg-ctl status
+                         # background (detached) daemon, returns immediately
+  tg-ctl run             # foreground (blocking) daemon — the process itself
+  tg-ctl status          # is it running? pid / bot / target pane / autostart
+  tg-ctl stop            # stop the background daemon
+  tg-ctl enable [--dry-run]
+                         # install OS autostart (launchd / systemd --user) AND start now
+                         # (--dry-run prints the plan and touches nothing)
+  tg-ctl disable         # remove OS autostart AND stop
+  tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
   tg-ctl install-hooks   # wire q→buttons: agent questions → Telegram buttons
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
-  tg-ctl run    # internal: the daemon process itself
+
+The run/start/status/stop/enable/disable lifecycle follows the shared agent-tools
+service-management contract (agenttools_service). Autostart matrix: macOS → launchd
+LaunchAgent; Linux → systemd --user unit; no supported autostart → start now but it
+will NOT survive reboot. enable/disable exit 4 when the OS autostart install/remove
+failed (the daemon is still started; autostart is just not live).
 
 Credentials: <config dir>/.env (TG_BOT_TOKEN, TG_CHAT_ID).
 Config:      <config dir>/config.yaml, top-level control: + voice: blocks.
@@ -586,6 +607,18 @@ function composeStatus(ctx: Ctx): string {
       ? "q→buttons hooks: installed (Claude Code)"
       : "q→buttons hooks: NOT installed — run `tg-ctl install-hooks`",
   )
+  // Autostart (the shared service-management lifecycle): an installed unit means the daemon
+  // comes back at login. Mirrors the q→buttons line — installed reports the kind/label, absent
+  // gets a hint. On the no-op fallback (no launchd/systemd) there's no unit to find.
+  const env = autostartEnv(ctx)
+  const kind = autostartKind(env)
+  lines.push(
+    kind === "none"
+      ? "autostart: not supported on this OS — `tg-ctl start` runs now but won't survive reboot"
+      : autostartUnitInstalled(env)
+        ? `autostart: enabled (${kind}, ${autostartUnitLabel(kind)})`
+        : "autostart: NOT enabled — run `tg-ctl enable` to start at login",
+  )
   return lines.join("\n")
 }
 
@@ -647,6 +680,13 @@ function startLauncher(ctx: Ctx, flags: StartFlags): void {
   proc.unref()
   closeSync(logFd) // the child holds its own dup
   console.log(`tg-ctl: daemon launch requested (bot ${ctx.botId}) — log: ${ctx.paths.log}`)
+  // Hint at autostart unless it's already installed, so a one-shot `start` doesn't silently die
+  // at the next reboot (the shared service-management contract: start HINTS at enable). Skipped
+  // on the no-op fallback OS, where there's nothing to enable.
+  const env = autostartEnv(ctx)
+  if (autostartKind(env) !== "none" && !autostartUnitInstalled(env)) {
+    console.log("tg-ctl: not set to start at login — run `tg-ctl enable` to survive reboots.")
+  }
 }
 
 // --- stop / status ---
@@ -677,6 +717,190 @@ function stopDaemon(ctx: Ctx): void {
     unlinkSync(ctx.paths.pid)
   } catch {}
   console.log(kill0(pid!) ? `tg-ctl: SIGTERM sent (pid ${pid}, still exiting)` : `tg-ctl: stopped (pid ${pid})`)
+}
+
+// --- enable / disable: OS autostart self-registration (the agenttools_service contract) ---
+
+// Exit code for an autostart enable/disable that failed to install/remove the OS unit (the OS
+// control command returned nonzero, or the unit file could not be written/removed). Mirrors the
+// agenttools_service contract's exit-code 4 for "autostart enable/disable failed", so a script
+// can branch on "the service is up but autostart is NOT live".
+const EXIT_AUTOSTART_FAILED = 4
+
+// Resolve the path the autostart unit should launch. launchd/systemd run the agent with a
+// minimal PATH, so argv MUST be absolute. The deployed binary is the ~/.files/bin/tg-ctl symlink
+// on PATH; fall back to this script's own path when it isn't installed (e.g. a worktree run) so
+// `enable` from a dev checkout still launches the right file.
+function resolveDeployedBin(home: string): string {
+  const deployed = join(home, ".files", "bin", "tg-ctl")
+  return existsSync(deployed) ? deployed : import.meta.path
+}
+
+// True when `systemctl --user` is usable on this Linux host. Cheap probe, never throws. macOS
+// never calls this (autostartKind short-circuits to launchd before hasSystemd is read).
+function hasUserSystemd(): boolean {
+  try {
+    const r = Bun.spawnSync(["systemctl", "--user", "--version"], { stdout: "ignore", stderr: "ignore" })
+    return r.exitCode === 0
+  } catch {
+    return false
+  }
+}
+
+function autostartEnv(ctx: Ctx): AutostartEnv {
+  return {
+    platform: process.platform,
+    home: ctx.home,
+    binPath: resolveDeployedBin(ctx.home),
+    bunPath: process.execPath,
+    logPath: ctx.paths.log,
+    // The resolved config dir, so a non-default `TG_CTL_CONFIG_DIR=/x tg-ctl enable` pins it into
+    // the unit (the OS launches the daemon with a minimal env that wouldn't carry it otherwise).
+    configDir: ctx.configDir,
+    xdgConfigHome: process.env.XDG_CONFIG_HOME ?? "",
+    hasSystemd: process.platform === "linux" ? hasUserSystemd() : false,
+  }
+}
+
+// The OS unit label/name for a status/enable message (the lib's launchd Label / systemd unit
+// name). Defined only for the kinds that HAVE a unit; "none" (the no-op fallback) installs no
+// unit, so it has no label and callers must not ask — guarded explicitly so the signature can't
+// silently mislabel a fallback as launchd.
+function autostartUnitLabel(kind: "launchd" | "systemd"): string {
+  return kind === "systemd" ? `${SYSTEMD_UNIT}.service` : LAUNCHD_LABEL
+}
+
+// Is the launchd/systemd unit file already on disk for tg-ctl? Cheap existence check (no plist/
+// unit body rendered); on the no-op fallback (no unit file) this returns false.
+function autostartUnitInstalled(env: AutostartEnv): boolean {
+  const path = autostartUnitPath(env)
+  return path !== undefined && existsSync(path)
+}
+
+// Run one plan command. Returns true on success. An `optional` command that fails is treated as
+// success (e.g. `launchctl unload` when nothing was loaded yet). stderr is surfaced on a hard
+// failure so the user sees the launchctl/systemctl error.
+function runAutostartCommand(cmd: AutostartCommand): boolean {
+  try {
+    const r = Bun.spawnSync(cmd.argv, { stdout: "ignore", stderr: "pipe" })
+    if (r.exitCode === 0) return true
+    if (cmd.optional) return true
+    const stderr = r.stderr ? new TextDecoder().decode(r.stderr).trim() : ""
+    console.error(`tg-ctl: ${cmd.describe} failed (${cmd.argv.join(" ")}): exit ${r.exitCode}${stderr ? ` — ${stderr}` : ""}`)
+    return false
+  } catch (err) {
+    if (cmd.optional) return true
+    console.error(`tg-ctl: ${cmd.describe} failed to spawn (${cmd.argv.join(" ")}): ${err}`)
+    return false
+  }
+}
+
+// `tg-ctl enable [--dry-run]` — install OS autostart AND start now. Mirrors the lib's
+// ServiceManager.enable single-owner contract:
+//   - launchd/systemd OWN the process (RunAtLoad / enable --now), so we stop any background
+//     (pidfile) instance first to avoid two daemons fighting over the bot, then install the unit;
+//     the activating command's exit code decides whether autostart is actually live.
+//   - if the OS control command FAILS (sandbox / missing binary), OR there's no supported OS
+//     autostart at all (the 'none' fallback), we fall back to a plain background `start` so the
+//     service is still up now, and report that it will NOT survive reboot (enabled=false).
+// Idempotent: re-running re-writes the same unit and reloads it. `--dry-run` prints the plan
+// (unit path + launchctl/systemctl commands) and touches nothing — the e2e test uses it so it
+// never loads a real LaunchAgent. Returns the process exit code.
+function enableAutostart(ctx: Ctx, dryRun: boolean): number {
+  const env = autostartEnv(ctx)
+  const plan = buildEnablePlan(env)
+  if (dryRun) {
+    console.log(`tg-ctl: [dry-run] autostart kind: ${plan.kind}` + (plan.kind !== "none" ? `, ${autostartUnitLabel(plan.kind)}` : ""))
+    if (plan.kind === "none") {
+      console.log("tg-ctl: [dry-run] no supported OS autostart — would `tg-ctl start` now (no reboot survival)")
+    }
+    if (plan.file) console.log(`tg-ctl: [dry-run] would write ${plan.file.path}`)
+    for (const cmd of plan.commands) console.log(`tg-ctl: [dry-run] would run: ${cmd.argv.join(" ")}`)
+    return 0
+  }
+
+  // No supported OS autostart: just background-start now (the lib's NoopAutostartBackend path).
+  if (plan.kind === "none") {
+    startLauncher(ctx, {})
+    console.error("tg-ctl: autostart is not supported on this OS — started now, but it will NOT survive reboot.")
+    return 0
+  }
+
+  // The OS is about to launch its own copy. Stop any background (pidfile) instance first so we
+  // don't end up with two processes on the same bot — the no-double-start invariant.
+  stopDaemon(ctx)
+
+  if (plan.file) {
+    try {
+      mkdirSync(dirname(plan.file.path), { recursive: true })
+      writeFileSync(plan.file.path, plan.file.content, { mode: plan.file.mode })
+    } catch (err) {
+      console.error(`tg-ctl: writing ${plan.file.path} failed: ${err}`)
+      return EXIT_AUTOSTART_FAILED
+    }
+  }
+  // Run all commands; the LAST one is the activating one (`launchctl load` / `enable --now`)
+  // whose success means autostart is live (mirrors the lib gating `enabled` on its exit code).
+  let activated = true
+  for (const cmd of plan.commands) {
+    if (!runAutostartCommand(cmd)) activated = false
+  }
+  if (!activated) {
+    // The unit file is on disk but the OS control command failed — autostart is NOT live. Fall
+    // back to a background start so the service is at least up now, and report enabled=false.
+    console.error(`tg-ctl: ${plan.kind} autostart command failed — falling back to a one-shot start (will NOT survive reboot).`)
+    startLauncher(ctx, {})
+    return EXIT_AUTOSTART_FAILED
+  }
+  // Past the kind === "none" early return, a launchd/systemd plan ALWAYS carries a file; narrow
+  // explicitly so the success message doesn't lean on a non-null assertion.
+  const where = plan.file ? ` at ${plan.file.path}` : ""
+  console.log(
+    `tg-ctl: autostart enabled — ${plan.kind} (${autostartUnitLabel(plan.kind)})${where}. ` +
+      "The daemon starts at login and is running now.",
+  )
+  return 0
+}
+
+// `tg-ctl disable` — remove OS autostart AND stop the running daemon. Mirrors the lib's
+// ServiceManager.disable: run the deactivating command (unload / disable --now) and only remove
+// the unit file if it succeeded — a still-loaded unit's file is left in place rather than
+// orphaning the live OS process. Then stop any background instance too. Idempotent: a missing
+// unit is a no-op, not an error. Returns the process exit code (4 if the OS deactivate failed).
+function disableAutostart(ctx: Ctx): number {
+  const env = autostartEnv(ctx)
+  const plan = buildDisablePlan(env)
+  let removeFailed = false
+  if (plan.filePath && existsSync(plan.filePath)) {
+    // The first command is the deactivator (unload / disable --now); it gates file removal.
+    const [deactivateCmd, ...postCmds] = plan.commands
+    const ok = deactivateCmd ? runAutostartCommand(deactivateCmd) : true
+    if (ok) {
+      try {
+        unlinkSync(plan.filePath)
+      } catch (err) {
+        console.error(`tg-ctl: removing ${plan.filePath} failed: ${err}`)
+        removeFailed = true
+      }
+      for (const cmd of postCmds) runAutostartCommand(cmd)
+    } else {
+      // Deactivate failed — leave the file so `status` doesn't lie about the unit being gone.
+      console.error(`tg-ctl: ${plan.kind} deactivate failed — leaving the unit file in place (the OS may still be running it).`)
+      removeFailed = true
+    }
+  }
+  // disable also stops the manager-spawned (background) instance. On launchd/systemd the unload/
+  // disable above already stopped the OS-owned copy; this is the catch-all for a pidfile instance.
+  stopDaemon(ctx)
+  if (removeFailed) return EXIT_AUTOSTART_FAILED
+  // On the 'none' fallback there was never an OS unit — say what actually happened (stopped the
+  // background instance) rather than the misleading "autostart disabled (none)".
+  console.log(
+    plan.kind === "none"
+      ? "tg-ctl: no OS autostart to remove — stopped the background instance."
+      : `tg-ctl: autostart disabled (${plan.kind}).`,
+  )
+  return 0
 }
 
 // --- hook/client handoff over a local Unix socket ---
@@ -1864,11 +2088,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 // --- CLI entrypoint (only runs when executed directly, not when imported) ---
 if (import.meta.main) {
   const cmd = process.argv[2]
-  if (cmd === "-h" || cmd === "--help") {
+  // Bare invocation (no subcommand) prints HELP on stdout and exits 0 — it NEVER launches the
+  // daemon (the shared service-management contract: a bare `<tool> <service>` is help, not run).
+  if (!cmd || cmd === "-h" || cmd === "--help") {
     console.log(USAGE)
     process.exit(0)
   }
-  if (!cmd || !["start", "run", "stop", "status", "ask", "install-hooks", "voice-setup"].includes(cmd)) {
+  if (!["start", "run", "stop", "status", "enable", "disable", "ask", "install-hooks", "voice-setup"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -1879,8 +2105,12 @@ if (import.meta.main) {
     installHooks(home)
     process.exit(0)
   }
-  // TG_CTL_CONFIG_DIR exists so tests can point a spawned daemon at a tmpdir.
-  const configDir = process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")
+  // TG_CTL_CONFIG_DIR exists so tests can point a spawned daemon at a tmpdir. Resolve it to an
+  // ABSOLUTE path: `enable` pins this dir into the launchd/systemd unit, and the OS launches the
+  // login daemon from its own cwd (not the shell's) — a relative override would resolve against
+  // the wrong directory and silently miss the .env it was enabled with. (The default branch is
+  // already absolute, so this is a no-op there.)
+  const configDir = resolve(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"))
   const fileEnv = loadEnv(join(configDir, ".env"))
   const env = { ...fileEnv, ...process.env }
 
@@ -1926,6 +2156,12 @@ if (import.meta.main) {
   if (cmd === "stop") {
     stopDaemon(ctx)
     process.exit(0)
+  }
+  if (cmd === "enable") {
+    process.exit(enableAutostart(ctx, process.argv.includes("--dry-run")))
+  }
+  if (cmd === "disable") {
+    process.exit(disableAutostart(ctx))
   }
   if (cmd === "status") {
     console.log(composeStatus(ctx))

@@ -38,11 +38,23 @@ I/O, fetch, signals, `bun:ffi`):
   PLAIN fallback grid — a real bordered table comes from `--format html` with `<table>`),
   `tg help format` (print the supported-HTML reference, basic + rich tiers; the topic-help
   convention — `--format-help` is a back-compat alias).
-- `tg-ctl` — inbound control daemon (`start`/`run`/`stop`/`status`): singleton via real
-  `flock(2)` over `bun:ffi`, Telegram `getUpdates` long-poll, tmux pane injection.
-  Spec: `docs/specs/2026-06-10-tg-ctl-control-design.md` (§16 = shipped v1 scope).
-  After merge to main it gets its own `~/.files/bin/tg-ctl` symlink (same live-symlink
-  rule as `tg`).
+- `tg-ctl` — inbound control daemon (`run`/`start`/`status`/`stop`/`enable`/`disable`):
+  singleton via real `flock(2)` over `bun:ffi`, Telegram `getUpdates` long-poll, tmux pane
+  injection. The lifecycle subcommands follow the shared agent-tools service-management
+  contract (`agenttools_service`): `run` = foreground/blocking; `start` = background detached
+  daemon; `status` = running?/pid/bot/target/autostart; `stop` = stop the background daemon;
+  `enable` = install OS autostart AND start now; `disable` = remove autostart AND stop. A bare
+  `tg-ctl` (no subcommand) prints HELP and never launches. OS-autostart matrix lives in
+  `features/tg-ctl/autostart.ts`, mirroring the lib's SEMANTICS: macOS → launchd LaunchAgent
+  (label `com.agenttools.tg-ctl.tg-ctl`, `RunAtLoad` + `KeepAlive{SuccessfulExit:false}`,
+  legacy `launchctl load`/`unload`); Linux with a usable `systemctl --user` → systemd `--user`
+  unit (`agenttools-tg-ctl-tg-ctl.service`, `Restart=on-failure`, `enable --now`); any other host
+  (Linux with no `systemctl --user` — containers, no D-Bus session — or an unsupported OS) → a
+  no-op fallback that starts now but won't survive reboot. tg-ctl is Bun/TS so it
+  reproduces the lib's CONTRACT, not its code; the full Python code-share happens when tg-cli
+  grows a Python seam (follow-up). Spec: `docs/specs/2026-06-10-tg-ctl-control-design.md`
+  (§16 = shipped v1 scope). After merge to main it gets its own `~/.files/bin/tg-ctl` symlink
+  (same live-symlink rule as `tg`).
 
 Feature modules live in `features/<feature-name>/` as **pure TypeScript modules** — no I/O;
 all external dependencies (spawns, fetch, file reads) are injected as function parameters so
@@ -162,7 +174,7 @@ touching any feature.
 
 ## Conventions
 
-- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All 1074 tests must pass.
+- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All 1116 tests must pass.
 - **Codex review** before committing non-trivial changes: `codex exec review --uncommitted`
   (findings appear at the end of output after thinking/exec noise — use `tail -80`).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in
