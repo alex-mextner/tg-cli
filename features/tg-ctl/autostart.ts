@@ -32,6 +32,14 @@
 //     to a plain background `start`, reporting `enabled=false` so the caller can warn it won't
 //     survive reboot. We reproduce exactly that.
 //
+// ONE deliberate divergence from the lib: tg-ctl has a `TG_CTL_CONFIG_DIR` override the lib does
+// not. The OS launches the daemon at login with a minimal environment that does NOT carry the
+// shell's $TG_CTL_CONFIG_DIR, so when `enable` ran against a NON-default config dir the unit MUST
+// pin it (launchd EnvironmentVariables / systemd Environment=), or the login-launched daemon falls
+// back to ~/.config/tg-cli and can't find the credentials it was enabled with. The default dir is
+// NOT pinned — the daemon resolves it identically on its own, so the unit stays byte-identical to
+// the lib's render (see autostartUnitEnv).
+//
 // Supported-OS autostart matrix (kept in sync with agent-tools lib/agenttools_service/README.md):
 //   macOS             → launchd LaunchAgent (~/Library/LaunchAgents/<label>.plist; RunAtLoad +
 //                       KeepAlive{SuccessfulExit:false} → launchd supervises across non-clean exits)
@@ -62,10 +70,36 @@ export interface AutostartEnv {
   bunPath: string;
   // Where launchd/systemd send the daemon's stdout/stderr — the tg-ctl daemon log path.
   logPath: string;
+  // The config dir the daemon was enabled with (ctx.configDir). The OS launches the daemon at
+  // login with a minimal environment — it does NOT inherit the shell's $TG_CTL_CONFIG_DIR — so
+  // when this is a NON-default dir (a `TG_CTL_CONFIG_DIR=/x tg-ctl enable`) the unit must pin it
+  // explicitly, or the login-launched daemon would silently fall back to ~/.config/tg-cli and not
+  // find the credentials/config it was enabled with. Empty/default ⇒ no env block (the daemon's
+  // own default resolves to the same path, so the unit stays byte-identical to the lib's shape).
+  configDir: string;
   // $XDG_CONFIG_HOME if set (the lib honors it for the systemd unit dir), else "".
   xdgConfigHome: string;
   // True when `systemctl --user` is usable on this Linux host (probed by the caller); macOS ignores it.
   hasSystemd: boolean;
+}
+
+// The default config dir the tg-ctl daemon resolves when $TG_CTL_CONFIG_DIR is unset (mirrors the
+// entrypoint's `process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")`). Used to decide
+// whether the autostart unit needs to PIN the config dir: only a non-default dir must be pinned.
+export function defaultConfigDir(home: string): string {
+  return `${home}/.config/tg-cli`;
+}
+
+// The environment variables the autostart unit must export so the login-launched daemon uses the
+// SAME config dir it was enabled with. Empty when the config dir is the daemon's own default — the
+// daemon resolves that path on its own, so pinning it would only bloat the unit (and break unit
+// byte-parity with the lib). Returns ordered [name, value] pairs.
+export function autostartUnitEnv(env: AutostartEnv): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [];
+  if (env.configDir && env.configDir !== defaultConfigDir(env.home)) {
+    pairs.push(['TG_CTL_CONFIG_DIR', env.configDir]);
+  }
+  return pairs;
 }
 
 // A single command to spawn, with a human label for plan output. `optional` commands may fail
@@ -175,6 +209,19 @@ export function launchdPlist(env: AutostartEnv): string {
   const argv = [env.bunPath, env.binPath, 'run'];
   const args = argv.map((a) => `\t\t<string>${xmlEscape(a)}</string>\n`).join('');
   const log = xmlEscape(env.logPath);
+  // EnvironmentVariables pins TG_CTL_CONFIG_DIR for a non-default config dir (launchd starts the
+  // agent with a minimal env, so the daemon won't inherit it otherwise). Omitted for the default
+  // dir so the plist stays byte-identical to the lib's render_launchd_plist shape.
+  const envPairs = autostartUnitEnv(env);
+  const envBlock =
+    envPairs.length === 0
+      ? ''
+      : '\t<key>EnvironmentVariables</key>\n' +
+        '\t<dict>\n' +
+        envPairs
+          .map(([k, v]) => `\t\t<key>${xmlEscape(k)}</key>\n\t\t<string>${xmlEscape(v)}</string>\n`)
+          .join('') +
+        '\t</dict>\n';
   return (
     '<?xml version="1.0" encoding="UTF-8"?>\n' +
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" ' +
@@ -185,6 +232,7 @@ export function launchdPlist(env: AutostartEnv): string {
     `\t<string>${xmlEscape(LAUNCHD_LABEL)}</string>\n` +
     '\t<key>ProgramArguments</key>\n' +
     `\t<array>\n${args}\t</array>\n` +
+    envBlock +
     '\t<key>RunAtLoad</key>\n' +
     '\t<true/>\n' +
     '\t<key>KeepAlive</key>\n' +
@@ -209,6 +257,13 @@ export function systemdUnit(env: AutostartEnv): string {
   const execStart = [env.bunPath, env.binPath, 'run'].map(systemdQuoteToken).join(' ');
   const desc = systemdEscapeValue(`${SERVICE_TOOL} ${SERVICE_NAME} service`);
   const log = systemdEscapeValue(env.logPath);
+  // Environment= pins TG_CTL_CONFIG_DIR for a non-default config dir — systemd --user does NOT
+  // export the shell's env into the unit, so the login-launched daemon would otherwise fall back
+  // to ~/.config/tg-cli. The whole `KEY=value` is one quoted token (a value with spaces stays one
+  // assignment); `%` is doubled like every other directive value. Omitted for the default dir.
+  const envBlock = autostartUnitEnv(env)
+    .map(([k, v]) => `Environment=${systemdQuoteToken(`${k}=${v}`)}\n`)
+    .join('');
   return (
     '[Unit]\n' +
     `Description=${desc}\n` +
@@ -217,6 +272,7 @@ export function systemdUnit(env: AutostartEnv): string {
     '\n' +
     '[Service]\n' +
     'Type=simple\n' +
+    envBlock +
     `ExecStart=${execStart}\n` +
     'Restart=on-failure\n' +
     'RestartSec=2\n' +

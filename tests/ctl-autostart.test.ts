@@ -9,8 +9,10 @@ import {
   LAUNCHD_LABEL,
   SYSTEMD_UNIT,
   autostartKind,
+  autostartUnitEnv,
   buildDisablePlan,
   buildEnablePlan,
+  defaultConfigDir,
   launchdPlist,
   launchdPlistPath,
   systemdUnit,
@@ -25,6 +27,8 @@ function env(overrides: Partial<AutostartEnv> = {}): AutostartEnv {
     binPath: '/home/u/.files/bin/tg-ctl',
     bunPath: '/home/u/.bun/bin/bun',
     logPath: '/home/u/.config/tg-cli/tg-ctl.123456.log',
+    // Default config dir → no TG_CTL_CONFIG_DIR pin (the daemon resolves the same path on its own).
+    configDir: '/home/u/.config/tg-cli',
     xdgConfigHome: '',
     hasSystemd: false,
     ...overrides,
@@ -136,4 +140,51 @@ test('disable plan (none fallback): no file, no commands', () => {
   expect(plan.kind).toBe('none');
   expect(plan.filePath).toBeUndefined();
   expect(plan.commands).toEqual([]);
+});
+
+// --- config-dir propagation: a non-default TG_CTL_CONFIG_DIR must survive into the OS unit, or the
+// login-launched daemon falls back to ~/.config/tg-cli and can't find the config it was enabled
+// with (PR #42 review). The DEFAULT dir is omitted so the unit stays byte-identical to the lib.
+
+test('autostartUnitEnv: default config dir → no env pins; a non-default dir → TG_CTL_CONFIG_DIR', () => {
+  expect(autostartUnitEnv(env())).toEqual([]);
+  expect(autostartUnitEnv(env({ configDir: defaultConfigDir('/home/u') }))).toEqual([]);
+  expect(autostartUnitEnv(env({ configDir: '/custom/cfg' }))).toEqual([['TG_CTL_CONFIG_DIR', '/custom/cfg']]);
+});
+
+test('launchd plist: default config dir emits NO EnvironmentVariables block', () => {
+  expect(launchdPlist(env())).not.toContain('EnvironmentVariables');
+});
+
+test('launchd plist: a non-default config dir pins TG_CTL_CONFIG_DIR in EnvironmentVariables', () => {
+  const plist = launchdPlist(env({ configDir: '/custom/cfg' }));
+  expect(plist).toContain('<key>EnvironmentVariables</key>');
+  expect(plist).toContain('<key>TG_CTL_CONFIG_DIR</key>\n\t\t<string>/custom/cfg</string>');
+});
+
+test('launchd plist: a config dir with XML metachars is escaped in the env block', () => {
+  const plist = launchdPlist(env({ configDir: '/c/<a> & b' }));
+  expect(plist).toContain('<string>/c/&lt;a&gt; &amp; b</string>');
+  expect(plist).not.toContain('<a>');
+});
+
+test('systemd unit: default config dir emits NO Environment= directive', () => {
+  expect(systemdUnit(env({ platform: 'linux', hasSystemd: true }))).not.toContain('Environment=');
+});
+
+test('systemd unit: a non-default config dir pins TG_CTL_CONFIG_DIR via Environment=, in [Service]', () => {
+  const unit = systemdUnit(env({ platform: 'linux', hasSystemd: true, configDir: '/custom/cfg' }));
+  expect(unit).toContain('Environment=TG_CTL_CONFIG_DIR=/custom/cfg');
+  // The Environment= line is inside [Service], before ExecStart.
+  const svc = unit.indexOf('[Service]');
+  const exec = unit.indexOf('ExecStart=');
+  const envIdx = unit.indexOf('Environment=');
+  expect(svc).toBeGreaterThanOrEqual(0);
+  expect(envIdx).toBeGreaterThan(svc);
+  expect(envIdx).toBeLessThan(exec);
+});
+
+test('systemd unit: a config dir with spaces / % is quoted as one Environment= token', () => {
+  const unit = systemdUnit(env({ platform: 'linux', hasSystemd: true, configDir: '/c/my 100% dir' }));
+  expect(unit).toContain('Environment="TG_CTL_CONFIG_DIR=/c/my 100%% dir"');
 });

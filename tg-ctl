@@ -754,6 +754,9 @@ function autostartEnv(ctx: Ctx): AutostartEnv {
     binPath: resolveDeployedBin(ctx.home),
     bunPath: process.execPath,
     logPath: ctx.paths.log,
+    // The resolved config dir, so a non-default `TG_CTL_CONFIG_DIR=/x tg-ctl enable` pins it into
+    // the unit (the OS launches the daemon with a minimal env that wouldn't carry it otherwise).
+    configDir: ctx.configDir,
     xdgConfigHome: process.env.XDG_CONFIG_HOME ?? "",
     hasSystemd: process.platform === "linux" ? hasUserSystemd() : false,
   }
@@ -2102,8 +2105,12 @@ if (import.meta.main) {
     installHooks(home)
     process.exit(0)
   }
-  // TG_CTL_CONFIG_DIR exists so tests can point a spawned daemon at a tmpdir.
-  const configDir = process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")
+  // TG_CTL_CONFIG_DIR exists so tests can point a spawned daemon at a tmpdir. Resolve it to an
+  // ABSOLUTE path: `enable` pins this dir into the launchd/systemd unit, and the OS launches the
+  // login daemon from its own cwd (not the shell's) — a relative override would resolve against
+  // the wrong directory and silently miss the .env it was enabled with. (The default branch is
+  // already absolute, so this is a no-op there.)
+  const configDir = resolve(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"))
   const fileEnv = loadEnv(join(configDir, ".env"))
   const env = { ...fileEnv, ...process.env }
 
