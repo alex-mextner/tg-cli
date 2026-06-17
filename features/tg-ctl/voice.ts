@@ -348,14 +348,24 @@ export function decideOnboarding(probe: WhisperProbe, language = 'auto'): Onboar
   };
 }
 
+// A status glyph for the setup-state line: a green check when configured, a
+// hollow circle when still pending. Plain unicode (NOT ANSI) so the SAME string
+// is meaningful on both surfaces — a terminal AND the Telegram reply (which
+// cannot render escape codes). The CLI TTY path may color these green/yellow
+// (colorizeVoiceStatus) without changing the text itself.
+export const STATUS_READY = '✓';
+export const STATUS_PENDING = '○';
+
 // The reply text the bot sends when an unconfigured voice note arrives, or when
 // `tg voice setup` reports its result. Kept here so the message is tested and
-// identical on both paths.
+// identical on both paths. The FIRST line is an explicit configured-vs-pending
+// status (the install-* state principle: green ✓ when configured, ○ when not),
+// so the user sees what is done vs pending without having to read the body.
 export function onboardingMessage(verdict: OnboardingVerdict): string {
   switch (verdict.kind) {
     case 'ready':
       return [
-        '🎙️ Voice transcription is now configured.',
+        `🎙️ ${STATUS_READY} Voice transcription is now configured.`,
         `runner: ${verdict.cfg.runner}`,
         `model: ${verdict.cfg.modelPath}`,
         `language: ${verdict.cfg.language}`,
@@ -363,10 +373,26 @@ export function onboardingMessage(verdict: OnboardingVerdict): string {
       ].join('\n');
     case 'need-ffmpeg':
       return [
-        '🎙️ A local Whisper was found, but `ffmpeg` is missing.',
+        `🎙️ ${STATUS_PENDING} A local Whisper was found, but \`ffmpeg\` is missing.`,
         'Install it (`brew install ffmpeg`), then run `tg voice setup`.',
       ].join('\n');
     case 'need-install':
-      return ['🎙️ Voice input is not set up yet.', verdict.hint].join('\n');
+      return [`🎙️ ${STATUS_PENDING} Voice input is not set up yet.`, verdict.hint].join('\n');
   }
+}
+
+// Colorize the leading status glyph of an onboardingMessage for terminal display
+// ONLY (the `tg voice setup` CLI path). Pure: returns the input unchanged when
+// `enabled` is false (a piped CLI run, and ALWAYS the Telegram-reply path, which
+// must never carry ANSI). Green for the ✓ ready glyph, yellow for the ○ pending
+// glyph — matching the install-* state convention (green done / yellow pending).
+// Only the glyph is recolored; the rest of the message stays default.
+const ANSI_GREEN = '\x1b[32m';
+const ANSI_YELLOW = '\x1b[33m';
+const ANSI_RESET = '\x1b[0m';
+export function colorizeVoiceStatus(message: string, enabled: boolean): string {
+  if (!enabled) return message;
+  return message
+    .replace(`🎙️ ${STATUS_READY}`, `🎙️ ${ANSI_GREEN}${STATUS_READY}${ANSI_RESET}`)
+    .replace(`🎙️ ${STATUS_PENDING}`, `🎙️ ${ANSI_YELLOW}${STATUS_PENDING}${ANSI_RESET}`);
 }

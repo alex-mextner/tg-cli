@@ -47,6 +47,7 @@ import {
   buildFfmpegArgv,
   buildWhisperCppArgv,
   cleanTranscript,
+  colorizeVoiceStatus,
   formatVoiceTranscript,
   FASTER_WHISPER_FALLBACK_SCRIPT,
   decideOnboarding,
@@ -58,6 +59,7 @@ import {
   type VoiceConfig,
 } from "./features/tg-ctl/voice"
 import { probeWhisper } from "./features/tg-ctl/voice-probe"
+import { shouldColorize } from "./features/render/help-color"
 import type {
   Action,
   AgentKind,
@@ -526,7 +528,11 @@ function runVoiceSetup(args: { configDir: string; home: string; language: string
       return false
     }
   }
-  console.log(onboardingMessage(verdict))
+  // This is the CLI path (`tg voice setup`): colorize the ✓/○ status glyph for a
+  // terminal (green=configured, yellow=pending), and never when piped/NO_COLOR.
+  // The DAEMON path (an unconfigured voice note) sends onboardingMessage to
+  // Telegram uncolored — it builds the message directly and never calls this.
+  console.log(colorizeVoiceStatus(onboardingMessage(verdict), shouldColorize()))
   return true
 }
 
