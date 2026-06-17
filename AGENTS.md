@@ -33,7 +33,7 @@ I/O, fetch, signals, `bun:ffi`):
   like `<table>`/`<h1>`/`<ul>`/`<hr>`/`<details>`/`<tg-math>`, otherwise normal `sendMessage`;
   see "Rich messages" below), `--tag`/`--title` (header badge; compose with rich),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
-  on sendMessage, `reply_parameters` on sendRichMessage; the ANSWER/ОТВЕТ tag requires it),
+  on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
   `--table` (render STDIN rows — TSV or `a | b` — as an aligned monospace `<pre>` table; the
   PLAIN fallback grid — a real bordered table comes from `--format html` with `<table>`),
   `--format-help` (print the supported-HTML reference, basic + rich tiers).
@@ -73,7 +73,8 @@ tests can pass fakes.
   parse-mode, emoji-entity → `<tg-emoji>`), `rich.ts` (Rich Message detection + limit validation —
   `isRichHtml` flags rich-only tags so a body routes to `sendRichMessage`, `validateRichHtml`
   pre-flights the documented limits), `prefix.ts` (the `✳️ [window]` header + tag/title
-  badge), `tag.ts` (the ANSWER/DECISION/PROBLEM/REPORT tag set + Russian aliases), `table.ts`
+  badge), `tag.ts` (the lowercase-english tag set — answer/decision/problem/report — validated
+  at parse time via `validateTag`), `table.ts`
   (`--table`: delimited STDIN rows → an aligned, box-drawn, HTML-escaped monospace `<pre>` table —
   alignment is computed on raw cells so escaping never skews columns), and `format-help.ts`
   (`--format-help`: the supported-HTML reference, basic + rich tiers).

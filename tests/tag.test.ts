@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { resolveTag, CANONICAL_TAGS } from '../features/render/tag';
+import { resolveTag, validateTag, CANONICAL_TAGS, ACCEPTED_TAGS, ACCEPTED_TAGS_LIST } from '../features/render/tag';
 
 // --- Canonical English tags resolve to their fallback badge + canonical word ---
 // cellDots = [colored cell0, neutral ▫️ for cells 1..n-1] — so a push
@@ -43,62 +43,78 @@ test('resolveTag is case-insensitive for English input', () => {
   expect(resolveTag('  report  ').word).toBe('REPORT'); // trims surrounding space
 });
 
-// --- Russian aliases map to the English canonicals ---
-test('resolveTag maps Russian aliases to the English canonicals', () => {
-  expect(resolveTag('ОТВЕТ')).toEqual({
-    fallback: '🔵 ANSWER',
-    dot: '🔵',
-    cellDots: ['🔵', '▫️', '▫️'],
-    word: 'ANSWER',
-    known: true,
-  });
-  expect(resolveTag('РЕШЕНИЕ')).toEqual({
-    fallback: '🟠 DECISION',
-    dot: '🟠',
-    cellDots: ['🟠', '▫️', '▫️'],
-    word: 'DECISION',
-    known: true,
-  });
-  expect(resolveTag('ПРОБЛЕМА')).toEqual({
-    fallback: '🔴 PROBLEM',
-    dot: '🔴',
-    cellDots: ['🔴', '▫️', '▫️'],
-    word: 'PROBLEM',
-    known: true,
-  });
-  expect(resolveTag('ОТЧЁТ')).toEqual({
-    fallback: '🟢 REPORT',
-    dot: '🟢',
-    cellDots: ['🟢', '▫️', '▫️'],
-    word: 'REPORT',
-    known: true,
-  });
+// --- Russian aliases are NO LONGER resolved (lowercase-english only) ---
+// resolveTag stays total (never throws), so a Cyrillic word resolves to the
+// not-known shape. The CLI never reaches this — validateTag rejects Cyrillic at
+// parse time before resolveTag runs — but the rendering helper must not crash on
+// off-list input.
+test('resolveTag no longer resolves Russian aliases (they are off-list)', () => {
+  for (const cyrillic of ['ОТВЕТ', 'РЕШЕНИЕ', 'ПРОБЛЕМА', 'ОТЧЁТ', 'ОТЧЕТ']) {
+    const r = resolveTag(cyrillic);
+    expect(r.known).toBe(false);
+    expect(r.fallback).toBe('');
+    expect(r.dot).toBe('');
+    expect(r.cellDots).toEqual([]);
+  }
 });
 
-test('resolveTag: Russian aliases are case-insensitive too', () => {
-  expect(resolveTag('ответ').word).toBe('ANSWER');
-  expect(resolveTag('Решение').word).toBe('DECISION');
-});
-
-// --- The Ё→Е spelling of ОТЧЁТ is tolerated (agents type both) ---
-test('resolveTag tolerates the ОТЧЕТ (Е, no Ё) spelling', () => {
-  expect(resolveTag('ОТЧЕТ')).toEqual({
-    fallback: '🟢 REPORT',
-    dot: '🟢',
-    cellDots: ['🟢', '▫️', '▫️'],
-    word: 'REPORT',
-    known: true,
-  });
-  expect(resolveTag('отчет').word).toBe('REPORT');
-});
-
-// --- Unknown tag soft-renders (no hard fail) ---
-test('resolveTag: an unknown tag is NOT known, has no fallback/dot/cellDots, word is uppercased', () => {
+// --- An off-list input resolves to the not-known shape (no hard fail) ---
+test('resolveTag: an off-list tag is NOT known, has no fallback/dot/cellDots, word is uppercased', () => {
   expect(resolveTag('wat')).toEqual({ fallback: '', dot: '', cellDots: [], word: 'WAT', known: false });
-  expect(resolveTag('FIXME')).toEqual({ fallback: '', dot: '', cellDots: [], word: 'FIXME', known: false });
+  expect(resolveTag('NOTAG')).toEqual({ fallback: '', dot: '', cellDots: [], word: 'NOTAG', known: false });
 });
 
 // --- The canonical-tag list is the single source of truth ---
 test('CANONICAL_TAGS lists the four English canonicals', () => {
   expect([...CANONICAL_TAGS]).toEqual(['ANSWER', 'DECISION', 'PROBLEM', 'REPORT']);
+});
+
+// === validateTag: lowercase-english ONLY (ROADMAP "tg --tag: lowercase-english only") ===
+
+test('ACCEPTED_TAGS are the lowercase-english spellings of the canonicals', () => {
+  expect([...ACCEPTED_TAGS]).toEqual(['answer', 'decision', 'problem', 'report']);
+  expect(ACCEPTED_TAGS_LIST).toBe('answer, decision, problem, report');
+});
+
+test('validateTag ACCEPTS each lowercase-english tag (returns null)', () => {
+  for (const ok of ['answer', 'decision', 'problem', 'report']) {
+    expect(validateTag(ok)).toBeNull();
+  }
+});
+
+test('validateTag accepts surrounding whitespace (trimmed)', () => {
+  expect(validateTag('  answer  ')).toBeNull();
+  expect(validateTag('\treport\n')).toBeNull();
+});
+
+test('validateTag REJECTS uppercase / mixed-case english with a 3-part error', () => {
+  for (const bad of ['ANSWER', 'Answer', 'DECISION', 'Report', 'PROBLEM']) {
+    const err = validateTag(bad);
+    expect(err).not.toBeNull();
+    // WHAT — names the offending value
+    expect(err).toContain(`invalid --tag '${bad}'`);
+    // WHY — the rule
+    expect(err).toContain('lowercase english');
+    // HOW — the accepted set
+    expect(err).toContain('Use one of: answer, decision, problem, report');
+  }
+});
+
+test('validateTag REJECTS Cyrillic aliases with the helpful error', () => {
+  for (const bad of ['ОТВЕТ', 'РЕШЕНИЕ', 'ПРОБЛЕМА', 'ОТЧЁТ', 'ответ']) {
+    const err = validateTag(bad);
+    expect(err).not.toBeNull();
+    expect(err).toContain(`invalid --tag '${bad}'`);
+    expect(err).toContain('lowercase english');
+    expect(err).toContain('answer, decision, problem, report');
+  }
+});
+
+test('validateTag REJECTS unknown words with the helpful error', () => {
+  for (const bad of ['fixme', 'note', 'wat', 'answ', 'answers']) {
+    const err = validateTag(bad);
+    expect(err).not.toBeNull();
+    expect(err).toContain(`invalid --tag '${bad}'`);
+    expect(err).toContain('Use one of: answer, decision, problem, report');
+  }
 });
