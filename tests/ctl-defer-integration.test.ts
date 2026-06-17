@@ -95,6 +95,14 @@ function injected(cfgDir: string): string[] {
   return readFileSync(p, 'utf8').split('\n').filter((l) => l.length > 0);
 }
 
+// The daemon's stdout/stderr log (markers like the dead-letter / re-defer lines)
+// — polled by tests to gate on an async handler having run, rather than sleeping
+// a fixed time that a loaded CI runner can outrun.
+function daemonLogText(cfgDir: string): string {
+  const p = join(cfgDir, 'daemon.log');
+  return existsSync(p) ? readFileSync(p, 'utf8') : '';
+}
+
 async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess> {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
   const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
@@ -609,16 +617,15 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
   // the deterministic proof the flush woke while Q3 was still pending and chose to
   // re-defer the residual (the finding-#1 behavior). Answering Q3 earlier could
   // race the 800ms settle and remove Q3 before the flush evaluates the gate.
-  const daemonLog = (): string => (existsSync(join(cfgDir, 'daemon.log')) ? readFileSync(join(cfgDir, 'daemon.log'), 'utf8') : '');
   {
     const t0 = Date.now();
-    while (Date.now() - t0 < 8000 && !daemonLog().includes('abandon raced a new question')) await Bun.sleep(50);
+    while (Date.now() - t0 < 8000 && !daemonLogText(cfgDir).includes('abandon raced a new question')) await Bun.sleep(50);
   }
   // The flush re-deferred (did NOT dead-letter) because a live question was pending.
-  expect(daemonLog()).toContain('abandon raced a new question');
+  expect(daemonLogText(cfgDir)).toContain('abandon raced a new question');
   // ...and it must NOT have dropped the queue.
-  expect(daemonLog()).not.toContain('were NOT delivered');
-  expect(daemonLog()).not.toMatch(/dropped \d+ queued message/);
+  expect(daemonLogText(cfgDir)).not.toContain('were NOT delivered');
+  expect(daemonLogText(cfgDir)).not.toMatch(/dead-lettered \d+ queued message/);
 
   // Answer Q3 → its flush delivers m3 (the live question's message). The fix is
   // proven by m3 landing; with the bug (drop-everything) m3 would be lost.
@@ -720,7 +727,17 @@ test('a question removed WITHOUT an answer (hook socket closes) does not wedge l
   questionCallbackData = '';
   ask.kill(9);
   await ask.exited;
-  await Bun.sleep(300); // let the socket-close handler run onAbandon
+  // Wait for the socket-close handler to actually run onAbandon (dead-letter the
+  // idle pane) before sending the next inbound. Poll the daemon.log marker instead
+  // of a fixed sleep: under a loaded CI runner a blind 300ms can fire the next
+  // message before the abandon is processed, racing pending-question state.
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !daemonLogText(cfgDir).includes('question abandoned on %1 (idle)')) {
+      await Bun.sleep(50);
+    }
+    expect(daemonLogText(cfgDir)).toContain('question abandoned on %1 (idle)');
+  }
 
   // A NEW inbound now arrives. With the bug it would be deferred (queue non-empty
   // → ✍️, stuck forever). Fixed: no pending question, no flush in flight → it
@@ -740,7 +757,7 @@ test('a question removed WITHOUT an answer (hook socket closes) does not wedge l
     }
   }
   // The new message landed; the abandoned 'deferred one' was dropped (not wedged).
-  expect(injected(cfgDir)).toContain('[TG from Alex #22] after expiry');
+  expect(injected(cfgDir)).toContain('[TG from Alex tg#22] after expiry');
   expect(injected(cfgDir).some((l) => l.includes('deferred one'))).toBe(false);
   // It was DELIVERED (👀), not deferred (✍️).
   {
