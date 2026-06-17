@@ -22,6 +22,10 @@ export const DEFAULT_FEATURES: FeatureMap = {
   'auto-attach': true,
   'autolink-tasks': true,
   'autolink-prs': true,
+  // autolink-msgrefs links `tg#<id>` inbound-message references (the convention
+  // the inbound inject wrap renders) — distinct from a GitHub `#<id>`. Pure
+  // text + an optional t.me deep link; no CLI spawn, so default-ON is free.
+  'autolink-msgrefs': true,
   'md-as-pdf': true,
   // code-as-pdf renders attached code/config files (.ts, .json, .yaml, …) to a
   // mobile, syntax-highlighted PDF; by default ONLY the PDF is sent (the raw

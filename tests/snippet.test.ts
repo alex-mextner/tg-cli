@@ -40,6 +40,72 @@ test('parseLineSpec: no spec → null', () => {
   expect(parseLineSpec('plainword')).toBeNull();
 });
 
+test('parseLineSpec: a 0 line never yields a startLine of 0 (1-based)', () => {
+  // Lines are 1-based, so a 0 in the LINE position is not a valid line spec:
+  // `:0` / `:0-5` / `:5-0` stay plain prose rather than producing a bogus
+  // startLine 0.
+  expect(parseLineSpec('src/a.ts:0')).toBeNull();
+  expect(parseLineSpec('src/a.ts:0-5')).toBeNull();
+  expect(parseLineSpec('src/a.ts:5-0')).toBeNull();
+  // `:0:3` does NOT mean "line 0, col 3" — the `:0` fails the line:col form, so
+  // `src/a.ts:0` reads as the (literal) path with line 3. The point that holds:
+  // no spec ever carries startLine 0.
+  expect(parseLineSpec('src/a.ts:0:3')).toEqual({
+    path: 'src/a.ts:0',
+    startLine: 3,
+    endLine: 3,
+    col: undefined,
+  });
+  // A 0 COLUMN is still fine — only the line is constrained.
+  expect(parseLineSpec('src/a.ts:5:0')).toEqual({
+    path: 'src/a.ts',
+    startLine: 5,
+    endLine: 5,
+    col: 0,
+  });
+});
+
+// GitHub-anchor formats (file#L10, file#L10-L20, file#L10-20). The user pastes
+// these straight from a GitHub permalink; they must extract the same range as
+// the colon forms (tg#29). A `#L` with no digits, or with a 0 line, is not a
+// spec (returns null → token stays plain).
+test('parseLineSpec: file#L10 → single line (GitHub anchor)', () => {
+  expect(parseLineSpec('src/a.ts#L10')).toEqual({
+    path: 'src/a.ts',
+    startLine: 10,
+    endLine: 10,
+    col: undefined,
+  });
+});
+
+test('parseLineSpec: file#L10-L20 → range (GitHub two-anchor)', () => {
+  expect(parseLineSpec('src/a.ts#L10-L20')).toEqual({
+    path: 'src/a.ts',
+    startLine: 10,
+    endLine: 20,
+    col: undefined,
+  });
+});
+
+test('parseLineSpec: file#L10-20 → range (GitHub bare-second form)', () => {
+  expect(parseLineSpec('src/a.ts#L10-20')).toEqual({
+    path: 'src/a.ts',
+    startLine: 10,
+    endLine: 20,
+    col: undefined,
+  });
+});
+
+test('parseLineSpec: #L spec with a 0 line, no digits, or malformed range → null', () => {
+  expect(parseLineSpec('src/a.ts#L0')).toBeNull();
+  expect(parseLineSpec('src/a.ts#L')).toBeNull();
+  expect(parseLineSpec('src/a.ts#Labc')).toBeNull();
+  expect(parseLineSpec('src/a.ts#L10-')).toBeNull(); // missing second endpoint
+  expect(parseLineSpec('src/a.ts#L-10')).toBeNull(); // missing first endpoint
+  expect(parseLineSpec('src/a.ts#L0-5')).toBeNull(); // 0 start
+  expect(parseLineSpec('src/a.ts#L5-0')).toBeNull(); // 0 end
+});
+
 // --- ±2 context extraction (line numbers are 1-based) ---
 const SRC = ['line1', 'line2', 'line3', 'line4 TARGET', 'line5', 'line6', 'line7'].join('\n');
 

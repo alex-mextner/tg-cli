@@ -24,22 +24,38 @@ export interface LineSpec {
   col: number | undefined;
 }
 
-// Parse a trailing location spec: path:N | path:N-M | path:N:C. The column
-// form (path:N:C) is parsed but only the line is used for extraction (column is
-// surfaced for callers that may want it). Returns null when there is no spec.
+// Parse a trailing location spec. Two families, both surfaced by callers that
+// pass a file token: the colon forms a tool/editor emits (path:N | path:N-M |
+// path:N:C) and the GitHub permalink-anchor forms a human pastes (path#LN |
+// path#LN-LM | path#LN-M). The column form (path:N:C) is parsed but only the
+// line is used for extraction (column is surfaced for callers that may want it).
+// Line numbers are 1-based across ALL forms: a 0 line (`:0`, `#L0`, `:0-5`, …)
+// is not a valid spec, so the line captures require `[1-9]\d*` (the column may
+// still be 0). Returns null when there is no spec — the token stays plain prose.
 export function parseLineSpec(token: string): LineSpec | null {
   // path:N:C
-  let m = token.match(/^(.+?):(\d+):(\d+)$/);
+  let m = token.match(/^(.+?):([1-9]\d*):(\d+)$/);
   if (m) {
     return { path: m[1], startLine: +m[2], endLine: +m[2], col: +m[3] };
   }
   // path:N-M
-  m = token.match(/^(.+?):(\d+)-(\d+)$/);
+  m = token.match(/^(.+?):([1-9]\d*)-([1-9]\d*)$/);
   if (m) {
     return { path: m[1], startLine: +m[2], endLine: +m[3], col: undefined };
   }
   // path:N
-  m = token.match(/^(.+?):(\d+)$/);
+  m = token.match(/^(.+?):([1-9]\d*)$/);
+  if (m) {
+    return { path: m[1], startLine: +m[2], endLine: +m[2], col: undefined };
+  }
+  // path#LN-LM | path#LN-M (GitHub permalink anchor — the second endpoint's `L`
+  // is optional, matching GitHub's own URL fragments).
+  m = token.match(/^(.+?)#L([1-9]\d*)-L?([1-9]\d*)$/);
+  if (m) {
+    return { path: m[1], startLine: +m[2], endLine: +m[3], col: undefined };
+  }
+  // path#LN
+  m = token.match(/^(.+?)#L([1-9]\d*)$/);
   if (m) {
     return { path: m[1], startLine: +m[2], endLine: +m[2], col: undefined };
   }

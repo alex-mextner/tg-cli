@@ -26,7 +26,9 @@ the caption — REMOVE that. Detected files get attached; the path stays as writ
 
 ## Line-spec extraction (answer A)
 If a path carries a trailing location spec — `file.ts:42`, `file.ts:42-50`,
-`file.ts:42:5` (line, line-range, line:col, column) — then IN ADDITION to attaching F:
+`file.ts:42:5` (line, line-range, line:col, column), or the GitHub permalink-anchor
+forms `file.ts#L42` / `file.ts#L42-L50` / `file.ts#L42-50` (the second endpoint's
+`L` is optional, matching GitHub's URL fragments) — then IN ADDITION to attaching F:
 - AST-aware extract the referenced location **±2 lines of context**, where the ±2 is also
   AST-aware (snap to statement/node boundaries, not blind line math). Where no parser is
   available for the language, degrade to a sensible line-based ±2.
@@ -54,7 +56,7 @@ The 1024 threshold lives ONLY on R3/R4, and ONLY for INLINE pasted content (neve
 - **R4** — an inline pasted block **> 1024** chars becomes a fragment attachment.
 
 Per path:
-- **Line-spec path** (`file.ts:N` / `:N-M` / `:N:C`): show the AST-aware ±2 snippet inline
+- **Line-spec path** (`file.ts:N` / `:N-M` / `:N:C` / `#LN` / `#LN-LM`): show the AST-aware ±2 snippet inline
   (below the mention) AND attach the full marker-injected file — small or large, both.
 - **Bare path** (no line-spec): attach the file as-is; the path token stays in the text.
 - **EXPLICIT `--photo`/`--file`**: attach (a flag is a direct instruction). An explicit
@@ -104,7 +106,7 @@ filename base; auto-detect the extension from content (language detection → .t
    caption-overflow + splitting safety net (those are transmitter-level, not the feature).
 
 ## Tests (TDD, red-first)
-- parseArgs: paths NOT excised; multiple paths; line-spec parse (`:N`, `:N-M`, `:N:C`).
+- parseArgs: paths NOT excised; multiple paths; line-spec parse (`:N`, `:N-M`, `:N:C`, `#LN`, `#LN-LM`).
 - R2 full-dup strip; R3 ≤1024 inline-keep-no-attach; R4 >1024 → fragment file.
 - AST-aware ±2 extraction + shift-tab + TG quote formatting; marker-comment injection in copy.
 - caption > 1024 → separate text message.
