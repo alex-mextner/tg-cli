@@ -4,11 +4,14 @@ import {
   buildFfmpegArgv,
   buildWhisperCppArgv,
   cleanTranscript,
+  colorizeVoiceStatus,
   formatVoiceTranscript,
   DEFAULT_VOICE,
   decideOnboarding,
   isVoiceConfigured,
   onboardingMessage,
+  STATUS_READY,
+  STATUS_PENDING,
   parseVoiceConfig,
   pickWhisperCppModel,
   renderVoiceConfigBlock,
@@ -291,4 +294,61 @@ test('onboardingMessage covers each verdict', () => {
   expect(onboardingMessage(decideOnboarding(PROBE_READY))).toContain('configured');
   expect(onboardingMessage({ kind: 'need-ffmpeg' })).toContain('ffmpeg');
   expect(onboardingMessage({ kind: 'need-install', hint: 'do X' })).toContain('do X');
+});
+
+// --- setup status glyph (install-* state: green ✓ configured / yellow ○ pending) ---
+
+test('onboardingMessage leads with a ✓ status glyph when configured', () => {
+  const msg = onboardingMessage(decideOnboarding(PROBE_READY));
+  expect(msg).toContain(STATUS_READY);
+  expect(msg).not.toContain(STATUS_PENDING);
+  // The glyph sits on the FIRST line, right after the 🎙️ marker.
+  expect(msg.split('\n')[0]).toContain(`🎙️ ${STATUS_READY}`);
+});
+
+test('onboardingMessage leads with a ○ pending glyph when not yet set up', () => {
+  for (const verdict of [
+    { kind: 'need-ffmpeg' } as const,
+    { kind: 'need-install', hint: 'do X' } as const,
+  ]) {
+    const msg = onboardingMessage(verdict);
+    expect(msg).toContain(STATUS_PENDING);
+    expect(msg).not.toContain(STATUS_READY);
+    expect(msg.split('\n')[0]).toContain(`🎙️ ${STATUS_PENDING}`);
+  }
+});
+
+test('onboardingMessage carries NO ANSI — it is sent verbatim to Telegram (no escape codes)', () => {
+  // The shared message must be ANSI-free: the daemon path sends it straight to
+  // Telegram, which cannot render escape codes. Color is added later, CLI-only.
+  for (const verdict of [
+    decideOnboarding(PROBE_READY),
+    { kind: 'need-ffmpeg' } as const,
+    { kind: 'need-install', hint: 'do X' } as const,
+  ]) {
+    expect(onboardingMessage(verdict)).not.toContain('\x1b[');
+  }
+});
+
+test('colorizeVoiceStatus is a no-op when disabled (the Telegram/piped contract)', () => {
+  const ready = onboardingMessage(decideOnboarding(PROBE_READY));
+  const pending = onboardingMessage({ kind: 'need-install', hint: 'do X' });
+  expect(colorizeVoiceStatus(ready, false)).toBe(ready);
+  expect(colorizeVoiceStatus(pending, false)).toBe(pending);
+});
+
+test('colorizeVoiceStatus colors ONLY the status glyph for a terminal (green ✓ / yellow ○)', () => {
+  const ready = colorizeVoiceStatus(onboardingMessage(decideOnboarding(PROBE_READY)), true);
+  // Green (32) wraps the ✓ glyph; the rest of the text survives unchanged.
+  expect(ready).toContain(`\x1b[32m${STATUS_READY}\x1b[0m`);
+  expect(ready).toContain('configured');
+
+  const pending = colorizeVoiceStatus(onboardingMessage({ kind: 'need-install', hint: 'do X' }), true);
+  // Yellow (33) wraps the ○ glyph.
+  expect(pending).toContain(`\x1b[33m${STATUS_PENDING}\x1b[0m`);
+  expect(pending).toContain('do X');
+
+  // Stripping the ANSI yields the original (only color codes were injected).
+  const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, '');
+  expect(stripAnsi(ready)).toBe(onboardingMessage(decideOnboarding(PROBE_READY)));
 });

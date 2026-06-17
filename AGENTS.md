@@ -36,7 +36,8 @@ I/O, fetch, signals, `bun:ffi`):
   on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
   `--table` (render STDIN rows — TSV or `a | b` — as an aligned monospace `<pre>` table; the
   PLAIN fallback grid — a real bordered table comes from `--format html` with `<table>`),
-  `--format-help` (print the supported-HTML reference, basic + rich tiers).
+  `tg help format` (print the supported-HTML reference, basic + rich tiers; the topic-help
+  convention — `--format-help` is a back-compat alias).
 - `tg-ctl` — inbound control daemon (`start`/`run`/`stop`/`status`): singleton via real
   `flock(2)` over `bun:ffi`, Telegram `getUpdates` long-poll, tmux pane injection.
   Spec: `docs/specs/2026-06-10-tg-ctl-control-design.md` (§16 = shipped v1 scope).
@@ -82,7 +83,8 @@ tests can pass fakes.
   at parse time via `validateTag`), `table.ts`
   (`--table`: delimited STDIN rows → an aligned, box-drawn, HTML-escaped monospace `<pre>` table —
   alignment is computed on raw cells so escaping never skews columns), and `format-help.ts`
-  (`--format-help`: the supported-HTML reference, basic + rich tiers).
+  (the supported-HTML reference, basic + rich tiers — surfaced via `tg help format`, with
+  `--format-help` kept as a back-compat alias).
 - `features/tg-ctl/` — inbound control logic: `control:` config block parser, singleton/pidfile
   helpers, the update→action step function (allowlist, staleness, command split, `/agent`
   routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree
@@ -160,7 +162,7 @@ touching any feature.
 
 ## Conventions
 
-- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All 1066 tests must pass.
+- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All 1074 tests must pass.
 - **Codex review** before committing non-trivial changes: `codex exec review --uncommitted`
   (findings appear at the end of output after thinking/exec noise — use `tail -80`).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in

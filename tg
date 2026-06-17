@@ -79,23 +79,25 @@ export { VERSION } from "./features/cli/version"
 
 // --- Usage ---
 export const USAGE = `Usage:
-  tg [--format plain|html] "text message"
-  tg [--format plain|html] --photo screen.png
-  tg [--format plain|html] --photo screen.png "caption"
-  tg [--format plain|html] --file doc.pdf
-  tg [--format plain|html] --file doc.pdf "caption"
-  tg [--format plain|html] --photo a.png --photo b.png "caption"
-  tg [--format plain|html] --file a.pdf --file b.pdf
-  tg [--format plain|html] --photo a.png --file doc.pdf "caption"
+  tg "text message"
+  tg --photo screen.png "caption"
+  tg --file doc.pdf "caption"
+  tg --photo a.png --photo b.png "caption"   # repeatable; mix --photo/--file
   tg "see /abs/path/shot.png"   # existing file paths in text are auto-attached
   tg --reply-to 1234 --tag answer "answer"  # thread under inbound message 1234
   printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
   tg voice setup                # configure inbound voice→text (local Whisper STT)
   tg --ls-emoji-helpers
-  tg --format-help              # what Telegram message formatting supports
+
+The global options (--format, --tag, --title, --reply-to, the feature toggles)
+apply to ANY of the above forms — see Options below.
+
+Help topics (\`tg help <topic>\`):
+  format   what Telegram message formatting supports (HTML tags / entities)
 
 Options:
-  --format plain|html  message format (default: plain)
+  --format plain|html  message format (default: plain). A global modifier on
+                       every send form above (text, photo, file, table).
   --photo <path>       attach an image (repeatable)
   --file <path>        attach a document (repeatable)
   --with-original      for code/config files: also attach the RAW file next to
@@ -129,10 +131,13 @@ Options:
                        as a Rich Message). Composes with --tag/--title; any argv
                        text becomes a heading above the table. Keep cells
                        ASCII/Cyrillic (double-width emoji/CJK misalign columns).
-  --format-help        print the Telegram message-formatting reference (which
-                       HTML tags / entities are supported) and exit.
   -v, --version        print version and exit
   -h, --help           print this help and exit
+
+Topic help:
+  tg help format       the Telegram message-formatting reference (supported
+                       HTML tags / entities). The canonical form; the old
+                       --format-help flag still works as an alias.
 
 Auto-attach (feature, ON by default — toggle with --feature/--no-feature):
   File paths in the message text that resolve to an existing file (absolute,
@@ -288,6 +293,31 @@ if (import.meta.main) {
       timeout: 60_000,
     })
     process.exit(result.exitCode ?? 1)
+  }
+
+  // `tg help [<topic>]` — standard topic-help (the ecosystem convention; NOT a
+  // bespoke `--format-help` flag). `tg help format` prints the message-formatting
+  // reference; `tg help` (no/unknown topic) prints the main help, which lists the
+  // available topics. Exact leading-token match only, so `tg "help me"` (a longer
+  // first token followed by prose) still sends as an ordinary message. The
+  // `--format-help` flag is kept as a back-compat alias (handled via parseArgs).
+  if (
+    rawArgs[0] === "help" &&
+    (rawArgs.length === 1 || (rawArgs.length === 2 && !rawArgs[1].startsWith("-")))
+  ) {
+    const topic = rawArgs[1]
+    if (topic === "format") {
+      console.log(colorizeHelp(formatHelp(), shouldColorize()))
+      process.exit(0)
+    }
+    if (topic === undefined) {
+      console.log(colorizeHelp(USAGE, shouldColorize()))
+      process.exit(0)
+    }
+    // A `tg help <unknown>` names a topic that does not exist — say so (3-part:
+    // WHAT/WHY/HOW) on stderr and exit non-zero, rather than silently sending it.
+    console.error(`Error: unknown help topic '${topic}'. Available topics: format. See \`tg help\`.`)
+    process.exit(1)
   }
 
   // `tg replies ...` — recall what was sent over Telegram (the CTO's "вспомнить

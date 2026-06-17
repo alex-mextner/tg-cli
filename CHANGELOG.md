@@ -3,6 +3,25 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.14.0
+
+Help-UX cleanup: deduped usage, standard topic-help, and a configured-vs-pending
+status glyph on `tg voice setup` (ROADMAP "tg help specifics").
+
+- **Usage block no longer repeats `[--format plain|html]` on every line.**
+  `--format` is a global modifier shown ONCE in `Options:`; the usage examples
+  now read cleanly (`tg "text"`, `tg --photo … "caption"`, …) with a one-line
+  note that the global options apply to any form.
+- **`tg help format` is the canonical formatting reference** — the standard
+  topic-help convention (`tg help <topic>`), advertised in the main `tg --help`.
+  `tg help` with no topic prints the main help; an unknown topic
+  (`tg help bogus`) errors with a 3-part message and a non-zero exit. The old
+  `--format-help` flag is kept as a back-compat alias (byte-identical output).
+- **`tg voice setup` shows actual STATUS** — a green `✓` when voice transcription
+  is configured, a yellow `○` when it is still pending (the install-* state
+  principle). The glyph is plain unicode so it is meaningful on BOTH surfaces:
+  colorized for the terminal, and ANSI-free in the Telegram onboarding reply.
+
 ## 1.13.0
 
 `tg#<id>` message-ref convention + GitHub-anchor line specs.

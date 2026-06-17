@@ -65,7 +65,7 @@ tg --file report.pdf "caption"
 tg --photo image.png "caption"
 tg --reply-to 1234 --tag answer "answer that threads under message 1234"
 printf 'task\\tstatus\\nship\\tdone' | tg --table   # plain monospace <pre> fallback
-tg --format-help                                    # what formatting is supported
+tg help format                                      # what formatting is supported
 \`\`\`
 
 ## When to use
@@ -142,11 +142,11 @@ ASCII/Cyrillic — double-width emoji/CJK push columns out of alignment.
 printf 'task\\tstatus\\nship\\tdone\\nreview\\twip' | tg --table
 \`\`\`
 
-## Formatting reference (\`tg --format-help\`)
-\`tg --format-help\` prints the supported HTML tags and entities — the BASIC tier
+## Formatting reference (\`tg help format\`)
+\`tg help format\` prints the supported HTML tags and entities — the BASIC tier
 plus the RICH tier (tables, headings, lists, formulas) auto-sent through the same
 \`--format html\` — with a \`<table>\` example and the rich limits. Run it instead of
-guessing at markup.
+guessing at markup. (\`tg --format-help\` is a back-compat alias for the same.)
 
 ## Code/config files → mobile PDF (\`--with-original\` / \`--no-pdf\`)
 Attaching a code/config file (\`.ts\`, \`.tsx\`, \`.json\`, \`.yaml\`, \`.toml\`, \`.py\`,
@@ -196,7 +196,7 @@ const SKILL_BLURB =
   'requires it. `--format html` auto-sends a native Rich Message (tables, ' +
   'headings, lists, LaTeX formulas) when the body has a rich tag like `<table>`/' +
   '`<h1>`/`<ul>` — same flag, tg routes by content. `tg --table` is the plain ' +
-  'monospace `<pre>` fallback grid. `tg --format-help` lists every supported ' +
+  'monospace `<pre>` fallback grid. `tg help format` lists every supported ' +
   'HTML tag/entity (basic + rich tiers). ' +
   'Attaching a code/config file (.ts/.json/.yaml/.py/…) renders a mobile, ' +
   'syntax-highlighted PDF and by DEFAULT sends ONLY the PDF (raw file is useless ' +

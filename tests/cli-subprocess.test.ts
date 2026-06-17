@@ -15,8 +15,8 @@ function run(args: string[], stdin?: string) {
   });
 }
 
-test('--format-help prints the formatting reference and exits 0 (no creds needed)', () => {
-  const proc = run(['--format-help']);
+test('tg help format prints the formatting reference and exits 0 (no creds needed)', () => {
+  const proc = run(['help', 'format']);
   const out = proc.stdout.toString();
   expect(proc.exitCode).toBe(0);
   expect(out).toContain('Telegram message formatting');
@@ -25,11 +25,38 @@ test('--format-help prints the formatting reference and exits 0 (no creds needed
   expect(out).toContain('<tg-emoji');
 });
 
-test('--help references --format-help, --table and --reply-to', () => {
+test('--format-help still works as a back-compat alias for `tg help format`', () => {
+  // The flag is replaced by the topic-help convention but kept as an undocumented
+  // alias so older scripts/skills that learned `--format-help` do not break.
+  const flag = run(['--format-help']).stdout.toString();
+  const topic = run(['help', 'format']).stdout.toString();
+  expect(flag).toBe(topic);
+  expect(flag).toContain('Telegram message formatting');
+});
+
+test('bare `tg help` prints the main help (lists the format topic) and exits 0', () => {
+  const proc = run(['help']);
+  const out = proc.stdout.toString();
+  expect(proc.exitCode).toBe(0);
+  expect(out).toContain('Usage:');
+  expect(out).toContain('tg help <topic>');
+  expect(out).toContain('format');
+});
+
+test('`tg help <unknown>` errors with a 3-part message and exits non-zero', () => {
+  const proc = run(['help', 'bogus']);
+  expect(proc.exitCode).not.toBe(0);
+  const err = proc.stderr.toString();
+  expect(err).toContain("unknown help topic 'bogus'");
+  expect(err).toContain('Available topics: format');
+});
+
+test('--help advertises `tg help format`, --table and --reply-to', () => {
   const proc = run(['--help']);
   const out = proc.stdout.toString();
   expect(proc.exitCode).toBe(0);
-  expect(out).toContain('--format-help');
+  // The canonical topic-help form is advertised (not a bespoke --format-help flag).
+  expect(out).toContain('tg help format');
   expect(out).toContain('--table');
   expect(out).toContain('--reply-to');
 });

@@ -44,7 +44,9 @@ test('colorizeHelp colors the real USAGE: headers + the documented flags', () =>
   expect(out).toContain('\x1b[');
   // The plain content survives (option names still grep-able after coloring).
   expect(out).toContain('--reply-to');
-  expect(out).toContain('--format-help');
+  // Topic-help is advertised in the canonical `tg help format` form (the old
+  // --format-help flag is mentioned only as a back-compat alias).
+  expect(out).toContain('tg help format');
 });
 
 test('colorizeHelp colors the real format-help reference: a header + an option flag', () => {
