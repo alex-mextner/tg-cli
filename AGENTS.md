@@ -55,6 +55,11 @@ tests can pass fakes.
   `linear` CLI, and rewrites text with hyperlinks.
 - `features/autolink-prs/` — detects GitHub `#N` refs, resolves them against the cwd repo via
   `gh` (issues merge into the tickets block, PRs get their own block), repo-keyed 1 h cache.
+- `features/autolink-msgrefs/` — links `tg#<id>` inbound-message references (the convention the
+  inbound inject wrap renders, distinct from a GitHub `#<id>`). Pure detection runs FIRST in the
+  outbound transform — before the `#N` PR pass — so a `tg#3715` is never mis-resolved as issue/PR
+  #3715. Builds a `t.me/c/` deep link for a supergroup chat; in a private DM the ref is marked but
+  unlinked (no public per-message URL exists).
 - `features/autolink-refs/` — shared compound-ref parser (ranges/lists like `HYP-100..103/110`,
   `#5-7,9`): body links the written numbers, the bottom block enumerates the full range. Used by
   both autolink features (docs/specs/autolink-compound.md).
@@ -152,7 +157,7 @@ touching any feature.
 
 ## Conventions
 
-- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All 1010 tests must pass.
+- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All 1066 tests must pass.
 - **Codex review** before committing non-trivial changes: `codex exec review --uncommitted`
   (findings appear at the end of output after thinking/exec noise — use `tail -80`).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in

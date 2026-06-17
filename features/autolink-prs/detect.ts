@@ -12,8 +12,38 @@ import { expandGroup, groupsFromLeads, type LeadMatch } from '../autolink-refs/c
 // are.
 const REF_RE = /#[1-9][0-9]*/g;
 
+// Boundary test: a reference is rejected when the char on either side is a
+// letter or digit. Uses the Unicode property classes (not ASCII `[A-Za-z0-9]`)
+// so a STYLED token like `𝒕𝒈#3715` — where the msgref pass rendered `tg` as
+// Mathematical Bold Italic before this pass walks the body — is still treated as
+// "letter then #" and rejected, instead of letting the GitHub linkifier hijack
+// the message ref's `#3715`.
+const ALNUM_RE = /[\p{L}\p{N}]/u;
+
+// The full code point ending just before `idx`, or undefined at the start. The
+// `#` boundary may sit right after an astral char (e.g. Mathematical Bold Italic
+// `𝒈`, a UTF-16 surrogate pair); a bare `segment[idx-1]` would return only the
+// trailing low surrogate and mis-classify it as non-letter, so combine the pair.
+function codePointBefore(segment: string, idx: number): string | undefined {
+  if (idx <= 0) return undefined;
+  const lo = segment.charCodeAt(idx - 1);
+  if (lo >= 0xdc00 && lo <= 0xdfff && idx >= 2) {
+    const hi = segment.charCodeAt(idx - 2);
+    if (hi >= 0xd800 && hi <= 0xdbff) return segment.slice(idx - 2, idx);
+  }
+  return segment[idx - 1];
+}
+
+// The full code point starting at `idx` (handles a leading surrogate pair), or
+// undefined at the end.
+function codePointAt(segment: string, idx: number): string | undefined {
+  if (idx >= segment.length) return undefined;
+  const cp = segment.codePointAt(idx);
+  return cp === undefined ? undefined : String.fromCodePoint(cp);
+}
+
 function isAlnum(ch: string | undefined): boolean {
-  return ch !== undefined && /[A-Za-z0-9]/.test(ch);
+  return ch !== undefined && ALNUM_RE.test(ch);
 }
 
 /**
@@ -29,7 +59,7 @@ export function findRefMatches(segment: string): Array<{ start: number; end: num
   while ((m = REF_RE.exec(segment)) !== null) {
     const start = m.index;
     const end = start + m[0].length;
-    if (isAlnum(segment[start - 1]) || isAlnum(segment[end])) continue;
+    if (isAlnum(codePointBefore(segment, start)) || isAlnum(codePointAt(segment, end))) continue;
     out.push({ start, end, number: parseInt(m[0].slice(1), 10) });
   }
   return out;

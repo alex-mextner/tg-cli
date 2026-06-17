@@ -490,6 +490,35 @@ test('line-spec :N-M range and :N:C column parse onto the item', () => {
   rmSync(tsAbs, { force: true });
 });
 
+// GitHub permalink-anchor forms a human pastes (file#L10 / file#L10-L20). The
+// base path resolves and the referenced range lands on the item just like the
+// colon forms, so a pasted GitHub line link gets the inline excerpt too (tg#29).
+test('line-spec #L GitHub anchor on an existing file → attached with lineSpec', () => {
+  const tsAbs = join(dir, 'mod3.ts');
+  writeFileSync(tsAbs, 'a\nb\nc\nd\ne\nf');
+  const single = parseArgs([`see ${tsAbs}#L3`], dir, HOME);
+  expect(single.action).toBe('send');
+  if (single.action === 'send') {
+    expect(single.items[0].lineSpec).toEqual({
+      token: `${tsAbs}#L3`,
+      startLine: 3,
+      endLine: 3,
+      col: undefined,
+    });
+    expect(single.caption).toBe(`see ${tsAbs}#L3`);
+  }
+  const range = parseArgs([`${tsAbs}#L2-L4`], dir, HOME);
+  if (range.action === 'send') {
+    expect(range.items[0].lineSpec).toEqual({
+      token: `${tsAbs}#L2-L4`,
+      startLine: 2,
+      endLine: 4,
+      col: undefined,
+    });
+  }
+  rmSync(tsAbs, { force: true });
+});
+
 test('line-spec on a NON-existent file → plain text, no attach', () => {
   expect(parseArgs(['/nope/x.ts:42', 'hi'], dir, HOME)).toEqual({
     action: 'send',

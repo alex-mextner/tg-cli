@@ -25,9 +25,12 @@ test('wrapInbound does not re-substitute placeholders inside values', () => {
 
 // --- {id} placeholder: the inbound message_id surfaced for `tg --reply-to` ---
 
-test('wrapInbound substitutes {id} with #<messageId> when an id is given', () => {
+test('wrapInbound substitutes {id} with tg#<messageId> when an id is given', () => {
+  // The id renders as `tg#<id>` (NOT bare `#<id>`): `tg#` is the message-ref
+  // convention so the autolink layer can tell it apart from a GitHub issue/PR
+  // `#<id>` and never mis-resolve it (tg#28).
   expect(wrapInbound('[TG from {name} {id}] {msg} — reply via tg', 'Alex', 'hi', 1234)).toBe(
-    '[TG from Alex #1234] hi — reply via tg',
+    '[TG from Alex tg#1234] hi — reply via tg',
   );
 });
 
