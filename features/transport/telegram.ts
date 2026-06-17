@@ -8,7 +8,7 @@
 // exactly the transmitter's Transport (sendMessage/sendPhoto/sendDocument/
 // sendMediaGroup); the transmitter drives caption-overflow, the >4096 split and
 // the photos→text→documents ordering on top of it.
-import { readFileSync, statSync } from 'fs';
+import { closeSync, fstatSync, openSync, readSync } from 'fs';
 import { BOM_MAX_BYTES, maybeAddBom } from '../auto-attach/encoding';
 import { type Transport } from '../auto-attach/transmitter';
 import { type SendItem } from '../auto-attach/types';
@@ -50,6 +50,48 @@ export async function checkResponse(resp: Response, method: string): Promise<unk
   return json.result;
 }
 
+// Read a file into memory ONLY when it is at most `maxBytes`, using a single
+// file descriptor for the size check and the read. Opening once and calling
+// fstat + read on that SAME fd closes the check-then-read race (js/file-system-
+// race): a path-based statSync()+readFileSync() pair can observe two different
+// inodes if the path is swapped in between, whereas an fd is pinned to the inode
+// it opened. Returns the bytes, or null when the file is unreadable, empty, or
+// larger than the cap (the caller then streams it via Bun.file unchanged).
+export function readSmallFile(path: string, maxBytes: number): Uint8Array | null {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const size = fstatSync(fd).size;
+    if (size <= 0 || size > maxBytes) return null;
+    const buf = Buffer.allocUnsafe(size);
+    let read = 0;
+    while (read < size) {
+      const n = readSync(fd, buf, read, size - read, read);
+      if (n === 0) break; // file shrank under us mid-read
+      read += n;
+    }
+    // A short read means the file changed beneath us; bail to null so the caller
+    // streams the file via Bun.file unchanged rather than stitching a BOM onto a
+    // truncated body (which would defeat the very encoding fix this serves).
+    if (read !== size) return null;
+    // Guard the other direction too: if the file GREW after the initial fstat we
+    // would have read only a prefix while still satisfying read === size. Re-stat
+    // the same fd and reject a size change so we never BOM a partial body.
+    if (fstatSync(fd).size !== size) return null;
+    return new Uint8Array(buf.subarray(0, read));
+  } catch {
+    return null; // unreadable here → let Bun.file surface the real error downstream
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // already closed / invalid fd — nothing to do
+      }
+    }
+  }
+}
+
 // Upload bytes for an item. Text DOCUMENTS with non-ASCII UTF-8 content get
 // a BOM prepended to the uploaded copy (features/auto-attach/encoding.ts) so
 // Telegram's preview stops guessing legacy codepages for Cyrillic; the file
@@ -61,18 +103,13 @@ function blobFor(item: SendItem): { body: Blob | ReturnType<typeof Bun.file>; na
     return { body: new Blob([processed]), name: item.source.filename };
   }
   if (item.type === 'document') {
-    try {
-      const size = statSync(item.source.path).size;
-      if (size > 0 && size <= BOM_MAX_BYTES) {
-        const bytes = new Uint8Array(readFileSync(item.source.path));
-        const processed = maybeAddBom(bytes, item.source.path);
-        if (processed !== bytes) {
-          const name = item.source.path.slice(item.source.path.lastIndexOf('/') + 1);
-          return { body: new Blob([processed]), name };
-        }
+    const bytes = readSmallFile(item.source.path, BOM_MAX_BYTES);
+    if (bytes && bytes.length > 0) {
+      const processed = maybeAddBom(bytes, item.source.path);
+      if (processed !== bytes) {
+        const name = item.source.path.slice(item.source.path.lastIndexOf('/') + 1);
+        return { body: new Blob([processed]), name };
       }
-    } catch {
-      // unreadable here → let Bun.file surface the real error downstream
     }
   }
   return { body: Bun.file(item.source.path) };

@@ -3,6 +3,30 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.12.0
+
+`--tag` is now LOWERCASE-ENGLISH ONLY, and `--help` is colorized to match the
+rest of the agent-CLI ecosystem (review / rig / draw).
+
+- **`--tag` accepts only `answer` / `decision` / `problem` / `report`** (the
+  lowercase-english tag words). Russian aliases (`ОТВЕТ`/`РЕШЕНИЕ`/`ПРОБЛЕМА`/
+  `ОТЧЁТ`) and uppercase / mixed-case / unknown values are now **rejected** at
+  parse time with a 3-part error and a non-zero exit, instead of the old
+  soft-render-and-warn:
+
+  ```
+  invalid --tag 'ANSWER': tags must be lowercase english.
+  Use one of: answer, decision, problem, report
+  ```
+
+  The `answer` tag still requires `--reply-to`. Validation lives in
+  `validateTag` (`features/render/tag.ts`) and runs in `parseArgs`, so every
+  send path fails before touching Telegram.
+- **Colorized help.** `tg --help` and `tg --format-help` now colorize section
+  headers (bold cyan) and option names (green), matching review/rig/draw. Color
+  is dependency-free ANSI, auto-disabled when stdout is not a TTY or `NO_COLOR`
+  is set, so piped/redirected help stays plain.
+
 ## 1.11.0
 
 `tg replies` — recall what was sent over Telegram, so an agent can quickly

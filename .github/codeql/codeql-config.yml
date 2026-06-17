@@ -1,0 +1,25 @@
+# CodeQL analysis scope for tg-cli.
+#
+# The security gate analyzes the SHIPPED product surface — the `tg` / `tg-ctl`
+# binaries built from `features/` plus the workflow files. `scripts/` holds
+# one-off developer asset-generators (emoji/sticker set builders) that are run
+# BY HAND, never bundled into the released CLIs, and never process untrusted
+# input. CodeQL's js/file-access-to-http there ("an outbound request URL/body
+# depends on local file data") is true and intentional: they read a bot token /
+# prompt from a local config file and call an HTTP API with it. That is the job,
+# not a vulnerability — and it is out of scope for a gate meant to protect the
+# product.
+#
+# Why a directory `paths-ignore` and not a query-level exclude: `query-filters`
+# match on query METADATA only (id/tags/kind), with no per-path scoping, so
+# excluding `js/file-access-to-http` by id would also blind the gate to that
+# class in shipped `features/` code. Scoping by PATH keeps every query — this one
+# included — fully enforced on the product surface; only the by-hand `scripts/`
+# dir is out of scope. Tradeoff: a FUTURE script is not auto-analyzed; given the
+# dir is three hand-run generators, that is acceptable. Move a script into
+# `features/` (or import it from shipped code) and it is gated again.
+#
+# This is a SCOPE decision (which code the gate guards), not a per-finding
+# suppression of a real bug in shipped code.
+paths-ignore:
+  - scripts

@@ -8,6 +8,18 @@ test('visibleLength ignores HTML tags + counts unescaped entities', () => {
   expect(visibleLength('a &lt; b &amp; c', 'html')).toBe('a < b & c'.length);
 });
 
+test('visibleLength: single-pass decode does not double-unescape, tag-strip is complete', () => {
+  // js/double-escaping guard: `&amp;lt;` must decode to the literal `&lt;`
+  // (4 chars), never collapse to `<`.
+  expect(visibleLength('&amp;lt;', 'html')).toBe('&lt;'.length);
+  // js/incomplete-multi-character-sanitization guard: a dangling, unterminated
+  // tag at end-of-string contributes ZERO visible length (it is stripped, not
+  // left behind as it was under the old /<[^>]+>/g). An unescaped trailing `<b`
+  // is malformed Telegram HTML anyway (a real `<` must be `&lt;`).
+  expect(visibleLength('hi <script', 'html')).toBe('hi '.length);
+  expect(visibleLength('see a<b', 'html')).toBe('see a'.length);
+});
+
 test('HTML caption: raw length > 1024 but VISIBLE <= 1024 still rides as caption', () => {
   const calls: Array<{ method: string }> = [];
   const t: Transport = {

@@ -57,9 +57,9 @@ import {
   parseEmojiHelpers,
 } from "./features/render/html"
 import { buildPrefix } from "./features/render/prefix"
-import { resolveTag } from "./features/render/tag"
 import { toTablePre } from "./features/render/table"
 import { formatHelp } from "./features/render/format-help"
+import { colorizeHelp, shouldColorize } from "./features/render/help-color"
 import { createTelegramTransport } from "./features/transport/telegram"
 import {
   enumerateWorktreeRoots,
@@ -86,7 +86,7 @@ export const USAGE = `Usage:
   tg [--format plain|html] --file a.pdf --file b.pdf
   tg [--format plain|html] --photo a.png --file doc.pdf "caption"
   tg "see /abs/path/shot.png"   # existing file paths in text are auto-attached
-  tg --reply-to 1234 --tag ОТВЕТ "answer"  # thread under inbound message 1234
+  tg --reply-to 1234 --tag answer "answer"  # thread under inbound message 1234
   printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
   tg voice setup                # configure inbound voice→text (local Whisper STT)
   tg --ls-emoji-helpers
@@ -105,22 +105,21 @@ Options:
                        Overrides TG_PDF_DEVICE.
   --title <text>       explicit header title: "✳️ [window] <title>" (the message
                        body is NEVER pulled onto the header line)
-  --tag <TAG>          wordmark pill labeling the message; composes with --title:
+  --tag <tag>          wordmark pill labeling the message; composes with --title:
                        "✳️ [window] 🔵 ANSWER — <title>". Premium clients show the
                        custom-emoji pill; everyone else sees the unicode fallback
-                       below. Tags (case-insensitive, Russian aliases map to the
-                       English canonicals):
-                         ANSWER   / ОТВЕТ     🔵 ANSWER    answering a question
-                         DECISION / РЕШЕНИЕ   🟠 DECISION  a decision to confirm
-                         PROBLEM  / ПРОБЛЕМА  🔴 PROBLEM   a blocker / problem
-                         REPORT   / ОТЧЁТ     🟢 REPORT    a status / result report
-                       An unknown tag soft-renders as [TAG] + a stderr note.
+                       below. Tags are LOWERCASE ENGLISH ONLY (uppercase /
+                       Cyrillic / unknown are rejected with an error):
+                         answer    🔵 ANSWER    answering a question
+                         decision  🟠 DECISION  a decision to confirm
+                         problem   🔴 PROBLEM   a blocker / problem
+                         report    🟢 REPORT    a status / result report
   --reply-to <id>      thread the outbound message UNDER an inbound Telegram
                        message (sets reply_to_message_id). The id is the inbound
                        message's Telegram message_id — the tg-ctl daemon surfaces
                        it in the injected wrap as "[TG from Alex #<id>]". The
-                       ANSWER (ОТВЕТ) tag REQUIRES this: answering means
-                       answering a SPECIFIC message.
+                       answer tag REQUIRES this: answering means answering a
+                       SPECIFIC message.
   --table              read delimited rows from STDIN (TSV, or "a | b" per line),
                        render an aligned monospace table wrapped in <pre>, and
                        send it. The plain FALLBACK grid; a REAL native bordered
@@ -329,7 +328,7 @@ if (import.meta.main) {
   const flagResult = applyFeatureFlags(rawArgs)
   if (flagResult.error) {
     console.error(`Error: ${flagResult.error}`)
-    console.error(USAGE)
+    console.error(colorizeHelp(USAGE, shouldColorize({ isTTY: Boolean(process.stderr.isTTY) })))
     process.exit(1)
   }
   // config.yaml is read ONCE; the raw text feeds both the features: block
@@ -374,7 +373,7 @@ if (import.meta.main) {
   // No-send actions resolve BEFORE the credential gate so help/version/info
   // flags work without Telegram credentials configured.
   if (parsed.action === "help") {
-    console.log(USAGE)
+    console.log(colorizeHelp(USAGE, shouldColorize()))
     process.exit(0)
   }
   if (parsed.action === "version") {
@@ -382,12 +381,13 @@ if (import.meta.main) {
     process.exit(0)
   }
   if (parsed.action === "formatHelp") {
-    console.log(formatHelp())
+    console.log(colorizeHelp(formatHelp(), shouldColorize()))
     process.exit(0)
   }
   if (parsed.action === "error") {
     console.error(`Error: ${parsed.message}`)
-    console.error(USAGE)
+    // Errors go to stderr; colorize only when stderr is the terminal.
+    console.error(colorizeHelp(USAGE, shouldColorize({ isTTY: Boolean(process.stderr.isTTY) })))
     process.exit(1)
   }
 
@@ -632,15 +632,10 @@ if (import.meta.main) {
     caption = decodeTextEscapes(rawCaption)
   }
 
-  // An unknown --tag is not fatal: buildPrefix soft-renders it as a plain
-  // `[TAG]` badge. Emit a one-line stderr note here so the caller learns the
-  // tag was not recognized while the message still goes out.
-  if (tag && tag.trim() && !resolveTag(tag).known) {
-    console.error(
-      `tg: unknown tag '${tag.trim()}' — sending it as a plain [${tag.trim().toUpperCase()}] badge. ` +
-        "Known tags: ANSWER, DECISION, PROBLEM, REPORT (aliases ОТВЕТ/РЕШЕНИЕ/ПРОБЛЕМА/ОТЧЁТ).",
-    )
-  }
+  // `--tag` is validated at parse time (features/cli/args.ts → validateTag):
+  // only the lowercase-english words (answer/decision/problem/report) reach
+  // here, so there is no unknown-tag soft-render path to warn about — an invalid
+  // tag already failed with a 3-part error and a non-zero exit.
 
   // --- autolink-tasks: detect ticket codes, verify them via the linear CLI ---
   // (docs/specs/autolink-tasks.md). One `linear api` spawn per send, and only
