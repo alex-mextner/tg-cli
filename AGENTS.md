@@ -152,7 +152,7 @@ touching any feature.
 
 ## Conventions
 
-- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All ~578 tests must pass.
+- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All 1010 tests must pass.
 - **Codex review** before committing non-trivial changes: `codex exec review --uncommitted`
   (findings appear at the end of output after thinking/exec noise — use `tail -80`).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in
