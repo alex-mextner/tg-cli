@@ -82,26 +82,59 @@ export class DeferQueues {
 // (via the inject callback) and SKIP that one item, continuing with the rest —
 // the same forward-progress the pre-defer loop had.
 //
-// PURE control flow: all I/O (isPaneBusy, inject) is injected, so tests drive it
-// with plain callbacks and assert exactly which items landed vs were re-deferred.
+// The concurrent-flush hazard `isAbandoned` closes: a follow-up question can open
+// on this pane DURING the flush — newer inbound defers behind it (FIFO) — and then
+// be abandoned (hook timeout / socket close / send failure) with NO terminal
+// answer. The agent is still blocked locally on that prompt, but isPaneBusy() now
+// reports idle (the pending button is gone). Without this signal the loop would
+// paste that orphaned tail straight into the still-open prompt — the very "stale
+// resurface" this module exists to kill, on the concurrent-flush path. The daemon
+// sets the flag in onQuestionAbandoned and the loop, seeing it, returns the
+// untouched tail as `abandoned` so the caller DEAD-LETTERS it (never pastes,
+// never re-defers — there is no future answer to flush it).
+//
+// PURE control flow: all I/O (isPaneBusy, isAbandoned, inject) is injected, so
+// tests drive it with plain callbacks and assert exactly which items landed vs
+// were re-deferred vs dead-lettered.
+//
+// Residual race (same bounded window isPaneBusy already lives with): both guards
+// are read BEFORE each inject(). If a question opens or is abandoned DURING the
+// awaited paste of the current item, that one item still lands; the guard only
+// protects the items AFTER it. The daemon mutates this state from event-loop
+// callbacks (button-answer / socket-close), which cannot preempt a synchronous
+// guard read, so the window is exactly one in-flight paste — accepted, not closed,
+// because no observable bridge signal marks the boundary inside a single paste.
 export interface FlushOutcome {
   injected: string[];
   failed: string[]; // attempted but inject() returned false (logged, dropped)
   reDeferred: string[]; // a new question opened — flush these on its answer
+  abandoned: string[]; // a question was abandoned mid-flush — dead-letter these
 }
 
 export async function driveFlush(
   queue: readonly string[],
   isPaneBusy: () => boolean,
   inject: (text: string) => Promise<boolean>,
+  isAbandoned: () => boolean = () => false,
 ): Promise<FlushOutcome> {
   const injected: string[] = [];
   const failed: string[] = [];
+  // Both guards are RE-READ at the top of every iteration (not cached once): the
+  // daemon mutates the underlying state from event-loop callbacks between the
+  // awaited pastes, so a flag that flips mid-flush must be observed on the next
+  // item. A "cache the flag once" optimization would silently break that.
   for (let i = 0; i < queue.length; i++) {
+    // A question was abandoned mid-flush → stop and label the untouched tail
+    // `abandoned`. Checked before isPaneBusy because the two can race and the
+    // resolution differs: abandoned messages have no answer of their own coming.
+    // driveFlush does NOT itself decide dead-letter vs re-defer — it only marks the
+    // tail; the caller chooses (dead-letter if the pane is idle, re-defer if a
+    // DIFFERENT question is still live and will flush the queue on its answer).
+    if (isAbandoned()) return { injected, failed, reDeferred: [], abandoned: queue.slice(i) };
     // A new question opened → stop and re-defer everything not yet attempted.
-    if (isPaneBusy()) return { injected, failed, reDeferred: queue.slice(i) };
+    if (isPaneBusy()) return { injected, failed, reDeferred: queue.slice(i), abandoned: [] };
     if (await inject(queue[i])) injected.push(queue[i]);
     else failed.push(queue[i]); // pane gone / tmux error — drop, don't wedge
   }
-  return { injected, failed, reDeferred: [] };
+  return { injected, failed, reDeferred: [], abandoned: [] };
 }

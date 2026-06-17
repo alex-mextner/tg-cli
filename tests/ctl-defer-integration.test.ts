@@ -277,6 +277,367 @@ test('inbound text deferred while a question is open, flushed (and not lost) aft
   await daemon.exited;
 }, 30_000);
 
+test('a follow-up question ABANDONED mid-flush dead-letters its backlog instead of pasting it into the open prompt', async () => {
+  // Regression for the codex P2 concurrent-flush race. Sequence:
+  //   1. Q1 is answered → flushDeferred(%1) starts and sleeps 800ms (flushing).
+  //   2. DURING that settle a follow-up Q2 opens on the SAME pane; an inbound
+  //      message defers behind it (the pane is flushing AND has a pending
+  //      question, so it queues — strict FIFO).
+  //   3. Q2 is abandoned with NO Telegram answer (its hook socket closes). The
+  //      pending button is deleted BEFORE onAbandon runs, so paneHasPendingQuestion
+  //      is now false for it.
+  //   4. The flush loop wakes. With the BUG, onQuestionAbandoned returned early
+  //      purely on the flushingPanes guard (no dead-letter), and the loop — seeing
+  //      no pending question — pasted the orphaned backlog into the still-open
+  //      terminal prompt (the agent is still blocked locally on Q2). FIXED: the
+  //      abandonment is recorded, the loop dead-letters the residual queue and
+  //      warns the user; nothing is pasted.
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const plainMessages: string[] = []; // sendMessage bodies without inline buttons
+  let buttonMessageId = 0;
+  let questionCallbackData = '';
+
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        const batch = updateQueue.shift();
+        if (batch) return Response.json({ ok: true, result: batch });
+        await Bun.sleep(80);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as Record<string, unknown>;
+        const kb = (body.reply_markup as { inline_keyboard?: Array<Array<{ callback_data: string }>> } | undefined)
+          ?.inline_keyboard;
+        if (kb?.length) {
+          buttonMessageId += 1;
+          questionCallbackData = kb[0][0].callback_data;
+          return Response.json({ ok: true, result: { message_id: buttonMessageId } });
+        }
+        plainMessages.push(String(body.text ?? ''));
+        return Response.json({ ok: true, result: { message_id: 900 } });
+      }
+      if (url.pathname.endsWith('/setMessageReaction')) {
+        reactions.push((await req.json()) as Record<string, unknown>);
+        return Response.json({ ok: true, result: true });
+      }
+      // answerCallbackQuery / editMessageText
+      return Response.json({ ok: true, result: true });
+    },
+  });
+  servers.push(server);
+
+  const daemon = await startDaemon(cfgDir, server.port);
+  procs.push(daemon);
+
+  // 1) Open Q1 and defer one message behind it so the flush has a backlog to
+  //    drain when Q1 is answered (flushDeferred early-returns on an empty queue).
+  const ask1 = startAsk(cfgDir, server.port, {
+    requestId: 'q1',
+    agent: 'claude',
+    kind: 'question',
+    question: 'First?',
+    options: [{ label: 'Yes' }],
+  });
+  procs.push(ask1);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && questionCallbackData === '') await Bun.sleep(50);
+    expect(questionCallbackData).not.toBe('');
+  }
+  const q1Callback = questionCallbackData;
+  const q1MessageId = buttonMessageId;
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([
+    {
+      update_id: 30,
+      message: { message_id: 31, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q1 backlog' },
+    },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+  expect(reactions.at(-1)).toMatchObject({ message_id: 31, reaction: [{ type: 'emoji', emoji: '✍️' }] });
+  expect(injected(cfgDir)).toEqual([]);
+
+  // 2) Answer Q1 → flushDeferred(%1) starts and immediately sleeps 800ms. The
+  //    flush is now IN FLIGHT (flushingPanes has %1) for the whole settle window.
+  questionCallbackData = '';
+  updateQueue.push([
+    {
+      update_id: 31,
+      callback_query: {
+        id: 'cbq1',
+        from: { id: 1, first_name: 'Alex' },
+        message: { message_id: q1MessageId, chat: { id: 1 }, date: nowSec },
+        data: q1Callback,
+      },
+    },
+  ]);
+  await new Response(ask1.stdout).text();
+  await ask1.exited;
+
+  // 3) DURING the 800ms settle, a follow-up Q2 opens on the same pane.
+  const ask2 = startAsk(cfgDir, server.port, {
+    requestId: 'q2',
+    agent: 'claude',
+    kind: 'question',
+    question: 'Second?',
+    options: [{ label: 'Ok' }],
+  });
+  procs.push(ask2);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 4000 && questionCallbackData === '') await Bun.sleep(50);
+    expect(questionCallbackData).not.toBe('');
+  }
+
+  // ...and an inbound arrives behind Q2 (pane is flushing AND has a pending
+  // question → it defers, strict FIFO).
+  updateQueue.push([
+    {
+      update_id: 32,
+      message: { message_id: 33, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q2 orphan' },
+    },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !reactions.some((r) => r.message_id === 33)) await Bun.sleep(50);
+  }
+  expect(reactions.find((r) => r.message_id === 33)).toMatchObject({ reaction: [{ type: 'emoji', emoji: '✍️' }] });
+
+  // 4) Abandon Q2 with NO answer: kill its hook → socket close → onAbandon. The
+  //    pending button is deleted first, so by the time the flush loop next checks,
+  //    paneHasPendingQuestion(%1) is false. The FIX records the abandonment and the
+  //    loop dead-letters the residual instead of pasting it.
+  ask2.kill(9);
+  await ask2.exited;
+
+  // Wait for the flush to actually WAKE from its 800ms settle and reach a verdict,
+  // racing the two mutually-exclusive outcomes rather than sleeping a fixed time
+  // (a fixed sleep can pass vacuously if the buggy paste simply hasn't fired yet):
+  //   - BUG  → the flush pastes 'q2 orphan' into the still-open prompt (it appears
+  //            in the inject log), and no dead-letter notice is sent.
+  //   - FIX  → the flush dead-letters the residual: nothing is pasted and the user
+  //            gets the 'were NOT delivered' notice.
+  // Poll until whichever lands first; the assertions below then decide pass/fail.
+  // This fails FAST on the regression instead of hoping a fixed window covered it.
+  const orphanPasted = (): boolean => injected(cfgDir).some((l) => l.includes('q2 orphan'));
+  const deadLetterSent = (): boolean => plainMessages.some((m) => m.includes('were NOT delivered'));
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 10_000 && !orphanPasted() && !deadLetterSent()) await Bun.sleep(50);
+  }
+
+  // THE REGRESSION: the orphaned 'q2 orphan' must NEVER reach the open prompt.
+  // (With the bug it injects; fixed, it is dead-lettered.)
+  expect(orphanPasted()).toBe(false);
+  // Nothing at all should have been pasted — the pane's prompt is still open.
+  expect(injected(cfgDir)).toEqual([]);
+  // The flush woke and dead-lettered: the user was told the messages did not land.
+  // (This is also the positive proof the flush ran — a no-op flush sends nothing.)
+  expect(deadLetterSent()).toBe(true);
+
+  // 5) The flag must not LEAK: a later, legitimate question on the same pane must
+  //    still flush normally. If abandonedDuringFlush(%1) were left set, this next
+  //    flush would wrongly dead-letter a valid backlog (the most dangerous failure
+  //    mode of the new flag — silently dropping good messages). Open Q3, defer a
+  //    message behind it, answer it, and assert the message actually lands.
+  questionCallbackData = '';
+  const ask3 = startAsk(cfgDir, server.port, {
+    requestId: 'q3',
+    agent: 'claude',
+    kind: 'question',
+    question: 'Third?',
+    options: [{ label: 'Go' }],
+  });
+  procs.push(ask3);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && questionCallbackData === '') await Bun.sleep(50);
+    expect(questionCallbackData).not.toBe('');
+  }
+  const q3Callback = questionCallbackData;
+  const q3MessageId = buttonMessageId;
+  updateQueue.push([
+    {
+      update_id: 33,
+      message: { message_id: 34, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q3 good' },
+    },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !reactions.some((r) => r.message_id === 34)) await Bun.sleep(50);
+  }
+  expect(reactions.find((r) => r.message_id === 34)).toMatchObject({ reaction: [{ type: 'emoji', emoji: '✍️' }] });
+  updateQueue.push([
+    {
+      update_id: 34,
+      callback_query: {
+        id: 'cbq3',
+        from: { id: 1, first_name: 'Alex' },
+        message: { message_id: q3MessageId, chat: { id: 1 }, date: nowSec },
+        data: q3Callback,
+      },
+    },
+  ]);
+  await new Response(ask3.stdout).text();
+  await ask3.exited;
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !injected(cfgDir).some((l) => l.includes('q3 good'))) await Bun.sleep(100);
+  }
+  // The legitimate Q3 backlog flushed (flag was cleared, not leaked).
+  expect(injected(cfgDir).some((l) => l.includes('q3 good'))).toBe(true);
+  // ...and the orphan still never resurfaced in this flush.
+  expect(injected(cfgDir).some((l) => l.includes('q2 orphan'))).toBe(false);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('an abandonment racing a NEW live question re-defers (does not drop the live question backlog)', async () => {
+  // Regression for review finding #1: the abandoned-during-flush flag is keyed by
+  // PANE, but a pane can host a second LIVE question whose backlog must still be
+  // delivered. Sequence:
+  //   1. Q1 answered → flushDeferred(%1) starts, sleeps 800ms (flushing).
+  //   2. During the settle Q2 opens; m2 defers behind it; Q2 is abandoned (flag set).
+  //   3. ALSO during the settle Q3 opens (a real, still-pending question); m3 defers.
+  //   4. The flush wakes: the flag is set, but Q3 is pending. It must RE-DEFER the
+  //      residual (Q3's answer will flush it), NOT dead-letter it — dropping here
+  //      would silently lose m3, a legitimately-queued message of a live question.
+  //   5. Answer Q3 → m3 lands. (m2 rides along; per the per-pane design that is the
+  //      accepted lesser evil vs. dropping the live question's message.)
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const plainMessages: string[] = [];
+  let buttonMessageId = 0;
+  let questionCallbackData = '';
+
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        const batch = updateQueue.shift();
+        if (batch) return Response.json({ ok: true, result: batch });
+        await Bun.sleep(80);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as Record<string, unknown>;
+        const kb = (body.reply_markup as { inline_keyboard?: Array<Array<{ callback_data: string }>> } | undefined)
+          ?.inline_keyboard;
+        if (kb?.length) {
+          buttonMessageId += 1;
+          questionCallbackData = kb[0][0].callback_data;
+          return Response.json({ ok: true, result: { message_id: buttonMessageId } });
+        }
+        plainMessages.push(String(body.text ?? ''));
+        return Response.json({ ok: true, result: { message_id: 900 } });
+      }
+      if (url.pathname.endsWith('/setMessageReaction')) {
+        reactions.push((await req.json()) as Record<string, unknown>);
+        return Response.json({ ok: true, result: true });
+      }
+      return Response.json({ ok: true, result: true });
+    },
+  });
+  servers.push(server);
+
+  const daemon = await startDaemon(cfgDir, server.port);
+  procs.push(daemon);
+
+  const waitForButton = async (): Promise<void> => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && questionCallbackData === '') await Bun.sleep(50);
+    expect(questionCallbackData).not.toBe('');
+  };
+  const waitForReaction = async (id: number): Promise<void> => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !reactions.some((r) => r.message_id === id)) await Bun.sleep(50);
+    expect(reactions.find((r) => r.message_id === id)).toMatchObject({ reaction: [{ type: 'emoji', emoji: '✍️' }] });
+  };
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // Q1 + its backlog so the flush has work.
+  const ask1 = startAsk(cfgDir, server.port, { requestId: 'q1', agent: 'claude', kind: 'question', question: 'First?', options: [{ label: 'Y' }] });
+  procs.push(ask1);
+  await waitForButton();
+  const q1Cb = questionCallbackData;
+  const q1Msg = buttonMessageId;
+  updateQueue.push([{ update_id: 40, message: { message_id: 41, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q1 backlog' } }]);
+  await waitForReaction(41);
+
+  // Answer Q1 → flush starts and sleeps 800ms.
+  questionCallbackData = '';
+  updateQueue.push([{ update_id: 41, callback_query: { id: 'c1', from: { id: 1, first_name: 'Alex' }, message: { message_id: q1Msg, chat: { id: 1 }, date: nowSec }, data: q1Cb } }]);
+  await new Response(ask1.stdout).text();
+  await ask1.exited;
+
+  // During the settle: Q2 opens, m2 defers, Q2 abandoned.
+  const ask2 = startAsk(cfgDir, server.port, { requestId: 'q2', agent: 'claude', kind: 'question', question: 'Second?', options: [{ label: 'Y' }] });
+  procs.push(ask2);
+  await waitForButton();
+  questionCallbackData = '';
+  updateQueue.push([{ update_id: 42, message: { message_id: 43, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q2 orphan' } }]);
+  await waitForReaction(43);
+
+  // Q3 opens (a real, still-pending question) and m3 defers behind it — BEFORE we
+  // abandon Q2, so the flush is guaranteed to see Q3 pending when it wakes.
+  const ask3 = startAsk(cfgDir, server.port, { requestId: 'q3', agent: 'claude', kind: 'question', question: 'Third?', options: [{ label: 'Go' }] });
+  procs.push(ask3);
+  await waitForButton();
+  const q3Cb = questionCallbackData;
+  const q3Msg = buttonMessageId;
+  updateQueue.push([{ update_id: 43, message: { message_id: 44, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q3 live' } }]);
+  await waitForReaction(44);
+
+  // Now abandon Q2 (socket close → flag set). The flush, on waking from its 800ms
+  // settle, sees the flag AND Q3 pending → must re-defer, not dead-letter.
+  ask2.kill(9);
+  await ask2.exited;
+
+  // Wait for the daemon to log the re-defer decision BEFORE answering Q3. This is
+  // the deterministic proof the flush woke while Q3 was still pending and chose to
+  // re-defer the residual (the finding-#1 behavior). Answering Q3 earlier could
+  // race the 800ms settle and remove Q3 before the flush evaluates the gate.
+  const daemonLog = (): string => (existsSync(join(cfgDir, 'daemon.log')) ? readFileSync(join(cfgDir, 'daemon.log'), 'utf8') : '');
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !daemonLog().includes('abandon raced a new question')) await Bun.sleep(50);
+  }
+  // The flush re-deferred (did NOT dead-letter) because a live question was pending.
+  expect(daemonLog()).toContain('abandon raced a new question');
+  // ...and it must NOT have dropped the queue.
+  expect(daemonLog()).not.toContain('were NOT delivered');
+  expect(daemonLog()).not.toMatch(/dropped \d+ queued message/);
+
+  // Answer Q3 → its flush delivers m3 (the live question's message). The fix is
+  // proven by m3 landing; with the bug (drop-everything) m3 would be lost.
+  questionCallbackData = '';
+  updateQueue.push([{ update_id: 44, callback_query: { id: 'c3', from: { id: 1, first_name: 'Alex' }, message: { message_id: q3Msg, chat: { id: 1 }, date: nowSec }, data: q3Cb } }]);
+  await new Response(ask3.stdout).text();
+  await ask3.exited;
+
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 10_000 && !injected(cfgDir).some((l) => l.includes('q3 live'))) await Bun.sleep(100);
+  }
+  // The live question's message was delivered, NOT dropped (review finding #1).
+  expect(injected(cfgDir).some((l) => l.includes('q3 live'))).toBe(true);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
 test('a question removed WITHOUT an answer (hook socket closes) does not wedge later inbound', async () => {
   // Regression for the review finding: extending defer to "queue non-empty" would
   // permanently wedge a pane once its question expired without a Telegram answer
