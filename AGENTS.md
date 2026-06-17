@@ -33,7 +33,7 @@ I/O, fetch, signals, `bun:ffi`):
   like `<table>`/`<h1>`/`<ul>`/`<hr>`/`<details>`/`<tg-math>`, otherwise normal `sendMessage`;
   see "Rich messages" below), `--tag`/`--title` (header badge; compose with rich),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
-  on sendMessage, `reply_parameters` on sendRichMessage; the ANSWER/ОТВЕТ tag requires it),
+  on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
   `--table` (render STDIN rows — TSV or `a | b` — as an aligned monospace `<pre>` table; the
   PLAIN fallback grid — a real bordered table comes from `--format html` with `<table>`),
   `--format-help` (print the supported-HTML reference, basic + rich tiers).
@@ -55,6 +55,11 @@ tests can pass fakes.
   `linear` CLI, and rewrites text with hyperlinks.
 - `features/autolink-prs/` — detects GitHub `#N` refs, resolves them against the cwd repo via
   `gh` (issues merge into the tickets block, PRs get their own block), repo-keyed 1 h cache.
+- `features/autolink-msgrefs/` — links `tg#<id>` inbound-message references (the convention the
+  inbound inject wrap renders, distinct from a GitHub `#<id>`). Pure detection runs FIRST in the
+  outbound transform — before the `#N` PR pass — so a `tg#3715` is never mis-resolved as issue/PR
+  #3715. Builds a `t.me/c/` deep link for a supergroup chat; in a private DM the ref is marked but
+  unlinked (no public per-message URL exists).
 - `features/autolink-refs/` — shared compound-ref parser (ranges/lists like `HYP-100..103/110`,
   `#5-7,9`): body links the written numbers, the bottom block enumerates the full range. Used by
   both autolink features (docs/specs/autolink-compound.md).
@@ -73,7 +78,8 @@ tests can pass fakes.
   parse-mode, emoji-entity → `<tg-emoji>`), `rich.ts` (Rich Message detection + limit validation —
   `isRichHtml` flags rich-only tags so a body routes to `sendRichMessage`, `validateRichHtml`
   pre-flights the documented limits), `prefix.ts` (the `✳️ [window]` header + tag/title
-  badge), `tag.ts` (the ANSWER/DECISION/PROBLEM/REPORT tag set + Russian aliases), `table.ts`
+  badge), `tag.ts` (the lowercase-english tag set — answer/decision/problem/report — validated
+  at parse time via `validateTag`), `table.ts`
   (`--table`: delimited STDIN rows → an aligned, box-drawn, HTML-escaped monospace `<pre>` table —
   alignment is computed on raw cells so escaping never skews columns), and `format-help.ts`
   (`--format-help`: the supported-HTML reference, basic + rich tiers).
@@ -154,7 +160,7 @@ touching any feature.
 
 ## Conventions
 
-- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All ~578 tests must pass.
+- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All 1066 tests must pass.
 - **Codex review** before committing non-trivial changes: `codex exec review --uncommitted`
   (findings appear at the end of output after thinking/exec noise — use `tail -80`).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in

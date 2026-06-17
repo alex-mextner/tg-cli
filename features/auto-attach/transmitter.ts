@@ -13,6 +13,7 @@
 // feature is OFF, because they are not part of the feature — they are correct
 // behavior for any send.
 
+import { decodeHtmlEntities, stripHtmlTags } from '../render/html';
 import { isRichHtml, normalizeRichHtml, validateRichHtml } from '../render/rich';
 import { splitMessage } from './split';
 import { CAPTION_LIMIT, MESSAGE_LIMIT, type Format, type SendItem, type SendPlan } from './types';
@@ -48,14 +49,14 @@ export interface Transport {
 // not a full HTML length per Telegram's exact rules.
 export function visibleLength(text: string, format: Format): number {
   if (format !== 'html') return text.length;
-  const noTags = text.replace(/<[^>]+>/g, '');
-  const unescaped = noTags
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-  return unescaped.length;
+  // Strip tags first, then decode entities in a single pass (stripHtmlTags /
+  // decodeHtmlEntities in render/html). This replaces a `/<[^>]+>/g` strip (which
+  // left a dangling `<script` behind — js/incomplete-multi-character-sanitization)
+  // followed by a chain of `.replace()` entity decodes. The chained decode trips
+  // js/double-escaping: an `&amp;`→`&` step alongside `&lt;`→`<` etc. can feed one
+  // decode's output into another (e.g. `&amp;lt;`→`&lt;`→`<`). The single-pass
+  // decoder consumes each entity exactly once, so no replacement chains.
+  return decodeHtmlEntities(stripHtmlTags(text)).length;
 }
 
 // Can the single text message ride as a media caption? Only when there is

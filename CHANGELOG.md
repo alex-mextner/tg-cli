@@ -3,6 +3,47 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.13.0
+
+`tg#<id>` message-ref convention + GitHub-anchor line specs.
+
+- **Inbound wrap renders the message id as `tg#<id>`** (was bare `#<id>`):
+  `[TG from Alex tg#1234] …`. The `tg#` prefix is what lets the outbound
+  autolink layer tell a Telegram-message reference apart from a GitHub
+  issue/PR `#<id>` so a quoted-back `tg#3715` is never mis-resolved as #3715.
+- **New `autolink-msgrefs` feature** (ON by default). Links `tg#<id>` refs in
+  outbound text: a `t.me/c/` deep link in a supergroup chat, a marked-but-
+  unlinked styled reference in a private DM (no public per-message URL exists).
+  Runs BEFORE the `#N` PR pass. Toggle with `--no-feature autolink-msgrefs`.
+- **File line-specs now accept the GitHub permalink-anchor forms** `file#L10`,
+  `file#L10-L20`, and `file#L10-20` (the second endpoint's `L` is optional),
+  alongside the existing `file:N` / `:N-M` / `:N:C`. A pasted GitHub line link
+  gets the same inline excerpt + marker-injected attachment.
+
+## 1.12.0
+
+`--tag` is now LOWERCASE-ENGLISH ONLY, and `--help` is colorized to match the
+rest of the agent-CLI ecosystem (review / rig / draw).
+
+- **`--tag` accepts only `answer` / `decision` / `problem` / `report`** (the
+  lowercase-english tag words). Russian aliases (`ОТВЕТ`/`РЕШЕНИЕ`/`ПРОБЛЕМА`/
+  `ОТЧЁТ`) and uppercase / mixed-case / unknown values are now **rejected** at
+  parse time with a 3-part error and a non-zero exit, instead of the old
+  soft-render-and-warn:
+
+  ```
+  invalid --tag 'ANSWER': tags must be lowercase english.
+  Use one of: answer, decision, problem, report
+  ```
+
+  The `answer` tag still requires `--reply-to`. Validation lives in
+  `validateTag` (`features/render/tag.ts`) and runs in `parseArgs`, so every
+  send path fails before touching Telegram.
+- **Colorized help.** `tg --help` and `tg --format-help` now colorize section
+  headers (bold cyan) and option names (green), matching review/rig/draw. Color
+  is dependency-free ANSI, auto-disabled when stdout is not a TTY or `NO_COLOR`
+  is set, so piped/redirected help stays plain.
+
 ## 1.11.0
 
 `tg replies` — recall what was sent over Telegram, so an agent can quickly

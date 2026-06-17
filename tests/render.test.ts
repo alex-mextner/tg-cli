@@ -200,14 +200,19 @@ test('buildPrefix --tag (real ids) renders the pill in html, unicode fallback in
   expect(p.plain.endsWith('\n')).toBe(true);
 });
 
-test('buildPrefix --tag (Russian alias) resolves to the English canonical fallback', () => {
-  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'РЕШЕНИЕ' });
+test('buildPrefix --tag (lowercase english) resolves to the canonical fallback', () => {
+  // Lowercase-english is the ONLY accepted CLI input; the renderer uppercases it
+  // and resolves to the canonical pill/fallback.
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'decision' });
   expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 DECISION\n');
 });
 
-test('buildPrefix --tag (English alias, lowercase) resolves to the canonical fallback', () => {
-  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'decision' });
-  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 DECISION\n');
+test('buildPrefix --tag (Russian alias) no longer resolves — renders the bare [WORD] badge', () => {
+  // Cyrillic is rejected by the CLI (validateTag) before buildPrefix runs; the
+  // renderer itself stays total and shows a plain badge for any off-list word.
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'РЕШЕНИЕ' });
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] [РЕШЕНИЕ]\n');
+  expect(p.html).not.toContain('<tg-emoji');
 });
 
 test('buildPrefix --tag + --title compose: badge, em-dash, then title', () => {
@@ -234,15 +239,15 @@ test('buildPrefix --tag + --title compose: badge, em-dash, then title', () => {
   expect(p.html).not.toContain('ANSWER');
 });
 
-// The CTO's exact complaint case: `--tag ОТВЕТ --title "X"`. The first line must
+// The CTO's exact complaint case: `--tag answer --title "X"`. The first line must
 // be the styled --title text only; the tag is the pill badge. NO duplicate plain
-// "ANSWER"/"ОТВЕТ" word anywhere, and the title keeps its Bold-Italic styling.
-test('buildPrefix --tag ОТВЕТ --title "X": pill + styled title, no duplicate tag word', () => {
+// "ANSWER" word anywhere, and the title keeps its Bold-Italic styling.
+test('buildPrefix --tag answer --title "X": pill + styled title, no duplicate tag word', () => {
   const p = buildPrefix({
     aiEmoji: '✳️',
     model: 'no-brand',
     tmuxWindow: 'tg-cli',
-    tag: 'ОТВЕТ',
+    tag: 'answer',
     title: 'X',
   });
   expect(p.html).toBe(
@@ -252,9 +257,8 @@ test('buildPrefix --tag ОТВЕТ --title "X": pill + styled title, no duplicat
       '<tg-emoji emoji-id="5294185480294808567">▫️</tg-emoji>' +
       ' — 𝑿\n',
   );
-  // No second plain tag word, English OR Russian, anywhere on the line.
+  // No second plain tag word anywhere on the line — the pill is the only label.
   expect(p.html).not.toContain('ANSWER');
-  expect(p.html).not.toContain('ОТВЕТ');
   // The title IS styled (Bold-Italic 𝑿), not bare ASCII 'X'.
   expect(p.html).toContain('𝑿');
   expect(p.forceHtml).toBe(true);
@@ -280,10 +284,12 @@ test('buildPrefix: each canonical --tag + --title drops the plain word, keeps st
   }
 });
 
-test('buildPrefix unknown --tag soft-renders as a plain [TAG] badge (no hard fail)', () => {
+test('buildPrefix off-list --tag renders a plain [TAG] badge (renderer stays total)', () => {
+  // The CLI rejects off-list tags (validateTag) before they reach the renderer;
+  // buildPrefix itself never throws and shows a plain badge for any off-list word.
   const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'wat' });
   expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] [WAT]\n');
-  expect(p.html).not.toContain('<tg-emoji'); // unknown tag never emits a pill
+  expect(p.html).not.toContain('<tg-emoji'); // off-list tag never emits a pill
   expect(p.present).toBe(true);
 });
 

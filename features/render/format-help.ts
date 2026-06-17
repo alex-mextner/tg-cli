@@ -81,11 +81,11 @@ Plain fallback table (--table):
 Header badge (--tag / --title), composes with BOTH basic and rich sends:
   --title "<text>"   explicit headline on the \`✳️ [window]\` line (renders as the
                      header line above a rich body too).
-  --tag <TAG>        a labeling pill: ANSWER/DECISION/PROBLEM/REPORT
-                     (aliases ОТВЕТ/РЕШЕНИЕ/ПРОБЛЕМА/ОТЧЁТ). Composes with --title.
+  --tag <tag>        a labeling pill: lowercase english only —
+                     answer/decision/problem/report. Composes with --title.
   --reply-to <id>    thread the message under an inbound Telegram message
                      (sendMessage: reply_to_message_id; sendRichMessage:
-                     reply_parameters). ANSWER tag REQUIRES this.
+                     reply_parameters). The answer tag REQUIRES this.
 `;
 
 export function formatHelp(): string {

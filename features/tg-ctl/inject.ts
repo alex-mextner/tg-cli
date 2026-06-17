@@ -14,13 +14,17 @@ import type { InjectStep } from './types';
 //
 // `{id}` carries the inbound Telegram message_id so the agent reading its pane
 // knows the id to pass to `tg --reply-to <id>` (threaded replies). It renders as
-// `#<id>` (the `#` is part of the substitution, NOT the template). When no id is
-// available (a /agent route, a media item, …) the `{id}` placeholder is removed
-// from the TEMPLATE along with one adjacent space BEFORE substitution, so the
-// wrap reads naturally (`[TG from {name} {id}]` → `[TG from {name}]`). Doing the
-// cleanup on the template — never on the substituted output — is what keeps the
-// user's message intact: a `{msg}` containing double spaces or a ` : ` ratio
-// must come through verbatim and must NOT be collapsed (codex review finding).
+// `tg#<id>` (the `tg#` prefix is part of the substitution, NOT the template):
+// this is the message-ref convention (tg#28). The `tg#` — not a bare `#` — is
+// what lets the outbound autolink layer recognize a reply-to-a-message reference
+// and keep it distinct from a GitHub issue/PR `#<id>` (which would otherwise be
+// resolved against the cwd repo and mis-linked). When no id is available (a
+// /agent route, a media item, …) the `{id}` placeholder is removed from the
+// TEMPLATE along with one adjacent space BEFORE substitution, so the wrap reads
+// naturally (`[TG from {name} {id}]` → `[TG from {name}]`). Doing the cleanup on
+// the template — never on the substituted output — is what keeps the user's
+// message intact: a `{msg}` containing double spaces or a ` : ` ratio must come
+// through verbatim and must NOT be collapsed (codex review finding).
 export function wrapInbound(template: string, name: string, msg: string, messageId?: number): string {
   // No id → strip the `{id}` token (and one neighbouring space) from the
   // template first; with an id, substitute it as `#<id>` in place.
@@ -29,7 +33,7 @@ export function wrapInbound(template: string, name: string, msg: string, message
   return prepared.replace(/\{name\}|\{msg\}|\{id\}/g, (m) => {
     if (m === '{name}') return name;
     if (m === '{msg}') return msg;
-    return messageId !== undefined ? `#${messageId}` : '';
+    return messageId !== undefined ? `tg#${messageId}` : '';
   });
 }
 

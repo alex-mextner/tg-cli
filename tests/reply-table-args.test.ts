@@ -52,43 +52,66 @@ test('--reply-to rejects a non-positive-integer id', () => {
   });
 });
 
-// --- ANSWER tag REQUIRES --reply-to ---
+// --- the `answer` tag REQUIRES --reply-to ---
 
-test('--tag ANSWER without --reply-to is an actionable error', () => {
-  const r = parseArgs(['--tag', 'ANSWER', 'here is the answer'], CWD, HOME);
+test('--tag answer without --reply-to is an actionable error', () => {
+  const r = parseArgs(['--tag', 'answer', 'here is the answer'], CWD, HOME);
   expect(r.action).toBe('error');
   if (r.action === 'error') {
     expect(r.message).toContain('--reply-to');
-    expect(r.message).toContain('ANSWER');
+    expect(r.message).toContain('answer');
   }
 });
 
-test('the Russian ОТВЕТ alias is gated identically (case-insensitive)', () => {
-  expect(parseArgs(['--tag', 'ОТВЕТ', 'ответ'], CWD, HOME).action).toBe('error');
-  expect(parseArgs(['--tag', 'answer', 'a'], CWD, HOME).action).toBe('error');
+test('uppercase / Cyrillic tags are rejected at parse time, before the answer gate', () => {
+  // These never reach the --reply-to gate: validateTag rejects them as not
+  // lowercase-english first.
+  for (const bad of ['ANSWER', 'ОТВЕТ']) {
+    const r = parseArgs(['--tag', bad, 'a'], CWD, HOME);
+    expect(r.action).toBe('error');
+    if (r.action === 'error') {
+      expect(r.message).toContain(`invalid --tag '${bad}'`);
+      expect(r.message).toContain('lowercase english');
+    }
+  }
 });
 
-test('--tag ANSWER WITH --reply-to is accepted (the reply threads)', () => {
-  expect(parseArgs(['--tag', 'ОТВЕТ', '--reply-to', '99', 'answer'], CWD, HOME)).toEqual({
+test('a PADDED answer tag is normalized and still gated on --reply-to', () => {
+  // validateTag accepts surrounding whitespace; parseArgs trims it, so the
+  // answer-gate (a literal `tag === 'answer'` compare) still fires.
+  const r = parseArgs(['--tag', '  answer  ', 'here is the answer'], CWD, HOME);
+  expect(r.action).toBe('error');
+  if (r.action === 'error') expect(r.message).toContain('--reply-to');
+  // With --reply-to it sends, and the stored tag is the trimmed canonical form.
+  const ok = parseArgs(['--tag', '  answer  ', '--reply-to', '7', 'reply'], CWD, HOME);
+  expect(ok.action).toBe('send');
+  if (ok.action === 'send') expect(ok.tag).toBe('answer');
+});
+
+test('--tag answer WITH --reply-to is accepted (the reply threads)', () => {
+  expect(parseArgs(['--tag', 'answer', '--reply-to', '99', 'a reply'], CWD, HOME)).toEqual({
     action: 'send',
     items: [],
-    caption: 'answer',
+    caption: 'a reply',
     format: 'plain',
-    tag: 'ОТВЕТ',
+    tag: 'answer',
     replyTo: 99,
   });
 });
 
-test('the OTHER tags do NOT require --reply-to', () => {
-  for (const tag of ['DECISION', 'PROBLEM', 'REPORT', 'РЕШЕНИЕ', 'ПРОБЛЕМА', 'ОТЧЁТ']) {
+test('the OTHER lowercase-english tags do NOT require --reply-to', () => {
+  for (const tag of ['decision', 'problem', 'report']) {
     const r = parseArgs(['--tag', tag, 'body'], CWD, HOME);
     expect(r.action).toBe('send');
   }
 });
 
-test('an unknown tag is not subject to the ANSWER gate (still sends)', () => {
-  const r = parseArgs(['--tag', 'WHATEVER', 'body'], CWD, HOME);
-  expect(r.action).toBe('send');
+test('an unknown tag is rejected (lowercase-english only) — never reaches the answer gate', () => {
+  const r = parseArgs(['--tag', 'whatever', 'body'], CWD, HOME);
+  expect(r.action).toBe('error');
+  if (r.action === 'error') {
+    expect(r.message).toContain("invalid --tag 'whatever'");
+  }
 });
 
 // --- --table ---

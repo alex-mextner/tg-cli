@@ -32,8 +32,10 @@ export function buildPrefix(opts: {
   aiEmoji: string;
   model: string;
   tmuxWindow: string;
-  // Explicit message tag (`--tag`). Resolved case-insensitively; Russian
-  // aliases map to the English canonicals. Unknown → a soft `[TAG]` badge.
+  // Explicit message tag (`--tag`). The CLI validates this to a lowercase-english
+  // word (answer/decision/problem/report) before it reaches here; resolveTag
+  // uppercases + resolves it. The renderer itself stays total — an off-list value
+  // would render a plain `[TAG]` badge — but the CLI never passes one.
   tag?: string;
   // Explicit header title (`--title`). The message body is NEVER pulled up
   // here; only this explicit title ever appears on the header line.

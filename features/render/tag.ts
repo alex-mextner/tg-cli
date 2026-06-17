@@ -9,10 +9,14 @@
 //   ✳️ [window] 🔵 ANSWER — <title>        (unicode fallback)
 //   ✳️ [window] <ANSWER pill> — <title>    (premium, real pill ids uploaded)
 //
-// Russian aliases (ОТВЕТ / РЕШЕНИЕ / ПРОБЛЕМА / ОТЧЁТ) map onto the English
-// canonicals; matching is case-insensitive. An UNKNOWN tag is not a hard error:
-// it soft-renders as a plain `[TAG]` badge (uppercased) and a stderr note, so a
-// typo never blocks a send.
+// INPUT POLICY (CTO 2026-06-16, ROADMAP "tg --tag: lowercase-english only"):
+// `--tag` accepts ONLY the lowercase-english tag words — `answer` / `decision`
+// / `problem` / `report`. Uppercase (`ANSWER`), Cyrillic aliases (`ОТВЕТ`), and
+// unknown words are REJECTED at parse time (`validateTag`) with a 3-part error
+// and a non-zero exit, instead of the old soft-render-and-warn behavior. The
+// internal pipeline still keys on the UPPERCASE canonical (the pill set, the
+// fallback map, and the upload script), so `resolveTag` uppercases the already-
+// validated lowercase input to look it up.
 
 import { TAG_PILL_DOT, TAG_PILL_FALLBACK, tagPillCellDots } from '../branding/emoji';
 
@@ -21,24 +25,38 @@ import { TAG_PILL_DOT, TAG_PILL_FALLBACK, tagPillCellDots } from '../branding/em
 export const CANONICAL_TAGS = ['ANSWER', 'DECISION', 'PROBLEM', 'REPORT'] as const;
 export type CanonicalTag = (typeof CANONICAL_TAGS)[number];
 
-// Aliases → canonical (English) tag. Case-insensitive (we uppercase the input
-// before lookup). Both the English canonicals and the Russian words map here;
-// the English canonical always maps to itself so case-insensitive English
-// input ("answer") still resolves.
-const TAG_ALIASES: Record<string, CanonicalTag> = {
-  // English canonicals (self-mapping)
-  ANSWER: 'ANSWER',
-  DECISION: 'DECISION',
-  PROBLEM: 'PROBLEM',
-  REPORT: 'REPORT',
-  // Russian aliases → English canonical
-  ОТВЕТ: 'ANSWER',
-  РЕШЕНИЕ: 'DECISION',
-  ПРОБЛЕМА: 'PROBLEM',
-  ОТЧЁТ: 'REPORT',
-  // Tolerate the common "Ё→Е" spelling of ОТЧЁТ — agents type both.
-  ОТЧЕТ: 'REPORT',
-};
+// The accepted `--tag` values: the lowercase-english spelling of each canonical
+// tag. This is the ONLY accepted input form (see INPUT POLICY above). Derived
+// from CANONICAL_TAGS so the two never drift.
+export const ACCEPTED_TAGS: readonly string[] = CANONICAL_TAGS.map((t) => t.toLowerCase());
+
+// The canonical tags as an uppercase lookup set. There are no aliases anymore
+// (Cyrillic was removed; validateTag rejects off-list input before resolveTag
+// runs), so resolveTag just uppercases its input and checks membership.
+const CANONICAL_TAG_SET = new Set<string>(CANONICAL_TAGS);
+
+// A human-readable, comma-separated list of the accepted tags, for error/help
+// text ("use one of: answer, decision, problem, report").
+export const ACCEPTED_TAGS_LIST = ACCEPTED_TAGS.join(', ');
+
+/**
+ * Validate a raw `--tag` value against the lowercase-english-only policy.
+ *
+ * Returns `null` when the tag is accepted (a lowercase-english canonical word,
+ * after trimming surrounding whitespace). Otherwise returns a 3-part error
+ * MESSAGE — WHAT (`invalid --tag 'X'`), WHY (`tags must be lowercase english`),
+ * HOW (`use one of: answer, decision, problem, report`) — that the caller
+ * surfaces verbatim before exiting non-zero. Never throws.
+ *
+ * Rejects everything that is not exactly one of ACCEPTED_TAGS: uppercase
+ * (`ANSWER`), mixed case (`Answer`), Cyrillic aliases (`ОТВЕТ`), and any
+ * unknown word.
+ */
+export function validateTag(raw: string): string | null {
+  const value = raw.trim();
+  if (ACCEPTED_TAGS.includes(value)) return null;
+  return `invalid --tag '${value}': tags must be lowercase english. Use one of: ${ACCEPTED_TAGS_LIST}`;
+}
 
 export interface ResolvedTag {
   // The unicode fallback badge to show before/instead of the pill (e.g.
@@ -60,22 +78,21 @@ export interface ResolvedTag {
   // ANSWER/DECISION/PROBLEM/REPORT; for an unknown tag it is the uppercased raw
   // input (and `known` is false).
   word: string;
-  // True when the input resolved to a canonical tag; false for an unknown tag
-  // (the caller emits a one-line stderr note in that case but still sends).
+  // True when the input resolved to a canonical tag; false for an off-list tag.
   known: boolean;
 }
 
 /**
- * Resolve a raw `--tag` value to its canonical English tag + unicode fallback
- * badge. Case-insensitive; Russian aliases map to the English canonicals. Never
- * throws and never rejects: an unknown tag resolves to
- * `{ fallback: "", word: <UPPERCASED>, known: false }` so the caller can
- * soft-render `[TAG]` and warn rather than fail the send.
+ * Resolve a `--tag` value (already validated to a lowercase-english word at the
+ * CLI gate) to its canonical English tag + unicode fallback badge: uppercase the
+ * input and look it up. Total and case-insensitive — off-list input resolves to
+ * `{ known: false, word: <UPPER>, ... }` (empty badge) so the renderer never
+ * throws; the CLI never reaches that branch (validateTag rejects first).
  */
 export function resolveTag(raw: string): ResolvedTag {
   const key = raw.trim().toUpperCase();
-  const canonical = TAG_ALIASES[key];
-  if (canonical) {
+  if (CANONICAL_TAG_SET.has(key)) {
+    const canonical = key as CanonicalTag;
     return {
       fallback: TAG_PILL_FALLBACK[canonical],
       dot: TAG_PILL_DOT[canonical],

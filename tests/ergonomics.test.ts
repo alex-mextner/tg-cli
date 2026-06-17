@@ -135,15 +135,16 @@ test('--title is parsed as an explicit title; the body is NEVER pulled up', () =
 });
 
 test('--tag is parsed; it composes with --title and with a body', () => {
-  // A non-ANSWER tag composes freely. (ANSWER/ОТВЕТ now REQUIRES --reply-to —
-  // covered in reply-table-args.test.ts — so this case uses РЕШЕНИЕ/DECISION.)
-  expect(parseArgs(['--tag', 'РЕШЕНИЕ', '--title', 'Done', 'body'], dir, HOME)).toEqual({
+  // A non-answer tag composes freely. (The `answer` tag now REQUIRES --reply-to —
+  // covered in reply-table-args.test.ts — so this case uses `decision`.) Tags are
+  // lowercase-english only (validated at parse time).
+  expect(parseArgs(['--tag', 'decision', '--title', 'Done', 'body'], dir, HOME)).toEqual({
     action: 'send',
     items: [],
     caption: 'body',
     format: 'plain',
     title: 'Done',
-    tag: 'РЕШЕНИЕ',
+    tag: 'decision',
   });
   // Bare --tag with no body/title still sends.
   expect(parseArgs(['--tag', 'report'], dir, HOME)).toEqual({
@@ -168,6 +169,18 @@ test('--title / --tag require a value (a dashed next token is a missing value)',
     action: 'error',
     message: '--tag requires a value',
   });
+});
+
+test('--tag rejects uppercase / Cyrillic / unknown with a 3-part error (lowercase-english only)', () => {
+  for (const bad of ['ANSWER', 'Decision', 'ОТВЕТ', 'ПРОБЛЕМА', 'fixme']) {
+    const r = parseArgs(['--tag', bad, 'body'], dir, HOME);
+    expect(r.action).toBe('error');
+    if (r.action === 'error') {
+      expect(r.message).toContain(`invalid --tag '${bad}'`);
+      expect(r.message).toContain('lowercase english');
+      expect(r.message).toContain('Use one of: answer, decision, problem, report');
+    }
+  }
 });
 
 // --- code-as-pdf flags (--with-original / --no-pdf / --pdf-device) ---
@@ -472,6 +485,35 @@ test('line-spec :N-M range and :N:C column parse onto the item', () => {
       startLine: 2,
       endLine: 2,
       col: 5,
+    });
+  }
+  rmSync(tsAbs, { force: true });
+});
+
+// GitHub permalink-anchor forms a human pastes (file#L10 / file#L10-L20). The
+// base path resolves and the referenced range lands on the item just like the
+// colon forms, so a pasted GitHub line link gets the inline excerpt too (tg#29).
+test('line-spec #L GitHub anchor on an existing file → attached with lineSpec', () => {
+  const tsAbs = join(dir, 'mod3.ts');
+  writeFileSync(tsAbs, 'a\nb\nc\nd\ne\nf');
+  const single = parseArgs([`see ${tsAbs}#L3`], dir, HOME);
+  expect(single.action).toBe('send');
+  if (single.action === 'send') {
+    expect(single.items[0].lineSpec).toEqual({
+      token: `${tsAbs}#L3`,
+      startLine: 3,
+      endLine: 3,
+      col: undefined,
+    });
+    expect(single.caption).toBe(`see ${tsAbs}#L3`);
+  }
+  const range = parseArgs([`${tsAbs}#L2-L4`], dir, HOME);
+  if (range.action === 'send') {
+    expect(range.items[0].lineSpec).toEqual({
+      token: `${tsAbs}#L2-L4`,
+      startLine: 2,
+      endLine: 4,
+      col: undefined,
     });
   }
   rmSync(tsAbs, { force: true });

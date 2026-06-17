@@ -10,7 +10,7 @@ import { isNeverAttach } from '../auto-attach/denylist';
 import { parseLineSpec } from '../auto-attach/snippet';
 import { buildFileIndex, isRecursiveCandidate, matchFromIndex, type ListDir } from '../auto-attach/recursive';
 import { looksPathLike, resolveAcrossWorktrees } from '../auto-attach/worktree';
-import { resolveTag } from '../render/tag';
+import { validateTag } from '../render/tag';
 
 export interface ItemLineSpec {
   // The full original token as written (e.g. "src/a.ts:42-50"), kept so the
@@ -225,7 +225,19 @@ export function parseArgs(
       if (!nextArg || nextArg.startsWith('--')) {
         return { action: 'error', message: '--tag requires a value' };
       }
-      tag = nextArg;
+      // Reject anything that is not a lowercase-english tag (uppercase,
+      // Cyrillic, unknown) right here, with a 3-part WHAT/WHY/HOW message and a
+      // non-zero exit (the caller maps `action: 'error'` → exit 1). See the
+      // INPUT POLICY in features/render/tag.ts.
+      const tagError = validateTag(nextArg);
+      if (tagError) {
+        return { action: 'error', message: tagError };
+      }
+      // Store the trimmed canonical form. validateTag accepts surrounding
+      // whitespace (`' answer '`), so normalize here — otherwise the literal
+      // `tag === 'answer'` answer-gate below (and the value handed to send)
+      // would carry the padding and the gate would miss a padded `answer`.
+      tag = nextArg.trim();
       i += 2;
       continue;
     }
@@ -439,17 +451,17 @@ export function parseArgs(
   // The path token is intentionally KEPT in the caption (core correction).
   const caption = textParts.join(' ').replace(/^\s+|\s+$/g, '');
 
-  // The ANSWER tag means "I am answering THIS specific message", so it requires
-  // a reply target. Without `--reply-to` the CTO's `--tag ОТВЕТ` had no thread
-  // to attach to and read as a reply that wasn't one — make it an actionable
-  // error. Only ANSWER is gated; the other tags label a message without
-  // claiming to answer a particular one. Resolve the tag case-insensitively so
-  // ОТВЕТ / answer / ANSWER all gate identically (resolveTag handles aliases).
-  if (tag && replyTo === undefined && resolveTag(tag).word === 'ANSWER') {
+  // The `answer` tag means "I am answering THIS specific message", so it
+  // requires a reply target. Without `--reply-to` a `--tag answer` has no thread
+  // to attach to and reads as a reply that isn't one — make it an actionable
+  // error. Only `answer` is gated; the other tags label a message without
+  // claiming to answer a particular one. `tag` was already validated to one of
+  // the lowercase-english words, so a literal compare suffices.
+  if (tag && replyTo === undefined && tag === 'answer') {
     return {
       action: 'error',
       message:
-        "--tag ANSWER (ОТВЕТ) means you're answering a specific message — it requires --reply-to <message_id>. " +
+        "--tag answer means you're answering a specific message — it requires --reply-to <message_id>. " +
         'Use the id from the inbound `[TG from … #<id>]` wrap, or pick a different tag.',
     };
   }
