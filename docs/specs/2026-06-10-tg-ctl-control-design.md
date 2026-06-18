@@ -239,6 +239,25 @@ Claude Code hook installation remains an automation layer over that handoff
 - `PermissionRequest` → call `tg-ctl ask` with tool + args → Approve/Reject
   buttons → return
   `{hookSpecificOutput:{decision:{behavior:"allow"|"deny"}}}`.
+- **Plan-approval (`ExitPlanMode`)** is the harness BLOCKING plan-mode prompt
+  (ROADMAP "Forward harness confirmation / permission prompts to TG"). It is
+  recognized by `tool_name === "ExitPlanMode"` and forwarded as a permission with
+  **relabeled buttons — Proceed (allow) / Keep planning (deny)** — carrying the
+  plan text in the message body (clamped to stay inside Telegram's 4096-char
+  limit). It gets **NO dedicated PreToolUse matcher**: per the live hooks docs
+  BOTH `PreToolUse` and `PermissionRequest` can fire for the same ExitPlanMode
+  call, so a second matcher would double-forward the plan (and leave the losing
+  `tg-ctl ask` blocked until timeout). The `PermissionRequest *` catch-all already
+  delivers it exactly once. The hook reply shape follows the event that fired —
+  the request carries `permissionEvent`, and `tg-ctl ask` returns
+  `{hookSpecificOutput:{hookEventName:"PermissionRequest",decision:{behavior}}}`
+  (+ top-level `systemMessage` on deny — `decision` has no reason field) for
+  `PermissionRequest`, vs `{hookSpecificOutput:{hookEventName:"PreToolUse",
+  permissionDecision,permissionDecisionReason?}}` for `PreToolUse` (deny carries
+  the tapped label as the reason so the model gets the keep-planning intent).
+  `hookEventName` is REQUIRED in `hookSpecificOutput`. `permissionDecision:
+  "allow"` alone is sufficient for ExitPlanMode — no `updatedInput` echo required
+  (all confirmed against the live hooks docs).
 
 Codex uses the same `tg-ctl ask` handoff for `PermissionRequest` and returns
 the documented Codex shape:

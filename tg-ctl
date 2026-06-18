@@ -934,6 +934,21 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
         .filter((o): o is { label: string; description?: string } => o !== null)
     : undefined
 
+  // Custom allow/deny button wording (plan-approval → Proceed/Keep planning).
+  // Both labels must be present + non-empty strings, else fall back to the
+  // default Approve/Reject by leaving it undefined.
+  const dl = rec.decisionLabels
+  const decisionLabels =
+    dl && typeof dl === "object" &&
+    typeof (dl as Record<string, unknown>).allow === "string" && (dl as Record<string, unknown>).allow &&
+    typeof (dl as Record<string, unknown>).deny === "string" && (dl as Record<string, unknown>).deny
+      ? { allow: (dl as Record<string, string>).allow, deny: (dl as Record<string, string>).deny }
+      : undefined
+  // Which Claude hook event fired — decides the reply shape (PreToolUse →
+  // permissionDecision; PermissionRequest → decision.behavior). Default
+  // PermissionRequest preserves the pre-existing reply for older payloads.
+  const permissionEvent = rec.permissionEvent === "PreToolUse" ? "PreToolUse" : undefined
+
   return {
     requestId,
     buttonId: typeof rec.buttonId === "string" ? rec.buttonId : undefined,
@@ -945,6 +960,8 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     question,
     title: typeof rec.title === "string" ? rec.title : undefined,
     options,
+    decisionLabels,
+    permissionEvent,
   }
 }
 
