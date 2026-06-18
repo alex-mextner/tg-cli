@@ -128,11 +128,10 @@ test('raw ExitPlanMode PermissionRequest payload → Proceed/Keep-planning butto
   await ask.exited;
 
   // PermissionRequest reply shape (decision.behavior + required hookEventName),
-  // deny — we tapped "Keep planning"; the intent rides systemMessage (no reason
-  // field in this schema).
+  // deny — we tapped "Keep planning"; the intent rides decision.message, the
+  // documented model-facing deny reason, so Claude resumes planning.
   expect(JSON.parse(stdout)).toEqual({
-    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } },
-    systemMessage: 'Keep planning',
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: 'Keep planning' } },
   });
   expect(sentMessages).toHaveLength(1);
   expect(sentMessages[0].text).toContain('Plan ready');

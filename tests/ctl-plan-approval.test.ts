@@ -112,15 +112,19 @@ test('plan-approval allow with no permissionEvent → default PermissionRequest 
   expect(out).toEqual({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } });
 });
 
-test('ExitPlanMode arriving via PreToolUse → permissionEvent PreToolUse, allow emits permissionDecision shape', () => {
+test('ExitPlanMode arriving via PreToolUse → permissionEvent PreToolUse, allow echoes updatedInput', () => {
   const req = normalizeHookPayload(
     { hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', tool_input: { plan: 'do it' } },
     env,
   );
-  expect(req).toMatchObject({ kind: 'permission', permissionEvent: 'PreToolUse' });
+  expect(req).toMatchObject({ kind: 'permission', permissionEvent: 'PreToolUse', toolInput: { plan: 'do it' } });
   const out = formatAgentHookOutput(req!, { status: 'answered', requestId: req!.requestId, label: 'Proceed', value: 'allow', decision: 'allow' });
-  // PreToolUse reply shape — permissionDecision, NOT decision.behavior.
-  expect(out).toEqual({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' } });
+  // PreToolUse reply shape — permissionDecision, NOT decision.behavior. ExitPlanMode
+  // requires updatedInput ALONGSIDE allow (docs: "allow alone is not sufficient"),
+  // so the original tool_input is echoed back unchanged.
+  expect(out).toEqual({
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', updatedInput: { plan: 'do it' } },
+  });
 });
 
 test('PreToolUse deny carries the tapped label as permissionDecisionReason (keep-planning intent)', () => {
@@ -141,18 +145,70 @@ test('ExitPlanMode arriving via PermissionRequest → permissionEvent Permission
   );
   expect(req).toMatchObject({ kind: 'permission', permissionEvent: 'PermissionRequest' });
   const out = formatAgentHookOutput(req!, { status: 'answered', requestId: req!.requestId, label: 'Keep planning', value: 'deny', decision: 'deny' });
-  // The keep-planning intent rides systemMessage (PermissionRequest decision has
-  // no reason field); hookEventName is required in hookSpecificOutput.
-  expect(out).toEqual({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } }, systemMessage: 'Keep planning' });
+  // The keep-planning intent rides decision.message — the documented MODEL-facing
+  // deny reason ("for deny only: tells Claude why the permission was denied"), so
+  // Claude resumes planning instead of looping on an unexplained block.
+  expect(out).toEqual({
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: 'Keep planning' } },
+  });
 });
 
-test('a plain Claude permission deny (no decisionLabels) carries NO systemMessage — unchanged behavior', () => {
+test('a plain Claude permission deny (no decisionLabels) carries NO decision.message — unchanged behavior', () => {
   const req = normalizeHookPayload(
     { hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'rm -rf x' } },
     env,
   );
   const out = formatAgentHookOutput(req!, { status: 'answered', requestId: req!.requestId, label: 'Reject', value: 'deny', decision: 'deny' });
   expect(out).toEqual({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } } });
+});
+
+test('PreToolUse allow WITHOUT a carried tool_input emits a bare allow (no synthesized updatedInput)', () => {
+  // A hand-built / toolInput-less PreToolUse request must not invent updatedInput.
+  const req = {
+    requestId: 'p_x',
+    agent: 'claude' as const,
+    kind: 'permission' as const,
+    question: 'Proceed?',
+    title: 'Plan ready',
+    decisionLabels: { allow: 'Proceed', deny: 'Keep planning' },
+    permissionEvent: 'PreToolUse' as const,
+  };
+  const out = formatAgentHookOutput(req, { status: 'answered', requestId: 'p_x', label: 'Proceed', value: 'allow', decision: 'allow' });
+  expect(out).toEqual({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' } });
+});
+
+test('PreToolUse deny never carries updatedInput (echo is allow-only)', () => {
+  const req = normalizeHookPayload(
+    { hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', tool_input: { plan: 'do it' } },
+    env,
+  );
+  const out = formatAgentHookOutput(req!, { status: 'answered', requestId: req!.requestId, label: 'Keep planning', value: 'deny', decision: 'deny' });
+  expect(out).toEqual({
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Keep planning' },
+  });
+});
+
+test('an already-normalized PreToolUse request round-trips toolInput → updatedInput on allow', () => {
+  // Regression for the pass-through branch: a normalized payload carrying toolInput
+  // must keep it so a PreToolUse allow still echoes updatedInput.
+  const req = normalizeHookPayload(
+    {
+      requestId: 'r9',
+      agent: 'claude',
+      kind: 'permission',
+      question: 'Proceed with this plan?',
+      title: 'Plan ready',
+      decisionLabels: { allow: 'Proceed', deny: 'Keep planning' },
+      permissionEvent: 'PreToolUse',
+      toolInput: { plan: 'do it' },
+    },
+    env,
+  );
+  expect(req).toMatchObject({ permissionEvent: 'PreToolUse', toolInput: { plan: 'do it' } });
+  const out = formatAgentHookOutput(req!, { status: 'answered', requestId: 'r9', label: 'Proceed', value: 'allow', decision: 'allow' });
+  expect(out).toEqual({
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', updatedInput: { plan: 'do it' } },
+  });
 });
 
 test('a normalized plan-approval request passes through KEEPING decisionLabels + permissionEvent', () => {

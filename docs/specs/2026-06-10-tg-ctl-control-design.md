@@ -251,13 +251,18 @@ Claude Code hook installation remains an automation layer over that handoff
   delivers it exactly once. The hook reply shape follows the event that fired —
   the request carries `permissionEvent`, and `tg-ctl ask` returns
   `{hookSpecificOutput:{hookEventName:"PermissionRequest",decision:{behavior}}}`
-  (+ top-level `systemMessage` on deny — `decision` has no reason field) for
-  `PermissionRequest`, vs `{hookSpecificOutput:{hookEventName:"PreToolUse",
-  permissionDecision,permissionDecisionReason?}}` for `PreToolUse` (deny carries
-  the tapped label as the reason so the model gets the keep-planning intent).
-  `hookEventName` is REQUIRED in `hookSpecificOutput`. `permissionDecision:
-  "allow"` alone is sufficient for ExitPlanMode — no `updatedInput` echo required
-  (all confirmed against the live hooks docs).
+  for `PermissionRequest` — on a relabeled deny the keep-planning reason rides
+  `decision.message` (the live hooks reference documents it "for deny only: tells
+  Claude why the permission was denied" — the MODEL-facing channel, unlike
+  top-level `systemMessage`, which is user-only). vs
+  `{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision,
+  permissionDecisionReason?,updatedInput?}}` for `PreToolUse` (deny carries the
+  tapped label as `permissionDecisionReason` so the model gets the keep-planning
+  intent). `hookEventName` is REQUIRED in `hookSpecificOutput`. For a PreToolUse
+  ALLOW of ExitPlanMode the live hooks docs require `updatedInput` ALONGSIDE allow
+  ("Returning allow alone is not sufficient for these tools"), so the original
+  `tool_input` is echoed back unchanged as `updatedInput` (all confirmed against
+  the live hooks docs).
 
 Codex uses the same `tg-ctl ask` handoff for `PermissionRequest` and returns
 the documented Codex shape:

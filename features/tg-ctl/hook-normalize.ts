@@ -102,6 +102,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       // the default PermissionRequest output.
       decisionLabels: readDecisionLabels(p.decisionLabels),
       permissionEvent: p.permissionEvent === 'PreToolUse' ? 'PreToolUse' : undefined,
+      toolInput: asRecord(p.toolInput) ?? undefined,
       paneId: typeof p.paneId === 'string' ? p.paneId : env.paneId,
       cwd: typeof p.cwd === 'string' ? p.cwd : env.cwd,
       sessionName: typeof p.sessionName === 'string' ? p.sessionName : env.sessionName,
@@ -145,6 +146,9 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       title: 'Plan ready',
       decisionLabels: { allow: 'Proceed', deny: 'Keep planning' },
       permissionEvent: permissionEventOf(p),
+      // Carry the original input so a PreToolUse allow can echo it as updatedInput
+      // (docs: ExitPlanMode allow needs updatedInput, not allow alone).
+      ...(input ? { toolInput: input } : {}),
       paneId: env.paneId,
       cwd: cwd ?? env.cwd,
       sessionName: env.sessionName,
@@ -158,6 +162,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
     const question = detail ? `Allow ${toolName}? ${detail}` : `Allow ${toolName}?`;
     const req = build(env, 'permission', `${session}:perm:${toolName}:${detail}`, question, toolName, undefined, cwd);
     req.permissionEvent = permissionEventOf(p);
+    if (input) req.toolInput = input;
     return req;
   }
 

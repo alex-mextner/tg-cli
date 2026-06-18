@@ -47,6 +47,13 @@ export interface ButtonRequest {
   // PermissionRequest → decision.behavior), so the hook reply must match the
   // event that fired. Defaults to PermissionRequest (the `*` matcher we install).
   permissionEvent?: 'PreToolUse' | 'PermissionRequest';
+  // Permission-kind only: the tool's original `tool_input`, carried so a PreToolUse
+  // ExitPlanMode ALLOW can echo it back as `updatedInput`. The live hooks docs
+  // require allow + updatedInput for the user-interactive tools ("allow alone is
+  // not sufficient"); echoing the unchanged input is the documented round trip.
+  // (AskUserQuestion is a question-kind request and builds its own questions/answers
+  // updatedInput in the question branch — it never reads this field.)
+  toolInput?: Record<string, unknown>;
   opencode?: OpencodeRequestRef;
 }
 
@@ -181,29 +188,28 @@ export function formatAgentHookOutput(req: ButtonRequest, answer: ButtonAnswer):
     const denyReason = behavior === 'deny' && req.decisionLabels ? answer.label : undefined;
 
     // PreToolUse output (hookEventName REQUIRED): permissionDecision, with the deny
-    // reason in the event's own `permissionDecisionReason`. A bare allow is
-    // sufficient — `updatedInput` is OPTIONAL (we never modify the input), so it is
-    // omitted; the harness runs the tool with its original arguments.
+    // reason in the event's own `permissionDecisionReason`. For an ALLOW the live
+    // hooks docs require `updatedInput` ALONGSIDE allow for the user-interactive
+    // tools (ExitPlanMode / AskUserQuestion): "Returning allow alone is not
+    // sufficient for these tools." Echo the unchanged `tool_input` back so the tool
+    // runs without falling through to the local permission prompt.
     if (req.permissionEvent === 'PreToolUse') {
       const out: Record<string, unknown> = { hookEventName: 'PreToolUse', permissionDecision: behavior };
+      if (behavior === 'allow' && req.toolInput) out.updatedInput = req.toolInput;
       if (denyReason) out.permissionDecisionReason = denyReason;
       return { hookSpecificOutput: out };
     }
-    // PermissionRequest output (hookEventName REQUIRED): the `decision` object only
-    // documents `behavior` (+ optional `updatedInput`) — it has NO reason/message
-    // field, and the live hooks docs document NO model-facing reason channel for a
-    // PermissionRequest deny (unlike PreToolUse's `permissionDecisionReason`). The
-    // keep-planning intent therefore rides the documented top-level `systemMessage`
-    // — the universal "message shown to the user" channel. NOTE: per the docs that
-    // surfaces to the USER, not the model, so on this (production) path Claude sees
-    // the bare deny; the user sees the intent. Conveying it to the model would mean
-    // injecting it into the pane (the defer/inject infra) — a phased follow-up. A
-    // bare allow needs no `updatedInput` echo (it is optional).
-    const out: Record<string, unknown> = {
-      hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior } },
-    };
-    if (denyReason) out.systemMessage = denyReason;
-    return out;
+    // PermissionRequest output (hookEventName REQUIRED). The `decision` object has a
+    // `message` field documented "for deny only: tells Claude why the permission was
+    // denied" (live hooks reference, PermissionRequest decision control). That is the
+    // MODEL-facing reason channel — distinct from top-level `systemMessage`, which is
+    // "shown to the user" only. On a RELABELED deny (plan-approval → "Keep planning")
+    // the intent must reach Claude so it resumes planning rather than re-prompting on
+    // an unexplained block, so the tapped label rides `decision.message`. A bare allow
+    // needs no `updatedInput` echo (it is optional for a permission we never modify).
+    const decision: Record<string, unknown> = { behavior };
+    if (denyReason) decision.message = denyReason;
+    return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } };
   }
 
   if (req.agent === 'codex' && req.kind === 'permission') {

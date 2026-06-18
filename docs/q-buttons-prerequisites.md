@@ -101,15 +101,17 @@ in the pane). A generic Approve/Reject would lose the plan and mis-word the choi
 
 The hook **reply shape follows the event that fired**: `normalizeHookPayload`
 stamps `permissionEvent` from the payload's `hook_event_name`, and
-`formatAgentHookOutput` emits `hookSpecificOutput.decision.behavior` (+ top-level
-`systemMessage` on deny — the `decision` object has NO reason field, so the
-keep-planning intent rides the documented universal `systemMessage`) for the
-production `PermissionRequest` delivery, vs
-`hookSpecificOutput.permissionDecision` (+ `permissionDecisionReason` on deny, the
-keep-planning intent) if a `PreToolUse` matcher ever delivers it (another harness,
-or a hand-added matcher). The two events take different output schemas — confirmed
-against the live hooks docs; `behavior: "allow"` / `permissionDecision: "allow"`
-alone is sufficient for ExitPlanMode, no `updatedInput` echo. The same infra (registration guard,
+`formatAgentHookOutput` emits `hookSpecificOutput.decision.behavior` for the
+production `PermissionRequest` delivery — on a relabeled deny the keep-planning
+intent rides `decision.message` (the live hooks reference documents it "for deny
+only: tells Claude why the permission was denied" — the MODEL-facing channel;
+top-level `systemMessage` is user-only). vs `hookSpecificOutput.permissionDecision`
+(+ `permissionDecisionReason` on deny, the keep-planning intent) if a `PreToolUse`
+matcher ever delivers it (another harness, or a hand-added matcher). The two events
+take different output schemas — confirmed against the live hooks docs. A PreToolUse
+ALLOW of ExitPlanMode requires `updatedInput` ALONGSIDE allow ("Returning allow
+alone is not sufficient for these tools"), so the original `tool_input` is echoed
+back unchanged as `updatedInput`. The same infra (registration guard,
 defer-while-waiting, routed tap reply) applies unchanged; this is the "Forward
 harness confirmation / permission prompts to TG as inline buttons" item, extending
 tg-cli#30.
