@@ -239,6 +239,30 @@ Claude Code hook installation remains an automation layer over that handoff
 - `PermissionRequest` → call `tg-ctl ask` with tool + args → Approve/Reject
   buttons → return
   `{hookSpecificOutput:{decision:{behavior:"allow"|"deny"}}}`.
+- **Plan-approval (`ExitPlanMode`)** is the harness BLOCKING plan-mode prompt
+  (ROADMAP "Forward harness confirmation / permission prompts to TG"). It is
+  recognized by `tool_name === "ExitPlanMode"` and forwarded as a permission with
+  **relabeled buttons — Proceed (allow) / Keep planning (deny)** — carrying the
+  plan text in the message body (clamped to stay inside Telegram's 4096-char
+  limit). It gets **NO dedicated PreToolUse matcher**: per the live hooks docs
+  BOTH `PreToolUse` and `PermissionRequest` can fire for the same ExitPlanMode
+  call, so a second matcher would double-forward the plan (and leave the losing
+  `tg-ctl ask` blocked until timeout). The `PermissionRequest *` catch-all already
+  delivers it exactly once. The hook reply shape follows the event that fired —
+  the request carries `permissionEvent`, and `tg-ctl ask` returns
+  `{hookSpecificOutput:{hookEventName:"PermissionRequest",decision:{behavior}}}`
+  for `PermissionRequest` — on a relabeled deny the keep-planning reason rides
+  `decision.message` (the live hooks reference documents it "for deny only: tells
+  Claude why the permission was denied" — the MODEL-facing channel, unlike
+  top-level `systemMessage`, which is user-only). vs
+  `{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision,
+  permissionDecisionReason?,updatedInput?}}` for `PreToolUse` (deny carries the
+  tapped label as `permissionDecisionReason` so the model gets the keep-planning
+  intent). `hookEventName` is REQUIRED in `hookSpecificOutput`. For a PreToolUse
+  ALLOW of ExitPlanMode the live hooks docs require `updatedInput` ALONGSIDE allow
+  ("Returning allow alone is not sufficient for these tools"), so the original
+  `tool_input` is echoed back unchanged as `updatedInput` (all confirmed against
+  the live hooks docs).
 
 Codex uses the same `tg-ctl ask` handoff for `PermissionRequest` and returns
 the documented Codex shape:

@@ -7,6 +7,9 @@ test('empty settings → both hook groups added, changed=true', () => {
   const { settings, changed } = withClaudeHooks({}, CMD);
   expect(changed).toBe(true);
   const hooks = settings.hooks as Record<string, unknown[]>;
+  // ExitPlanMode (plan-approval) is NOT given its own PreToolUse matcher — it is
+  // delivered exactly once by the PermissionRequest `*` catch-all (a dedicated
+  // PreToolUse matcher would double-forward it; both events fire for that call).
   expect(hooks.PreToolUse).toEqual([
     { matcher: 'AskUserQuestion', hooks: [{ type: 'command', command: CMD, timeout: 120 }] },
   ]);

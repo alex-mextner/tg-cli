@@ -103,8 +103,13 @@ tests can pass fakes.
   walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`),
   `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons),
   `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker), `hook-normalize.ts`
-  (raw harness hook payload → ButtonRequest), `hook-install.ts` (idempotent q→buttons hook
-  merge for `tg-ctl install-hooks`), `defer.ts` (defer-while-waiting queue model: inbound text is
+  (raw harness hook payload → ButtonRequest; also forwards Claude Code `ExitPlanMode` plan-approval
+  — delivered by the `PermissionRequest *` catch-all — as a permission with Proceed/Keep-planning
+  buttons + the plan body, stamping `permissionEvent` so the hook reply matches the firing event:
+  PreToolUse→`permissionDecision`, PermissionRequest→`decision.behavior`), `hook-install.ts`
+  (idempotent q→buttons hook merge for `tg-ctl install-hooks` — PreToolUse matches `AskUserQuestion`,
+  plus a `PermissionRequest *` catch-all that also carries plan-approval; ExitPlanMode gets NO
+  dedicated matcher to avoid double-forwarding, since both events fire for it), `defer.ts` (defer-while-waiting queue model: inbound text is
   QUEUED per-pane while that pane has an open question and flushed on answer, so it is never pasted
   into the prompt — `driveFlush` re-checks the pane before EACH paste so a follow-up question
   re-defers the untouched tail), and `voice.ts` (inbound VOICE→text: `voice:` config block
@@ -174,7 +179,7 @@ touching any feature.
 
 ## Conventions
 
-- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All 1116 tests must pass.
+- **TDD**: write tests in `tests/*.test.ts` first; run with `bun test`. All 1136 tests must pass.
 - **Codex review** before committing non-trivial changes: `codex exec review --uncommitted`
   (findings appear at the end of output after thinking/exec noise — use `tail -80`).
 - **Version bumps**: the `VERSION` const in `tg` must have a matching `## <version>` section in

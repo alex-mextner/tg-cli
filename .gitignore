@@ -3,3 +3,5 @@
 .worktrees/
 __pycache__/
 *.pyc
+node_modules/
+bun.lock

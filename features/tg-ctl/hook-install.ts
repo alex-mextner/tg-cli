@@ -8,6 +8,14 @@
 // permissions via the `PermissionRequest` event. Hooks MERGE across scopes and
 // multiple matchers coexist, so adding ours never clobbers existing hooks; the
 // merge is keyed on (event, matcher, command) so re-running is a no-op.
+//
+// PLAN-APPROVAL (ExitPlanMode) is intentionally NOT given its own PreToolUse
+// matcher: per the live hooks docs both PreToolUse AND PermissionRequest can fire
+// for the SAME ExitPlanMode call, so a dedicated PreToolUse matcher would forward
+// the plan to Telegram twice (and leave the losing `tg-ctl ask` process blocked
+// until its 120s timeout). The `PermissionRequest *` catch-all already delivers
+// ExitPlanMode exactly once; `hook-normalize.ts` recognizes the tool there and
+// renders Proceed/Keep-planning buttons regardless of which event carried it.
 
 interface HookCmd {
   type: 'command';
@@ -21,12 +29,13 @@ interface HookGroup {
 
 const TIMEOUT_SEC = 120;
 
-// The two hook groups we install, keyed by settings.json event name.
-function desiredGroups(command: string): Record<string, HookGroup> {
-  return {
-    PreToolUse: { matcher: 'AskUserQuestion', hooks: [{ type: 'command', command, timeout: TIMEOUT_SEC }] },
-    PermissionRequest: { matcher: '*', hooks: [{ type: 'command', command, timeout: TIMEOUT_SEC }] },
-  };
+// The hook groups we install, as (event, group) entries.
+function desiredGroups(command: string): Array<{ event: string; group: HookGroup }> {
+  const cmd: HookCmd = { type: 'command', command, timeout: TIMEOUT_SEC };
+  return [
+    { event: 'PreToolUse', group: { matcher: 'AskUserQuestion', hooks: [cmd] } },
+    { event: 'PermissionRequest', group: { matcher: '*', hooks: [cmd] } },
+  ];
 }
 
 function groupHasCommand(group: unknown, matcher: string, command: string): boolean {
@@ -41,8 +50,7 @@ function groupHasCommand(group: unknown, matcher: string, command: string): bool
 
 export function claudeHooksInstalled(settings: Record<string, unknown>, command: string): boolean {
   const hooks = settings.hooks && typeof settings.hooks === 'object' ? (settings.hooks as Record<string, unknown>) : {};
-  const want = desiredGroups(command);
-  for (const [event, group] of Object.entries(want)) {
+  for (const { event, group } of desiredGroups(command)) {
     const arr = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
     if (!arr.some((g) => groupHasCommand(g, group.matcher ?? '', command))) return false;
   }
@@ -59,7 +67,7 @@ export function withClaudeHooks(
   const next: Record<string, unknown> = { ...settings };
   const hooks: Record<string, unknown> = next.hooks && typeof next.hooks === 'object' ? { ...(next.hooks as Record<string, unknown>) } : {};
   let changed = false;
-  for (const [event, group] of Object.entries(desiredGroups(command))) {
+  for (const { event, group } of desiredGroups(command)) {
     const existing = Array.isArray(hooks[event]) ? [...(hooks[event] as unknown[])] : [];
     if (!existing.some((g) => groupHasCommand(g, group.matcher ?? '', command))) {
       existing.push(group);

@@ -85,6 +85,37 @@ question TEXT, `updatedInput` replaces wholesale — is unchanged in
 | opencode | ✅ | ✅ | native, no tmux |
 | pi / aider / gemini | ❌ | ❌ | tmux floor only; bot replies "limited" |
 
+## Plan-approval (ExitPlanMode) forwarded as Proceed / Keep planning
+
+Claude Code's plan-mode **plan-approval** is a BLOCKING prompt gated as the
+`ExitPlanMode` tool. It is delivered to `tg-ctl ask` by the **`PermissionRequest *`
+catch-all** the installer already wires — it does **NOT** get its own dedicated
+`PreToolUse` matcher, because per the live hooks docs BOTH `PreToolUse` and
+`PermissionRequest` can fire for the same ExitPlanMode call, so a second matcher
+would forward the plan to Telegram twice (and leave the losing `tg-ctl ask`
+blocked until its 120s timeout). `tg-ctl ask` recognizes `tool_name ===
+"ExitPlanMode"` and forwards it as a permission with relabeled buttons —
+**Proceed** (allow) / **Keep planning** (deny) — carrying the plan text in the
+message body (clamped to stay inside Telegram's 4096-char limit; the full plan is
+in the pane). A generic Approve/Reject would lose the plan and mis-word the choice.
+
+The hook **reply shape follows the event that fired**: `normalizeHookPayload`
+stamps `permissionEvent` from the payload's `hook_event_name`, and
+`formatAgentHookOutput` emits `hookSpecificOutput.decision.behavior` for the
+production `PermissionRequest` delivery — on a relabeled deny the keep-planning
+intent rides `decision.message` (the live hooks reference documents it "for deny
+only: tells Claude why the permission was denied" — the MODEL-facing channel;
+top-level `systemMessage` is user-only). vs `hookSpecificOutput.permissionDecision`
+(+ `permissionDecisionReason` on deny, the keep-planning intent) if a `PreToolUse`
+matcher ever delivers it (another harness, or a hand-added matcher). The two events
+take different output schemas — confirmed against the live hooks docs. A PreToolUse
+ALLOW of ExitPlanMode requires `updatedInput` ALONGSIDE allow ("Returning allow
+alone is not sufficient for these tools"), so the original `tool_input` is echoed
+back unchanged as `updatedInput`. The same infra (registration guard,
+defer-while-waiting, routed tap reply) applies unchanged; this is the "Forward
+harness confirmation / permission prompts to TG as inline buttons" item, extending
+tg-cli#30.
+
 ## Defer inbound while the agent is waiting (v1.6.0)
 
 When an agent has an outstanding button question (a `pendingButton` whose pane is
