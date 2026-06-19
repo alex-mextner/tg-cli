@@ -33,7 +33,7 @@ import {
 } from "./features/tg-ctl/autostart"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
-import { findAgentInPane, parsePaneList, parseProcList, pickTargetPane } from "./features/tg-ctl/discover"
+import { findAgentInPane, panesWithRetry, parsePaneList, parseProcList, pickTargetPane } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
 import { botIdFromToken, ctlPaths, pidStatus, readPidFile } from "./features/tg-ctl/lock"
 import {
@@ -288,17 +288,22 @@ const PANE_FORMAT =
 // tmux absent / no server / ps failure → empty snapshot, never a crash:
 // discovery then degrades to the no-agent reply path.
 function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
-  let panes: PaneInfo[] = []
   let procs: ProcInfo[] = []
-  try {
-    const tmux = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", PANE_FORMAT], {
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    if (tmux.exitCode === 0) panes = parsePaneList(tmux.stdout.toString())
-  } catch {
-    // tmux binary missing
-  }
+  // Retry a transient empty/failed `tmux list-panes` before accepting "no panes" — the daemon's
+  // long-running launchd runtime intermittently read an empty pane list and mis-reported live
+  // agents as absent (idle-exit thrash + the misleading "not in tmux" reply). panesWithRetry is
+  // a no-op on the happy path (breaks on the first non-empty read) and pure/unit-tested.
+  const panes = panesWithRetry(
+    () => {
+      try {
+        const tmux = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", PANE_FORMAT], { stdout: "pipe", stderr: "pipe" })
+        return { exitCode: tmux.exitCode ?? 1, stdout: tmux.stdout.toString() }
+      } catch {
+        return null // tmux binary missing — retrying cannot help
+      }
+    },
+    { sleep: (ms) => Bun.sleepSync(ms) },
+  )
   try {
     const ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], {
       stdout: "pipe",
