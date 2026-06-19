@@ -304,14 +304,21 @@ function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
     },
     { sleep: (ms) => Bun.sleepSync(ms) },
   )
-  try {
-    const ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], {
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    if (ps.exitCode === 0) procs = parseProcList(ps.stdout.toString())
-  } catch {
-    // ps missing — never on a supported platform
+  // The ps query gets the SAME transient-empty resilience as tmux above: `ps -axo` returning an
+  // empty list is impossible on a live system (system procs always exist), so an empty/failed read
+  // is a launchd-runtime flake — and an empty procs list makes findAgentInPane match nothing, so
+  // live agent panes report as "no agent" exactly like an empty tmux read (the gap the tmux-only
+  // retry missed). Retry an exit-0-but-empty read; break on the first non-empty or a hard failure.
+  for (let i = 0; i < 3; i++) {
+    if (i > 0) Bun.sleepSync(120)
+    try {
+      const ps = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="], { stdout: "pipe", stderr: "pipe" })
+      if (ps.exitCode !== 0) break // ps failed hard — retrying unlikely to help
+      procs = parseProcList(ps.stdout.toString())
+      if (procs.length > 0) break
+    } catch {
+      break // ps missing — never on a supported platform
+    }
   }
   return { panes, procs }
 }
@@ -330,10 +337,28 @@ function readRegistration(paths: CtlPaths): Registration | null {
 // An explicit `tg-ctl start --session X` (stored in the registration) outranks
 // config.yaml's control.session: it is the fresher, more specific intent, and
 // the auto-start path never sets it (tg passes only --pane/--cwd).
+// Rate-limit the no-agent diagnostic so the per-poll idle check can't spam the log.
+let lastNoAgentLogMs = 0
 function discoverTarget(ctx: Ctx): DiscoverResult {
   const { panes, procs } = snapshot()
   const reg = readRegistration(ctx.paths)
-  return pickTargetPane(panes, procs, reg, reg?.sessionName ?? ctx.cfg.session)
+  const result = pickTargetPane(panes, procs, reg, reg?.sessionName ?? ctx.cfg.session)
+  // OBSERVABILITY: a "no-agent" result is what produces the misleading "Claude Code not in tmux"
+  // reply. It has been an UNREPRODUCIBLE intermittent in the launchd runtime, so log the snapshot
+  // shape on it — the next occurrence then shows the REAL cause (tmux-empty vs ps-empty vs
+  // agent-match-fail vs a stale registration) instead of failing silently. Rate-limited to ≤1/10s.
+  if (!result.ok && result.reason === "no-agent") {
+    const now = Date.now()
+    if (now - lastNoAgentLogMs > 10_000) {
+      lastNoAgentLogMs = now
+      const agentPanes = panes.filter((p) => findAgentInPane(p, procs)).length
+      log(
+        `no-agent reply: panes=${panes.length} procs=${procs.length} agent-panes=${agentPanes} ` +
+          `reg=${reg ? `${reg.paneId ?? "?"}@${reg.cwd ?? "?"}` : "none"}`,
+      )
+    }
+  }
+  return result
 }
 
 // All tmux panes that host an agent, as /agent selection candidates (item 1).
