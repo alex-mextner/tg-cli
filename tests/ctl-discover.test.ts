@@ -5,6 +5,7 @@ import {
   findAgentInPane,
   findAgentInAncestry,
   pickTargetPane,
+  panesWithRetry,
 } from '../features/tg-ctl/discover';
 import type { PaneInfo, ProcInfo } from '../features/tg-ctl/types';
 
@@ -308,4 +309,84 @@ test('no agent anywhere → no-agent with empty candidates', () => {
   const panes = [pane('work', 0, '%2', 300, '-zsh', '/Users/ultra')];
   const r = pickTargetPane(panes, PROCS, { paneId: '%2', cwd: '/Users/ultra' }, 'work');
   expect(r).toEqual({ ok: false, reason: 'no-agent', candidates: [] });
+});
+
+// --- panesWithRetry (tg-ctl discovery resilience) ---
+
+const ONE_PANE = '4\t1\t%0\t10481\t2.1.181\t/Users/ultra/work/hyperide';
+
+test('panesWithRetry: returns panes on the first successful non-empty read (no retry)', () => {
+  let calls = 0;
+  const panes = panesWithRetry(() => {
+    calls++;
+    return { exitCode: 0, stdout: ONE_PANE };
+  });
+  expect(panes).toHaveLength(1);
+  expect(panes[0].paneId).toBe('%0');
+  expect(calls).toBe(1); // happy path is a single call
+});
+
+test('panesWithRetry: retries a transient exit-0-but-EMPTY read, then succeeds', () => {
+  const seq = ['', '', ONE_PANE]; // two empty reads (the launchd flake), then the real list
+  let i = 0;
+  const slept: number[] = [];
+  const panes = panesWithRetry(
+    () => ({ exitCode: 0, stdout: seq[i++] }),
+    { sleep: (ms) => slept.push(ms) },
+  );
+  expect(panes).toHaveLength(1);
+  expect(i).toBe(3); // it kept trying until non-empty
+  expect(slept).toEqual([120, 120]); // a delay before each retry, not before the first attempt
+});
+
+test('panesWithRetry: ANY non-zero exit breaks immediately — not retried (no server / socket gone / connect failed)', () => {
+  // The "no agent right now" steady state when tmux is unused exits non-zero; retrying it would
+  // block the daemon ~240ms per message. Even when a LATER attempt would succeed, the non-zero
+  // breaks first — non-zero is treated as "cannot reach a server", not a flake. Robust to tmux's
+  // varying no-server stderr wording (we never read stderr).
+  const seq = [{ exitCode: 1, stdout: '' }, { exitCode: 0, stdout: ONE_PANE }];
+  let i = 0;
+  const slept: number[] = [];
+  const panes = panesWithRetry(() => seq[i++], { sleep: (ms) => slept.push(ms) });
+  expect(panes).toEqual([]); // broke on the first (non-zero) read, never reached the success
+  expect(i).toBe(1);
+  expect(slept).toEqual([]); // no retry, no sleep
+});
+
+test('panesWithRetry: a persistent exit-0-but-EMPTY read retries to give-up, sleeping attempts-1 times', () => {
+  let calls = 0;
+  const slept: number[] = [];
+  const panes = panesWithRetry(
+    () => {
+      calls++;
+      return { exitCode: 0, stdout: '' }; // exit 0 but empty — the targeted wrong/empty-server flake
+    },
+    { attempts: 3, delayMs: 50, sleep: (ms) => slept.push(ms) },
+  );
+  expect(panes).toEqual([]); // empty parse never falsely registers as non-empty
+  expect(calls).toBe(3); // this is the ONE retried branch
+  expect(slept).toEqual([50, 50]); // delayMs honored, a delay only BETWEEN attempts (never trailing)
+});
+
+test('panesWithRetry: sleep is optional — exit-0-empty without a sleep fn loops bounded, no throw', () => {
+  let calls = 0;
+  const panes = panesWithRetry(() => {
+    calls++;
+    return { exitCode: 0, stdout: '' }; // the retried branch, exercised without a sleep fn
+  }); // no opts at all — sleep undefined
+  expect(panes).toEqual([]);
+  expect(calls).toBe(3); // default attempts, tight loop, still bounded
+});
+
+test('panesWithRetry: a null run (tmux binary missing) breaks immediately — no pointless retries', () => {
+  let calls = 0;
+  const panes = panesWithRetry(
+    () => {
+      calls++;
+      return null;
+    },
+    { sleep: () => {} },
+  );
+  expect(panes).toEqual([]);
+  expect(calls).toBe(1);
 });

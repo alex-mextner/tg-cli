@@ -187,3 +187,40 @@ export function pickTargetPane(
   if (candidates.length > 1) return { ok: false, reason: 'ambiguous', candidates };
   return { ok: false, reason: 'no-agent', candidates: [] };
 }
+
+// Resilient pane query (tg-ctl discovery): run `tmux list-panes -a` and parse, RETRYING the one
+// transient flake. In the daemon's long-running launchd runtime the tmux query was observed to
+// intermittently exit 0 with an EMPTY pane list (a momentary connect to the wrong/empty server) —
+// which silently degraded EVERY inbound message to the "no agent" reply and idle-exited the daemon,
+// despite live agent panes. We retry ONLY that case (exit 0 + empty); a non-zero exit is NOT
+// retried (see the cost note below).
+//
+// COST, honestly: only the exit-0-but-EMPTY read is retried (the targeted flake), so the
+// blocking cost is paid ONLY on that path — up to (attempts-1)×delayMs (~240ms) of sync sleep
+// before giving up. Every other outcome breaks on the FIRST attempt with no delay: panes found
+// (happy path), the tmux binary missing (run() → null), and ANY non-zero exit. A non-zero exit
+// from `tmux list-panes` means the client could not reach a server (no server running, the socket
+// is gone, connect failed) — which is the STEADY STATE whenever tmux is simply unused, not a
+// flake; retrying it would block the daemon's single thread (and the Telegram long-poll) ~240ms on
+// every inbound message in the whole "no agent right now" population. So we never retry a non-zero
+// exit — that also makes the policy robust to tmux's varying no-server stderr wording (no fragile
+// message match). PURE: the caller injects `run` (the real Bun.spawnSync) and `sleep`, so this is
+// unit-testable. `run` returns null when the tmux binary is missing.
+export function panesWithRetry(
+  run: () => { exitCode: number; stdout: string } | null,
+  opts: { attempts?: number; delayMs?: number; sleep?: (ms: number) => void } = {},
+): PaneInfo[] {
+  const attempts = Math.max(1, opts.attempts ?? 3);
+  const delayMs = Math.max(0, opts.delayMs ?? 120);
+  let panes: PaneInfo[] = [];
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) opts.sleep?.(delayMs);
+    const r = run();
+    if (r === null) break; // tmux binary missing — retrying cannot help
+    if (r.exitCode !== 0) break; // could not reach a server (no server / socket gone / connect failed) — not a flake
+    panes = parsePaneList(r.stdout);
+    if (panes.length > 0) break; // got panes — done
+    // exit 0 but EMPTY → the transient wrong/empty-server read → retry
+  }
+  return panes;
+}
