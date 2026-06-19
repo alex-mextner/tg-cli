@@ -10,7 +10,7 @@
 // EVERY update — rejected senders, stale messages and unsupported kinds
 // included — so nothing is ever replayed into a live agent session.
 
-import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate } from './types';
+import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
 import { parseButtonCallback } from './questions';
 import { parseAgentCallback, parseAgentCommand } from './agent-match';
 
@@ -30,6 +30,13 @@ export interface StepOpts {
   // Format a reply's quote-anchor timestamp (item 3). Injected so the daemon
   // can use local time while tests stay deterministic; defaults to UTC.
   fmtTime?: (unixSec: number) => string;
+  // Forum-topics mode (docs/specs/tg-forum-topics.md). OFF by default: when unset/false a
+  // topic message falls through to the normal flat handling (behaviour unchanged). When on,
+  // the entrypoint injects `topicStatusOf` (threadId → current binding status, or null when
+  // untracked) so stepUpdates can route a topic message purely — bound → inject, awaiting →
+  // /new answer — without owning the binding store (the entrypoint owns it, like routes).
+  topicsEnabled?: boolean;
+  topicStatusOf?: (threadId: number) => TopicStatus | null;
 }
 
 // Default quote-anchor time format: deterministic UTC `YYYY-MM-DD HH:MM`.
@@ -121,6 +128,22 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     }
 
     const name = m.from?.first_name || m.from?.username || 'tg';
+
+    // Forum-topics mode: a topic service message or a message inside a TRACKED topic is
+    // handled here and the flat dispatch is skipped. topicActionFor returns null ONLY when
+    // this is not a topic message we own (topics OFF, General, a non-forum reply-thread, or
+    // an untracked topic) → fall through to the normal handling, unchanged. A KNOWN topic
+    // returns a (possibly empty) action list so its messages can NEVER leak to a flat agent
+    // (the media/closed mis-routing the review caught).
+    if (opts.topicsEnabled) {
+      const topicActions = topicActionFor(m, name, opts);
+      if (topicActions) {
+        actions.push(...topicActions);
+        actions.push({ kind: 'ack', messageId: m.message_id });
+        continue;
+      }
+    }
+
     let action: Action | null = null;
     if (m.text) {
       // A reply carrying prose forwards the quote anchor (items 2,3) via
@@ -178,6 +201,77 @@ function textAction(text: string, name: string, opts: StepOpts, messageId: numbe
   // A plain inbound message: surface its message_id in the wrap so the agent can
   // thread its answer with `tg --reply-to <id>` (threaded replies).
   return { kind: 'inject-text', text: opts.wrap(name, text, messageId) };
+}
+
+// A harness/daemon slash-command (`/compact`, `/stop now`) vs a path-or-prose message that
+// merely starts with `/` (`/etc/hosts is broken`). A command is `/` + a letter + word chars,
+// then a space or end — so a SECOND slash (a path) or a leading non-letter is NOT a command.
+export function isLikelySlashCommand(text: string): boolean {
+  return /^\/[a-zA-Z][\w-]*(\s|$)/.test(text);
+}
+
+// Forum-topics routing (docs/specs/tg-forum-topics.md §8). Returns the action list for a
+// topic service-message or a message inside a TRACKED topic, else null to fall through to the
+// flat handling. PURE: the bound/awaiting decision uses the injected `topicStatusOf` lookup;
+// the entrypoint owns the binding store and resolves threadId→pane.
+//
+// A KNOWN topic always returns a list (possibly empty) so its messages can NEVER fall through
+// to a flat agent — leaking a topic message to the flat picker injects it into the wrong agent
+// and replies in General (the media/closed mis-routing the review caught). null is reserved for
+// "not ours": General, a non-forum reply-thread (message_thread_id present but is_topic_message
+// absent — a supergroup reply thread, NOT a forum topic), or an untracked topic.
+function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | null {
+  if (m.forum_topic_created) {
+    // The service message's thread id IS the topic id (== its own message_id as a fallback).
+    const threadId = m.message_thread_id ?? m.message_id;
+    // Guard against a DUPLICATE create for a topic already in-flight or bound: re-emitting
+    // topic-new would let the entrypoint reset it to awaiting-path (createTopic + upsert) and
+    // lose the live pane. Only an untracked or previously-closed topic starts the flow.
+    const created = opts.topicStatusOf?.(threadId) ?? null;
+    if (created === 'bound' || created === 'awaiting-path' || created === 'awaiting-model') return [];
+    return [{ kind: 'topic-new', threadId, name: m.forum_topic_created.name, from: name }];
+  }
+  const threadId = m.message_thread_id;
+  if (threadId === undefined) return null; // General / non-topic message → flat handling
+  // close/reopen are gated on the topic being TRACKED — an untracked topic (created before the
+  // bot joined / before topics were enabled) closing is not ours, so don't emit an action the
+  // entrypoint has no binding for (keeps the "untracked → not ours" symmetry; review catch).
+  if (m.forum_topic_closed) return (opts.topicStatusOf?.(threadId) ?? null) !== null ? [{ kind: 'topic-close', threadId }] : [];
+  if (m.forum_topic_reopened) return (opts.topicStatusOf?.(threadId) ?? null) !== null ? [{ kind: 'topic-reopen', threadId }] : [];
+  // A topic RENAME is a recognized service message — swallow it (ack, never leak to flat), keeping
+  // the "known topic never falls to flat" invariant. Persisting the new TopicBinding.name (for the
+  // tmux-window slug) is the increment-2 entrypoint's job; here we just don't mis-route it.
+  if (m.forum_topic_edited) return [];
+  // A non-forum supergroup reply-thread also carries message_thread_id; only a real forum
+  // topic message sets is_topic_message. Without it we'd false-capture a reply thread whose id
+  // happened to match a tracked topic — so require the flag for non-service messages.
+  if (!m.is_topic_message) return null;
+  const status = opts.topicStatusOf?.(threadId) ?? null;
+  // A real forum-topic message (is_topic_message) for a topic the daemon hasn't bound yet is still
+  // OURS — acked, not leaked to a flat agent (which would reply in General, out of the topic). The
+  // increment-2 entrypoint binds it (e.g. spawns on first message); until then it is a no-op ack,
+  // never a mis-route (review: untracked must not reply in General, spec §10).
+  if (status === null) return [];
+  if (status === 'bound') {
+    // A message to the topic's agent. A real slash-command is injected verbatim (so /compact,
+    // /stop, … reach the agent); everything else is PROSE — wrapped so the agent gets the
+    // sender + message_id and can `tg --reply-to <id>` back into the topic. The command test is
+    // narrow (`/word` …, no second slash) so a path-like message — `/etc/hosts is broken`,
+    // `/tmp/foo crashed` — is treated as prose, not mis-read as a command (review catch). A
+    // media-only message (no text) is acked but NOT injected here — routing media into the topic
+    // is increment 2; the point is it must never leak to a flat agent.
+    const text = m.text ?? '';
+    if (!text) return [];
+    const injectText = isLikelySlashCommand(text) ? text : opts.wrap(name, text, m.message_id);
+    return [{ kind: 'topic-route', threadId, injectText, from: name, messageId: m.message_id }];
+  }
+  if (status === 'closed') {
+    // Re-attach/re-spawn is the entrypoint's job (increment 2). For now: ack, never leak to flat.
+    return [];
+  }
+  // awaiting-path / awaiting-model: an answer to the /new flow (the path; the model arrives as
+  // a button callback in increment 2).
+  return [{ kind: 'topic-answer', threadId, text: m.text ?? '', from: name, messageId: m.message_id }];
 }
 
 function photoAction(updateId: number, m: TgMessage, name: string): Action {

@@ -67,6 +67,15 @@ export interface TgTextQuote {
   text: string;
 }
 
+// A forum topic service message (Bot API 6.3+). `forum_topic_created` carries the new
+// topic's name; closed/reopened carry no extra fields. The owning message's
+// `message_thread_id` IS the topic id. See docs/specs/tg-forum-topics.md.
+export interface TgForumTopicCreated {
+  name: string;
+  icon_color?: number;
+  icon_custom_emoji_id?: string;
+}
+
 export interface TgMessage {
   message_id: number;
   from?: TgUser;
@@ -80,6 +89,13 @@ export interface TgMessage {
   audio?: TgVoice; // an audio file/note — same transcribe path as voice
   reply_to_message?: TgMessage; // the message this one replies to (items 2,3)
   quote?: TgTextQuote; // the user's partial-quote selection from it (item 2)
+  // --- forum topics (docs/specs/tg-forum-topics.md) ---
+  message_thread_id?: number; // the topic id; absent in General / non-forum chats
+  is_topic_message?: boolean; // true for a user message inside a topic
+  forum_topic_created?: TgForumTopicCreated; // service msg: a new topic was created
+  forum_topic_edited?: { name?: string; icon_custom_emoji_id?: string }; // service msg: topic renamed/re-iconed
+  forum_topic_closed?: Record<string, never>; // service msg: topic closed (empty object)
+  forum_topic_reopened?: Record<string, never>; // service msg: topic reopened (empty object)
 }
 
 export interface TgCallbackQuery {
@@ -168,7 +184,19 @@ export type Action =
       // this quote anchor prepended (built from the replied-to message).
       replyToMessageId?: number;
       replyAnchor?: string;
-    };
+    }
+  // --- forum topics (docs/specs/tg-forum-topics.md) ---
+  // A new topic was created → start the per-topic /new flow (ask path, then model).
+  | { kind: 'topic-new'; threadId: number; name: string; from: string }
+  // A user message inside a topic still in the /new flow → feed the path/model answer
+  // to the state machine. `text` is the raw user text (a path, or unused once buttons land).
+  | { kind: 'topic-answer'; threadId: number; text: string; from: string; messageId: number }
+  // A user message inside a BOUND topic → inject into that topic's pane. injectText is
+  // already wrapped; the entrypoint maps threadId→paneId and threads the ack with threadId.
+  | { kind: 'topic-route'; threadId: number; injectText: string; from: string; messageId: number }
+  // Topic closed / reopened service messages → mark the binding (entrypoint persists).
+  | { kind: 'topic-close'; threadId: number }
+  | { kind: 'topic-reopen'; threadId: number };
 
 export interface StepResult {
   actions: Action[];
@@ -231,4 +259,26 @@ export interface CtlPaths {
   log: string;
   routes: string; // message_id→pane map for reply recognition + LRU/MRU picker
   history: string; // append-only JSONL message log for `tg replies` recall
+  topics?: string; // threadId→agent binding map for forum-topics mode
+}
+
+// --- forum topics (docs/specs/tg-forum-topics.md) ---
+
+// Where a topic is in the per-topic /new lifecycle.
+//   awaiting-path  — created; asked for the working directory
+//   awaiting-model — got a path; asked for the model
+//   bound          — agent spawned + pane bound; messages route here
+//   closed         — topic closed or its pane died; re-attaches on reopen/next message
+export type TopicStatus = 'awaiting-path' | 'awaiting-model' | 'bound' | 'closed';
+
+// One forum topic's binding to an agent. Persisted as a JSON array (CtlPaths.topics),
+// written by the entrypoint on every state transition (same pattern as routes).
+export interface TopicBinding {
+  threadId: number; // message_thread_id (the topic id)
+  name: string; // the topic name (used for the tmux window slug + display)
+  status: TopicStatus;
+  path?: string; // chosen working directory (set at awaiting-model)
+  model?: string; // chosen model id from the catalog (set at spawn)
+  paneId?: string; // the spawned tmux pane ("%N"), set at bound
+  ts: number; // unix seconds of the last transition
 }
