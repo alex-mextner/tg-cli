@@ -36,11 +36,11 @@ test('detectHtmlTags ignores non-tags and bare comparison operators', () => {
 });
 
 // --- parseModeFor ---
-test('parseModeFor: explicit html always wins, plain only upgrades on real tags', () => {
+test('parseModeFor follows --format only; plain is NEVER upgraded from content', () => {
   expect(parseModeFor('html')).toBe('HTML');
-  expect(parseModeFor('html', 'hi')).toBe('HTML');
-  expect(parseModeFor('plain', '<b>x</b>')).toBe('HTML');
-  expect(parseModeFor('plain', 'hi')).toBeUndefined();
+  // Plain stays plain even when the text looks like HTML — a literal <b> or a pasted
+  // link/`://` URL must not be handed to Telegram's HTML entity parser (it 400s with
+  // "can't parse entities" on the user's ordinary text). HTML is opt-in via --format html.
   expect(parseModeFor('plain')).toBeUndefined();
 });
 
