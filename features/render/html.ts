@@ -55,10 +55,13 @@ export function detectHtmlTags(text: string): boolean {
   return htmlPattern.test(text)
 }
 
-export function parseModeFor(formatValue: Format, text?: string): "HTML" | undefined {
-  if (formatValue === "html") return "HTML"
-  if (text && detectHtmlTags(text)) return "HTML"
-  return undefined
+// parse_mode follows the user's EXPLICIT --format only. It must NOT be inferred from message
+// content: a plain-mode message that happens to contain a tag-like token (a literal `<b>`, a
+// pasted `<a href>`, a `://` URL inside other markup) would otherwise be shipped under
+// parse_mode=HTML and rejected by Telegram's entity parser ("can't parse entities") even though
+// the user never asked for HTML. HTML is opt-in via `--format html`.
+export function parseModeFor(formatValue: Format): "HTML" | undefined {
+  return formatValue === "html" ? "HTML" : undefined
 }
 
 // Render custom-emoji entities to inline <tg-emoji> tags.

@@ -140,7 +140,7 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
   };
 
   const sendMessage = async (text: string, formatValue: Format, entities: EmojiEntity[]): Promise<void> => {
-    const parseMode = parseModeFor(formatValue, text);
+    const parseMode = parseModeFor(formatValue);
     let outText = text;
     if (parseMode && entities.length > 0) {
       outText = convertEntitiesToHtml(text, entities);
@@ -208,7 +208,7 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
       form.append('chat_id', chatId);
       if (name) form.append('photo', body, name);
       else form.append('photo', body);
-      const parseMode = parseModeFor(fmt, cap);
+      const parseMode = parseModeFor(fmt);
       if (cap) form.append('caption', cap);
       if (parseMode) form.append('parse_mode', parseMode);
       const resp = await fetch(`${api}/sendPhoto`, { method: 'POST', body: form });
@@ -220,7 +220,7 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
       form.append('chat_id', chatId);
       if (name) form.append('document', body, name);
       else form.append('document', body);
-      const parseMode = parseModeFor(fmt, cap);
+      const parseMode = parseModeFor(fmt);
       if (cap) form.append('caption', cap);
       if (parseMode) form.append('parse_mode', parseMode);
       const resp = await fetch(`${api}/sendDocument`, { method: 'POST', body: form });
@@ -233,7 +233,7 @@ export function createTelegramTransport(ctx: TelegramCtx): Transport {
     sendMediaGroup: async (kind, mediaItems, cap, fmt) => {
       const form = new FormData();
       form.append('chat_id', chatId);
-      const parseMode = parseModeFor(fmt, cap);
+      const parseMode = parseModeFor(fmt);
       const media = mediaItems.map((item, i) => {
         const { body, name } = blobFor(item);
         const field = `file${i}`;
