@@ -52,6 +52,7 @@ import { aggregateUsage, orderByLruMru, parseRoutes, recognizeRoute, routeMatche
 import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
 import { inboundHistoryRecords } from "./features/replies/inbound"
 import { stepUpdates } from "./features/tg-ctl/updates"
+import { appendTopic, findTopic, markClosed, markReopened, parseTopics, serializeTopics } from "./features/tg-ctl/topics"
 import {
   buildFasterWhisperArgv,
   buildFfmpegArgv,
@@ -83,6 +84,8 @@ import type {
   TargetPane,
   TgMessage,
   TgUpdate,
+  TopicBinding,
+  TopicStatus,
 } from "./features/tg-ctl/types"
 
 export const USAGE = `Usage:
@@ -1763,6 +1766,100 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
+  // --- forum topics (docs/specs/tg-forum-topics.md §7, §8) ---
+  // The binding store is read fresh on each access (like routes) and rewritten on every
+  // transition. It is only consulted when control.topics is enabled; with the flag off the
+  // store stays empty and topicStatusOf below is never wired into stepUpdates, so the flat
+  // 1:1 path is byte-identical.
+  const loadTopics = (): TopicBinding[] => parseTopics(readFileOrNull(ctx.paths.topics))
+  const persistTopics = (topics: TopicBinding[]): void => {
+    // Best-effort, off the inject path: a write error must never break the poll loop — it is
+    // logged, not thrown. A lost close/reopen transition leaves the binding at its prior status
+    // (e.g. still `bound` after a swallowed close), but that does NOT mis-route: handleTopicRoute
+    // re-verifies the pane on the NEXT message and closes a binding whose pane is gone. So the
+    // store self-heals on the next routed message rather than relying on another service message.
+    try {
+      writeFileSync(ctx.paths.topics, serializeTopics(topics), { mode: 0o600 })
+    } catch (err) {
+      log(`topics persist failed: ${err}`)
+    }
+  }
+  // threadId → current binding status (or null when untracked) for stepUpdates' pure routing.
+  const topicStatusOf = (threadId: number): TopicStatus | null => findTopic(loadTopics(), threadId)?.status ?? null
+  // sendMessage threaded into a topic — all topic-originated daemon output MUST carry
+  // message_thread_id or it lands in General (spec §3).
+  const sendToTopic = (threadId: number, text: string): Promise<number | null> =>
+    sendMessage(ctx, text, { message_thread_id: threadId })
+
+  // Route an inbound message inside a BOUND topic into that topic's mapped pane. The
+  // injectText is already wrapped by stepUpdates. Safety (mirrors handleReplyRoute's
+  // routeMatchesPane defense): a tmux pane id is REUSED after kill-pane, so before injecting we
+  // require (a) the pane still hosts an agent AND (b) — when the binding recorded a working
+  // `path` (every spawn-created binding does) — the live pane's path still matches it, so a
+  // DIFFERENT project's agent that inherited the old `%N` can never receive this topic's
+  // message. Any failure marks the binding closed and reports into the topic; it NEVER falls
+  // through to the flat discovered target (which would leak a topic message into a 1:1 agent).
+  const handleTopicRoute = async (action: Extract<Action, { kind: "topic-route" }>): Promise<boolean> => {
+    const topics = loadTopics()
+    const binding = findTopic(topics, action.threadId)
+    if (!binding || binding.status !== "bound" || !binding.paneId) {
+      // stepUpdates only emits topic-route for a status it saw as 'bound'; a race that lost the
+      // pane between the status read and here closes it rather than mis-routing.
+      await sendToTopic(action.threadId, "this topic's agent is no longer bound — recreate the topic")
+      return false
+    }
+    const { panes, procs } = snapshot()
+    const pane = panes.find((p) => p.paneId === binding.paneId)
+    if (!pane || findAgentInPane(pane, procs) === null) {
+      // The agent's pane is genuinely GONE (closed / no agent there) → terminal. Mark the binding
+      // closed (increment 2's re-spawn picks it up), tell the human, inject nothing.
+      persistTopics(appendTopic(topics, markClosed(binding, Math.floor(Date.now() / 1000))))
+      await sendToTopic(action.threadId, "this topic's agent has exited — recreate the topic to respawn it")
+      return false
+    }
+    // The pane hosts an agent but its path no longer matches the binding's recorded project
+    // (pane-id reuse guard). Treat this as NON-terminal and recoverable: a path mismatch can be a
+    // tmux pane-id REUSE by another project's agent (must not inject — leak) BUT also a transient
+    // empty pane_current_path read or the agent doing a legitimate `cd`. So SKIP this message
+    // (never leak into a stranger) WITHOUT closing the binding — a true reuse keeps failing the
+    // same way (no harm), while a transient/cd self-heals on the next message. (markClosed here
+    // would irreversibly kill a still-live topic with no respawn path until increment 2.)
+    if (binding.path !== undefined && !routeMatchesPane({ recognizedCwd: binding.path, panePath: pane.panePath })) {
+      await sendToTopic(action.threadId, "this topic's agent pane can't be confirmed right now — try again")
+      return false
+    }
+    if (shouldDeferInbound(binding.paneId)) {
+      // The pane passed the same-project guard above, so we defer behind its open question /
+      // backlog exactly like the flat path. KNOWN GAP (increment-2 hardening): the shared
+      // deferred-flush drain re-verifies agent-presence but NOT panePath, so a kill-pane + id
+      // reuse in the narrow enqueue→flush window could still flush into a stranger's pane. This
+      // is a property of the shared flush mechanism (flat 1:1 shares it); tightening it means
+      // teaching the flush drain about per-route project identity, deferred to the spawn increment.
+      enqueueDeferred(binding.paneId, action.injectText)
+      lastWasDeferred = true
+      return true
+    }
+    const res = await executeInjectSteps(buildTextInjectPlan(binding.paneId, action.injectText))
+    if (!res.ok) {
+      await sendToTopic(action.threadId, res.error)
+      return false
+    }
+    return true
+  }
+
+  // forum_topic_closed / reopened on a tracked topic → persist the status transition. The
+  // binding is retained (closed keeps the path/model for a later re-spawn); reopen drops back
+  // into the /new flow (increment 2 owns the actual re-attach/spawn).
+  const handleTopicLifecycle = (action: Extract<Action, { kind: "topic-close" | "topic-reopen" }>): boolean => {
+    const topics = loadTopics()
+    const binding = findTopic(topics, action.threadId)
+    if (!binding) return false // untracked — stepUpdates already filtered, defensive only
+    const ts = Math.floor(Date.now() / 1000)
+    const next = action.kind === "topic-close" ? markClosed(binding, ts) : markReopened(binding, ts)
+    persistTopics(appendTopic(topics, next))
+    return true
+  }
+
   // getFile → /file/ download into ~/.cache/tg-cli/inbound under the daemon-
   // chosen name (never the Telegram basename, spec §5.2). Returns the local path
   // or null (already logged + replied). Shared by media + voice download. The
@@ -2026,6 +2123,21 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return downloadMedia(action)
       case "transcribe-voice":
         return transcribeVoice(action)
+      case "topic-route":
+        return handleTopicRoute(action)
+      case "topic-close":
+      case "topic-reopen":
+        return handleTopicLifecycle(action)
+      case "topic-new":
+      case "topic-answer":
+        // SEAM for increment 2 (spawn + bind executor, spec §9.2): the /new flow that asks
+        // the path + model and runs `tmux new-window`. Until that lands, a topic-create /
+        // in-flight answer is a logged no-op — no binding is created, so a later message in
+        // the topic stays UNTRACKED (topicStatusOf → null) and is ACKed-only by stepUpdates,
+        // never leaking into a flat agent. The flag default-off means this branch is dead for
+        // every existing 1:1 user.
+        log(`topic ${action.threadId}: ${action.kind} (spawn executor not yet wired — increment 2)`)
+        return true
       case "ack":
         if (lastWasDeferred) {
           lastWasDeferred = false
@@ -2095,6 +2207,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           const p = (n: number): string => String(n).padStart(2, "0")
           return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
         },
+        // Forum-topics mode (spec §8). OFF by default: when ctx.cfg.topics is false stepUpdates
+        // ignores message_thread_id and the flat 1:1 path is byte-identical to before. When on,
+        // topicStatusOf reads the binding store so topic messages route per-topic.
+        topicsEnabled: ctx.cfg.topics,
+        topicStatusOf: ctx.cfg.topics ? topicStatusOf : undefined,
       })
 
       // At-most-once (spec §10): persist the offset BEFORE acting. A crash

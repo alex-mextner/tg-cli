@@ -162,6 +162,35 @@ control:
 
 > **One bot token per machine.** Telegram allows a single `getUpdates` consumer per token. Outbound `tg` is unaffected.
 
+### Forum topics — one topic per agent (opt-in, experimental)
+
+When the bot chat is a **forum supergroup** (Topics enabled), tg-ctl can route per **topic**:
+a message in topic *T* injects into that topic's bound agent pane. Opt in:
+
+```yaml
+control:
+  topics: true   # default false — leave off for normal 1:1 routing
+```
+
+Default **OFF**: with the flag off, a forum-topic message falls through to the normal flat
+routing, so existing 1:1 behaviour is unchanged. What's wired today is the **routing half** — an
+inbound topic message routes to its bound pane.
+
+Caveats while this is experimental:
+
+- **The agent's own `tg` replies still go to General**, not the topic — only the *daemon's*
+  own status/error messages thread back into topic *T* so far. Per-topic threading of the
+  agent's replies needs `tg --topic` (a later increment), so don't enable this expecting the
+  agent's answers to land in the thread yet.
+- **Creating a topic does not spawn an agent yet** (the per-topic `/new` path+model flow +
+  `tmux new-window` spawn is not wired), so a topic only routes once it already has a binding.
+- **Closing then reopening a topic does NOT re-attach its agent yet.** Reopen drops the old
+  pane binding and waits for the spawn flow — which isn't wired — so the topic lands in a
+  dead-end "awaiting model" state while the original agent keeps running, untracked, in its
+  old pane. Don't close/reopen a live topic until the spawn executor lands.
+
+See `docs/specs/tg-forum-topics.md` (§9 increment plan) for the full design and remaining work.
+
 ### Recalling messages (`tg replies`, v1.11.0)
 
 `tg replies` lets an agent (or you) quickly recall what was sent over Telegram —

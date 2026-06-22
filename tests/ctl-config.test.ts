@@ -50,6 +50,16 @@ test('parseControlConfig booleans use the feature-flags token sets', () => {
   expect(parseControlConfig('control:\n  enabled: maybe\n')).toEqual({});
 });
 
+test('parseControlConfig parses the topics flag with the same token sets', () => {
+  for (const v of ['true', 'yes', 'on', '1']) {
+    expect(parseControlConfig(`control:\n  topics: ${v}\n`)).toEqual({ topics: true });
+  }
+  for (const v of ['false', 'no', 'off', '0']) {
+    expect(parseControlConfig(`control:\n  topics: ${v}\n`)).toEqual({ topics: false });
+  }
+  expect(parseControlConfig('control:\n  topics: maybe\n')).toEqual({}); // unrecognized → ignore
+});
+
 test('parseControlConfig strips surrounding quotes from string values', () => {
   const yaml = "control:\n  session: 'my session'\n  inject_wrap: \"{name}: {msg}\"\n";
   expect(parseControlConfig(yaml)).toEqual({
@@ -98,6 +108,12 @@ test('resolveControlConfig: partial fields override defaults, the rest stay', ()
   expect(r.idleExitMin).toBe(DEFAULT_CONTROL.idleExitMin);
   expect(r.injectWrap).toBe(DEFAULT_CONTROL.injectWrap);
   expect(r.transport).toBe('auto');
+  expect(r.topics).toBe(false); // not set in the partial → defaults OFF
+});
+
+test('resolveControlConfig: topics defaults OFF and an explicit true flows through', () => {
+  expect(resolveControlConfig({}).topics).toBe(false);
+  expect(resolveControlConfig({ topics: true }).topics).toBe(true);
 });
 
 test('resolveControlConfig: transport outside the union falls back to auto', () => {
