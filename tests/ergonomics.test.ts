@@ -559,3 +559,58 @@ test('plain existing path with no spec has NO lineSpec field', () => {
   // No spec: the lineSpec field is absent, not undefined.
   if (r.action === 'send') expect('lineSpec' in r.items[0]).toBe(false);
 });
+
+// --- --topic <id> (forum-topics increment 2): parse + validation + back-compat ---
+test('--topic <id> parses a positive topic id onto the send result', () => {
+  const r = parseArgs(['--topic', '7', 'hi'], dir, HOME);
+  expect(r).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'hi',
+    format: 'plain',
+    topic: 7,
+  });
+});
+
+test('--topic composes with --reply-to (a threaded reply INSIDE a topic)', () => {
+  const r = parseArgs(['--topic', '7', '--reply-to', '1234', '--tag', 'answer', 'a'], dir, HOME);
+  expect(r).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'a',
+    format: 'plain',
+    tag: 'answer',
+    replyTo: 1234,
+    topic: 7,
+  });
+});
+
+test('--topic with a non-positive / non-numeric id is a parse error', () => {
+  expect(parseArgs(['--topic', '0', 'x'], dir, HOME).action).toBe('error');
+  expect(parseArgs(['--topic', '-3', 'x'], dir, HOME).action).toBe('error');
+  expect(parseArgs(['--topic', 'abc', 'x'], dir, HOME).action).toBe('error');
+});
+
+test('--topic without a value is a parse error', () => {
+  expect(parseArgs(['--topic'], dir, HOME)).toEqual({
+    action: 'error',
+    message: '--topic requires a topic id',
+  });
+});
+
+test('a bare --topic (no body) resolves to help, not an empty send', () => {
+  // --topic is a pure routing modifier — with nothing to post it is an empty
+  // invocation (like no flag at all), not a header-only send.
+  expect(parseArgs(['--topic', '7'], dir, HOME)).toEqual({ action: 'help' });
+});
+
+test('REGRESSION: a no-topic send leaves topic undefined (1:1 path unchanged)', () => {
+  // toEqual ignores undefined-valued keys, so the result is shape-equal to the
+  // pre-feature send shape; the entrypoint reads `topic` as undefined and stamps
+  // no message_thread_id (the wire-level byte-identical guarantee is proven in
+  // cli-topic-send.test.ts). The `topic` key being present-but-undefined matches
+  // how the result already carries replyTo/pdfDevice when unset.
+  const r = parseArgs(['just a message'], dir, HOME);
+  expect(r).toEqual({ action: 'send', items: [], caption: 'just a message', format: 'plain' });
+  if (r.action === 'send') expect(r.topic).toBeUndefined();
+});

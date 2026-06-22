@@ -71,6 +71,13 @@ export type ParseResult =
       // daemon surfaces it in the injected wrap as `#<id>`). Absent when the flag
       // is not given (keeps no-flag send results byte-identical).
       replyTo?: number;
+      // Forum topic (`--topic <id>`): sets message_thread_id on EVERY outbound
+      // send so an agent's `tg` reply threads INTO its bound topic instead of
+      // General (docs/specs/tg-forum-topics.md §8). The id is the topic's
+      // message_thread_id. The entrypoint falls back to the TG_TOPIC env when the
+      // flag is absent; an explicit flag wins. Absent (and no TG_TOPIC) keeps
+      // no-flag send results byte-identical for the 1:1 path.
+      topic?: number;
       // `tg --table`: read delimited rows from stdin, render an aligned <pre>
       // monospace table, and send it (composes with --tag/--title). The flag is
       // a boolean; the rows come from stdin, not argv. Absent when not given.
@@ -188,6 +195,7 @@ export function parseArgs(
   let noPdf: true | undefined;
   let pdfDevice: string | undefined;
   let replyTo: number | undefined;
+  let topic: number | undefined;
   let table: true | undefined;
 
   let i = 0;
@@ -277,6 +285,24 @@ export function parseArgs(
         };
       }
       replyTo = Number(nextArg);
+      i += 2;
+      continue;
+    }
+    // Forum topic: `--topic <id>`. Same validation as --reply-to (a positive
+    // integer message_thread_id); anything else is a clear error rather than a
+    // silently-dropped topic (which would scatter the reply to General).
+    if (arg === '--topic') {
+      const nextArg = args[i + 1];
+      if (!nextArg || nextArg.startsWith('--')) {
+        return { action: 'error', message: '--topic requires a topic id' };
+      }
+      if (!/^[1-9][0-9]*$/.test(nextArg)) {
+        return {
+          action: 'error',
+          message: `--topic expects a positive topic id, got '${nextArg}'`,
+        };
+      }
+      topic = Number(nextArg);
       i += 2;
       continue;
     }
@@ -487,6 +513,7 @@ export function parseArgs(
     noPdf,
     pdfDevice,
     replyTo,
+    topic,
     table,
   };
 }

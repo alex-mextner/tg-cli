@@ -51,7 +51,7 @@ test('`tg help <unknown>` errors with a 3-part message and exits non-zero', () =
   expect(err).toContain('Available topics: format');
 });
 
-test('--help advertises `tg help format`, --table and --reply-to', () => {
+test('--help advertises `tg help format`, --table, --reply-to and --topic', () => {
   const proc = run(['--help']);
   const out = proc.stdout.toString();
   expect(proc.exitCode).toBe(0);
@@ -59,6 +59,7 @@ test('--help advertises `tg help format`, --table and --reply-to', () => {
   expect(out).toContain('tg help format');
   expect(out).toContain('--table');
   expect(out).toContain('--reply-to');
+  expect(out).toContain('--topic');
 });
 
 test('--help piped (non-TTY) is PLAIN — no ANSI color codes leak into the output', () => {
@@ -109,5 +110,21 @@ test('--reply-to with a bad id errors before the credential gate', () => {
   const err = proc.stderr.toString();
   expect(proc.exitCode).not.toBe(0);
   expect(err).toContain('positive message id');
+  expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+test('--topic with a bad id errors before the credential gate', () => {
+  const proc = run(['--topic', 'nope', 'x']);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).not.toBe(0);
+  expect(err).toContain('positive topic id');
+  expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+test('--topic without a value errors before the credential gate', () => {
+  const proc = run(['--topic']);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).not.toBe(0);
+  expect(err).toContain('--topic requires a topic id');
   expect(err).not.toContain('TG_BOT_TOKEN');
 });

@@ -134,16 +134,29 @@ mirroring how `routes.cwd` already flows).
    an error INTO the topic, never leaking to a flat agent) and `topic-close`/`topic-reopen` (persist
    the transition). All topic-originated daemon output carries `message_thread_id`. Integration test
    `tests/ctl-topics-integration.test.ts` proves: 1:1 routing unchanged (flag off AND on), topic
-   routing into the bound pane, and the dead-pane no-leak + threaded error. `tg --topic` (the agent's
-   own `tg` reply threading) is still a follow-up — for now the AGENT's `tg` replies post to General
-   unless given the thread id; daemon replies are already threaded.
+   routing into the bound pane, and the dead-pane no-leak + threaded error.
+   **`tg --topic` (the agent's own `tg` reply threading) — LANDED (increment 2):** the OUTBOUND
+   `tg` send learned a `--topic <id>` flag and a `TG_TOPIC` env fallback (the flag wins). When set,
+   EVERY outbound primitive (sendMessage/sendRich/sendPhoto/sendDocument/sendMediaGroup) carries
+   `message_thread_id` — NOT consumed after the first message, so a >4096 split and album items all
+   stay in the topic. With neither flag nor env the wire payload is byte-identical to before (the
+   1:1 path is untouched). The `TG_TOPIC` env is **ADVISORY** (an agent shell can inherit a stale
+   value): a malformed value is logged and ignored (posts to General), and a well-formed but
+   server-REJECTED value (closed/deleted topic, non-forum chat → `message thread not found` /
+   `TOPIC_CLOSED`) makes the send retry ONCE without the thread id rather than hard-fail — so a
+   daily-critical send never dies because of a stale ambient default. An EXPLICIT `--topic` stays
+   strict: the agent asked for that topic, so a rejection surfaces as a real error. Still DEFERRED
+   (increment 4): the DAEMON auto-stamping `TG_TOPIC` into the bound pane's env so the agent need
+   not pass `--topic` — that touches the spawn/inject path and lands with the spawn executor (the
+   advisory fallback above is what keeps that future auto-stamp safe against a since-closed topic).
 2. **Spawn + bind executor (the remaining seam)** — entrypoint handles `topic-new`/`topic-answer`:
    the `/new` button flow + `tmux new-window` spawn + persistence. Until this lands those two Actions
    are logged no-ops, so no binding is ever created from inside the daemon — a topic only routes if a
    binding already exists in the store (e.g. seeded by a future spawn step). This is the clean seam.
 4. **Lifecycle polish** — re-spawn on a dead/closed pane (today it marks closed + asks the human to
    recreate the topic), daemon-restart re-bind, General-vs-topic edge cases, admin-permission
-   onboarding error, `tg --topic` for agent-side reply threading.
+   onboarding error, and the DAEMON auto-stamping a bound pane's `TG_TOPIC` env (so the agent's `tg`
+   threads automatically without `--topic`; the explicit flag/env already landed in increment 2).
 
 ## 10. Edge cases / decisions
 
