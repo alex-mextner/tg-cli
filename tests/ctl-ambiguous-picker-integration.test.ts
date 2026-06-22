@@ -271,8 +271,10 @@ async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
 
 const pickerOf = (sends: SentMessage[]): SentMessage | undefined => sends.find((s) => s.hasMarkup);
 
-test('AMBIGUOUS plain message → inline-keyboard picker (buttons, NO "candidates:" text dump)', async () => {
-  // Two registered agents, both live → pickTargetPaneFromSet returns ambiguous.
+test('AMBIGUOUS plain message, NO last message → inline-keyboard picker (buttons, NO "candidates:" text dump)', async () => {
+  // Two registered agents, both live, and routes.json is EMPTY (no last message in
+  // the chat) → pickTargetPaneFromSet returns ambiguous and the no-reply last-message
+  // bind has nothing to prefer, so the picker is the correct outcome (tg-cli#78).
   const h = makeHarness([
     { paneId: PANE_HYPER, cwd: '' }, // cwd empty so tier-3 cwd match can't collapse it
     { paneId: PANE_TOOLS, cwd: '' },
@@ -301,6 +303,105 @@ test('AMBIGUOUS plain message → inline-keyboard picker (buttons, NO "candidate
   expect(picker!.buttons.every((b) => b.callback_data.startsWith('tga:'))).toBe(true);
   // No silent inject while the human picks.
   expect(injectedLines(h.injectLog).length).toBe(0);
+}, 15_000);
+
+test('NO-REPLY plain message → binds DIRECTLY to the last-message agent, NO picker (tg-cli#78)', async () => {
+  // Two registered live agents, and the LAST MESSAGE in the chat came from agent-tools
+  // (%2) — its outbound send is the newest route. A fresh non-reply message must land
+  // ON %2 directly (the agent the CTO was just talking to), never popping a picker.
+  const now = Math.floor(Date.now() / 1000);
+  const h = makeHarness(
+    [
+      { paneId: PANE_HYPER, cwd: '' },
+      { paneId: PANE_TOOLS, cwd: '' },
+    ],
+    [
+      { id: 400, paneId: PANE_HYPER, cwd: '', ts: now - 60 }, // hyperide spoke earlier
+      { id: 401, paneId: PANE_TOOLS, cwd: '', ts: now }, // agent-tools spoke LAST
+    ],
+  );
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+  procs.push(daemon);
+
+  tg.pushText(706, 30, 'continue where we left off');
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.length > 0);
+  await Bun.sleep(200);
+
+  // Bound to the last-message agent (%2) directly — no picker, and never into %0.
+  expect(pickerOf(tg.sends)).toBeUndefined();
+  const lines = injectedLines(h.injectLog);
+  expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(false);
+  expect(lines.join('\n')).toContain('continue where we left off');
+}, 15_000);
+
+test('NO-REPLY bind FLIPS to whoever posted last (a newer post from the other agent wins)', async () => {
+  // Mirror of the test above, but now HYPERIDE (%0) posted the last message. The same
+  // fresh non-reply message must flip and bind to %0 — proving the bind tracks the
+  // last message, not a fixed agent.
+  const now = Math.floor(Date.now() / 1000);
+  const h = makeHarness(
+    [
+      { paneId: PANE_HYPER, cwd: '' },
+      { paneId: PANE_TOOLS, cwd: '' },
+    ],
+    [
+      { id: 410, paneId: PANE_TOOLS, cwd: '', ts: now - 60 }, // agent-tools spoke earlier
+      { id: 411, paneId: PANE_HYPER, cwd: '', ts: now }, // hyperide spoke LAST
+    ],
+  );
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+  procs.push(daemon);
+
+  tg.pushText(707, 32, 'ship it');
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.length > 0);
+  await Bun.sleep(200);
+
+  expect(pickerOf(tg.sends)).toBeUndefined();
+  const lines = injectedLines(h.injectLog);
+  expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`))).toBe(false);
+  expect(lines.join('\n')).toContain('ship it');
+}, 15_000);
+
+test('NO-REPLY bind: last-message agent GONE → never guesses into the gone pane (no fabricated button)', async () => {
+  // The last message came from hyperide (%0), but %0 is now GONE (mode "tools" → only
+  // agent-tools %2 is live). The last-message bind must NOT inject into the gone %0
+  // nor fabricate a button for it. (The pure fallback-to-picker is asserted by the
+  // resolveByLastMessage unit test "last-message pane is GONE → stays ambiguous"; with
+  // a SINGLE live agent the SET tier may legitimately resolve to %2 directly, so the
+  // integration invariant here is only "never the gone pane", #49 safety.)
+  const now = Math.floor(Date.now() / 1000);
+  const h = makeHarness(
+    [
+      { paneId: PANE_HYPER, cwd: '' },
+      { paneId: PANE_TOOLS, cwd: '' },
+    ],
+    [{ id: 420, paneId: PANE_HYPER, cwd: '', ts: now }], // last message from the now-gone %0
+  );
+  const tg = startFakeTg();
+  h.setMode('tools'); // %0 gone, only %2 live
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+  procs.push(daemon);
+
+  tg.pushText(708, 34, 'where did everyone go');
+
+  // With only ONE live agent the SET tier may resolve directly to %2 (a single live
+  // registered pane is unambiguous) — that is acceptable; the invariant under test is
+  // that the GUESS path never fabricates %0 and never injects into the gone pane.
+  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.length > 0);
+  await Bun.sleep(200);
+
+  // Nothing was injected into the gone %0, and no button was ever offered for it.
+  expect(injectedLines(h.injectLog).some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(false);
+  const picker = pickerOf(tg.sends);
+  if (picker) expect(picker.buttons.some((b) => b.text.includes('hyperide'))).toBe(false);
 }, 15_000);
 
 test('TAP a button → routes the pending message to the chosen pane', async () => {
@@ -425,6 +526,39 @@ test('AMBIGUOUS control verb (/stop, no routable text) → select-only picker, N
   expect(injectedLines(h.injectLog).length).toBe(0);
   // And the source /stop message earned NO 👀 — it did not execute.
   expect(tg.reactions.some((r) => r.messageId === stopMsgId && r.emoji === '👀')).toBe(false);
+}, 15_000);
+
+test('DESTRUCTIVE /kill NEVER auto-binds to the last-message agent (asks even WITH a last message)', async () => {
+  // Two registered live agents AND a populated routes.json (agent-tools %2 posted last).
+  // A harmless content message WOULD bind to %2 — but /kill is destructive and must NOT
+  // guess: it uses the base discover() (not discoverForInject), so it ASKS via the
+  // select-picker rather than killing the guessed last-message agent (tg-cli#78 safety).
+  const now = Math.floor(Date.now() / 1000);
+  const h = makeHarness(
+    [
+      { paneId: PANE_HYPER, cwd: '' },
+      { paneId: PANE_TOOLS, cwd: '' },
+    ],
+    [{ id: 430, paneId: PANE_TOOLS, cwd: '', ts: now }], // %2 posted the last message
+  );
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+  procs.push(daemon);
+
+  const killMsgId = 36;
+  tg.pushText(709, killMsgId, '/kill');
+
+  await waitFor(() => pickerOf(tg.sends) !== undefined);
+  await Bun.sleep(300);
+
+  // It posted a select-picker (asked), NOT killed the last-message agent.
+  const picker = pickerOf(tg.sends);
+  expect(picker).toBeDefined();
+  expect(picker!.buttons.length).toBe(2);
+  // No inject of any kind, and the /kill earned no 👀 (it did not execute).
+  expect(injectedLines(h.injectLog).length).toBe(0);
+  expect(tg.reactions.some((r) => r.messageId === killMsgId && r.emoji === '👀')).toBe(false);
 }, 15_000);
 
 test('candidatesForPicker drops a discovery pane that is NOT a live agent (no synthetic dead button)', async () => {

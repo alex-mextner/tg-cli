@@ -42,7 +42,7 @@ import {
   parsePaneList,
   parseProcList,
   pickTargetPaneFromSet,
-  resolveAmbiguousByActivity,
+  resolveByLastMessage,
 } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
@@ -68,6 +68,7 @@ import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
   aggregateUsage,
   fsRoutesLockIo,
+  lastMessagePane,
   orderByLruMru,
   parseRoutes,
   recognizeRoute,
@@ -1783,21 +1784,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   let consecutive409 = 0
   let warned409 = false
 
-  // paneId → most-recent outbound-send unix seconds, from routes.json. This is the
-  // SAME LRU/MRU activity signal the reply picker ranks by (tg-cli#75 fix B): the
-  // "most-recently-active agent" is the pane whose last `tg` send is newest.
-  const lastActiveByPane = (): Map<string, number> => {
-    const usage = aggregateUsage(parseRoutes(readFileOrNull(ctx.paths.routes)))
-    const out = new Map<string, number>()
-    for (const [paneId, u] of usage) out.set(paneId, u.lastTs)
-    return out
-  }
+  // The origin pane of the LAST MESSAGE in the chat, from routes.json (tg-cli#78):
+  // the pane that produced the newest outbound `tg` send. This is the single
+  // "who posted last" value the no-reply bind uses — NOT a per-pane aggregate.
+  const lastMessagePaneId = (): string | null => lastMessagePane(parseRoutes(readFileOrNull(ctx.paths.routes)))
 
-  // The base discovery: §10 priority chain + liveness bookkeeping, NO auto-bind.
-  // Used by liveness/history paths that must NOT silently pick an agent. The
-  // no-reply auto-bind lives ONLY in discoverForInject below, so it can never leak
-  // onto the reply path (which uses handleReplyRoute's own #49 fail-closed, not
-  // discover()) or the history-attribution path.
+  // The base discovery: §10 priority chain + liveness bookkeeping, NO last-message
+  // bind. Used by liveness/history paths that must NOT silently pick an agent. The
+  // no-reply bind lives ONLY in discoverForInject below, so it can never leak onto
+  // the reply path (which uses handleReplyRoute's own #49 fail-closed, not discover())
+  // or the history-attribution path.
   const discover = (): DiscoverResult => {
     const result = discoverTarget(ctx)
     // Agent panes existing — even ambiguous ones — keep the daemon alive.
@@ -1805,19 +1801,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return result
   }
 
-  // discover() PLUS the no-reply auto-bind (fix B, tg-cli#75): an otherwise-ambiguous
-  // NON-reply inbound binds to the most-recently-active agent rather than asking.
-  // This runs BEFORE #76's ambiguous-picker: a fresh message after a burst from one
-  // agent lands there directly; the picker fires only when auto-bind CANNOT resolve
-  // (no activity history, or a tie at the most-recent ts). The usage map is built
-  // LAZILY — only on a genuinely ambiguous base result — so the common ok/no-agent
-  // path never reads routes.json. This is the ONLY discovery used by the non-reply
-  // INJECT paths (injectViaTarget with autoBind). A no-history / tie case stays
-  // ambiguous → #76's picker (the unscoped fail-closed, #49).
+  // discover() PLUS the no-reply last-message bind (tg-cli#78): an otherwise-ambiguous
+  // NON-reply inbound binds to the agent of the LAST MESSAGE in the chat rather than
+  // asking. This runs BEFORE #76's ambiguous-picker: a fresh message after the last
+  // agent posted lands there directly; the picker fires only when there is NO last
+  // message, or its pane is gone / not a candidate. The lookup is LAZY — only on a
+  // genuinely ambiguous base result — so the common ok/no-agent path never reads
+  // routes.json. This is the ONLY discovery used by the non-reply INJECT paths
+  // (injectViaTarget with autoBind). A no-last-message case stays ambiguous → #76's
+  // picker (the unscoped fail-closed, #49).
   const discoverForInject = (): DiscoverResult => {
     const result = discover()
     if (result.ok || result.reason !== "ambiguous") return result
-    return resolveAmbiguousByActivity(result, lastActiveByPane())
+    return resolveByLastMessage(result, lastMessagePaneId())
   }
 
   // Resolve a DiscoverResult's ambiguous `TargetPane[]` to the picker's
@@ -1849,13 +1845,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // true only when the plan actually executed — the caller uses it to decide
   // whether the source message earns its 👀 delivery receipt.
   //
-  // `autoBind` (default off, fix B/tg-cli#75) opts a HARMLESS content inject
-  // (text/photo/voice) into the no-reply auto-bind: an otherwise-ambiguous non-reply
-  // message lands on the most-recently-active agent FIRST (discoverForInject), so the
-  // picker below fires LESS often. It is OFF for control keys (/stop's Escape) —
-  // interrupting a GUESSED agent is the wrong default; an ambiguous control verb asks.
+  // `autoBind` (default off, tg-cli#78) opts a HARMLESS content inject
+  // (text/photo/voice) into the no-reply last-message bind: an otherwise-ambiguous
+  // non-reply message lands on the agent of the LAST MESSAGE in the chat FIRST
+  // (discoverForInject), so the picker below fires LESS often. It is OFF for control
+  // keys (/stop's Escape) — interrupting a GUESSED agent is the wrong default; an
+  // ambiguous control verb asks.
   //
-  // When the target is STILL ambiguous (auto-bind off, or no recent agent to prefer)
+  // When the target is STILL ambiguous (auto-bind off, or no last message to prefer)
   // and the inject carries routable text, it posts the agent PICKER (tappable buttons,
   // tg-cli#76) and arms the pending route — a tap injects `deferText` verbatim, exactly
   // like the /agent picker. A control verb with no text (inject-key /stop) has nothing

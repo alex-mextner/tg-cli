@@ -7,7 +7,7 @@ import {
   pickTargetPane,
   pickTargetPaneFromSet,
   panesWithRetry,
-  resolveAmbiguousByActivity,
+  resolveByLastMessage,
 } from '../features/tg-ctl/discover';
 import type { DiscoverResult, PaneInfo, ProcInfo, TargetPane } from '../features/tg-ctl/types';
 
@@ -464,7 +464,7 @@ test('panesWithRetry: a null run (tmux binary missing) breaks immediately — no
   expect(calls).toBe(1);
 });
 
-// --- resolveAmbiguousByActivity (tg-cli#75 fix B: no-reply auto-bind) ---
+// --- resolveByLastMessage (tg-cli#78: no-reply bind to the last-message agent) ---
 
 function target(paneId: string): TargetPane {
   return { pane: pane('s', 0, paneId, 100, 'claude', '/p', 'win'), agent: 'claude' };
@@ -474,51 +474,43 @@ function ambiguous(...paneIds: string[]): DiscoverResult {
   return { ok: false, reason: 'ambiguous', candidates: paneIds.map(target) };
 }
 
-test('resolveAmbiguousByActivity: binds an ambiguous result to the MOST-RECENT active pane', () => {
-  // %5 spoke last (ts 200) → a non-reply inbound auto-binds there instead of asking.
-  const usage = new Map([
-    ['%2', 100],
-    ['%5', 200],
-  ]);
-  const r = resolveAmbiguousByActivity(ambiguous('%2', '%5'), usage);
+test('resolveByLastMessage: binds an ambiguous result to the last-message pane', () => {
+  // %5 posted the last message in the chat → a non-reply inbound binds there, no picker.
+  const r = resolveByLastMessage(ambiguous('%2', '%5'), '%5');
   expect(r.ok).toBe(true);
   if (r.ok) expect(r.target.pane.paneId).toBe('%5');
 });
 
-test('resolveAmbiguousByActivity: a partial-history candidate set still binds the only-known pane', () => {
-  // Only %2 has activity; %5 never spoke. The "last agent" is unambiguously %2.
-  const usage = new Map([['%2', 100]]);
-  const r = resolveAmbiguousByActivity(ambiguous('%2', '%5'), usage);
+test('resolveByLastMessage: the last-message pane flips with a newer post (binds the new last pane)', () => {
+  // The newest message is from %2 now → it wins over %5.
+  const r = resolveByLastMessage(ambiguous('%2', '%5'), '%2');
   expect(r.ok).toBe(true);
   if (r.ok) expect(r.target.pane.paneId).toBe('%2');
 });
 
-test('resolveAmbiguousByActivity: NO history for any candidate → stays ambiguous (picker fires)', () => {
-  const r = resolveAmbiguousByActivity(ambiguous('%2', '%5'), new Map());
+test('resolveByLastMessage: NO last message → stays ambiguous (picker fires)', () => {
+  const r = resolveByLastMessage(ambiguous('%2', '%5'), null);
   expect(r.ok).toBe(false);
   if (!r.ok) expect(r.reason).toBe('ambiguous');
 });
 
-test('resolveAmbiguousByActivity: a TIE at the most-recent ts stays ambiguous (no "last agent")', () => {
-  const usage = new Map([
-    ['%2', 200],
-    ['%5', 200], // identical most-recent ts → genuinely ambiguous
-  ]);
-  const r = resolveAmbiguousByActivity(ambiguous('%2', '%5'), usage);
+test('resolveByLastMessage: last-message pane is GONE (not a candidate) → stays ambiguous (picker)', () => {
+  // The last message came from %9, but %9 is no longer a live candidate → don't guess.
+  const r = resolveByLastMessage(ambiguous('%2', '%5'), '%9');
   expect(r.ok).toBe(false);
   if (!r.ok) expect(r.reason).toBe('ambiguous');
 });
 
-test('resolveAmbiguousByActivity: a no-agent result is passed through untouched (no false bind)', () => {
+test('resolveByLastMessage: a no-agent result is passed through untouched (no false bind)', () => {
   const noAgent: DiscoverResult = { ok: false, reason: 'no-agent', candidates: [] };
-  const r = resolveAmbiguousByActivity(noAgent, new Map([['%2', 100]]));
+  const r = resolveByLastMessage(noAgent, '%2');
   expect(r.ok).toBe(false);
   if (!r.ok) expect(r.reason).toBe('no-agent');
 });
 
-test('resolveAmbiguousByActivity: an already-resolved (ok) result is returned unchanged', () => {
+test('resolveByLastMessage: an already-resolved (ok) result is returned unchanged', () => {
   const ok: DiscoverResult = { ok: true, target: target('%7') };
-  const r = resolveAmbiguousByActivity(ok, new Map([['%2', 999]]));
+  const r = resolveByLastMessage(ok, '%2');
   expect(r.ok).toBe(true);
   if (r.ok) expect(r.target.pane.paneId).toBe('%7');
 });
