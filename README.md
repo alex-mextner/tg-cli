@@ -178,10 +178,16 @@ inbound topic message routes to its bound pane.
 
 Caveats while this is experimental:
 
-- **The agent's own `tg` replies still go to General**, not the topic — only the *daemon's*
-  own status/error messages thread back into topic *T* so far. Per-topic threading of the
-  agent's replies needs `tg --topic` (a later increment), so don't enable this expecting the
-  agent's answers to land in the thread yet.
+- **An agent's own `tg` replies now thread into a topic — when told which one.** Pass
+  `tg --topic <id>` (or set `TG_TOPIC=<id>` in the agent's env) and every outbound message
+  carries `message_thread_id`, landing in topic *T* instead of General. Without the flag/env the
+  reply still goes to General (byte-identical to before). `TG_TOPIC` is *advisory*: a stale or
+  closed topic id makes a **text / rich** send (`tg "…"`) log and fall back to General rather than
+  hard-failing, whereas an explicit `--topic` stays strict. (A `--photo`/`--file`/album send with a
+  stale env topic is NOT covered by the fallback and still fails — the multipart rebuild is out of
+  scope here; pass a known-good `--topic` or no topic for media.) What is NOT wired yet: the daemon
+  auto-stamping a bound pane's `TG_TOPIC` so the agent threads *automatically* — that lands with the
+  spawn executor. Until then the agent (or its launcher) must supply the topic id.
 - **Creating a topic does not spawn an agent yet** (the per-topic `/new` path+model flow +
   `tmux new-window` spawn is not wired), so a topic only routes once it already has a binding.
 - **Closing then reopening a topic does NOT re-attach its agent yet.** Reopen drops the old

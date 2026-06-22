@@ -34,6 +34,9 @@ I/O, fetch, signals, `bun:ffi`):
   see "Rich messages" below), `--tag`/`--title` (header badge; compose with rich),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
   on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
+  `--topic <id>` (post INTO a forum topic — stamps `message_thread_id` on EVERY outbound
+  primitive so an agent's reply threads into its bound topic instead of General; falls back to
+  the `TG_TOPIC` env, flag wins; no flag/env → General, byte-identical to before),
   `--table` (render STDIN rows — TSV or `a | b` — as an aligned monospace `<pre>` table; the
   PLAIN fallback grid — a real bordered table comes from `--format html` with `<table>`),
   `tg help format` (print the supported-HTML reference, basic + rich tiers; the topic-help

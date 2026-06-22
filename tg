@@ -91,11 +91,12 @@ export const USAGE = `Usage:
   tg --photo a.png --photo b.png "caption"   # repeatable; mix --photo/--file
   tg "see /abs/path/shot.png"   # existing file paths in text are auto-attached
   tg --reply-to 1234 --tag answer "answer"  # thread under inbound message 1234
+  tg --topic 7 "status"         # post INTO forum topic 7 (else TG_TOPIC)
   printf 'task\\tstatus\\nship\\tdone' | tg --table   # aligned <pre> table
   tg voice setup                # configure inbound voice→text (local Whisper STT)
   tg --ls-emoji-helpers
 
-The global options (--format, --tag, --title, --reply-to, the feature toggles)
+The global options (--format, --tag, --title, --reply-to, --topic, the feature toggles)
 apply to ANY of the above forms — see Options below.
 
 Help topics (\`tg help <topic>\`):
@@ -130,6 +131,12 @@ Options:
                        it in the injected wrap as "[TG from Alex #<id>]". The
                        answer tag REQUIRES this: answering means answering a
                        SPECIFIC message.
+  --topic <id>         post INTO a forum topic: sets message_thread_id on every
+                       outbound message so an agent's reply threads into its
+                       bound topic instead of General (forum chats only). Falls
+                       back to the TG_TOPIC env when the flag is absent; the flag
+                       wins. No flag and no TG_TOPIC → posts to General (today's
+                       behavior).
   --table              read delimited rows from STDIN (TSV, or "a | b" per line),
                        render an aligned monospace table wrapped in <pre>, and
                        send it. The plain FALLBACK grid; a REAL native bordered
@@ -642,7 +649,36 @@ if (import.meta.main) {
 
   const tmuxWindow = getTmuxWindow()
 
-  const { items, caption: rawCaption, format, title, tag, withOriginal, noPdf, pdfDevice, replyTo, table } = parsed
+  const { items, caption: rawCaption, format, title, tag, withOriginal, noPdf, pdfDevice, replyTo, topic, table } = parsed
+
+  // Forum-topic thread id (docs/specs/tg-forum-topics.md §8): the explicit
+  // `--topic <id>` flag wins; otherwise fall back to the TG_TOPIC env (merged
+  // config `.env` → process.env, same precedence as the credentials). A
+  // malformed TG_TOPIC is IGNORED (logged) rather than fatal — the env is an
+  // ambient default an agent's shell may inherit stale, and a daily-critical
+  // send must never die because of it; the message simply goes to General. An
+  // explicit `--topic` was already validated to a positive int at parse time.
+  let messageThreadId: number | undefined = topic
+  // An EXPLICIT --topic is strict (a thread error surfaces). A topic taken from
+  // the TG_TOPIC env is ADVISORY: an agent's shell may have inherited a stale /
+  // closed / foreign id, so a thread rejection must fall back to General rather
+  // than kill the send (handled in the transport via threadIdAdvisory).
+  let threadIdAdvisory = false
+  if (messageThreadId === undefined && env.TG_TOPIC) {
+    // A launcher/daemon that writes TG_TOPIC via a file or with a trailing
+    // newline would otherwise fail the regex and silently degrade to General;
+    // trim first (the --topic flag arrives as its own argv token, no trim needed).
+    const rawTopic = env.TG_TOPIC.trim()
+    if (/^[1-9][0-9]*$/.test(rawTopic)) {
+      messageThreadId = Number(rawTopic)
+      threadIdAdvisory = true
+    } else {
+      // Strip control chars before logging an env value (avoid log-injection via
+      // a crafted TG_TOPIC); the message is for the local terminal only.
+      const safe = rawTopic.replace(/[^\x20-\x7e]/g, "?").slice(0, 64)
+      console.error(`tg: ignoring invalid TG_TOPIC '${safe}' (expected a positive topic id) — posting to General`)
+    }
+  }
 
   // `tg --table`: read delimited rows from stdin, render an aligned <pre>
   // monospace table (Telegram has no native HTML tables), and use it as the
@@ -1294,6 +1330,8 @@ if (import.meta.main) {
     chatId: CHAT_ID,
     recordRoute,
     replyToMessageId: replyTo,
+    messageThreadId,
+    threadIdAdvisory,
   })
   await transmit(plan, transport)
 
