@@ -58,8 +58,51 @@ test('--tag answer without --reply-to is an actionable error', () => {
   const r = parseArgs(['--tag', 'answer', 'here is the answer'], CWD, HOME);
   expect(r.action).toBe('error');
   if (r.action === 'error') {
-    expect(r.message).toContain('--reply-to');
-    expect(r.message).toContain('answer');
+    // The clear, non-misleading message: an answer MUST reply to a message.
+    expect(r.message).toContain('--tag answer must reply to a specific message');
+    expect(r.message).toContain('--reply-to <message_id>');
+    // And it is the ONLY surface that reveals the hidden terminal-only escape,
+    // framed strictly as the terminal-origin / no-Telegram-id case.
+    expect(r.message).toContain('--terminal-question');
+    expect(r.message).toContain('originated in the terminal');
+  }
+});
+
+// --- the HIDDEN terminal-only bypass (`--terminal-question`) ---
+
+test('--terminal-question permits --tag answer WITHOUT --reply-to (terminal-origin)', () => {
+  // The question came from the terminal/agent harness — there is no inbound
+  // Telegram message_id to reply to. The explicit escape allows the answer.
+  const r = parseArgs(['--tag', 'answer', '--terminal-question', 'terminal answer'], CWD, HOME);
+  expect(r.action).toBe('send');
+  if (r.action === 'send') {
+    expect(r.tag).toBe('answer');
+    expect(r.replyTo).toBeUndefined();
+    expect(r.terminalQuestion).toBe(true);
+  }
+});
+
+test('--terminal-question is recognized as a real flag (not unknown, not message text)', () => {
+  // Used WITHOUT --tag answer it is simply consumed; it never becomes caption
+  // text and never trips the unknown-flag guard.
+  const r = parseArgs(['--terminal-question', 'just a message'], CWD, HOME);
+  expect(r.action).toBe('send');
+  if (r.action === 'send') {
+    expect(r.caption).toBe('just a message');
+    expect(r.terminalQuestion).toBe(true);
+  }
+});
+
+test('--tag answer with BOTH --reply-to and --terminal-question still sends (reply wins the thread)', () => {
+  const r = parseArgs(
+    ['--tag', 'answer', '--reply-to', '42', '--terminal-question', 'reply'],
+    CWD,
+    HOME,
+  );
+  expect(r.action).toBe('send');
+  if (r.action === 'send') {
+    expect(r.replyTo).toBe(42);
+    expect(r.terminalQuestion).toBe(true);
   }
 });
 
