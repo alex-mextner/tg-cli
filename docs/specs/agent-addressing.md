@@ -24,8 +24,9 @@ several agents run side by side:
   replies with the exact selector to address it (`/agent <selector> <message>`);
   it injects nothing, since there is no message yet.
 
-This complements the existing default routing (last-`tg`-sender registration):
-`/agent` is the explicit override when last-write-wins is not who you mean.
+This complements the existing default routing (the per-pane registration set —
+every live session that ran `tg` is registered; tg-cli#67): `/agent` is the
+explicit override when the auto-picked target is not who you mean.
 
 ## Command grammar
 

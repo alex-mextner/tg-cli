@@ -57,12 +57,15 @@ question TEXT, `updatedInput` replaces wholesale — is unchanged in
 2. **One `tg-ctl` daemon running** for the bot (auto-starts from `tg` when inside
    tmux **and** `control.enabled` — default ON; or `tg-ctl start`). Singleton via
    flock; one machine per bot token (else Telegram 409).
-3. **The asking session is the registered control target.** The daemon checks
-   each hook request with `registrationAllowsHook`: `paneId` is authoritative;
-   else `cwd`; else `sessionName`. A mismatch fast-passes with NO Telegram prompt
-   (so a globally installed hook never blocks an unrelated keyboard session). The
-   registration is written by the last `tg` send (last-write-wins) — i.e. the
-   pane that most recently called `tg`.
+3. **The asking session is a registered control target.** Each `tg` send from an
+   agent session UPSERTS that session's pane/cwd into a per-pane registration SET
+   (keyed by `paneId`), so EVERY live session registers concurrently — a fresh
+   `tg` send no longer clobbers another session's registration (tg-cli#67). The
+   daemon forwards a hook request when its pane matches ANY registered entry
+   (`registrationSetAllowsHook`, per-entry rule: `paneId` is authoritative; else
+   `cwd`; else `sessionName`). A request whose pane matches no entry fast-passes
+   with NO Telegram prompt (so a globally installed hook never blocks an
+   unrelated keyboard session). Dead-pane entries are pruned by tmux liveness.
 4. **The agent-side hook is installed** (the missing piece):
    - **Claude Code**: `PreToolUse` matcher `AskUserQuestion` → `tg-ctl ask` →
      return `{hookSpecificOutput:{permissionDecision:"allow",updatedInput:{questions,answers:{<question text>:<label>}}}}`;

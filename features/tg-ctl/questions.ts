@@ -99,6 +99,23 @@ export function registrationAllowsHook(
   return false;
 }
 
+// Per-pane registration SET gate (tg-cli#67): a hook question is forwarded when
+// its pane (the asking session's TMUX_PANE, carried in the ask payload) matches
+// ANY registered entry — so EVERY concurrently-registered session's questions
+// forward, each scoped to its own pane, instead of only the single global
+// last-writer. Each entry is checked with the same per-entry rule as the
+// single-registration path (registrationAllowsHook), so the paneId-authoritative
+// guard (a second keyboard session in the same cwd but a different pane is
+// rejected by THAT entry) is preserved unchanged. An empty set rejects
+// (fail-closed), matching `reg === null`.
+export function registrationSetAllowsHook(
+  regs: Registration[],
+  req: Pick<ButtonRequest, 'paneId' | 'cwd' | 'sessionName'>,
+  resolvePath: (p: string) => string = (p) => p,
+): boolean {
+  return regs.some((reg) => registrationAllowsHook(reg, req, resolvePath));
+}
+
 export function questionCapability(agent: AgentKind): QuestionCapability {
   if (agent === 'claude' || agent === 'codex' || agent === 'opencode') return 'buttons';
   return 'unsupported';
