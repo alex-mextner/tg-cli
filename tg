@@ -606,7 +606,9 @@ if (import.meta.main) {
     process.exit(1)
   }
 
-  const API = `https://api.telegram.org/bot${BOT_TOKEN}`
+  // Honor TG_API_BASE (default api.telegram.org) — same as the tg-ctl daemon — so a test
+  // harness can point the OUTBOUND sender at a mock Bot-API server (review qa bot harness).
+  const API = `${process.env.TG_API_BASE || "https://api.telegram.org"}/bot${BOT_TOKEN}`
 
   // --- Tmux context ---
   // The raw tmux window name (no brackets). buildPrefix wraps it in [] and
