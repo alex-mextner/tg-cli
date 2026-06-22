@@ -62,6 +62,18 @@ test('--help advertises `tg help format`, --table, --reply-to and --topic', () =
   expect(out).toContain('--topic');
 });
 
+test('--help does NOT advertise the hidden terminal-only bypass flag', () => {
+  // `--terminal-question` is the escape for the answer-requires-reply-to gate.
+  // It must be discoverable ONLY from that gate's error message — never from
+  // --help/usage. A normal user reading the help must not learn the escape.
+  const out = run(['--help']).stdout.toString();
+  expect(out).not.toContain('--terminal-question');
+  expect(out).not.toContain('terminal-question');
+  // Same for the `tg help` main-help surface.
+  const helpMain = run(['help']).stdout.toString();
+  expect(helpMain).not.toContain('terminal-question');
+});
+
 test('--help piped (non-TTY) is PLAIN — no ANSI color codes leak into the output', () => {
   // Color is gated on an interactive stdout; a captured subprocess pipe is not a
   // TTY, so the help must be plain text (no `\x1b[` escapes) even though an
@@ -81,9 +93,25 @@ test('--tag answer without --reply-to errors before the credential gate', () => 
   const proc = run(['--tag', 'answer', 'an answer']);
   const err = proc.stderr.toString();
   expect(proc.exitCode).not.toBe(0);
-  expect(err).toContain('--reply-to');
+  // The clear, non-misleading message — not an HTML-escaping artifact.
+  expect(err).toContain('--tag answer must reply to a specific message');
+  expect(err).toContain('--reply-to <message_id>');
+  // The error — and ONLY the error — reveals the hidden terminal-only escape.
+  expect(err).toContain('--terminal-question');
+  expect(err).toContain('originated in the terminal');
   // It must NOT be the missing-credentials error — the parse error fires first.
   expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+test('--terminal-question lets --tag answer pass the parse gate (reaches the credential gate)', () => {
+  // With the bypass, the answer-without-reply-to parse error is GONE; the send
+  // proceeds far enough to hit the missing-credentials gate (no creds in this
+  // test env). The proof is the ABSENCE of the answer-gate error.
+  const proc = run(['--tag', 'answer', '--terminal-question', 'a terminal answer']);
+  const err = proc.stderr.toString();
+  expect(err).not.toContain('--tag answer must reply to a specific message');
+  // It got past parsing → it now fails on credentials, not on the answer gate.
+  expect(err).toContain('TG_BOT_TOKEN');
 });
 
 test('--tag with an uppercase tag is rejected (lowercase-english only) before the credential gate', () => {

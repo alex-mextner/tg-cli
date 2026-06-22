@@ -82,6 +82,15 @@ export type ParseResult =
       // monospace table, and send it (composes with --tag/--title). The flag is
       // a boolean; the rows come from stdin, not argv. Absent when not given.
       table?: true;
+      // `--terminal-question`: the HIDDEN escape for the `answer`-requires-
+      // `--reply-to` gate. The answered question originated in the TERMINAL (the
+      // Claude/agent harness) where there is no inbound Telegram message_id to
+      // reply to, so an `--tag answer` legitimately has no `--reply-to` target.
+      // This flag — and ONLY this flag — permits that. It is DELIBERATELY absent
+      // from USAGE/`--help`: the only place it is surfaced is the error raised
+      // when `--tag answer` lacks `--reply-to`. Absent when not given, so a
+      // normal send result stays byte-identical.
+      terminalQuestion?: true;
     };
 
 // Extensions that Telegram's sendPhoto accepts. SVG is intentionally excluded:
@@ -197,6 +206,9 @@ export function parseArgs(
   let replyTo: number | undefined;
   let topic: number | undefined;
   let table: true | undefined;
+  // Hidden escape for the answer-gate (see the gate below + the type comment on
+  // `terminalQuestion`). Never advertised in USAGE/--help.
+  let terminalQuestion: true | undefined;
 
   let i = 0;
   while (i < args.length) {
@@ -309,6 +321,16 @@ export function parseArgs(
     // `--table` is a boolean — the rows are read from stdin by the entrypoint.
     if (arg === '--table') {
       table = true;
+      i += 1;
+      continue;
+    }
+    // `--terminal-question` is a boolean — the HIDDEN escape for the
+    // `answer`-requires-`--reply-to` gate (see the gate below). Recognized here
+    // so it is consumed as a real flag (not an "unknown flag" error and not
+    // swallowed into the message text), but it is intentionally NOT documented
+    // in USAGE/--help: it must only be learned from the gate's error message.
+    if (arg === '--terminal-question') {
+      terminalQuestion = true;
       i += 1;
       continue;
     }
@@ -486,12 +508,23 @@ export function parseArgs(
   // error. Only `answer` is gated; the other tags label a message without
   // claiming to answer a particular one. `tag` was already validated to one of
   // the lowercase-english words, so a literal compare suffices.
-  if (tag && replyTo === undefined && tag === 'answer') {
+  //
+  // The ONE legitimate exception: the question originated in the TERMINAL (the
+  // Claude/agent harness) where no inbound Telegram message_id exists to reply
+  // to. `--terminal-question` is the explicit, HIDDEN escape for exactly that
+  // case — it permits `--tag answer` without `--reply-to`. The flag is NOT in
+  // USAGE/--help by design; the only place it is surfaced is this very error
+  // message, and only framed as the terminal-origin escape. So a normal user
+  // reading --help never sees it; only someone who hit THIS error and genuinely
+  // has a terminal-origin question (no Telegram id) learns it.
+  if (tag === 'answer' && replyTo === undefined && !terminalQuestion) {
     return {
       action: 'error',
       message:
-        "--tag answer means you're answering a specific message — it requires --reply-to <message_id>. " +
-        'Use the id from the inbound `[TG from … #<id>]` wrap, or pick a different tag.',
+        '--tag answer must reply to a specific message — pass --reply-to <message_id>. ' +
+        'Use the id from the inbound `[TG from … #<id>]` wrap. ' +
+        'If this answers a question that originated in the terminal and there is no ' +
+        'Telegram message id to reply to, pass --terminal-question.',
     };
   }
 
@@ -515,5 +548,6 @@ export function parseArgs(
     replyTo,
     topic,
     table,
+    terminalQuestion,
   };
 }
