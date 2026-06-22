@@ -8,6 +8,7 @@
 // are ordered by how recently + how often each pane was last messaged — both
 // derived from this same map (no separate usage state).
 
+import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 
 export interface Route {
@@ -50,6 +51,208 @@ export function appendRoute(existing: Route[], route: Route): Route[] {
 
 export function serializeRoutes(routes: Route[]): string {
   return JSON.stringify(routes);
+}
+
+// Cross-process mutex around the routes-file read-modify-write (`tg recordRoute`).
+//
+// WHY: two agents racing a `tg` send each do read→appendRoute→write with NO
+// coordination, so the second writer overwrites the first's just-added entry
+// (last-writer-wins). The losing entry is exactly the origin→message_id mapping
+// the daemon needs to recognize a reply — its loss is a second way a reply
+// silently falls through to the wrong pane. Serializing the RMW makes every
+// concurrent send's route survive (no lost updates).
+//
+// HOW: an O_EXCL lockfile is the cross-process mutex (atomic create, no bun:ffi
+// needed — the daemon's flock binds to a long-lived fd, but `tg` is a short-lived
+// CLI that holds the lock for ~1ms). `acquire` returns false when the lock is
+// already held (O_EXCL EEXIST); we spin a bounded number of times with a small
+// sleep. The body runs under `try/finally`, so a `tg` that completes ALWAYS
+// releases — the only way a lock outlives its writer is a SIGKILL mid-RMW.
+//
+// STALENESS BY PID-LIVENESS, NOT MTIME: a stale lock is one whose OWNER PROCESS
+// IS DEAD — never "older than N seconds". This is what makes break-then-acquire
+// race-free: a LIVE writer's pid is alive, so its lock is never classified stale
+// and never broken out from under it (the mtime-age approach had exactly that
+// race — a slow-but-alive writer past the age window could be clobbered). The io
+// reports the lock owner's liveness; only a dead owner's lock is removed.
+//
+// PURE/INJECTABLE: every effect (the RMW body, acquire/release, owner-liveness
+// probe, break, sleep) is passed in, so this is unit-testable with no real files
+// and the concurrency behavior is asserted deterministically. `tg` wires the real
+// fs + `process.kill(pid, 0)`.
+export interface RoutesLockIo {
+  // Try to create the lock EXCLUSIVELY, recording OUR pid. true = acquired,
+  // false = already held by someone else.
+  acquire: () => boolean;
+  // Release ONLY if we still own the lock (the `tg` impl unlinks only when the
+  // file still carries our pid token), so a release never deletes a lock a
+  // different writer took after ours was broken.
+  release: () => void;
+  // Is the CURRENT lockfile's owner process DEAD? true → safe to break. false →
+  // owner alive (or unknowable: treated as alive, i.e. NOT broken — conservative).
+  // null → no lockfile present.
+  ownerDead: () => boolean | null;
+  // Remove the lock IFF its owner is (still) dead — re-checks ownership/liveness
+  // so it can't delete a fresh lock a racing live writer just created.
+  breakIfDead: () => void;
+  sleep: (ms: number) => void;
+}
+
+export interface RoutesLockOpts {
+  attempts?: number; // spin attempts (default 50)
+  delayMs?: number; // sleep between attempts (default 10ms)
+  // What to do when the lock can't be acquired within the budget (sustained
+  // contention from LIVE writers):
+  //   'skip'         → do NOT run body; return undefined. SAFE for a read-modify-
+  //                    write of a shared file: running it unlocked could clobber a
+  //                    concurrent writer's good entry (the lost-update the lock is
+  //                    meant to prevent — review #55 / codex P2). The current
+  //                    writer's own entry is dropped, but no OTHER writer's is.
+  //   'run-unlocked' → run body anyway (default; legacy, for bodies that are NOT a
+  //                    shared-file RMW and just must not be blocked).
+  onContended?: 'skip' | 'run-unlocked';
+}
+
+// Run `body` while holding the routes lock. The lock is ALWAYS released (even if
+// body throws). Returns body's value, or `undefined` when the lock could not be
+// acquired AND onContended is 'skip'.
+export function withRoutesLock<T>(io: RoutesLockIo, body: () => T, opts: RoutesLockOpts = {}): T | undefined {
+  const attempts = Math.max(1, opts.attempts ?? 50);
+  const delayMs = Math.max(0, opts.delayMs ?? 10);
+  const onContended = opts.onContended ?? 'run-unlocked';
+
+  let held = false;
+  for (let i = 0; i < attempts; i++) {
+    if (io.acquire()) {
+      held = true;
+      break;
+    }
+    // Held by someone else. Break it ONLY if its owner process is dead (a
+    // SIGKILLed `tg`); a live owner is left strictly alone — no clobber.
+    if (io.ownerDead() === true) {
+      io.breakIfDead();
+      if (io.acquire()) {
+        held = true;
+        break;
+      }
+    }
+    if (i < attempts - 1) io.sleep(delayMs); // no sleep after the last attempt
+  }
+  // Never acquired (sustained contention from live writers). For a shared-file
+  // RMW the caller passes onContended:'skip' — running unlocked here would let
+  // this writer clobber the entry a concurrent holder is about to write. Skipping
+  // loses only THIS send's own route bookkeeping, never another writer's.
+  if (!held && onContended === 'skip') return undefined;
+  try {
+    return body();
+  } finally {
+    if (held) io.release();
+  }
+}
+
+// Real-fs RoutesLockIo backing withRoutesLock for `tg`. The lockfile content is
+// the owner pid; liveness is `process.kill(pid, 0)` (injectable for tests). All
+// removals are ownership-checked: release/breakIfDead unlink ONLY when the file
+// still holds the pid they expect, so no removal can ever nuke a fresh lock a
+// racing live writer just created. `isAlive` defaults to a real kill(0) probe;
+// `now` is unused here (kept out — staleness is liveness, not age).
+export function fsRoutesLockIo(
+  lockPath: string,
+  deps: { ownPid?: number; isAlive?: (pid: number) => boolean } = {},
+): RoutesLockIo {
+  const ownPid = deps.ownPid ?? process.pid;
+  const isAlive =
+    deps.isAlive ??
+    ((pid: number): boolean => {
+      try {
+        process.kill(pid, 0); // signal 0 = liveness probe, never actually signals
+        return true;
+      } catch (e) {
+        // ESRCH = no such process (dead). EPERM = alive but not ours to signal.
+        return (e as NodeJS.ErrnoException)?.code === 'EPERM';
+      }
+    });
+
+  // THREE states, not two — the missing distinction caused a permanent wedge: a
+  // SIGKILL in the narrow window between openSync('wx') (file created, empty) and
+  // writeFileSync(pid) leaves a present-but-EMPTY lockfile. Treating "unreadable
+  // pid" the same as "no file" meant such a lock was NEVER breakable (no owner to
+  // probe) — every later send then spun the full budget and ran unlocked forever.
+  //   'absent'      → no lockfile at all
+  //   'unparseable' → file exists but holds no valid pid (the SIGKILL-window orphan)
+  //   <number>      → the owner pid
+  type LockOwner = 'absent' | 'unparseable' | number;
+  const readOwner = (): LockOwner => {
+    let raw: string;
+    try {
+      raw = readFileSync(lockPath, 'utf8');
+    } catch {
+      return 'absent';
+    }
+    const pid = Number(raw.trim());
+    return Number.isInteger(pid) && pid > 0 ? pid : 'unparseable';
+  };
+
+  // A lock is breakable (its owner effectively gone) when the file holds an
+  // unparseable owner OR a dead pid. 'absent' is never "dead" — there is nothing.
+  const ownerGone = (o: LockOwner): boolean => o === 'unparseable' || (typeof o === 'number' && !isAlive(o));
+
+  // Unlink ONLY if the file still holds `expected` (our pid, or the exact orphan
+  // we just observed). The re-read makes the remove atomic w.r.t. ownership: a
+  // writer that re-took the lock meanwhile has a different owner, so we leave it.
+  const unlinkIfOwner = (expected: LockOwner): void => {
+    try {
+      if (readOwner() === expected) unlinkSync(lockPath);
+    } catch {
+      // already gone / unreadable — fine
+    }
+  };
+
+  return {
+    acquire: (): boolean => {
+      let fd: number;
+      try {
+        fd = openSync(lockPath, 'wx'); // O_CREAT|O_EXCL — EEXIST if already held
+      } catch (e) {
+        // Only EEXIST means "held, spin/break". Any other errno (ENOENT dir gone,
+        // EACCES no perm) is a hard failure: signal it by THROWING so withRoutesLock
+        // doesn't waste the full spin budget — recordRoute's outer try swallows it
+        // and the send proceeds without route bookkeeping (best-effort, unchanged).
+        if ((e as NodeJS.ErrnoException)?.code === 'EEXIST') return false;
+        throw e;
+      }
+      // fd is open: ALWAYS close it, and on a write failure remove the empty lock
+      // we just created (else it would wedge until a liveness break).
+      try {
+        writeFileSync(fd, String(ownPid));
+      } catch {
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          /* best-effort cleanup */
+        }
+        return false;
+      } finally {
+        try {
+          closeSync(fd);
+        } catch {
+          /* fd cleanup */
+        }
+      }
+      return true;
+    },
+    release: () => unlinkIfOwner(ownPid),
+    ownerDead: (): boolean | null => {
+      const o = readOwner();
+      if (o === 'absent') return null; // no lockfile
+      return ownerGone(o);
+    },
+    breakIfDead: () => {
+      const o = readOwner();
+      if (o !== 'absent' && ownerGone(o)) unlinkIfOwner(o); // re-checked
+    },
+    sleep: (ms) => Bun.sleepSync(ms),
+  };
 }
 
 // The pane that produced `messageId`, or null when unrecognized. The LAST entry

@@ -37,7 +37,14 @@ import {
 } from "./features/autolink-tasks/state"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { botIdFromToken, ctlPaths } from "./features/tg-ctl/lock"
-import { appendRoute, parseRoutes, resolveRouteCwd, serializeRoutes } from "./features/tg-ctl/routes"
+import {
+  appendRoute,
+  fsRoutesLockIo,
+  parseRoutes,
+  resolveRouteCwd,
+  serializeRoutes,
+  withRoutesLock,
+} from "./features/tg-ctl/routes"
 import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
 import { outboundHistoryText } from "./features/replies/outbound"
 import { runReplies } from "./features/replies/cli"
@@ -912,14 +919,41 @@ if (import.meta.main) {
     if (firstOutboundId === null) firstOutboundId = messageId
     if (!ROUTES_PATH || !TMUX_PANE) return
     try {
-      const existing = parseRoutes(existsSync(ROUTES_PATH) ? readFileSync(ROUTES_PATH, "utf8") : null)
-      const next = appendRoute(existing, {
+      // Resolve the route cwd (a tmux display-message lookup) BEFORE taking the
+      // lock — it's the slow part, and keeping it out of the critical section
+      // shrinks the lock hold to a fast read-append-write so contention timeouts
+      // are essentially impossible (the codex #55 scenario was a writer blocked on
+      // exactly this lookup WHILE holding the lock). Snapshot ts here too so the
+      // locked body is pure file I/O.
+      const newRoute = {
         id: messageId,
         paneId: TMUX_PANE,
         cwd: resolveRouteCwd({ queryPanePath, fallbackCwd: process.cwd() }),
         ts: Math.floor(Date.now() / 1000),
-      })
-      writeFileSync(ROUTES_PATH, serializeRoutes(next))
+      }
+      // Serialize the read-modify-write across concurrent agents: two `tg` sends
+      // racing this RMW would last-writer-wins-clobber each other's route entries,
+      // dropping the very origin→message_id mapping the daemon needs to recognize a
+      // reply. The O_EXCL lockfile (fsRoutesLockIo) is the cross-process mutex; a
+      // dead-owner lock is broken by PID-liveness, so a live writer is never
+      // clobbered. onContended:'skip' — if we can't get the lock within the budget,
+      // we SKIP rather than write unlocked (an unlocked write could clobber the
+      // concurrent holder's entry; skipping drops only THIS send's bookkeeping).
+      withRoutesLock(
+        fsRoutesLockIo(`${ROUTES_PATH}.lock`),
+        () => {
+          // Read race-free under the lock: one readFileSync, ENOENT (first ever
+          // write) → empty. NOT existsSync-then-read (a TOCTOU check-then-use).
+          let raw: string | null
+          try {
+            raw = readFileSync(ROUTES_PATH, "utf8")
+          } catch {
+            raw = null
+          }
+          writeFileSync(ROUTES_PATH, serializeRoutes(appendRoute(parseRoutes(raw), newRoute)))
+        },
+        { onContended: "skip" },
+      )
     } catch {
       // best-effort: never let route bookkeeping break a send
     }
