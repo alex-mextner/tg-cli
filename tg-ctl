@@ -37,6 +37,7 @@ import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/conf
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
 import { findAgentInPane, panesWithRetry, parsePaneList, parseProcList, pickTargetPaneFromSet } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
+import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
 import { botIdFromToken, ctlPaths, pidStatus, readPidFile } from "./features/tg-ctl/lock"
 import {
   buildButtonMessage,
@@ -298,6 +299,32 @@ async function answerCallbackQuery(ctx: Ctx, callbackQueryId: string, text: stri
 
 async function editMessageText(ctx: Ctx, messageId: number, text: string): Promise<void> {
   await botPost(ctx, "editMessageText", { chat_id: ctx.chatId, message_id: messageId, text })
+}
+
+// Publish the bot's own slash-commands to Telegram's "/" autocomplete + menu
+// button (setMyCommands), so `/agent` and the rest are discoverable instead of
+// blind-typed. Best-effort and idempotent: a network/API failure is logged and
+// ignored — the daemon's job is routing, not the menu. The ENTIRE body is
+// wrapped: botPost already swallows transport errors, but the whole publish path
+// is belt-and-suspenders try/catch'd so no future regression on this side path
+// can ever throw into runDaemon and abort startup. validateBotCommands guards
+// the list against Telegram's constraints (the test suite enforces it too).
+//
+// Scope: the default (global) scope — the menu shows in every chat with the bot.
+// tg-ctl is a single-user personal control bot (one TG_CHAT_ID), so global is the
+// intended choice; a multi-tenant bot would scope per chat to avoid leaking the
+// menu to other chats.
+async function publishBotCommands(ctx: Ctx): Promise<void> {
+  try {
+    validateBotCommands()
+    const json = await botPost(ctx, "setMyCommands", { commands: BOT_COMMANDS })
+    if (json?.ok === true) log(`setMyCommands ok — published ${BOT_COMMANDS.length} commands`)
+    else log("setMyCommands did not confirm ok — menu may be stale (continuing)")
+  } catch (err) {
+    // Unreachable on today's code (botPost is try/catch'd, validate only throws
+    // on a bad list we control) — but startup must survive it regardless.
+    log(`setMyCommands failed — menu not published (continuing): ${err}`)
+  }
 }
 
 // Tab separator — pane_current_path may contain spaces (see discover.ts).
@@ -2456,6 +2483,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return true
     }
   }
+
+  // Publish the command menu once on startup, before entering the poll loop.
+  // Best-effort — publishBotCommands swallows every failure so a Telegram
+  // hiccup can never block routing.
+  await publishBotCommands(ctx)
 
   log(`daemon up — pid ${process.pid}, bot ${ctx.botId}, offset ${offset}`)
 

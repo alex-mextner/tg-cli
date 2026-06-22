@@ -49,10 +49,20 @@ const reactions: { chat_id: number; message_id: number; reaction: { type: string
 let serveCount = 0; // how many times the queue was (re-)delivered
 let fetchedFileId: string | null = null;
 
+let setMyCommandsHits = 0;
+
 const server = Bun.serve({
   port: 0,
   async fetch(req) {
     const url = new URL(req.url);
+    if (url.pathname.endsWith('/setMyCommands')) {
+      // Startup self-provisions the command menu (issue #68) — acknowledge so it
+      // doesn't 404-log; the dedicated payload assertions live in
+      // ctl-setmycommands-integration.test.ts.
+      setMyCommandsHits += 1;
+      await req.json();
+      return Response.json({ ok: true, result: true });
+    }
     if (url.pathname.endsWith('/getUpdates')) {
       const offset = Number(url.searchParams.get('offset') ?? '0');
       offsets.push(offset);
@@ -169,6 +179,9 @@ test('daemon round-trip: stale notice, guard replies, /status, allowlist drop, m
   // The PATH shim actually intercepted discovery — without this the test
   // could pass by accident while talking to a real tmux server.
   expect(readFileSync(shimLog, 'utf8')).toContain('list-panes');
+
+  // Startup self-provisioned the command menu exactly once (issue #68).
+  expect(setMyCommandsHits).toBe(1);
 
   // Clean shutdown.
   daemon.kill('SIGTERM');
