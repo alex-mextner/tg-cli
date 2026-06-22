@@ -1059,8 +1059,26 @@ function canForwardButtonRequest(req: ButtonRequest): boolean {
   return !(req.agent === "codex" && req.kind !== "permission")
 }
 
-function hookMatchesRegistration(ctx: Ctx, req: ButtonRequest): boolean {
-  return registrationAllowsHook(readRegistration(ctx.paths), req, resolve)
+function hookMatchesRegistration(reg: Registration | null, req: ButtonRequest): boolean {
+  return registrationAllowsHook(reg, req, resolve)
+}
+
+// One-line, greppable descriptors for the ask-forward log. They identify which
+// question arrived and which registration it was matched against, so a silent
+// non-forward (the question stays in the harness) becomes a visible log line
+// stating exactly why it was dropped — never a bare socket.end("null").
+function describeAskRequest(req: ButtonRequest): string {
+  return `agent=${req.agent} kind=${req.kind} req=${req.requestId} pane=${req.paneId ?? "-"} cwd=${req.cwd ?? "-"} session=${req.sessionName ?? "-"}`
+}
+
+function describeRegistration(reg: Registration | null): string {
+  if (!reg) return "none"
+  return `pane=${reg.paneId ?? "-"} cwd=${reg.cwd ?? "-"} session=${reg.sessionName ?? "-"}`
+}
+
+function describeHookLine(line: string): string {
+  const one = line.replace(/\s+/g, " ").trim()
+  return one.length > 120 ? `${one.slice(0, 120)}…` : one
 }
 
 function startHookServer(
@@ -1126,16 +1144,27 @@ async function handleHookSocketLine(
     // malformed hook payload: let the local agent UI take over
   }
   if (!req) {
+    // A non-forward must NEVER be silent: the question stays in the harness and
+    // the operator gets zero signal. Every drop below logs a distinct, greppable
+    // `ask-forward` reason so a question that doesn't reach Telegram is visible.
+    log(`ask-forward dropped: reason=unparsable-payload line=${describeHookLine(line)}`)
     socket.end("null\n")
     return
   }
 
-  if (!hookMatchesRegistration(ctx, req)) {
+  log(`ask-forward arrived: ${describeAskRequest(req)}`)
+
+  const registration = readRegistration(ctx.paths)
+  if (!hookMatchesRegistration(registration, req)) {
+    log(
+      `ask-forward dropped: reason=not-registered ${describeAskRequest(req)} reg=${describeRegistration(registration)}`,
+    )
     socket.end("null\n")
     return
   }
 
   if (!canForwardButtonRequest(req)) {
+    log(`ask-forward dropped: reason=not-forwardable ${describeAskRequest(req)}`)
     socket.end("null\n")
     void sendMessage(
       ctx,
@@ -1146,6 +1175,7 @@ async function handleHookSocketLine(
 
   const pendingKey = callbackRequestId(req)
   if (activeKeys.has(pendingKey)) {
+    log(`ask-forward dropped: reason=duplicate-in-flight ${describeAskRequest(req)} key=${pendingKey}`)
     socket.end("null\n")
     return
   }
@@ -1207,6 +1237,9 @@ async function handleHookSocketLine(
   const payload = buildButtonMessage(ctx.chatId, req)
   const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
   if (messageId === null) {
+    // The low-level `sendMessage failed: …` is already logged in botPost; tie it
+    // to THIS forwarded question being abandoned so the drop is greppable too.
+    log(`ask-forward dropped: reason=send-failed ${describeAskRequest(req)}`)
     if (pending.get(pendingKey) === entry) {
       pending.delete(pendingKey)
       activeKeys.delete(pendingKey)
@@ -1216,6 +1249,7 @@ async function handleHookSocketLine(
     }
     return
   }
+  log(`ask-forward posted: ${describeAskRequest(req)} messageId=${messageId}`)
   entry.messageId = messageId
   if (pending.get(pendingKey) !== entry || entry.finalText) {
     void editMessageText(ctx, messageId, entry.finalText ?? "expired — answer in terminal")
@@ -1259,7 +1293,13 @@ async function askDaemon(ctx: Ctx): Promise<void> {
     sessionName: tmuxSessionName(),
   }
   const req = normalizeHookPayload(payload, env)
-  if (!req) return
+  if (!req) {
+    // Unsupported payload shape (multi-question / multi-select / free-form / an
+    // event we don't forward). This never reaches the daemon, so the daemon log
+    // can't see it — emit here (hook process stderr) so the drop isn't silent.
+    log(`ask-forward dropped: reason=unsupported-payload agent=${env.agent} pane=${env.paneId ?? "-"} cwd=${env.cwd ?? "-"}`)
+    return
+  }
   const requestLine = JSON.stringify(req)
 
   const output = await new Promise<string | null>((resolve) => {
@@ -1284,6 +1324,13 @@ async function askDaemon(ctx: Ctx): Promise<void> {
     })
   })
   if (output && output !== "null") console.log(output)
+  else {
+    // The daemon declined (replied "null") or the connection failed / timed out,
+    // so nothing was forwarded and the harness UI takes over. The daemon already
+    // logs WHY it declined (ask-forward dropped: …); log here too in case the
+    // daemon was unreachable (no socket) and never got a chance to.
+    log(`ask-forward not-posted: req=${req.requestId} agent=${req.agent} pane=${req.paneId ?? "-"} — daemon declined or unreachable`)
+  }
 }
 
 async function readStdinText(): Promise<string> {
