@@ -20,6 +20,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     log: join(configDir, `${base}.log`),
     routes: join(configDir, `${base}.routes.json`),
     history: join(configDir, `${base}.history.jsonl`),
+    topics: join(configDir, `${base}.topics.json`),
   };
 }
 

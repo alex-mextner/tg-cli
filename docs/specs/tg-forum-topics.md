@@ -117,18 +117,33 @@ mirroring how `routes.cwd` already flows).
 
 ## 9. Increment plan (ship small, each green + reviewed)
 
-1. **Foundation (pure core + tests)** — this PR: `types.ts` (thread/forum fields + `TopicBinding`
-   + topic Actions), `features/tg-ctl/topics.ts` (binding store parse/append/lookup + the pure
-   state machine), `features/tg-ctl/models.ts` (catalog), `stepUpdates` recognising the topic
-   updates and emitting the new Actions, full unit tests. No spawning yet — the entrypoint logs
-   the new Actions as no-ops behind a `control.topics` flag (default off) so nothing changes for
-   existing users until the executor lands.
-2. **Spawn + bind executor** — entrypoint handles `topic-new`/`topic-answer`: the `/new` button
-   flow + `tmux new-window` spawn + persistence.
-3. **Per-topic routing + outbound threading** — `topic-route` inject + `message_thread_id` on
-   every topic reply/ack; `tg --topic`.
-4. **Lifecycle polish** — close/reopen, re-spawn on dead pane, daemon-restart re-bind, General-vs-topic
-   edge cases, admin-permission onboarding error.
+> Note: the items below are listed in **landing order** (1 → 3 → 2 → 4), NOT renumbered — the
+> routing half (3) shipped before the spawn executor (2) because routing carries no agent-launch
+> risk and is independently testable against a seeded binding. The numbers are the original plan ids.
+
+1. **Foundation (pure core + tests)** — LANDED (2157f09): `types.ts` (thread/forum fields +
+   `TopicBinding` + topic Actions), `features/tg-ctl/topics.ts` (binding store parse/append/lookup
+   + the pure state machine), `features/tg-ctl/models.ts` (catalog), `stepUpdates` recognising the
+   topic updates and emitting the new Actions, full unit tests. The pure layer only — the entrypoint
+   did not yet consume the Actions (dead-wired behind a not-yet-existent `control.topics` flag).
+3. **Per-topic routing + outbound threading (routing half)** — LANDED: the `control.topics` config
+   flag (default OFF) + the `topics` state file (`CtlPaths.topics`); the poll loop passes
+   `topicsEnabled`/`topicStatusOf` into `stepUpdates`; `executeAction` handles `topic-route` (map
+   `threadId → paneId` from the store, re-verify the pane still hosts an agent, inject the wrapped
+   text with the flat path's defer-guard — a dead/missing pane marks the binding `closed` and posts
+   an error INTO the topic, never leaking to a flat agent) and `topic-close`/`topic-reopen` (persist
+   the transition). All topic-originated daemon output carries `message_thread_id`. Integration test
+   `tests/ctl-topics-integration.test.ts` proves: 1:1 routing unchanged (flag off AND on), topic
+   routing into the bound pane, and the dead-pane no-leak + threaded error. `tg --topic` (the agent's
+   own `tg` reply threading) is still a follow-up — for now the AGENT's `tg` replies post to General
+   unless given the thread id; daemon replies are already threaded.
+2. **Spawn + bind executor (the remaining seam)** — entrypoint handles `topic-new`/`topic-answer`:
+   the `/new` button flow + `tmux new-window` spawn + persistence. Until this lands those two Actions
+   are logged no-ops, so no binding is ever created from inside the daemon — a topic only routes if a
+   binding already exists in the store (e.g. seeded by a future spawn step). This is the clean seam.
+4. **Lifecycle polish** — re-spawn on a dead/closed pane (today it marks closed + asks the human to
+   recreate the topic), daemon-restart re-bind, General-vs-topic edge cases, admin-permission
+   onboarding error, `tg --topic` for agent-side reply threading.
 
 ## 10. Edge cases / decisions
 

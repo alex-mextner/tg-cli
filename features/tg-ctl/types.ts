@@ -14,6 +14,11 @@ export interface ControlConfig {
   stalenessSec: number; // drop inbound older than this (default 300)
   idleExitMin: number; // daemon exits after this long with no agent pane (default 30)
   allowedSenders: number[]; // extra allowed sender user ids
+  // Forum-topics mode (docs/specs/tg-forum-topics.md). Default OFF: when false the daemon
+  // never enters topic mode and a forum-topic message falls through to the normal flat
+  // handling (1:1 behaviour byte-identical). Opt in per machine with `control.topics: true`
+  // once the chat is a forum supergroup with the bot as a topic-managing admin.
+  topics: boolean;
 }
 
 // enabled defaults ON (user decision 2026-06-10, post-review): inbound is armed
@@ -31,6 +36,9 @@ export const DEFAULT_CONTROL: ControlConfig = {
   stalenessSec: 300,
   idleExitMin: 30,
   allowedSenders: [],
+  // OFF by default — topic mode activates only when the operator opts in (the routing half
+  // ships before the spawn executor, so an accidental opt-in must not break the flat path).
+  topics: false,
 };
 
 // --- Telegram update shapes (only the fields we read) ---
@@ -259,7 +267,7 @@ export interface CtlPaths {
   log: string;
   routes: string; // message_id→pane map for reply recognition + LRU/MRU picker
   history: string; // append-only JSONL message log for `tg replies` recall
-  topics?: string; // threadId→agent binding map for forum-topics mode
+  topics: string; // threadId→agent binding map for forum-topics mode (always allocated)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---
