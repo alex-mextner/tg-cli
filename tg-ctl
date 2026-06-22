@@ -1725,6 +1725,28 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return true
     }
 
+    // Post the LRU/MRU-ordered agent picker for this reply and arm its pending
+    // selection. Shared by the unrecognized-multi-agent case AND the
+    // recognized-but-unconfirmed origin case (a known origin we currently can't
+    // SEE must never auto-collapse onto the wrong agent — let the human pick).
+    const postReplyPicker = async (candidates: AgentCandidate[]): Promise<boolean> => {
+      const usage = aggregateUsage(routes)
+      const order = orderByLruMru(candidates.map((c) => c.paneId), usage)
+      const byPane = new Map(candidates.map((c) => [c.paneId, c]))
+      const sorted = order.map((pid) => byPane.get(pid)!).filter(Boolean)
+      const token = `a${++agentTokenSeq}`
+      // preserveOrder: keep the LRU/MRU ranking — groupBySession must not re-sort.
+      const payload = buildAgentSelectMessage(ctx.chatId, sorted, token, action.injectText, true)
+      const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+      if (messageId === null) {
+        await sendMessage(ctx, "couldn't post the reply picker")
+        return false
+      }
+      const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
+      pendingAgent.set(token, { message: action.injectText, candidates: sorted, messageId, timer, prewrapped: true })
+      return true
+    }
+
     if (recognized) {
       const { panes, procs } = snapshot()
       const pane = panes.find((p) => p.paneId === recognized.paneId)
@@ -1738,7 +1760,36 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // the picker rather than risk mis-routing.
       const sameProject = routeMatchesPane({ recognizedCwd: recognized.cwd, panePath: pane?.panePath })
       if (pane && sameProject && findAgentInPane(pane, procs)) return injectVerbatim(recognized.paneId)
-      // recognized pane gone / reused / unverifiable → fall through to the picker
+
+      // We KNOW the origin pane but the snapshot can't CONFIRM it. snapshot()
+      // already retried the transient empty/partial `tmux list-panes` read
+      // (panesWithRetry); if it STILL can't see the recognized pane there are two
+      // shapes — and the launchd no-locale flake (`no-agent reply: panes=0`) makes
+      // a zero/partial snapshot a real, recurring runtime state, not a one-off:
+      //   (a) the snapshot returned ZERO/partial panes — origin almost certainly
+      //       still alive, just invisible. The OLD code fell through and, when the
+      //       partial snapshot left exactly ONE agent visible (deterministically
+      //       the last writer of the single global registration slot — [rig]/%2),
+      //       silently injected the recognized reply into THAT wrong agent. A
+      //       recognized reply must NEVER lose to whatever single agent is visible.
+      //   (b) the origin pane is genuinely gone/reused/different-project — the
+      //       legitimate fall-through to the picker (04cb6e5).
+      // Tell them apart by whether the origin pane appears in the snapshot AT ALL
+      // (`pane` IS that lookup — undefined ⇔ not visible). When it is NOT visible,
+      // post the PICKER (human disambiguates) instead of the single-candidate
+      // auto-inject — never the registration's last-writer pane.
+      if (!pane) {
+        const candidates = listAgentCandidates()
+        if (candidates.length === 0) {
+          await sendMessage(ctx, NO_AGENT_REPLY)
+          return false
+        }
+        // Even a single visible candidate is NOT trusted here: the recognized
+        // origin is unconfirmed, so post the picker rather than auto-inject.
+        return postReplyPicker(candidates)
+      }
+      // origin pane visible but not a same-project agent → genuinely reused/gone;
+      // fall through to the normal picker path below.
     }
 
     const candidates = listAgentCandidates()
@@ -1746,24 +1797,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await sendMessage(ctx, NO_AGENT_REPLY)
       return false
     }
-    if (candidates.length === 1) return injectVerbatim(candidates[0].paneId)
+    // An UNRECOGNIZED reply (no origin known) with a single agent is unambiguous —
+    // inject there. The recognized-but-unconfirmed case above never reaches here.
+    if (!recognized && candidates.length === 1) return injectVerbatim(candidates[0].paneId)
 
-    // Unrecognized reply with several agents → picker ordered LRU/MRU.
-    const usage = aggregateUsage(routes)
-    const order = orderByLruMru(candidates.map((c) => c.paneId), usage)
-    const byPane = new Map(candidates.map((c) => [c.paneId, c]))
-    const sorted = order.map((pid) => byPane.get(pid)!).filter(Boolean)
-    const token = `a${++agentTokenSeq}`
-    // preserveOrder: keep the LRU/MRU ranking — groupBySession must not re-sort.
-    const payload = buildAgentSelectMessage(ctx.chatId, sorted, token, action.injectText, true)
-    const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
-    if (messageId === null) {
-      await sendMessage(ctx, "couldn't post the reply picker")
-      return false
-    }
-    const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
-    pendingAgent.set(token, { message: action.injectText, candidates: sorted, messageId, timer, prewrapped: true })
-    return true
+    // Anything else — several agents, OR a recognized reply that fell through
+    // (origin visible but reused/gone) — goes to the LRU/MRU-ordered picker.
+    return postReplyPicker(candidates)
   }
 
   // --- forum topics (docs/specs/tg-forum-topics.md §7, §8) ---
@@ -2257,7 +2297,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           const { panes, procs } = snapshot()
           const pane = panes.find((p) => p.paneId === recognized.paneId)
           const sameProject = routeMatchesPane({ recognizedCwd: recognized.cwd, panePath: pane?.panePath })
-          return pane && sameProject && findAgentInPane(pane, procs) ? recognized.paneId : null
+          if (pane && sameProject && findAgentInPane(pane, procs)) return recognized.paneId
+          // Mirror handleReplyRoute's recognized-but-unconfirmed guard (HISTORY
+          // STAMP ONLY — this return is the scoped-recall pane, NEVER an inject
+          // target). When the origin pane is NOT visible (`!pane` — the launchd
+          // empty/partial flake), the reply still BELONGS to its recognized origin
+          // (the picker routes it there), so stamp it under the origin pane, NOT
+          // the default discovered target (the registration's last-writer = the
+          // WRONG pane). A genuinely reused/different-project VISIBLE pane (`pane`
+          // present but failed the same-project/agent check above) falls back to
+          // the default. The two recognized-but-unconfirmed paths intentionally
+          // diverge: handleReplyRoute posts the picker (delivery), this stamps the
+          // origin pane (attribution) — neither ever injects into an unconfirmed pane.
+          return pane ? null : recognized.paneId
         }
         appendHistory(
           ctx.paths.history,

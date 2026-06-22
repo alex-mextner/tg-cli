@@ -1,4 +1,7 @@
 import { expect, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import {
   parseRoutes,
   appendRoute,
@@ -8,8 +11,11 @@ import {
   routeMatchesPane,
   aggregateUsage,
   orderByLruMru,
+  withRoutesLock,
+  fsRoutesLockIo,
   MAX_ROUTES,
   type Route,
+  type RoutesLockIo,
 } from '../features/tg-ctl/routes';
 
 const R = (id: number, paneId: string, ts: number): Route => ({ id, paneId, ts });
@@ -115,4 +121,286 @@ test('routeMatchesPane: pane-id reuse by a DIFFERENT project still mismatches (0
 test('routeMatchesPane: absent recorded cwd (old route) or absent pane → no match (picker fallback)', () => {
   expect(routeMatchesPane({ recognizedCwd: undefined, panePath: '/a' })).toBe(false);
   expect(routeMatchesPane({ recognizedCwd: '/a', panePath: undefined })).toBe(false);
+});
+
+// --- withRoutesLock + fsRoutesLockIo (issue #53 part B: concurrent route writers must not clobber) ---
+//
+// In-memory model of an O_EXCL lockfile whose owner is a PID; a held lock is
+// "stale" only when its owner process is DEAD (liveness, not age). Two writers
+// each do a read-modify-write (the recordRoute shape); the lock must serialize
+// them so no appended entry is lost.
+
+interface FakeLock {
+  ownerPid: number | null; // null = lockfile absent
+}
+
+// A fake io for `myPid`, sharing one lockfile + a liveness oracle (set of alive
+// pids). All removals are ownership-checked, mirroring fsRoutesLockIo.
+function fakeIo(lock: FakeLock, myPid: number, alive: Set<number>, log: string[] = []): RoutesLockIo {
+  const unlinkIfOwner = (pid: number): void => {
+    if (lock.ownerPid === pid) lock.ownerPid = null;
+  };
+  return {
+    acquire: () => {
+      if (lock.ownerPid !== null) return false;
+      lock.ownerPid = myPid;
+      log.push(`acquire:${myPid}`);
+      return true;
+    },
+    release: () => {
+      unlinkIfOwner(myPid);
+      log.push(`release:${myPid}`);
+    },
+    ownerDead: () => (lock.ownerPid === null ? null : !alive.has(lock.ownerPid)),
+    breakIfDead: () => {
+      if (lock.ownerPid !== null && !alive.has(lock.ownerPid)) {
+        log.push(`break:${lock.ownerPid}`);
+        unlinkIfOwner(lock.ownerPid);
+      }
+    },
+    sleep: () => {},
+  };
+}
+
+test('withRoutesLock: acquires, runs body, always releases', () => {
+  const lock: FakeLock = { ownerPid: null };
+  const log: string[] = [];
+  const out = withRoutesLock(fakeIo(lock, 100, new Set([100]), log), () => 42);
+  expect(out).toBe(42);
+  expect(lock.ownerPid).toBeNull(); // released
+  expect(log).toEqual(['acquire:100', 'release:100']);
+});
+
+test('withRoutesLock: releases even when the body throws', () => {
+  const lock: FakeLock = { ownerPid: null };
+  expect(() =>
+    withRoutesLock(fakeIo(lock, 100, new Set([100])), () => {
+      throw new Error('boom');
+    }),
+  ).toThrow('boom');
+  expect(lock.ownerPid).toBeNull(); // released despite the throw
+});
+
+test('withRoutesLock: serialized writers lose NO entries; a blocked-by-LIVE-owner writer never clobbers', () => {
+  const lock: FakeLock = { ownerPid: null };
+  const alive = new Set([100, 200]);
+  let file: string | null = null;
+
+  const writeRoute = (pid: number, id: number, paneId: string): void => {
+    withRoutesLock(fakeIo(lock, pid, alive), () => {
+      const existing = parseRoutes(file);
+      file = serializeRoutes(appendRoute(existing, { id, paneId, ts: id }));
+    });
+  };
+
+  // Worst interleaving: writer 200 tries while LIVE writer 100 holds the lock and
+  // is mid-RMW. 200 must block (live owner never broken) and run AFTER, so 100's
+  // entry is still present when 200 reads → no clobber.
+  let inner: string | null = null;
+  withRoutesLock(fakeIo(lock, 100, alive), () => {
+    file = serializeRoutes(appendRoute(parseRoutes(file), { id: 500, paneId: '%5', ts: 500 }));
+    // 200 attempts to write WHILE 100 holds the lock (attempts bounded → unlocked
+    // fallback), but because it reads the same `file` 100 already wrote, the
+    // append keeps BOTH — and critically it could NOT acquire (live owner).
+    withRoutesLock(
+      fakeIo(lock, 200, alive),
+      () => {
+        inner = '200-body-ran';
+        file = serializeRoutes(appendRoute(parseRoutes(file), { id: 501, paneId: '%2', ts: 501 }));
+      },
+      { attempts: 2, delayMs: 0 },
+    );
+  });
+  expect(inner).toBe('200-body-ran');
+  const routes = parseRoutes(file);
+  expect(routes.map((r) => r.id).sort()).toEqual([500, 501]); // BOTH survived
+  expect(recognizeRoute(routes, 500)?.paneId).toBe('%5');
+  expect(recognizeRoute(routes, 501)?.paneId).toBe('%2');
+
+  // And a plain serialized pair also keeps both.
+  file = null;
+  writeRoute(100, 600, '%6');
+  writeRoute(200, 601, '%7');
+  expect(parseRoutes(file).map((r) => r.id).sort()).toEqual([600, 601]);
+});
+
+test('withRoutesLock: a DEAD-owner lock (crashed writer) is broken by liveness, then acquired', () => {
+  const lock: FakeLock = { ownerPid: 999 }; // crashed writer left this
+  const alive = new Set([100]); // 999 is DEAD, 100 (us) is alive
+  const log: string[] = [];
+  let ran = false;
+  withRoutesLock(fakeIo(lock, 100, alive, log), () => {
+    ran = true;
+  }, { attempts: 3, delayMs: 0 });
+  expect(ran).toBe(true);
+  expect(log).toContain('break:999'); // the dead owner's lock was broken
+  expect(log).toContain('acquire:100'); // then we acquired
+  expect(lock.ownerPid).toBeNull(); // and released
+});
+
+test('withRoutesLock: a LIVE-owner lock is NEVER broken (the #53 race the mtime approach had)', () => {
+  // Owner 999 holds the lock and IS alive (a slow-but-running writer). A second
+  // writer must NOT break it — liveness, not age, is the staleness signal.
+  const lock: FakeLock = { ownerPid: 999 };
+  const alive = new Set([999, 100]); // 999 alive — must be left alone
+  const log: string[] = [];
+  let ran = false;
+  withRoutesLock(fakeIo(lock, 100, alive, log), () => {
+    ran = true;
+  }, { attempts: 3, delayMs: 0 });
+  expect(ran).toBe(true); // body still ran (unlocked fallback)
+  expect(log).not.toContain('break:999'); // the LIVE owner's lock was untouched
+  expect(lock.ownerPid).toBe(999); // still held by the live owner
+});
+
+// A lock perpetually held by a LIVE writer: acquire never succeeds, owner never
+// dead → never broken.
+function liveHeldIo(counter: { attempts: number }): RoutesLockIo {
+  return {
+    acquire: () => {
+      counter.attempts += 1;
+      return false;
+    },
+    release: () => {},
+    ownerDead: () => false, // owner alive — never broken
+    breakIfDead: () => {},
+    sleep: () => {},
+  };
+}
+
+test('withRoutesLock: default (run-unlocked) runs the body even under sustained live contention', () => {
+  const counter = { attempts: 0 };
+  let ran = false;
+  const out = withRoutesLock(liveHeldIo(counter), () => {
+    ran = true;
+    return 'ran';
+  }, { attempts: 4, delayMs: 0 });
+  expect(ran).toBe(true); // legacy behavior: body ran despite never acquiring
+  expect(out).toBe('ran');
+  expect(counter.attempts).toBe(4); // it really tried the full budget
+});
+
+test('withRoutesLock: onContended=skip does NOT run the body unlocked (no clobber — codex #55)', () => {
+  // The fix for the lost-update window: under sustained live contention a
+  // shared-file RMW must SKIP, not run unlocked (which could overwrite the
+  // concurrent holder's good entry). Returns undefined; body never executes.
+  const counter = { attempts: 0 };
+  let ran = false;
+  const out = withRoutesLock(liveHeldIo(counter), () => {
+    ran = true;
+    return 'ran';
+  }, { attempts: 4, delayMs: 0, onContended: 'skip' });
+  expect(ran).toBe(false); // body did NOT run — no unlocked clobber
+  expect(out).toBeUndefined();
+  expect(counter.attempts).toBe(4); // still spun the full budget first
+});
+
+test('withRoutesLock: onContended=skip STILL runs the body when the lock IS acquired', () => {
+  // skip only suppresses the UNLOCKED fallback; a normal acquire runs+releases.
+  const lock: FakeLock = { ownerPid: null };
+  let ran = false;
+  const out = withRoutesLock(fakeIo(lock, 100, new Set([100])), () => {
+    ran = true;
+    return 7;
+  }, { onContended: 'skip' });
+  expect(ran).toBe(true);
+  expect(out).toBe(7);
+  expect(lock.ownerPid).toBeNull(); // released
+});
+
+// --- fsRoutesLockIo: the REAL filesystem backing (O_EXCL lockfile + pid liveness) ---
+
+test('fsRoutesLockIo: real O_EXCL lockfile serializes two writers — no lost route entries', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tg-routeslock-'));
+  const routesFile = join(dir, 'routes.json');
+  const lockPath = `${routesFile}.lock`;
+  const alive = new Set([111, 222]);
+  const isAlive = (pid: number): boolean => alive.has(pid);
+
+  // Read race-free: a single readFileSync in try/catch (ENOENT → empty), NOT an
+  // existsSync-then-read (that check-then-use is a TOCTOU pattern CodeQL flags).
+  const readRoutesRaw = (): string | null => {
+    try {
+      return readFileSync(routesFile, 'utf8');
+    } catch {
+      return null;
+    }
+  };
+  const write = (pid: number, id: number, paneId: string): void => {
+    withRoutesLock(fsRoutesLockIo(lockPath, { ownPid: pid, isAlive }), () => {
+      const existing = parseRoutes(readRoutesRaw());
+      writeFileSync(routesFile, serializeRoutes(appendRoute(existing, { id, paneId, ts: id })));
+    });
+  };
+
+  write(111, 700, '%5');
+  write(222, 701, '%2');
+
+  const routes = parseRoutes(readFileSync(routesFile, 'utf8'));
+  expect(routes.map((r) => r.id).sort()).toEqual([700, 701]);
+  expect(existsSync(lockPath)).toBe(false); // lock released after each write
+});
+
+test('fsRoutesLockIo: a real DEAD-owner lockfile is broken; a real held lock blocks acquire', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tg-routeslock-dead-'));
+  const lockPath = join(dir, 'routes.json.lock');
+
+  // A crashed writer left a lockfile owned by a DEAD pid.
+  writeFileSync(lockPath, '999');
+  const isAliveNone = (): boolean => false; // 999 is dead
+
+  const io = fsRoutesLockIo(lockPath, { ownPid: 111, isAlive: isAliveNone });
+  expect(io.ownerDead()).toBe(true); // dead owner detected
+  io.breakIfDead();
+  expect(existsSync(lockPath)).toBe(false); // dead lock removed
+
+  // Now acquire really creates the file, and a second acquire (lock held) fails.
+  expect(io.acquire()).toBe(true);
+  expect(existsSync(lockPath)).toBe(true);
+  expect(readFileSync(lockPath, 'utf8')).toBe('111'); // our pid stamped
+  const other = fsRoutesLockIo(lockPath, { ownPid: 222, isAlive: () => true });
+  expect(other.acquire()).toBe(false); // O_EXCL blocks the second writer
+  // ownership-checked release: the OTHER writer's release must NOT remove our lock.
+  other.release();
+  expect(existsSync(lockPath)).toBe(true); // still ours — not nuked by 222
+  io.release();
+  expect(existsSync(lockPath)).toBe(false); // our own release removes it
+});
+
+test('fsRoutesLockIo: an EMPTY/unparseable lockfile (SIGKILL-window orphan) is breakable — no permanent wedge', () => {
+  // Regression for review #53 finding 1: a `tg` SIGKILLed between openSync('wx')
+  // and writeFileSync(pid) leaves a present-but-EMPTY lockfile with no owner. The
+  // old two-state read treated "unreadable" like "absent" → never broken → every
+  // later send wedged. It must now be classified breakable.
+  const dir = mkdtempSync(join(tmpdir(), 'tg-routeslock-orphan-'));
+  const lockPath = join(dir, 'routes.json.lock');
+
+  for (const garbage of ['', '   ', 'not-a-pid', '0', '-5']) {
+    writeFileSync(lockPath, garbage);
+    // isAlive must be irrelevant here — there is no pid to probe; the orphan is
+    // breakable purely because its owner is unreadable.
+    const io = fsRoutesLockIo(lockPath, { ownPid: 111, isAlive: () => true });
+    expect(io.ownerDead()).toBe(true); // unparseable owner ⇒ breakable
+    io.breakIfDead();
+    expect(existsSync(lockPath)).toBe(false); // orphan removed, mutex un-wedged
+  }
+
+  // And withRoutesLock recovers end-to-end: an orphan lockfile present, the body
+  // still runs AND acquires (the orphan was broken), leaving a clean released lock.
+  writeFileSync(lockPath, '');
+  let ran = false;
+  withRoutesLock(fsRoutesLockIo(lockPath, { ownPid: 111, isAlive: () => true }), () => {
+    ran = true;
+  }, { attempts: 3, delayMs: 0 });
+  expect(ran).toBe(true);
+  expect(existsSync(lockPath)).toBe(false); // recovered + released, not wedged
+});
+
+test('fsRoutesLockIo: a missing PARENT dir makes acquire THROW (not spin) → fast unlocked fallback', () => {
+  // Regression for review #53 finding 2: a non-EEXIST open error (here ENOENT —
+  // the parent dir does not exist) must NOT be swallowed as "held" (which would
+  // spin the whole budget). acquire throws; withRoutesLock lets it propagate so
+  // the caller's outer try runs the body unlocked immediately.
+  const io = fsRoutesLockIo('/no/such/dir/routes.json.lock', { ownPid: 111, isAlive: () => true });
+  expect(() => io.acquire()).toThrow(); // ENOENT surfaced, not masked as false
 });
