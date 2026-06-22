@@ -1781,26 +1781,64 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return result
   }
 
-  const replyNotFound = async (found: Extract<DiscoverResult, { ok: false }>): Promise<void> => {
-    await sendMessage(
-      ctx,
-      found.reason === "ambiguous"
-        ? `ambiguous target — candidates:\n${formatCandidates(found.candidates)}`
-        : NO_AGENT_REPLY,
-    )
+  // Resolve a DiscoverResult's ambiguous `TargetPane[]` to the picker's
+  // `AgentCandidate[]` (window names + cwd → distinct labels). The TargetPane
+  // shape carries no window name, so re-derive over a fresh listAgentCandidates()
+  // snapshot, keeping ONLY the discovery-narrowed panes that are STILL a live
+  // agent candidate. A pane that raced away between the two snapshots (or no
+  // longer passes the agent-candidate criterion) drops out — the picker shows
+  // only panes a tap can actually route into, never a synthetic button into a
+  // dead/non-agent pane. The set/discovery layer already guarantees ≥2 live
+  // candidates on the ambiguous path, so the result is non-empty in practice; if
+  // a freak full race emptied it, postRoutePicker/postSelectPicker fall back to
+  // the no-agent reply rather than an empty button set.
+  const candidatesForPicker = (panes: TargetPane[]): AgentCandidate[] => {
+    const want = new Set(panes.map((c) => c.pane.paneId))
+    return listAgentCandidates().filter((c) => want.has(c.paneId))
+  }
+
+  // The "not found" reply for a target that genuinely has NO agent. The ambiguous
+  // case never reaches here anymore — it posts the inline-keyboard PICKER (buttons,
+  // like /agent) instead of the old plain-text candidate dump (tg-cli#72). Kept as
+  // a tiny helper for the no-agent message + the /kill path's reuse.
+  const replyNoAgent = async (): Promise<void> => {
+    await sendMessage(ctx, NO_AGENT_REPLY)
   }
 
   // Pick a target, run the plan; every failure mode turns into a TG reply so
   // the human is never left wondering whether the message landed. Returns
   // true only when the plan actually executed — the caller uses it to decide
-  // whether the source message earns its 👀 delivery receipt.
+  // whether the source message earns its 👀 delivery receipt. On an AMBIGUOUS
+  // target (several live agents, none clearly the one) carrying routable text, it
+  // posts the agent PICKER (tappable buttons) and arms the pending route — a tap
+  // injects `deferText` verbatim, exactly like the /agent picker. A control verb
+  // with no text (inject-key /stop) has nothing to route through a tap, so it
+  // falls back to the picker WITHOUT a pending route (select-only) — the buttons
+  // still tell the human which agents are live instead of a text dump.
   const injectViaTarget = async (
     buildPlan: (paneId: string) => InjectStep[],
     deferText?: string,
   ): Promise<boolean> => {
     const found = discover()
     if (!found.ok) {
-      await replyNotFound(found)
+      // Routable text present (a real message) → route picker: a tap injects it
+      // verbatim. Empty/whitespace deferText is treated as "no text" (same rule as
+      // postAgentPicker's selectOnly), so it never arms a pending route that would
+      // inject nothing on tap.
+      if (found.reason === "ambiguous" && deferText !== undefined && deferText.trim() !== "") {
+        return postRoutePicker(candidatesForPicker(found.candidates), deferText)
+      }
+      if (found.reason === "ambiguous") {
+        // No routable text (a /stop with several agents): show the live agents as
+        // a select-only picker rather than dumping them as text. A select-only tap
+        // does NOT re-run the control verb (it only hands back the selector), so
+        // the verb did NOT execute — return false so the source message earns no
+        // 👀 "delivered" receipt (matching the kill-agent ambiguous branch below
+        // and this function's "true only when the plan executed" contract).
+        await postSelectPicker(candidatesForPicker(found.candidates))
+        return false
+      }
+      await replyNoAgent()
       return false
     }
     const paneId = found.target.pane.paneId
@@ -1867,6 +1905,47 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
     pendingAgent.set(token, { message, candidates: subset, messageId, timer, selectOnly: message.trim() === "" })
+    return true
+  }
+
+  // Select-only picker (buttons, no pending route): the bare-`/agent` flow, but
+  // also the fallback for an ambiguous control verb that carries no routable text
+  // (a /stop or /kill across several agents) — the buttons show the live agents
+  // instead of a plain-text dump, and a tap hands back the selector to address one.
+  // Guards an empty subset (a freak full race where candidatesForPicker filtered
+  // every discovery pane out) → the no-agent reply, never a button-less picker
+  // (mirrors postRoutePicker; matches the candidatesForPicker fallback comment).
+  const postSelectPicker = async (subset: AgentCandidate[]): Promise<boolean> => {
+    if (subset.length === 0) {
+      await replyNoAgent()
+      return false
+    }
+    return postAgentPicker(subset, "")
+  }
+
+  // Route picker for ALREADY-WRAPPED text (a tap injects it VERBATIM, prewrapped:
+  // true) — the ambiguous-target path (injectViaTarget) and, with a gone-target
+  // `notice`, the reply-route picker. Unlike postReplyPicker it does NOT reorder by
+  // LRU/MRU: the ambiguous fleet has no prior reply usage to rank by. Returns false
+  // only when the picker send itself failed.
+  const postRoutePicker = async (
+    subset: AgentCandidate[],
+    prewrappedText: string,
+    notice?: string,
+  ): Promise<boolean> => {
+    if (subset.length === 0) {
+      await replyNoAgent()
+      return false
+    }
+    const token = `a${++agentTokenSeq}`
+    const payload = buildAgentSelectMessage(ctx.chatId, subset, token, prewrappedText, false, notice)
+    const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+    if (messageId === null) {
+      await sendMessage(ctx, "couldn't post the agent picker — try a narrower /agent <window>")
+      return false
+    }
+    const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
+    pendingAgent.set(token, { message: prewrappedText, candidates: subset, messageId, timer, prewrapped: true })
     return true
   }
 
@@ -2024,14 +2103,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // selection. Shared by the unrecognized-multi-agent case AND the
     // recognized-but-unconfirmed origin case (a known origin we currently can't
     // SEE must never auto-collapse onto the wrong agent — let the human pick).
-    const postReplyPicker = async (candidates: AgentCandidate[]): Promise<boolean> => {
+    // `notice` prepends a gone-target line ("That agent … is no longer running")
+    // when the reply's recorded origin pane is no longer a live, same-project agent.
+    const postReplyPicker = async (candidates: AgentCandidate[], notice?: string): Promise<boolean> => {
       const usage = aggregateUsage(routes)
       const order = orderByLruMru(candidates.map((c) => c.paneId), usage)
       const byPane = new Map(candidates.map((c) => [c.paneId, c]))
       const sorted = order.map((pid) => byPane.get(pid)!).filter(Boolean)
       const token = `a${++agentTokenSeq}`
       // preserveOrder: keep the LRU/MRU ranking — groupBySession must not re-sort.
-      const payload = buildAgentSelectMessage(ctx.chatId, sorted, token, action.injectText, true)
+      const payload = buildAgentSelectMessage(ctx.chatId, sorted, token, action.injectText, true, notice)
       const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
       if (messageId === null) {
         await sendMessage(ctx, "couldn't post the reply picker")
@@ -2041,6 +2122,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       pendingAgent.set(token, { message: action.injectText, candidates: sorted, messageId, timer, prewrapped: true })
       return true
     }
+
+    // A human label for the GONE origin agent of this recognized reply — the
+    // project dir (cwd basename) it was recorded against, else its pane id. Used
+    // in the picker notice so the CTO sees WHICH agent vanished, not just "an agent".
+    const goneOriginLabel = (): string => {
+      const cwd = recognized?.cwd
+      if (cwd) {
+        const base = cwd.replace(/\/+$/, "").split("/").pop()
+        if (base) return base
+      }
+      return recognized?.paneId ?? "the agent you replied to"
+    }
+    const goneNotice = (): string => `That agent (${goneOriginLabel()}) is no longer running — pick a live one:`
 
     if (recognized) {
       const { panes, procs } = snapshot()
@@ -2080,11 +2174,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           return false
         }
         // Even a single visible candidate is NOT trusted here: the recognized
-        // origin is unconfirmed, so post the picker rather than auto-inject.
-        return postReplyPicker(candidates)
+        // origin is unconfirmed, so post the picker rather than auto-inject. The
+        // origin pane isn't visible — it may be a snapshot flake OR genuinely gone;
+        // either way the human picks. Name the agent they meant so a real kill
+        // reads as "that agent is gone" rather than a silent re-ask (CTO ask, #72).
+        return postReplyPicker(candidates, goneNotice())
       }
       // origin pane visible but not a same-project agent → genuinely reused/gone;
-      // fall through to the normal picker path below.
+      // fall through to the normal picker path below (with the gone notice).
     }
 
     const candidates = listAgentCandidates()
@@ -2097,8 +2194,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (!recognized && candidates.length === 1) return injectVerbatim(candidates[0].paneId)
 
     // Anything else — several agents, OR a recognized reply that fell through
-    // (origin visible but reused/gone) — goes to the LRU/MRU-ordered picker.
-    return postReplyPicker(candidates)
+    // (origin visible but reused/gone) — goes to the LRU/MRU-ordered picker. A
+    // recognized reply that reached here KNEW an origin that's now gone (its pane
+    // was reused by a different project), so it carries the gone notice; an
+    // unrecognized reply never knew an origin, so no notice.
+    return postReplyPicker(candidates, recognized ? goneNotice() : undefined)
   }
 
   // --- forum topics (docs/specs/tg-forum-topics.md §7, §8) ---
@@ -2436,7 +2536,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "kill-agent": {
         const found = discover()
         if (!found.ok) {
-          await replyNotFound(found)
+          // Ambiguous /kill (several live agents) → show the live agents as a
+          // select-only picker (buttons) instead of a plain-text candidate dump;
+          // no-agent → the no-agent reply. (A tap on the picker hands back the
+          // selector to re-issue against one agent — kill-on-tap is out of scope.)
+          if (found.reason === "ambiguous") {
+            await postSelectPicker(candidatesForPicker(found.candidates))
+          } else {
+            await replyNoAgent()
+          }
           return false
         }
         if (found.target.agentPid === undefined) {
