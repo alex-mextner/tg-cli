@@ -1,0 +1,257 @@
+import { afterAll, expect, test } from 'bun:test';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import type { Subprocess } from 'bun';
+
+// Integration coverage for the bare-`/agent` inline-keyboard PICKER (the CTO's
+// "где кнопки?" bug). The daemon runs the real `tmux list-panes` + `ps` queries,
+// so we put a FAKE tmux + ps on PATH that report THREE claude panes in the same
+// numeric window "4" with DISTINCT cwds — the exact reported shape that used to
+// render three indistinguishable "4 · claude" text rows and no buttons. We then:
+//   1. assert a bare `/agent` posts an inline keyboard (not plain text) whose
+//      buttons carry DISTINCT, cwd-derived labels (rig / 3d-cli / hyperide);
+//   2. tap one button and assert the select-only confirmation (no inject).
+
+const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
+
+const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-picker-'));
+writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
+writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
+writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));
+
+// Fake tmux: two list-panes shapes the daemon asks for, keyed by the -F format.
+//   PANE_FORMAT  → session\twindow_index\tpane_id\tpane_pid\tcmd\tpath
+//   pane→name    → pane_id\twindow_name   (window names are EMPTY → bare "4")
+// Three claude panes in session/window "4", distinct cwds.
+const binDir = join(cfgDir, 'bin');
+mkdirSync(binDir);
+// tmux log: every non-list-panes invocation (the inject's send-keys/paste) is
+// appended here so the round-trip test can assert WHICH pane was injected into.
+const tmuxLog = join(cfgDir, 'tmux-invocations.log');
+const tmuxScript = `#!/bin/sh
+# Only 'list-panes' is exercised by discovery; everything else is logged + no-op.
+case "$*" in
+  *list-panes*)
+    case "$*" in
+      *pane_current_path*)
+        printf '4\\t0\\t%%5001\\t5001\\tnode\\t/Users/u/xp/rig\\n'
+        printf '4\\t0\\t%%5002\\t5002\\tnode\\t/Users/u/xp/3d-cli\\n'
+        printf '4\\t0\\t%%5003\\t5003\\tnode\\t/Users/u/work/hyperide\\n'
+        ;;
+      *window_name*)
+        # window names deliberately EMPTY (trailing tab) → session-name fallback "4"
+        printf '%%5001\\t\\n%%5002\\t\\n%%5003\\t\\n'
+        ;;
+    esac
+    ;;
+  *)
+    echo "$*" >> "${tmuxLog}"
+    ;;
+esac
+exit 0
+`;
+writeFileSync(join(binDir, 'tmux'), tmuxScript, { mode: 0o755 });
+
+// Fake ps: each pane pid IS a claude process (findAgentInPane walks from pane_pid
+// and matches the 'claude' argv0). A couple of system procs for realism.
+const psScript = `#!/bin/sh
+printf '    1     0 /sbin/launchd\\n'
+printf ' 5001     1 claude --resume\\n'
+printf ' 5002     1 claude --resume\\n'
+printf ' 5003     1 claude --resume\\n'
+exit 0
+`;
+writeFileSync(join(binDir, 'ps'), psScript, { mode: 0o755 });
+
+let callbackData: string | null = null;
+let callbackServed = false;
+let routeMsgServed = false;
+const sentMessages: Array<Record<string, unknown>> = [];
+const editedMessages: Array<Record<string, unknown>> = [];
+const answeredCallbacks: unknown[] = [];
+
+const server = Bun.serve({
+  port: 0,
+  async fetch(req) {
+    const url = new URL(req.url);
+    if (url.pathname.endsWith('/getUpdates')) {
+      // Honour the long-poll `offset`: never re-serve an update the daemon has
+      // already consumed (it advances offset to last_update_id + 1). This makes
+      // the harness immune to a double poll re-delivering the same `/agent`.
+      const offset = Number(url.searchParams.get('offset') ?? '0');
+      // First poll: deliver the bare `/agent` text message. After the picker is
+      // posted, deliver a tap on its first button.
+      if (offset <= 100 && sentMessages.length === 0) {
+        return Response.json({
+          ok: true,
+          result: [
+            {
+              update_id: 100,
+              message: {
+                message_id: 10,
+                from: { id: 1, first_name: 'Alex' },
+                chat: { id: 1 },
+                date: Math.floor(Date.now() / 1000),
+                text: '/agent',
+              },
+            },
+          ],
+        });
+      }
+      if (offset <= 200 && callbackData && !callbackServed) {
+        callbackServed = true;
+        return Response.json({
+          ok: true,
+          result: [
+            {
+              update_id: 200,
+              callback_query: {
+                id: 'cb1',
+                from: { id: 1, first_name: 'Alex' },
+                message: { message_id: 77, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) },
+                data: callbackData,
+              },
+            },
+          ],
+        });
+      }
+      // After the select-only tap is answered, deliver the SUGGESTED command
+      // (`/agent rig hello there`) to prove the handed-back selector actually
+      // routes — the finding-#1 round-trip the unit test asserts in isolation.
+      if (offset <= 300 && callbackServed && answeredCallbacks.length > 0 && !routeMsgServed) {
+        routeMsgServed = true;
+        return Response.json({
+          ok: true,
+          result: [
+            {
+              update_id: 300,
+              message: {
+                message_id: 30,
+                from: { id: 1, first_name: 'Alex' },
+                chat: { id: 1 },
+                date: Math.floor(Date.now() / 1000),
+                text: '/agent rig hello there',
+              },
+            },
+          ],
+        });
+      }
+      await Bun.sleep(80);
+      return Response.json({ ok: true, result: [] });
+    }
+    if (url.pathname.endsWith('/sendMessage')) {
+      const body = (await req.json()) as Record<string, unknown>;
+      sentMessages.push(body);
+      const markup = body.reply_markup as
+        | { inline_keyboard?: Array<Array<{ callback_data?: string }>> }
+        | undefined;
+      const firstBtn = markup?.inline_keyboard?.[0]?.[0]?.callback_data;
+      if (firstBtn) callbackData = firstBtn;
+      return Response.json({ ok: true, result: { message_id: 77 } });
+    }
+    if (url.pathname.endsWith('/editMessageText')) {
+      editedMessages.push((await req.json()) as Record<string, unknown>);
+      return Response.json({ ok: true, result: true });
+    }
+    if (url.pathname.endsWith('/answerCallbackQuery')) {
+      answeredCallbacks.push(await req.json());
+      return Response.json({ ok: true, result: true });
+    }
+    if (url.pathname.endsWith('/setMessageReaction')) {
+      return Response.json({ ok: true, result: true });
+    }
+    return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+  },
+});
+
+const procs: Subprocess[] = [];
+
+afterAll(async () => {
+  for (const p of procs) {
+    if (p.exitCode === null) {
+      p.kill(9);
+      await p.exited;
+    }
+  }
+  server.stop(true);
+});
+
+test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and a tap selects (no inject)', async () => {
+  const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+    env: {
+      // Our fake tmux + ps MUST shadow the real ones → binDir first on PATH.
+      PATH: `${binDir}:${process.env.PATH ?? ''}`,
+      HOME: cfgDir,
+      TG_CTL_CONFIG_DIR: cfgDir,
+      TG_API_BASE: `http://127.0.0.1:${server.port}`,
+    },
+    stdio: ['ignore', logFd, logFd],
+  });
+  procs.push(daemon);
+  closeSync(logFd);
+
+  const socket = join(cfgDir, 'tg-ctl.123.sock');
+  const t0 = Date.now();
+  while (Date.now() - t0 < 5000 && !existsSync(socket)) await Bun.sleep(50);
+  expect(existsSync(socket)).toBe(true);
+
+  // Wait for the picker, the tap answer, AND the follow-up route's inject.
+  const tEnd = Date.now() + 10000;
+  const injected = (): boolean => {
+    const log = existsSync(tmuxLog) ? readFileSync(tmuxLog, 'utf8') : '';
+    // Per-LINE match (the fake tmux logs one invocation per line): send-keys /
+    // paste-buffer and `-t %5001` must be on the SAME line, not merely co-present.
+    return /^(send-keys|paste-buffer)\b.*-t %5001\b/m.test(log);
+  };
+  while (
+    Date.now() < tEnd &&
+    (sentMessages.length === 0 || answeredCallbacks.length === 0 || !routeMsgServed || !injected())
+  ) {
+    await Bun.sleep(80);
+  }
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+
+  // 1. The bare `/agent` produced an inline keyboard — BUTTONS, not a text list.
+  expect(sentMessages.length).toBeGreaterThanOrEqual(1);
+  const picker = sentMessages[0];
+  const markup = picker.reply_markup as
+    | { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> }
+    | undefined;
+  expect(markup).toBeDefined();
+  const buttons = markup!.inline_keyboard.flat();
+  // one button per agent
+  expect(buttons.length).toBe(3);
+  // DISTINCT, cwd-derived labels — the fix for three indistinguishable "4 · claude"
+  const labels = buttons.map((b) => b.text);
+  expect(labels).toEqual(['rig · claude', '3d-cli · claude', 'hyperide · claude']);
+  expect(new Set(labels).size).toBe(3);
+  // each button is a tga: callback
+  expect(buttons.every((b) => b.callback_data.startsWith('tga:'))).toBe(true);
+  // it is a PICKER prompt, NOT the old "address with /agent <window> <message>" text
+  expect(String(picker.text)).toContain('Pick an agent');
+  expect(String(picker.text)).not.toContain('address with /agent');
+
+  // 2. The tap was acknowledged as a selection and the prompt was edited to the
+  //    select-only confirmation — nothing was injected (no tmux send-keys).
+  expect(answeredCallbacks).toEqual([{ callback_query_id: 'cb1', text: 'selected' }]);
+  expect(editedMessages.length).toBeGreaterThanOrEqual(1);
+  const edited = String(editedMessages[0].text);
+  expect(edited).toContain('selected rig · claude');
+  expect(edited).toContain('/agent rig');
+
+  // 3. Round-trip (finding #1): the suggested `/agent rig hello there` confidently
+  //    routed to the cwd-`rig` pane %5001 and injected — the cwd-derived selector
+  //    really addresses the picked agent (matchWindows scores the cwd, not just
+  //    the bare window name "4").
+  const log = existsSync(tmuxLog) ? readFileSync(tmuxLog, 'utf8') : '';
+  // send-keys / paste-buffer targeting `-t %5001` on the SAME line (per-line, not
+  // merely both-present-somewhere) — proves the inject hit the chosen pane.
+  expect(/^(send-keys|paste-buffer)\b.*-t %5001\b/m.test(log)).toBe(true);
+  // and NOT into a sibling pane
+  expect(log).not.toContain('%5002');
+  expect(log).not.toContain('%5003');
+}, 25_000);
