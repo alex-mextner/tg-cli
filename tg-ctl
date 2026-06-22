@@ -19,6 +19,7 @@ import {
   buildAgentSelectMessage,
   dedupeCandidates,
   distinctLabels,
+  isBareWindowName,
   matchWindows,
   suggestSelector,
   type AgentCandidate,
@@ -35,7 +36,14 @@ import {
 } from "./features/tg-ctl/autostart"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
-import { findAgentInPane, panesWithRetry, parsePaneList, parseProcList, pickTargetPaneFromSet } from "./features/tg-ctl/discover"
+import {
+  findAgentInPane,
+  panesWithRetry,
+  parsePaneList,
+  parseProcList,
+  pickTargetPaneFromSet,
+  resolveAmbiguousByActivity,
+} from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
 import { botIdFromToken, ctlPaths, pidStatus, readPidFile } from "./features/tg-ctl/lock"
@@ -197,7 +205,14 @@ export function readOffset(content: string | null): number {
 // One line per candidate so the ambiguity reply names realistic choices.
 export function formatCandidates(candidates: TargetPane[]): string {
   return candidates
-    .map((c) => `${c.pane.sessionName}:${c.pane.windowIndex} ${c.pane.paneId} (${c.agent}, ${c.pane.panePath})`)
+    .map((c) => {
+      // Lead with the user-set window name — the label the CTO recognizes
+      // (tg-cli#75) — but ONLY when it's a real name, not a bare default
+      // (a number / shell command / version string). Applying the picker's
+      // isBareWindowName keeps this diagnostic line in sync with the buttons.
+      const win = isBareWindowName(c.pane.windowName) ? "" : `${c.pane.windowName} `
+      return `${win}${c.pane.sessionName}:${c.pane.windowIndex} ${c.pane.paneId} (${c.agent}, ${c.pane.panePath})`
+    })
     .join("\n")
 }
 
@@ -328,13 +343,18 @@ async function publishBotCommands(ctx: Ctx): Promise<void> {
 }
 
 // Tab separator — pane_current_path may contain spaces (see discover.ts).
+// #{window_name} is carried in the CORE snapshot (a fixed field BEFORE the greedy
+// path) so the /agent picker can label by the user-set window name reliably
+// (tg-cli#75 fix C); the previous separate window-name tmux call did NOT pass the
+// UTF-8 locale env, so under launchd the tab-mangle blanked every name and the
+// picker fell back to the cwd basename.
 const PANE_FORMAT =
-  "#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}"
+  "#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{window_name}\t#{pane_current_path}"
 
 // Subprocess env with a GUARANTEED UTF-8 locale. THE root cause of the "Claude Code not in tmux"
 // saga: under launchd the daemon inherits NO locale (LANG/LC_* unset), and tmux then classifies the
 // TAB separator in PANE_FORMAT as non-printable and ESCAPES it to `_` in its `-F` output. Every line
-// then collapses to a single field, parsePaneList drops it (<6 fields), snapshot() returns ZERO
+// then collapses to a single field, parsePaneList drops it (<7 fields), snapshot() returns ZERO
 // panes, and the daemon reports "not in tmux" for every message despite live agent panes. A UTF-8
 // locale makes tmux emit real tabs. It MUST be passed explicitly on the spawn — Bun.spawnSync does
 // NOT pick up a runtime `process.env` mutation — so this env is handed to every discovery subprocess.
@@ -487,26 +507,15 @@ function discoverTarget(ctx: Ctx): DiscoverResult {
 }
 
 // All tmux panes that host an agent, as /agent selection candidates (item 1).
-// Window names are fetched in a SEPARATE tmux call so the core PANE_FORMAT /
-// parsePaneList (relied on by inject + q→buttons) stays untouched; a pane with
-// no name falls back to its session name.
+// The window name comes from the CORE snapshot's #{window_name} field (tg-cli#75
+// fix C) — NOT a separate tmux call: that call skipped the UTF-8 locale env, so
+// under launchd the tab-mangle blanked every name and the picker fell back to the
+// cwd basename ("hyperide · claude" instead of "ext · claude"). A pane with no
+// usable name (empty / a bare default) is detected downstream (isBareWindowName)
+// and the label leans on the cwd basename there; here we fall back to the session
+// name only when the snapshot carried no window name at all.
 function listAgentCandidates(): AgentCandidate[] {
   const { panes, procs } = snapshot()
-  const nameByPane = new Map<string, string>()
-  try {
-    const r = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{window_name}"], {
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    if (r.exitCode === 0) {
-      for (const line of r.stdout.toString().split("\n")) {
-        const tab = line.indexOf("\t")
-        if (tab > 0) nameByPane.set(line.slice(0, tab), line.slice(tab + 1).trim())
-      }
-    }
-  } catch {
-    // tmux missing — candidates will just use session names as window names
-  }
   const out: AgentCandidate[] = []
   for (const pane of panes) {
     const found = findAgentInPane(pane, procs)
@@ -515,10 +524,10 @@ function listAgentCandidates(): AgentCandidate[] {
       paneId: pane.paneId,
       sessionName: pane.sessionName,
       windowIndex: pane.windowIndex,
-      windowName: nameByPane.get(pane.paneId) || pane.sessionName,
+      windowName: pane.windowName || pane.sessionName,
       agent: found.agent,
       // cwd — the picker derives a distinct project-dir label from its basename
-      // when window names collide (the "4 · claude" ×3 bug).
+      // when window names collide or are bare defaults (the "4 · claude" ×3 bug).
       panePath: pane.panePath,
     })
   }
@@ -1774,11 +1783,41 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   let consecutive409 = 0
   let warned409 = false
 
+  // paneId → most-recent outbound-send unix seconds, from routes.json. This is the
+  // SAME LRU/MRU activity signal the reply picker ranks by (tg-cli#75 fix B): the
+  // "most-recently-active agent" is the pane whose last `tg` send is newest.
+  const lastActiveByPane = (): Map<string, number> => {
+    const usage = aggregateUsage(parseRoutes(readFileOrNull(ctx.paths.routes)))
+    const out = new Map<string, number>()
+    for (const [paneId, u] of usage) out.set(paneId, u.lastTs)
+    return out
+  }
+
+  // The base discovery: §10 priority chain + liveness bookkeeping, NO auto-bind.
+  // Used by liveness/history paths that must NOT silently pick an agent. The
+  // no-reply auto-bind lives ONLY in discoverForInject below, so it can never leak
+  // onto the reply path (which uses handleReplyRoute's own #49 fail-closed, not
+  // discover()) or the history-attribution path.
   const discover = (): DiscoverResult => {
     const result = discoverTarget(ctx)
     // Agent panes existing — even ambiguous ones — keep the daemon alive.
     if (result.ok || result.candidates.length > 0) lastAgentSeenMs = Date.now()
     return result
+  }
+
+  // discover() PLUS the no-reply auto-bind (fix B, tg-cli#75): an otherwise-ambiguous
+  // NON-reply inbound binds to the most-recently-active agent rather than asking.
+  // This runs BEFORE #76's ambiguous-picker: a fresh message after a burst from one
+  // agent lands there directly; the picker fires only when auto-bind CANNOT resolve
+  // (no activity history, or a tie at the most-recent ts). The usage map is built
+  // LAZILY — only on a genuinely ambiguous base result — so the common ok/no-agent
+  // path never reads routes.json. This is the ONLY discovery used by the non-reply
+  // INJECT paths (injectViaTarget with autoBind). A no-history / tie case stays
+  // ambiguous → #76's picker (the unscoped fail-closed, #49).
+  const discoverForInject = (): DiscoverResult => {
+    const result = discover()
+    if (result.ok || result.reason !== "ambiguous") return result
+    return resolveAmbiguousByActivity(result, lastActiveByPane())
   }
 
   // Resolve a DiscoverResult's ambiguous `TargetPane[]` to the picker's
@@ -1808,18 +1847,27 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // Pick a target, run the plan; every failure mode turns into a TG reply so
   // the human is never left wondering whether the message landed. Returns
   // true only when the plan actually executed — the caller uses it to decide
-  // whether the source message earns its 👀 delivery receipt. On an AMBIGUOUS
-  // target (several live agents, none clearly the one) carrying routable text, it
-  // posts the agent PICKER (tappable buttons) and arms the pending route — a tap
-  // injects `deferText` verbatim, exactly like the /agent picker. A control verb
-  // with no text (inject-key /stop) has nothing to route through a tap, so it
-  // falls back to the picker WITHOUT a pending route (select-only) — the buttons
-  // still tell the human which agents are live instead of a text dump.
+  // whether the source message earns its 👀 delivery receipt.
+  //
+  // `autoBind` (default off, fix B/tg-cli#75) opts a HARMLESS content inject
+  // (text/photo/voice) into the no-reply auto-bind: an otherwise-ambiguous non-reply
+  // message lands on the most-recently-active agent FIRST (discoverForInject), so the
+  // picker below fires LESS often. It is OFF for control keys (/stop's Escape) —
+  // interrupting a GUESSED agent is the wrong default; an ambiguous control verb asks.
+  //
+  // When the target is STILL ambiguous (auto-bind off, or no recent agent to prefer)
+  // and the inject carries routable text, it posts the agent PICKER (tappable buttons,
+  // tg-cli#76) and arms the pending route — a tap injects `deferText` verbatim, exactly
+  // like the /agent picker. A control verb with no text (inject-key /stop) has nothing
+  // to route through a tap, so it falls back to the picker WITHOUT a pending route
+  // (select-only) — the buttons still tell the human which agents are live, not a
+  // text dump.
   const injectViaTarget = async (
     buildPlan: (paneId: string) => InjectStep[],
     deferText?: string,
+    autoBind = false,
   ): Promise<boolean> => {
-    const found = discover()
+    const found = autoBind ? discoverForInject() : discover()
     if (!found.ok) {
       // Routable text present (a real message) → route picker: a tap injects it
       // verbatim. Empty/whitespace deferText is treated as "no text" (same rule as
@@ -2357,7 +2405,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const noun = action.mediaKind === "photo" ? "photo" : "file"
     const msg = `sent ${noun}: ${dest}` + (action.caption ? `\n${action.caption}` : "")
     const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, msg, action.messageId)
-    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped)
+    // A non-reply photo/file → auto-bind to the last-active agent like a text msg.
+    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped, true)
   }
 
   // Voice note → text (inbound STT). Unconfigured? Walk the user through setup
@@ -2440,7 +2489,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       })
     }
     const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, quoted, action.messageId)
-    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped)
+    // A non-reply voice note → auto-bind to the last-active agent like a text msg.
+    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped, true)
   }
 
   // Best-effort delivery receipt (spec §10): 👀 on the source message. A
@@ -2528,12 +2578,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "agent-callback":
         return handleAgentCallback(action)
       case "inject-text":
-        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text), action.text)
+        // A plain non-reply message → opt into the no-reply auto-bind (fix B).
+        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text), action.text, true)
       case "reply-route":
         return handleReplyRoute(action)
       case "inject-key":
         return injectViaTarget((paneId) => buildKeyInjectPlan(paneId, action.key))
       case "kill-agent": {
+        // /kill sends SIGINT — a DESTRUCTIVE verb. It must NOT auto-bind to a
+        // guessed agent (killing the wrong one is unrecoverable); on an ambiguous
+        // fleet it asks (the select-picker below) rather than the no-reply auto-bind
+        // that resolves a harmless content inject. So this uses the base discover(),
+        // not discoverForInject (tg-cli#75 review).
         const found = discover()
         if (!found.ok) {
           // Ambiguous /kill (several live agents) → show the live agents as a

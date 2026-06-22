@@ -61,6 +61,22 @@ The picker reuses the `/agent` selection machinery (`pendingAgent`, `tga:`
 callbacks); the reply's pending message is stored `prewrapped` so the tap injects
 the anchored text verbatim (no double-wrap).
 
+### No-reply auto-bind to the most-recently-active agent (tg-cli#75)
+
+A plain message that is **not** a reply has no anchor to recognize, so it goes
+through `discoverTarget` → `pickTargetPaneFromSet`. With several live agent panes
+and no registration pinning one, that picker returns `ambiguous`. Rather than
+immediately asking, `resolveAmbiguousByActivity` binds the message to the
+**most-recently-active agent** — the pane whose last outbound `tg` send is newest,
+the SAME `aggregateUsage` LRU/MRU signal the reply picker ranks by. The CTO almost
+always means "the agent I was just talking to", so a fresh message after a burst
+of activity lands there without a tap. Precedence is preserved: a recognized reply
+route still wins first; the auto-bind only resolves an otherwise-ambiguous
+**non-reply**; and when there is genuinely **no** "last agent" to prefer — no
+activity history, or a tie at the most-recent timestamp — it stays ambiguous and
+the button picker / ambiguous-target reply fires (the unscoped fail-closed). The
+auto-bind REDUCES how often the picker fires; it never replaces it.
+
 Both paths honor defer-while-waiting: a reply to a pane with an open question is
 queued (✍️) and flushed when the question is answered (see
 `docs/q-buttons-prerequisites.md`).

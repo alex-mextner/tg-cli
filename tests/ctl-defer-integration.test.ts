@@ -41,7 +41,7 @@ case "$sub" in
   list-panes)
     # Fields passed as %s args — the pane id is literally '%1', which must NOT
     # reach the printf FORMAT string (printf would read it as a directive).
-    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '${PANE_ID}' '${PANE_PID}' 'claude' '${cwd}'
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '${PANE_ID}' '${PANE_PID}' 'claude' 'main' '${cwd}'
     ;;
   display-message)
     printf 'main\\n'

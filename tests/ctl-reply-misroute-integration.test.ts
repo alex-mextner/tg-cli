@@ -50,22 +50,16 @@ sub="$1"; shift
 mode=$(cat '${join(cfgDir, 'tmux-mode')}' 2>/dev/null || echo normal)
 case "$sub" in
   list-panes)
-    # window_name variant (#{pane_id}\\t#{window_name}) used by listAgentCandidates
-    name_format=0
-    for a in "$@"; do case "$a" in *window_name*) name_format=1;; esac; done
+    # 7-field core PANE_FORMAT carries #{window_name} (field 6, before the path).
+    # The window names ('3d', 'rig') are what the /agent picker labels by now.
     # "empty"   → no panes at all (the full launchd flake)
     # "partial" → ONLY %2 visible (origin %5 missing — the realistic misroute:
     #             the recognition snapshot can't confirm %5, but a later snapshot
     #             shows just the registration's last writer %2)
     # "normal"  → both agent panes visible
     if [ "$mode" = "empty" ]; then exit 0; fi
-    if [ "$name_format" = "1" ]; then
-      [ "$mode" = "partial" ] || printf '%s\\t%s\\n' '${PANE_3D}' '3d'
-      printf '%s\\t%s\\n' '${PANE_RIG}' 'rig'
-    else
-      [ "$mode" = "partial" ] || printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 's3d' '0' '${PANE_3D}' '${PID_3D}' 'claude' '${dir3d}'
-      printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'srig' '0' '${PANE_RIG}' '${PID_RIG}' 'claude' '${dirRig}'
-    fi
+    [ "$mode" = "partial" ] || printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 's3d' '0' '${PANE_3D}' '${PID_3D}' 'claude' '3d' '${dir3d}'
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'srig' '0' '${PANE_RIG}' '${PID_RIG}' 'claude' 'rig' '${dirRig}'
     ;;
   display-message)
     # -t <pane> ... #{pane_current_path}: echo that pane's path.
@@ -118,7 +112,16 @@ interface Harness {
   setMode: (m: 'normal' | 'empty' | 'partial') => void;
 }
 
-function makeHarness(): Harness {
+interface HarnessOpts {
+  // Omit the registration file so pickTargetPaneFromSet can't pin a single pane —
+  // a NON-reply text then sees BOTH agents and is genuinely ambiguous, exercising
+  // the no-reply auto-bind (fix B). The reply tests keep the default registration.
+  noRegistration?: boolean;
+  // routes.json entries (the LRU/MRU activity). Default: %5 sent message 500.
+  routes?: Array<{ id: number; paneId: string; cwd: string; ts: number }>;
+}
+
+function makeHarness(opts: HarnessOpts = {}): Harness {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-misroute-'));
   // Distinct project dirs so routeMatchesPane can confirm same-project for %5.
   const dir3d = join(cfgDir, 'proj-3d');
@@ -130,16 +133,17 @@ function makeHarness(): Harness {
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
   // Registration points at %2 (the [rig] agent) — the single global slot's last
-  // writer, exactly the pane the bug delivered the reply into.
-  writeFileSync(
-    join(cfgDir, 'tg-ctl.123.registration.json'),
-    JSON.stringify({ paneId: PANE_RIG, cwd: dirRig }),
-  );
-  // routes.json: outbound message 500 originated from the [3d] agent (%5).
-  writeFileSync(
-    join(cfgDir, 'tg-ctl.123.routes.json'),
-    JSON.stringify([{ id: 500, paneId: PANE_3D, cwd: dir3d, ts: Math.floor(Date.now() / 1000) }]),
-  );
+  // writer, exactly the pane the bug delivered the reply into. Omitted for the
+  // no-reply auto-bind tests so the non-reply path is genuinely ambiguous.
+  if (!opts.noRegistration) {
+    writeFileSync(
+      join(cfgDir, 'tg-ctl.123.registration.json'),
+      JSON.stringify({ paneId: PANE_RIG, cwd: dirRig }),
+    );
+  }
+  // routes.json: outbound message 500 originated from the [3d] agent (%5) by default.
+  const routes = opts.routes ?? [{ id: 500, paneId: PANE_3D, cwd: dir3d, ts: Math.floor(Date.now() / 1000) }];
+  writeFileSync(join(cfgDir, 'tg-ctl.123.routes.json'), JSON.stringify(routes));
 
   mkdirSync(join(cfgDir, 'bin'));
   writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmux(cfgDir, dir3d, dirRig, injectLog), { mode: 0o755 });
@@ -184,6 +188,8 @@ async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess>
 interface FakeTg {
   port: number;
   pushReply: (updateId: number, messageId: number, replyToId: number, text: string) => void;
+  // A plain NON-reply text message (no reply_to_message) — the fix-B path.
+  pushText: (updateId: number, messageId: number, text: string) => void;
   sends: Array<{ text: string; hasMarkup: boolean }>;
   reactions: Array<Record<string, unknown>>;
   stop: () => void;
@@ -238,6 +244,21 @@ function startFakeTg(): FakeTg {
             date: nowSec,
             text,
             reply_to_message: { message_id: replyToId, date: nowSec, chat: { id: 1 }, text: 'orig' },
+          },
+        },
+      ]);
+    },
+    pushText: (updateId, messageId, text) => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      queue.push([
+        {
+          update_id: updateId,
+          message: {
+            message_id: messageId,
+            from: { id: 1, first_name: 'Alex' },
+            chat: { id: 1 },
+            date: nowSec,
+            text, // NO reply_to_message → the no-reply auto-bind path (fix B)
           },
         },
       ]);
@@ -328,10 +349,17 @@ test('REGRESSION unrecognized + multi-agent: posts the picker (can\'t guess the 
 
   // Reply to an id NOT in routes.json → unrecognized. Two agents visible, so an
   // unrecognized reply correctly posts the picker (can't guess the origin).
+  // CONTRACT (tg-cli#75 fix B): the default harness HAS activity history (%5 sent
+  // message 500), yet a REPLY must STILL post the picker — the no-reply auto-bind
+  // lives only on the inject path (discoverForInject), NOT on handleReplyRoute. If
+  // a refactor ever let the auto-bind leak onto the reply path, this would inject
+  // into %5 instead of posting the picker, and this test would catch it (#49
+  // fail-closed on the reply path is preserved).
   tg.pushReply(601, 11, 999999, 'reply to an unknown message');
   await waitFor(() => tg.sends.some((s) => s.hasMarkup));
   expect(tg.sends.some((s) => s.hasMarkup)).toBe(true);
-  // No silent inject for an unrecognized multi-agent reply.
+  // No silent inject for an unrecognized multi-agent reply (NOT even into the
+  // most-recently-active %5 — the auto-bind must not touch the reply path).
   const lines = injectedLines(h.injectLog);
   expect(lines.length).toBe(0);
 }, 15_000);
@@ -355,4 +383,75 @@ test('REGRESSION single-agent: an UNRECOGNIZED reply with ONE visible agent inje
   // Injected directly into the single visible agent (%2) — and NO picker posted.
   expect(lines.some((l) => l.startsWith(`${PANE_RIG}\t`))).toBe(true);
   expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
+}, 15_000);
+
+// === tg-cli#75 fix B: a NON-reply inbound auto-binds to the most-recent agent ===
+
+test('NO-REPLY AUTO-BIND: an ambiguous non-reply message binds to the most-recently-active agent (%5), no picker', async () => {
+  // No registration → both agents visible and unpinned → a non-reply text is
+  // ambiguous. routes.json shows %5 (3d) spoke most recently, so the auto-bind
+  // lands the message in %5 WITHOUT posting a picker.
+  const h = makeHarness({ noRegistration: true });
+  const tg = startFakeTg();
+  h.setMode('normal'); // both agents visible
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+  procs.push(daemon);
+
+  tg.pushText(700, 20, 'a plain message, no reply');
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.some((s) => s.hasMarkup));
+  await Bun.sleep(300);
+
+  const lines = injectedLines(h.injectLog);
+  // Bound to %5 (the most-recently-active), NOT %2, and NO picker posted.
+  expect(lines.some((l) => l.startsWith(`${PANE_3D}\t`))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_RIG}\t`))).toBe(false);
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
+}, 15_000);
+
+test('NO-REPLY AUTO-BIND respects recency: %2 most-recent → binds to %2', async () => {
+  // Same shape, but now %2 (rig) is the most-recent sender → the auto-bind flips
+  // to %2. Proves it tracks ACTUAL recency, not a fixed pane.
+  const h = makeHarness({
+    noRegistration: true,
+    routes: [
+      { id: 500, paneId: PANE_3D, cwd: '/x', ts: 1000 },
+      { id: 501, paneId: PANE_RIG, cwd: '/y', ts: 2000 }, // %2 newer
+    ],
+  });
+  const tg = startFakeTg();
+  h.setMode('normal');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+  procs.push(daemon);
+
+  tg.pushText(701, 21, 'another plain message');
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.some((s) => s.hasMarkup));
+  await Bun.sleep(300);
+
+  const lines = injectedLines(h.injectLog);
+  expect(lines.some((l) => l.startsWith(`${PANE_RIG}\t`))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_3D}\t`))).toBe(false);
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
+}, 15_000);
+
+test('NO-REPLY no-history: an ambiguous non-reply with NO activity stays ambiguous → the picker fires', async () => {
+  // Empty routes.json → no "last agent" to prefer → the auto-bind must NOT guess.
+  // It stays ambiguous, so the agent button PICKER fires (tg-cli#76) — the safe
+  // outcome (unscoped fail-closed, #49). The auto-bind REDUCES how often the picker
+  // fires; with no recency to lean on, it does not suppress it.
+  const h = makeHarness({ noRegistration: true, routes: [] });
+  const tg = startFakeTg();
+  h.setMode('normal');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+  procs.push(daemon);
+
+  tg.pushText(702, 22, 'plain message, nobody spoke yet');
+
+  await waitFor(() => tg.sends.some((s) => s.hasMarkup));
+  await Bun.sleep(300);
+
+  // No silent inject anywhere; the daemon posted the button picker (reply_markup).
+  expect(injectedLines(h.injectLog).length).toBe(0);
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(true);
 }, 15_000);

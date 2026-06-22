@@ -150,8 +150,8 @@ function makeCfgDir(opts: {
       `echo "$@" >> '${tmuxLog}'`,
       'case "$1" in',
       '  list-panes)',
-      // session\twindow\tpane\tpid\tcommand\tpath
-      `    printf 'work\\t0\\t%%1\\t4242\\t2.1.150\\t/tmp/proj\\n' ;;`,
+      // session\twindow\tpane\tpid\tcommand\twindow_name\tpath
+      `    printf 'work\\t0\\t%%1\\t4242\\t2.1.150\\twork\\t/tmp/proj\\n' ;;`,
       '  *) : ;;',
       'esac',
       'exit 0',

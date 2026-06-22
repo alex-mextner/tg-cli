@@ -7,10 +7,10 @@ import type { Subprocess } from 'bun';
 // Integration coverage for the bare-`/agent` inline-keyboard PICKER (the CTO's
 // "где кнопки?" bug). The daemon runs the real `tmux list-panes` + `ps` queries,
 // so we put a FAKE tmux + ps on PATH that report THREE claude panes in the same
-// numeric window "4" with DISTINCT cwds — the exact reported shape that used to
-// render three indistinguishable "4 · claude" text rows and no buttons. We then:
+// numeric window "4" with DISTINCT user-set window names (rig / 3d / ext). We then:
 //   1. assert a bare `/agent` posts an inline keyboard (not plain text) whose
-//      buttons carry DISTINCT, cwd-derived labels (rig / 3d-cli / hyperide);
+//      buttons carry DISTINCT labels from the WINDOW NAMES (tg-cli#75 fix C) — not
+//      the cwd basenames the daemon used to fall back to ("hyperide");
 //   2. tap one button and assert the select-only confirmation (no inject).
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
@@ -31,19 +31,15 @@ mkdirSync(binDir);
 const tmuxLog = join(cfgDir, 'tmux-invocations.log');
 const tmuxScript = `#!/bin/sh
 # Only 'list-panes' is exercised by discovery; everything else is logged + no-op.
+# 7-field core PANE_FORMAT now carries #{window_name} (field 6, BEFORE the path) so
+# the picker labels by the user-set window name (tg-cli#75 fix C). Three claude
+# panes in the SAME numeric window "4" but with DISTINCT user-set window names
+# (rig / 3d / ext) — the CTO's exact setup ("rig", "3d") rather than the cwd dirs.
 case "$*" in
   *list-panes*)
-    case "$*" in
-      *pane_current_path*)
-        printf '4\\t0\\t%%5001\\t5001\\tnode\\t/Users/u/xp/rig\\n'
-        printf '4\\t0\\t%%5002\\t5002\\tnode\\t/Users/u/xp/3d-cli\\n'
-        printf '4\\t0\\t%%5003\\t5003\\tnode\\t/Users/u/work/hyperide\\n'
-        ;;
-      *window_name*)
-        # window names deliberately EMPTY (trailing tab) → session-name fallback "4"
-        printf '%%5001\\t\\n%%5002\\t\\n%%5003\\t\\n'
-        ;;
-    esac
+    printf '4\\t0\\t%%5001\\t5001\\tnode\\trig\\t/Users/u/xp/rig\\n'
+    printf '4\\t0\\t%%5002\\t5002\\tnode\\t3d\\t/Users/u/xp/3d-cli\\n'
+    printf '4\\t0\\t%%5003\\t5003\\tnode\\text\\t/Users/u/work/hyperide\\n'
     ;;
   *)
     echo "$*" >> "${tmuxLog}"
@@ -225,9 +221,12 @@ test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and 
   const buttons = markup!.inline_keyboard.flat();
   // one button per agent
   expect(buttons.length).toBe(3);
-  // DISTINCT, cwd-derived labels — the fix for three indistinguishable "4 · claude"
+  // DISTINCT labels from the user-set WINDOW NAMES (tg-cli#75 fix C) — NOT the cwd
+  // basenames (which would read "rig · claude", "3d-cli · claude", "hyperide ·
+  // claude"). The window name "ext" proves it: its cwd basename is "hyperide", so a
+  // cwd-derived label would say "hyperide", a window-name label says "ext".
   const labels = buttons.map((b) => b.text);
-  expect(labels).toEqual(['rig · claude', '3d-cli · claude', 'hyperide · claude']);
+  expect(labels).toEqual(['rig · claude', '3d · claude', 'ext · claude']);
   expect(new Set(labels).size).toBe(3);
   // each button is a tga: callback
   expect(buttons.every((b) => b.callback_data.startsWith('tga:'))).toBe(true);
