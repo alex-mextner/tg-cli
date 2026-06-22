@@ -965,11 +965,36 @@ function disableAutostart(ctx: Ctx): number {
 
 const MAX_HOOK_REQUEST_BYTES = 64 * 1024
 
+// How long an UNSCOPED forwarded question (paneId undefined — the hook ran
+// without TMUX_PANE) may stay open before it self-clears to "expired — answer in
+// terminal". This bound exists ONLY for the unscoped case, because an unscoped
+// question defers inbound for ALL panes (paneHasPendingQuestion's fail-closed
+// `if (!pb.req.paneId) return true`); without the bound it would wedge every
+// pane's routing forever. A SCOPED question gets NO timer and waits indefinitely
+// for its Telegram answer or socket close — that is safe (the timer is armed only
+// for the `!req.paneId` branch in handleHookSocketLine). Overridable via env only
+// so the integration tests can exercise the expiry without a real 110s wait;
+// production never sets it.
+const UNSCOPED_ABANDON_MS = (() => {
+  const raw = Number(process.env.TG_CTL_UNSCOPED_TIMEOUT_MS)
+  // setTimeout clamps any delay > 2^31-1 ms to ~1ms in Node/Bun, which would
+  // flip a huge "wait longer" override into "expire instantly" — the opposite of
+  // intent. Clamp to TIMEOUT_MAX so an oversized value still means "a long wait".
+  // A non-positive / non-numeric / absent value (incl. 0) falls back to the 110s
+  // default — 0 is NOT "expire instantly" (the bound is a backstop, never zero).
+  const TIMEOUT_MAX = 2_147_483_647
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, TIMEOUT_MAX) : 110_000
+})()
+
 interface PendingButton {
   req: ButtonRequest
   socket: Socket
   messageId: number | null
-  timer: ReturnType<typeof setTimeout>
+  // Only a SCOPED-less (unscoped) question arms an abandon timer; a scoped
+  // question waits forever, so its timer is undefined. clearTimeout(undefined)
+  // is a safe no-op, so every clearTimeout(entry.timer) call site is correct
+  // whether or not the timer was armed.
+  timer?: ReturnType<typeof setTimeout>
   finalText?: string
 }
 
@@ -1123,17 +1148,41 @@ async function handleHookSocketLine(
     req,
     socket,
     messageId: null,
-    timer: undefined as unknown as ReturnType<typeof setTimeout>,
   }
-  entry.timer = setTimeout(() => {
-    if (pending.get(pendingKey) !== entry) return
-    pending.delete(pendingKey)
-    activeKeys.delete(pendingKey)
-    if (entry.req.paneId) onAbandon(entry.req.paneId)
-    if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, "expired — answer in terminal")
-    else entry.finalText = "expired — answer in terminal"
-    socket.end("null\n")
-  }, 110_000)
+  // A SCOPED question (paneId known) waits INDEFINITELY for its Telegram answer
+  // or a socket close — no abandon timer. This is the CTO's daily lifeline: a
+  // forwarded question must not silently expire to "answer in terminal" while the
+  // human is still deciding. It is safe to wait forever because a scoped question
+  // defers inbound for ONLY its own pane (paneHasPendingQuestion's
+  // `pb.req.paneId === paneId` arm), and THAT pane's agent is itself blocked
+  // waiting on this very question — so the deferral never starves inbound the
+  // agent would otherwise process, and the queue flushes when the answer arrives.
+  //
+  // With the timer gone, the ONLY non-answer release for a scoped entry is the
+  // socket 'close' below (registered before any await, so a close at any point —
+  // even before messageId is set — is caught and dead-letters the pane). The hook
+  // client (`tg-ctl ask`) holds this socket open for the agent's whole block, so
+  // the agent's death closes the fd and frees the pane; a half-open socket would
+  // be the only way to strand it, the same fd the kernel reaps on process exit.
+  //
+  // An UNSCOPED question (paneId undefined) still gets the bound: it defers ALL
+  // panes (the fail-closed `if (!pb.req.paneId) return true`), so leaving it open
+  // forever WOULD wedge every pane's routing. The timer is the only thing that
+  // keeps that fail-closed defer from becoming a permanent all-pane wedge. The
+  // #55 reply-route picker resolves where a REPLY goes, not a question's own
+  // paneId — an unscoped question is never re-scoped, so this bound must stay.
+  if (!req.paneId) {
+    entry.timer = setTimeout(() => {
+      if (pending.get(pendingKey) !== entry) return
+      pending.delete(pendingKey)
+      activeKeys.delete(pendingKey)
+      // Unscoped → no onAbandon(paneId) (there is no pane to dead-letter); the
+      // editMessageText/finalText path mirrors the socket-close branch.
+      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, "expired — answer in terminal")
+      else entry.finalText = "expired — answer in terminal"
+      socket.end("null\n")
+    }, UNSCOPED_ABANDON_MS)
+  }
   pending.set(pendingKey, entry)
 
   let socketClosed = false
