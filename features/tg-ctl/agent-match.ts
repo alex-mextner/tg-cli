@@ -14,6 +14,10 @@ export interface AgentCandidate {
   windowIndex: number;
   windowName: string;
   agent: AgentKind;
+  // pane_current_path — the agent's cwd. Its basename (the project dir) is the
+  // human-meaningful distinguisher when several panes share a bare/numeric
+  // window name (e.g. three `claude` sessions in window "4" → "rig", "3d-cli").
+  panePath?: string;
 }
 
 // --- command parse ---
@@ -107,18 +111,53 @@ export interface MatchResult {
   confident: boolean;
 }
 
-// Fuzzy-match `selector` against candidate window names (phonetic). Returns the
-// tied best matches; `confident` when that set is a single pane.
+// Pick the tied-best candidates by a per-candidate scorer (lower = better).
+function bestMatches(
+  candidates: AgentCandidate[],
+  scoreFn: (c: AgentCandidate) => number,
+): AgentCandidate[] {
+  const scored = candidates
+    .map((c) => ({ c, score: scoreFn(c) }))
+    .filter((x) => x.score < Infinity)
+    .sort((a, b) => a.score - b.score);
+  if (scored.length === 0) return [];
+  const best = scored[0].score;
+  return scored.filter((x) => x.score === best).map((x) => x.c);
+}
+
+// A STRICT score for the cwd tier: ONLY an EXACT phonetic match (0) counts;
+// anything looser — prefix, substring, edit-distance — is rejected (Infinity).
+// The cwd is a fallback signal consulted for EVERY typed `/agent <selector>`, so
+// it must be conservative: a short/common typed token (`/agent dev`) must NOT
+// prefix-resonate into an unrelated project's cwd (`…/development`) and silently
+// route there. An exact cwd hit is exactly what the picker hands back (the full
+// project basename), so the bare-`/agent` round-trip is unaffected.
+function strictScoreOf(selKey: string, name: string): number {
+  return scoreOf(selKey, name) === 0 ? 0 : Infinity;
+}
+
+// Fuzzy-match `selector` (phonetic) against the candidates, in TWO tiers so the
+// window name always takes precedence over the cwd:
+//   1. window NAMES only (fuzzy) — unchanged legacy behaviour. `/agent deploy`
+//      against a real `deploy` window routes there and is never pulled into a tie
+//      by some other pane that merely sits in a `…/deploy` cwd.
+//   2. only if tier 1 found NOTHING, retry consulting each pane's cwd project dir
+//      too — but the cwd is matched STRICTLY (EXACT only). This makes a
+//      picker-suggested cwd selector route when the window names carry no usable
+//      signal — bare/numeric (the "4 · claude" ×3 bug) OR auto-renamed to the
+//      SAME meaningful name (tmux's default rename gives several claude panes an
+//      identical `node`/`claude` window name) — WITHOUT letting a fuzzy typo
+//      resonate into a different pane's cwd.
+// `confident` = the tied-best set is a single pane.
 export function matchWindows(selector: string, candidates: AgentCandidate[]): MatchResult {
   const selKey = phoneticKey(selector);
   if (!selKey) return { matches: [], confident: false };
-  const scored = candidates
-    .map((c) => ({ c, score: scoreOf(selKey, c.windowName) }))
-    .filter((x) => x.score < Infinity)
-    .sort((a, b) => a.score - b.score);
-  if (scored.length === 0) return { matches: [], confident: false };
-  const best = scored[0].score;
-  const matches = scored.filter((x) => x.score === best).map((x) => x.c);
+  let matches = bestMatches(candidates, (c) => scoreOf(selKey, c.windowName));
+  if (matches.length === 0) {
+    // Tier 1 found nothing → no window name matched, so rank purely by the STRICT
+    // cwd score (EXACT only).
+    matches = bestMatches(candidates, (c) => strictScoreOf(selKey, cwdBasename(c.panePath)));
+  }
   return { matches, confident: matches.length === 1 };
 }
 
@@ -153,6 +192,127 @@ export function groupBySession(candidates: AgentCandidate[], preserveOrder = fal
   });
 }
 
+// --- distinct candidate labels ---
+
+// The basename of a cwd path (the project dir). Trailing slashes are stripped so
+// `/Users/u/xp/rig/` → `rig`. An empty/root path yields ''.
+function cwdBasename(path: string | undefined): string {
+  if (!path) return '';
+  const trimmed = path.replace(/\/+$/, '');
+  if (!trimmed) return '';
+  const idx = trimmed.lastIndexOf('/');
+  return idx === -1 ? trimmed : trimmed.slice(idx + 1);
+}
+
+// A window name that does NOT distinguish a pane: empty, or the bare numeric
+// fallback tmux hands back when no name is set (the candidate builder falls back
+// to the session name, which is often just the window index like "4"). Such a
+// name can't tell two panes apart — the label must lean on the cwd instead.
+function isBareWindowName(name: string): boolean {
+  return name.trim() === '' || /^\d+$/.test(name.trim());
+}
+
+// Distinct, human-meaningful labels — one per candidate, SAME index order.
+//
+// The bug this fixes: three `claude` panes in window "4" all rendered as the
+// identical "4 · claude", impossible to tell apart. Strategy per candidate:
+//   - base = `<window> · <agent>` when the window name distinguishes it;
+//   - otherwise (bare/numeric name) or when several candidates would collide on
+//     the same base, append the cwd project dir → `<base> · <project>` (or just
+//     `<project> · <agent>` when the window name carries no signal at all).
+// A genuinely indistinguishable pair (same window, same agent, same cwd) gets
+// the pane id appended so the buttons are never two identical strings.
+export function distinctLabels(candidates: AgentCandidate[]): string[] {
+  let labels = candidates.map((c) => {
+    const project = cwdBasename(c.panePath);
+    if (isBareWindowName(c.windowName)) {
+      // The window name is useless — lead with the project when we have one, else
+      // the (possibly empty) window name. A genuinely empty lead would render a
+      // dangling "· claude", so fall back to the agent alone in that corner case.
+      const lead = project || c.windowName.trim();
+      return lead ? `${lead} · ${c.agent}` : c.agent;
+    }
+    return `${c.windowName} · ${c.agent}`;
+  });
+  // Resolve collisions in passes: any label still shared by >1 candidate gets the
+  // NEXT distinguisher appended (the cwd project dir, then — as the last resort —
+  // the pane id, which is unique per tmux server). A pass that adds the project
+  // only touches labels that don't already carry it (a bare window name already
+  // led with the project), so it never produces "rig · claude · rig".
+  const appendDistinguisher = (suffixOf: (c: AgentCandidate) => string): boolean => {
+    const counts = new Map<string, number>();
+    for (const l of labels) counts.set(l, (counts.get(l) ?? 0) + 1);
+    let changed = false;
+    labels = labels.map((label, i) => {
+      if ((counts.get(label) ?? 0) <= 1) return label;
+      const suffix = suffixOf(candidates[i]);
+      if (!suffix || label.endsWith(` · ${suffix}`) || label.startsWith(`${suffix} · `)) return label;
+      changed = true;
+      return `${label} · ${suffix}`;
+    });
+    return changed;
+  };
+  appendDistinguisher((c) => cwdBasename(c.panePath));
+  // Pane id always disambiguates (unique per server) — the final guarantee.
+  appendDistinguisher((c) => c.paneId);
+  return labels;
+}
+
+// The `/agent <selector>` token that addresses `target` after a bare-`/agent`
+// pick. CRITICAL: the handed-back command must actually route. A selector is a
+// SINGLE whitespace-free token (the command grammar takes the first token), so a
+// window name / project dir containing a space is unusable as-is — its first word
+// would tokenize off and the rest would leak into the message. Each candidate
+// token is therefore (a) rejected if it has whitespace, and (b) run through
+// `matchWindows` and accepted ONLY if it resolves CONFIDENTLY to this exact pane.
+// We try the window name first (most natural to type), then the cwd project dir
+// (the distinct label tapped); if neither qualifies we hand back the most
+// specific non-empty token, choosing a whitespace-free one when possible — the
+// worst case is the picker re-opens, never a silent misroute into another pane.
+export function suggestSelector(target: AgentCandidate, candidates: AgentCandidate[]): string {
+  // A selector is one whitespace-free token, so trim and require a single word.
+  const name = target.windowName.trim();
+  const project = cwdBasename(target.panePath).trim();
+  const singleToken = (s: string): boolean => s !== '' && !/\s/.test(s);
+  const match = (token: string): MatchResult | null => (singleToken(token) ? matchWindows(token, candidates) : null);
+  const routesToTarget = (m: MatchResult | null): boolean =>
+    m !== null && m.confident && m.matches[0].paneId === target.paneId;
+  // A token is SAFE to hand back if it does NOT confidently route to a DIFFERENT
+  // pane — re-typing it then either routes to target or (ambiguous/no-match)
+  // honestly re-opens the picker. A token that confidently routes ELSEWHERE is a
+  // silent misroute and must never be suggested.
+  const routesElsewhere = (m: MatchResult | null): boolean =>
+    m !== null && m.confident && m.matches[0].paneId !== target.paneId;
+
+  const nameMatch = match(name);
+  if (routesToTarget(nameMatch)) return name;
+  const projMatch = match(project);
+  if (routesToTarget(projMatch)) return project;
+  // Fallback (no token confidently routed to target): pick a single-token
+  // candidate that does NOT misroute. Re-running it just re-opens the picker.
+  if (singleToken(project) && !routesElsewhere(projMatch)) return project;
+  if (singleToken(name) && !routesElsewhere(nameMatch)) return name;
+  // Everything we have would misroute or is empty — hand back a placeholder so
+  // the instruction reads `… send: /agent <window> <message>` (the user edits it)
+  // rather than a command that silently lands in the wrong pane.
+  return '<window>';
+}
+
+// Drop candidates that name the SAME pane (same paneId) — a defensive guard
+// against a merged/flaky snapshot listing one pane twice. Keeps first-seen
+// order. A pane id is unique per tmux server, so this never collapses two real
+// distinct agents; it only removes a literal duplicate row.
+export function dedupeCandidates(candidates: AgentCandidate[]): AgentCandidate[] {
+  const seen = new Set<string>();
+  const out: AgentCandidate[] = [];
+  for (const c of candidates) {
+    if (seen.has(c.paneId)) continue;
+    seen.add(c.paneId);
+    out.push(c);
+  }
+  return out;
+}
+
 // --- selection button payload ---
 
 const AGENT_CALLBACK_PREFIX = 'tga';
@@ -175,23 +335,32 @@ export function buildAgentSelectMessage(
 ): AgentSelectPayload & { chat_id: number } {
   const groups = groupBySession(candidates, preserveOrder);
   const indexOf = new Map(candidates.map((c, i) => [c, i] as const));
+  // Labels are computed over ALL candidates so collision resolution is global
+  // (two panes in different sessions can still share a window name).
+  const labels = distinctLabels(candidates);
+  const labelOf = (c: AgentCandidate): string => labels[indexOf.get(c) ?? 0];
   const lines: string[] = [];
   const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
   for (const g of groups) {
     lines.push(`▸ ${g.session}`);
     for (const c of g.candidates) {
-      lines.push(`   ${c.windowName} · ${c.agent}`);
+      const label = labelOf(c);
+      lines.push(`   ${label}`);
       keyboard.push([
         {
-          text: `${c.windowName} · ${c.agent}`,
+          text: label,
           callback_data: `${AGENT_CALLBACK_PREFIX}:${token}:${indexOf.get(c)}`,
         },
       ]);
     }
   }
-  const head = messagePreview
+  // No message yet (bare `/agent`) → this is a PICKER, not a route: pick an
+  // agent first, then send the message. With a preview it's the route picker.
+  // `.trim()` so the header matches the daemon's `selectOnly` (message.trim()
+  // === '') decision exactly — a whitespace-only message is select-only too.
+  const head = messagePreview.trim()
     ? `Route to which agent?\n“${truncate(messagePreview, 80)}”`
-    : 'Route to which agent?';
+    : 'Pick an agent to address:';
   return {
     chat_id: chatId,
     text: `${head}\n\n${lines.join('\n')}`,

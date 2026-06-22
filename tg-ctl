@@ -17,8 +17,10 @@ import { createConnection, createServer, type Server, type Socket } from "net"
 import { dirname, join, resolve } from "path"
 import {
   buildAgentSelectMessage,
-  groupBySession,
+  dedupeCandidates,
+  distinctLabels,
   matchWindows,
+  suggestSelector,
   type AgentCandidate,
 } from "./features/tg-ctl/agent-match"
 import {
@@ -420,9 +422,13 @@ function listAgentCandidates(): AgentCandidate[] {
       windowIndex: pane.windowIndex,
       windowName: nameByPane.get(pane.paneId) || pane.sessionName,
       agent: found.agent,
+      // cwd — the picker derives a distinct project-dir label from its basename
+      // when window names collide (the "4 · claude" ×3 bug).
+      panePath: pane.panePath,
     })
   }
-  return out
+  // A pane id is unique per tmux server; dedupe guards a merged/flaky snapshot.
+  return dedupeCandidates(out)
 }
 
 // Execute an InjectStep plan. verify-pane re-runs discovery on a CURRENT
@@ -1325,6 +1331,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       messageId: number | null
       timer: ReturnType<typeof setTimeout>
       prewrapped?: boolean
+      // Bare `/agent` picker: there is no message yet. A tap must NOT inject an
+      // empty message — it confirms the choice and tells the user the selector
+      // to address it with (`/agent <selector> <message>`).
+      selectOnly?: boolean
     }
   >()
   let agentTokenSeq = 0
@@ -1637,11 +1647,43 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return res.ok ? { ok: true } : { ok: false, error: res.error }
   }
 
-  const routedReply = (windowName: string, agent: string, deferred?: boolean): string =>
-    deferred ? `⏳ queued for ${windowName} · ${agent} (answering a question)` : `→ ${windowName} · ${agent}`
+  // `label` identifies the chosen agent: `<window> · <agent>` for a direct/
+  // confident route, or the picker's DISTINCT label (cwd-derived) when several
+  // agents shared a bare window name — so the confirmation never reads an
+  // ambiguous "4 · claude".
+  const routedReply = (label: string, deferred?: boolean): string =>
+    deferred ? `⏳ queued for ${label} (answering a question)` : `→ ${label}`
 
-  // /agent routing (item 1): bare list, confident phonetic match → direct
-  // inject, ambiguous / no-selector → session-grouped selection buttons.
+  // The distinct label for `target` within `fleet` (cwd-derived disambiguation),
+  // falling back to `<window> · <agent>` if the target isn't in the fleet.
+  const labelFor = (target: AgentCandidate, fleet: AgentCandidate[]): string => {
+    const i = fleet.indexOf(target)
+    return i >= 0 ? distinctLabels(fleet)[i] : `${target.windowName} · ${target.agent}`
+  }
+
+  // Post the session-grouped inline-keyboard agent PICKER and arm its pending
+  // selection. `message` empty ⇒ a bare-`/agent` select-only picker (a tap
+  // confirms the choice, no inject); non-empty ⇒ the route picker (a tap injects
+  // the message). Returns false only when the picker send itself failed.
+  const postAgentPicker = async (subset: AgentCandidate[], message: string): Promise<boolean> => {
+    const token = `a${++agentTokenSeq}`
+    const payload = buildAgentSelectMessage(ctx.chatId, subset, token, message)
+    const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+    // Picker send failed (Telegram rejected / >4096-char list / network): do NOT
+    // store a pending route it can never resolve, and do NOT earn a 👀 receipt.
+    if (messageId === null) {
+      await sendMessage(ctx, "couldn't post the agent picker — try a narrower /agent <window>")
+      return false
+    }
+    const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
+    pendingAgent.set(token, { message, candidates: subset, messageId, timer, selectOnly: message.trim() === "" })
+    return true
+  }
+
+  // /agent routing (item 1): bare `/agent` → an inline-keyboard PICKER (tappable
+  // buttons, one distinct-labelled button per agent); confident phonetic match →
+  // direct inject; ambiguous / no-match → the same session-grouped picker
+  // carrying the pending message.
   const handleAgentRoute = async (action: Extract<Action, { kind: "agent-route" }>): Promise<boolean> => {
     const candidates = listAgentCandidates()
     if (candidates.length === 0) {
@@ -1649,10 +1691,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     if (!action.all.trim()) {
-      const groups = groupBySession(candidates)
-      const lines = groups.flatMap((g) => [`▸ ${g.session}`, ...g.candidates.map((c) => `   ${c.windowName} · ${c.agent}`)])
-      await sendMessage(ctx, `agents (address with /agent <window> <message>):\n${lines.join("\n")}`)
-      return true
+      // Bare `/agent`: show the tappable picker so the CTO can SELECT an agent
+      // (the buttons he asked for — "где кнопки?"), with distinct labels.
+      return postAgentPicker(candidates, "")
     }
 
     let subset = candidates
@@ -1673,7 +1714,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             return false
           }
           if (res.deferred) lastWasDeferred = true
-          await sendMessage(ctx, routedReply(target.windowName, target.agent, res.deferred))
+          await sendMessage(ctx, routedReply(labelFor(target, candidates), res.deferred))
           return true
         }
         subset = m.matches
@@ -1690,22 +1731,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return false
       }
       if (res.deferred) lastWasDeferred = true
-      await sendMessage(ctx, routedReply(target.windowName, target.agent, res.deferred))
+      await sendMessage(ctx, routedReply(labelFor(target, candidates), res.deferred))
       return true
     }
 
-    const token = `a${++agentTokenSeq}`
-    const payload = buildAgentSelectMessage(ctx.chatId, subset, token, message)
-    const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
-    // Picker send failed (Telegram rejected / >4096-char list / network): do NOT
-    // store a pending route it can never resolve, and do NOT earn a 👀 receipt.
-    if (messageId === null) {
-      await sendMessage(ctx, "couldn't post the agent picker — try a narrower /agent <window>")
-      return false
-    }
-    const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
-    pendingAgent.set(token, { message, candidates: subset, messageId, timer })
-    return true
+    return postAgentPicker(subset, message)
   }
 
   const handleAgentCallback = async (action: Extract<Action, { kind: "agent-callback" }>): Promise<boolean> => {
@@ -1728,6 +1758,32 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     pendingAgent.delete(action.token)
     clearTimeout(pending.timer)
+    // Bare-`/agent` select-only picker: there is no message to inject. Confirm
+    // the choice and hand back the exact selector to address this agent — the
+    // selector matchWindows keys on is the window name (its cwd basename when the
+    // window name is bare/numeric, which still phonetically matches that pane).
+    if (pending.selectOnly) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "selected")
+      if (pending.messageId !== null) {
+        // Verify the suggested selector against the FULL live fleet, not the
+        // pending subset: an ambiguous `/agent <sel>` (no message) narrows
+        // `pending.candidates` to the matches, but the user's follow-up `/agent
+        // <selector> <message>` re-resolves against ALL agents — a pane OUTSIDE
+        // the subset whose window name matches the suggestion would otherwise be
+        // a silent misroute (review finding). A fresh snapshot that still
+        // contains the chosen pane is authoritative; if it raced away, fall back
+        // to the pending subset (the picker re-opens — safe).
+        const live = listAgentCandidates()
+        const fleet = live.some((c) => c.paneId === target.paneId) ? live : pending.candidates
+        const liveTarget = fleet.find((c) => c.paneId === target.paneId) ?? target
+        const selector = suggestSelector(liveTarget, fleet)
+        // Show the DISTINCT label (not the ambiguous "4 · claude") so the user
+        // sees which agent they picked, then the exact command to address it.
+        const label = labelFor(liveTarget, fleet)
+        void editMessageText(ctx, pending.messageId, `selected ${label} — send: /agent ${selector} <message>`)
+      }
+      return true
+    }
     // A reply's pending text already carries its wrap/anchor → inject verbatim;
     // a /agent message is raw → wrap it. Both defer behind an open question. A
     // callback edits its own prompt, so it must NOT set lastWasDeferred.
@@ -1748,7 +1804,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       void editMessageText(
         ctx,
         pending.messageId,
-        res.ok ? routedReply(target.windowName, target.agent, res.deferred) : `inject failed: ${res.error ?? ""}`,
+        res.ok ? routedReply(labelFor(target, pending.candidates), res.deferred) : `inject failed: ${res.error ?? ""}`,
       )
     }
     return res.ok
