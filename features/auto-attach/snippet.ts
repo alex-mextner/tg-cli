@@ -62,6 +62,18 @@ export function parseLineSpec(token: string): LineSpec | null {
   return null;
 }
 
+// A path+line spec written in prose is usually glued to wrapping punctuation:
+// `(src/a.ts:42)`, `src/a.ts:42.`, `` `src/a.ts:42` ``, `<src/a.ts:42>`,
+// `src/a.ts:10-20),`. parseLineSpec anchors every form with `$`, so any leading opener
+// or trailing closer/sentence punctuation makes it return null and the excerpt is
+// silently dropped (tg#29). Strip a run of leading openers and a run of trailing
+// closers/sentence punctuation so the bare `path:line` underneath re-parses. A clean
+// token passes through unchanged; INTERIOR chars are untouched, so `path:10-20`,
+// `path:42:5`, and a `http://…` colon survive.
+export function stripSpecWrappers(token: string): string {
+  return token.replace(/^[(\[{<'"`]+/, "").replace(/[)\]}>'"`.,;!?]+$/, "");
+}
+
 function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
 }

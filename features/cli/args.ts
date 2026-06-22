@@ -7,7 +7,7 @@
 import { readdirSync, statSync } from 'fs';
 import { isAbsolute, join, resolve } from 'path';
 import { isNeverAttach } from '../auto-attach/denylist';
-import { parseLineSpec } from '../auto-attach/snippet';
+import { parseLineSpec, stripSpecWrappers } from '../auto-attach/snippet';
 import { buildFileIndex, isRecursiveCandidate, matchFromIndex, type ListDir } from '../auto-attach/recursive';
 import { looksPathLike, resolveAcrossWorktrees } from '../auto-attach/worktree';
 import { validateTag } from '../render/tag';
@@ -401,7 +401,10 @@ export function parseArgs(
       let resolved = resolveWithWorktrees(seg);
       let spec: ItemLineSpec | undefined;
       if (!resolved) {
-        const ls = parseLineSpec(seg);
+        // Try the raw token, then the same token with wrapping punctuation stripped
+        // (`(file.ts:42)`, `file.ts:42.`, `` `file.ts:42` ``) so a spec glued to prose
+        // punctuation still resolves (tg#29). The full original `seg` stays the caption token.
+        const ls = parseLineSpec(seg) ?? parseLineSpec(stripSpecWrappers(seg));
         if (ls) {
           const baseResolved = resolveWithWorktrees(ls.path);
           if (baseResolved) {

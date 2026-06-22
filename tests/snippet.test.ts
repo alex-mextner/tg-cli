@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import {
   parseLineSpec,
+  stripSpecWrappers,
   extractContextRange,
   shiftTab,
   renderQuote,
@@ -33,6 +34,25 @@ test('parseLineSpec: file.ts:42:5 → line + column', () => {
     endLine: 42,
     col: 5,
   });
+});
+
+// tg#29: a spec glued to prose punctuation parses after stripping wrappers.
+test('stripSpecWrappers: strips leading openers + trailing punctuation, keeps interior', () => {
+  expect(stripSpecWrappers('(src/a.ts:42)')).toBe('src/a.ts:42');
+  expect(stripSpecWrappers('src/a.ts:42.')).toBe('src/a.ts:42');
+  expect(stripSpecWrappers('`src/a.ts:42`')).toBe('src/a.ts:42');
+  expect(stripSpecWrappers('<src/a.ts:42>')).toBe('src/a.ts:42');
+  expect(stripSpecWrappers('src/a.ts:10-20),')).toBe('src/a.ts:10-20');
+  // interior untouched: range, line:col, and a scheme colon all survive
+  expect(stripSpecWrappers('src/a.ts:42:5')).toBe('src/a.ts:42:5');
+  expect(stripSpecWrappers('src/a.ts:42')).toBe('src/a.ts:42'); // clean token unchanged
+});
+
+test('parseLineSpec ∘ stripSpecWrappers: wrapped specs re-parse', () => {
+  const want = { path: 'src/a.ts', startLine: 42, endLine: 42, col: undefined };
+  for (const wrapped of ['(src/a.ts:42)', 'src/a.ts:42.', '`src/a.ts:42`', '<src/a.ts:42>']) {
+    expect(parseLineSpec(stripSpecWrappers(wrapped))).toEqual(want);
+  }
 });
 
 test('parseLineSpec: no spec → null', () => {
