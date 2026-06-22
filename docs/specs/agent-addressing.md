@@ -60,12 +60,15 @@ selector usable; this is deliberately a *light* fold, not full Metaphone.
 
 When a choice is needed (a bare `/agent`, OR an ambiguous/no-match route),
 `buildAgentSelectMessage(chatId, candidates, token, preview)` builds a message
-whose text lists the candidates grouped by session (`▸ <session>` then
-`  <label>`) and one inline button per candidate, each labelled with `<label>`.
-Callback data is `tga:<token>:<index>` (index into the candidate list). `token`
-keys the daemon's `pendingAgent` store (message + candidate subset + button
-message id + `selectOnly`), TTL 10 min. With no `preview` (bare `/agent`) the
-header is `Pick an agent to address:`; with one it is `Route to which agent?`.
+that is a SHORT prompt plus one inline button per candidate, each labelled with
+`<label>`. The message text is the prompt ONLY — there is **no** per-agent text
+list and **no** `▸ <session>` group header (both were redundant noise that just
+duplicated the buttons; #63). The buttons carry the distinct labels; they stay
+grouped by session for a stable row order. Callback data is `tga:<token>:<index>`
+(index into the candidate list). `token` keys the daemon's `pendingAgent` store
+(message + candidate subset + button message id + `selectOnly`), TTL 10 min. With
+no `preview` (bare `/agent`) the prompt is `Pick an agent:`; with one it is
+`Route to which agent?` followed by the quoted message preview.
 
 ### Distinct labels (`distinctLabels`)
 

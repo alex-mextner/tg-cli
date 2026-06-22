@@ -322,10 +322,13 @@ export interface AgentSelectPayload {
   reply_markup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 }
 
-// Build the "pick an agent" message: the grouped candidate list in the text, one
-// button per candidate (labelled `window · agent`), rows grouped by session.
-// `token` keys the daemon's pending-message store; callback data is
-// `tga:<token>:<index>` where index is into `candidates` (button order).
+// Build the "pick an agent" message: a SHORT prompt + one inline-keyboard button
+// per candidate (labelled with its distinct `window · agent` label). The buttons
+// carry the labels, so the message text is intentionally just the prompt — NO
+// per-agent text list and NO `▸ <session>` group header (both were redundant
+// noise duplicating the buttons; see #63). Buttons stay grouped by session for a
+// stable row order. `token` keys the daemon's pending-message store; callback
+// data is `tga:<token>:<index>` where index is into `candidates` (button order).
 export function buildAgentSelectMessage(
   chatId: number,
   candidates: AgentCandidate[],
@@ -339,16 +342,12 @@ export function buildAgentSelectMessage(
   // (two panes in different sessions can still share a window name).
   const labels = distinctLabels(candidates);
   const labelOf = (c: AgentCandidate): string => labels[indexOf.get(c) ?? 0];
-  const lines: string[] = [];
   const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
   for (const g of groups) {
-    lines.push(`▸ ${g.session}`);
     for (const c of g.candidates) {
-      const label = labelOf(c);
-      lines.push(`   ${label}`);
       keyboard.push([
         {
-          text: label,
+          text: labelOf(c),
           callback_data: `${AGENT_CALLBACK_PREFIX}:${token}:${indexOf.get(c)}`,
         },
       ]);
@@ -358,12 +357,12 @@ export function buildAgentSelectMessage(
   // agent first, then send the message. With a preview it's the route picker.
   // `.trim()` so the header matches the daemon's `selectOnly` (message.trim()
   // === '') decision exactly — a whitespace-only message is select-only too.
-  const head = messagePreview.trim()
+  const text = messagePreview.trim()
     ? `Route to which agent?\n“${truncate(messagePreview, 80)}”`
-    : 'Pick an agent to address:';
+    : 'Pick an agent:';
   return {
     chat_id: chatId,
-    text: `${head}\n\n${lines.join('\n')}`,
+    text,
     reply_markup: { inline_keyboard: keyboard },
   };
 }

@@ -234,6 +234,10 @@ test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and 
   // it is a PICKER prompt, NOT the old "address with /agent <window> <message>" text
   expect(String(picker.text)).toContain('Pick an agent');
   expect(String(picker.text)).not.toContain('address with /agent');
+  // buttons-only (#63): the message text must NOT duplicate the buttons — no
+  // `▸ <window>` group header and no per-agent label line in the body.
+  expect(String(picker.text)).not.toContain('▸');
+  for (const label of labels) expect(String(picker.text)).not.toContain(label);
 
   // 2. The tap was acknowledged as a selection and the prompt was edited to the
   //    select-only confirmation — nothing was injected (no tmux send-keys).
