@@ -35,7 +35,7 @@ import {
 } from "./features/tg-ctl/autostart"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
-import { findAgentInPane, panesWithRetry, parsePaneList, parseProcList, pickTargetPane } from "./features/tg-ctl/discover"
+import { findAgentInPane, panesWithRetry, parsePaneList, parseProcList, pickTargetPaneFromSet } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
 import { botIdFromToken, ctlPaths, pidStatus, readPidFile } from "./features/tg-ctl/lock"
 import {
@@ -43,14 +43,28 @@ import {
   callbackRequestId,
   formatAgentHookOutput,
   questionCapability,
-  registrationAllowsHook,
+  registrationSetAllowsHook,
   resolveButtonCallback,
   type ButtonRequest,
 } from "./features/tg-ctl/questions"
+import {
+  parseRegistrations,
+  pruneRegistrations,
+  serializeRegistrations,
+  upsertRegistration,
+} from "./features/tg-ctl/registration-store"
 import { claudeHooksInstalled, withClaudeHooks } from "./features/tg-ctl/hook-install"
 import { normalizeHookPayload, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
-import { aggregateUsage, orderByLruMru, parseRoutes, recognizeRoute, routeMatchesPane } from "./features/tg-ctl/routes"
+import {
+  aggregateUsage,
+  fsRoutesLockIo,
+  orderByLruMru,
+  parseRoutes,
+  recognizeRoute,
+  routeMatchesPane,
+  withRoutesLock,
+} from "./features/tg-ctl/routes"
 import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
 import { inboundHistoryRecords } from "./features/replies/inbound"
 import { stepUpdates } from "./features/tg-ctl/updates"
@@ -353,12 +367,54 @@ function snapshot(): { panes: PaneInfo[]; procs: ProcInfo[] } {
   return { panes, procs }
 }
 
-function readRegistration(paths: CtlPaths): Registration | null {
+// Read the per-pane registration SET (tg-cli#67). Tolerates the legacy
+// single-object file shape (a daemon upgraded in place keeps the live
+// registration written by the previous version — see parseRegistrations).
+// `livePaneIds` prunes entries whose pane is gone; pass null to skip pruning
+// (no snapshot available, or a momentarily-empty/flaky one — pruning on empty
+// would wipe every live session at once).
+function readRegistrations(paths: CtlPaths, livePaneIds: Set<string> | null = null): Registration[] {
+  let raw: string | null
   try {
-    const parsed = JSON.parse(readFileSync(paths.registration, "utf8"))
-    return parsed && typeof parsed === "object" ? (parsed as Registration) : null
+    raw = readFileSync(paths.registration, "utf8")
   } catch {
-    return null
+    return []
+  }
+  return pruneRegistrations(parseRegistrations(raw), livePaneIds)
+}
+
+// Durably PRUNE dead-pane entries from the on-disk store (review finding): the
+// daemon reads-and-prunes in memory every poll, but without writing the pruned
+// set back, dead entries accumulate forever — and upsertRegistration's cap
+// evicts by insertion order, so 100 piled-up dead entries would eventually evict
+// a still-LIVE session and silently drop its questions (the exact failure this
+// feature fights). So when discovery sees the store shrink under a TRUSTWORTHY
+// live-pane set, persist the smaller set. Race-safe: re-read + re-prune INSIDE
+// the registration lock, so a `tg start` that upserted between the poll read and
+// here is not clobbered. Best-effort and off the hot path — never throws, and is
+// skipped entirely on a flaky/empty snapshot (livePaneIds === null).
+function pruneRegistrationsOnDisk(paths: CtlPaths, livePaneIds: Set<string> | null): void {
+  if (livePaneIds === null) return
+  try {
+    withRoutesLock(
+      fsRoutesLockIo(`${paths.registration}.lock`),
+      () => {
+        let raw: string | null
+        try {
+          raw = readFileSync(paths.registration, "utf8")
+        } catch {
+          return
+        }
+        const current = parseRegistrations(raw)
+        const pruned = pruneRegistrations(current, livePaneIds)
+        if (pruned.length !== current.length) {
+          writeFileSync(paths.registration, serializeRegistrations(pruned))
+        }
+      },
+      { onContended: "skip" }, // a live writer holds the lock — let it; we prune next poll
+    )
+  } catch {
+    // best-effort prune — never break the poll loop
   }
 }
 
@@ -371,8 +427,19 @@ function readRegistration(paths: CtlPaths): Registration | null {
 let lastNoAgentLogMs = 0
 function discoverTarget(ctx: Ctx): DiscoverResult {
   const { panes, procs } = snapshot()
-  const reg = readRegistration(ctx.paths)
-  const result = pickTargetPane(panes, procs, reg, reg?.sessionName ?? ctx.cfg.session)
+  // Prune dead-pane entries against the live snapshot, but ONLY when the snapshot
+  // actually has panes — an empty/flaky read must not wipe every registration
+  // (panesWithRetry already retried the transient empty case).
+  const livePaneIds = panes.length > 0 ? new Set(panes.map((p) => p.paneId)) : null
+  const regs = readRegistrations(ctx.paths, livePaneIds)
+  // Persist the prune so dead-pane entries can't accumulate to the cap and evict
+  // a live session (review finding). Off the hot path, lock-guarded, no-op when
+  // nothing was pruned or the snapshot is untrustworthy.
+  pruneRegistrationsOnDisk(ctx.paths, livePaneIds)
+  // An explicit `tg-ctl start --session X` (the fresher, more specific intent)
+  // outranks config.yaml's control.session; the auto-start path never sets it.
+  const sessionPin = regs.find((r) => r.sessionName)?.sessionName ?? ctx.cfg.session
+  const result = pickTargetPaneFromSet(panes, procs, regs, sessionPin)
   // OBSERVABILITY: a "no-agent" result is what produces the misleading "Claude Code not in tmux"
   // reply. It has been an UNREPRODUCIBLE intermittent in the launchd runtime, so log the snapshot
   // shape on it — the next occurrence then shows the REAL cause (tmux-empty vs ps-empty vs
@@ -382,9 +449,10 @@ function discoverTarget(ctx: Ctx): DiscoverResult {
     if (now - lastNoAgentLogMs > 10_000) {
       lastNoAgentLogMs = now
       const agentPanes = panes.filter((p) => findAgentInPane(p, procs)).length
+      const regSummary = regs.length > 0 ? regs.map((r) => `${r.paneId ?? "?"}@${r.cwd ?? "?"}`).join(",") : "none"
       log(
         `no-agent reply: panes=${panes.length} procs=${procs.length} agent-panes=${agentPanes} ` +
-          `reg=${reg ? `${reg.paneId ?? "?"}@${reg.cwd ?? "?"}` : "none"}`,
+          `regs=${regs.length} reg=${regSummary}`,
       )
     }
   }
@@ -633,13 +701,24 @@ function composeStatus(ctx: Ctx): string {
         ? `tg-ctl: not running (stale pidfile, pid ${pid}) — bot ${ctx.botId}`
         : `tg-ctl: not running — bot ${ctx.botId}`,
   ]
-  const reg = readRegistration(ctx.paths)
-  lines.push(
-    reg
-      ? `registration: pane ${reg.paneId ?? "?"}, cwd ${reg.cwd ?? "?"}` +
-          (reg.sessionName ? `, session ${reg.sessionName}` : "")
-      : "registration: none",
-  )
+  // Show every LIVE registered session (the per-pane set), not just one — a
+  // multi-session operator must SEE that all their panes are registered to
+  // forward. Prune against the live snapshot so closed panes don't show as ghosts
+  // (review finding); a flaky/empty snapshot skips pruning (shows all, fail-safe).
+  const statusPanes = snapshot().panes
+  const statusLive = statusPanes.length > 0 ? new Set(statusPanes.map((p) => p.paneId)) : null
+  const regs = readRegistrations(ctx.paths, statusLive)
+  if (regs.length === 0) {
+    lines.push("registrations: none")
+  } else {
+    lines.push(`registrations: ${regs.length}`)
+    for (const reg of regs) {
+      lines.push(
+        `  - pane ${reg.paneId ?? "?"}, cwd ${reg.cwd ?? "?"}` +
+          (reg.sessionName ? `, session ${reg.sessionName}` : ""),
+      )
+    }
+  }
   const found = discoverTarget(ctx)
   lines.push(
     found.ok
@@ -726,13 +805,42 @@ function installHooks(home: string): void {
 
 function startLauncher(ctx: Ctx, flags: StartFlags): void {
   mkdirSync(ctx.configDir, { recursive: true })
-  // Registration is written synchronously EVEN IF the daemon already runs —
-  // a fresh `tg` call re-targets a long-lived daemon at the current pane.
+  // UPSERT this session's entry into the per-pane registration SET (tg-cli#67),
+  // keyed by paneId — instead of OVERWRITING one global slot. A `tg` send from
+  // any OTHER live session no longer clobbers this session's registration, so
+  // every concurrently-registered session's questions keep forwarding. Written
+  // synchronously EVEN IF the daemon already runs — a fresh `tg` call re-targets
+  // a long-lived daemon at the current pane (its own entry only).
   const reg: Registration = { registeredAt: Math.floor(Date.now() / 1000) }
   if (flags.paneId) reg.paneId = flags.paneId
   if (flags.cwd) reg.cwd = flags.cwd
   if (flags.session) reg.sessionName = flags.session
-  writeFileSync(ctx.paths.registration, JSON.stringify(reg))
+  // Serialize the read-modify-write across concurrent `tg start`s (two sessions
+  // racing the upsert would last-writer-wins-clobber each other's entry — the
+  // very lost-update the routes lock was built for). Same O_EXCL lockfile +
+  // PID-liveness break; onContended:'skip' loses only THIS start's bookkeeping,
+  // never another session's entry. Best-effort: a write failure must never block
+  // the daemon launch below, so the whole RMW is swallowed.
+  try {
+    withRoutesLock(
+      fsRoutesLockIo(`${ctx.paths.registration}.lock`),
+      () => {
+        let raw: string | null
+        try {
+          raw = readFileSync(ctx.paths.registration, "utf8")
+        } catch {
+          raw = null
+        }
+        writeFileSync(
+          ctx.paths.registration,
+          serializeRegistrations(upsertRegistration(parseRegistrations(raw), reg)),
+        )
+      },
+      { onContended: "skip" },
+    )
+  } catch {
+    // best-effort registration bookkeeping — never block the daemon launch
+  }
 
   // No lock, no pipes (see header). The daemon flocks first and exits 0 if
   // another instance holds the bot, so double-starts are a cheap no-op.
@@ -1059,8 +1167,8 @@ function canForwardButtonRequest(req: ButtonRequest): boolean {
   return !(req.agent === "codex" && req.kind !== "permission")
 }
 
-function hookMatchesRegistration(reg: Registration | null, req: ButtonRequest): boolean {
-  return registrationAllowsHook(reg, req, resolve)
+function hookMatchesRegistration(regs: Registration[], req: ButtonRequest): boolean {
+  return registrationSetAllowsHook(regs, req, resolve)
 }
 
 // One-line, greppable descriptors for the ask-forward log. They identify which
@@ -1071,9 +1179,11 @@ function describeAskRequest(req: ButtonRequest): string {
   return `agent=${req.agent} kind=${req.kind} req=${req.requestId} pane=${req.paneId ?? "-"} cwd=${req.cwd ?? "-"} session=${req.sessionName ?? "-"}`
 }
 
-function describeRegistration(reg: Registration | null): string {
-  if (!reg) return "none"
-  return `pane=${reg.paneId ?? "-"} cwd=${reg.cwd ?? "-"} session=${reg.sessionName ?? "-"}`
+function describeRegistration(regs: Registration[]): string {
+  if (regs.length === 0) return "none"
+  return regs
+    .map((reg) => `pane=${reg.paneId ?? "-"} cwd=${reg.cwd ?? "-"} session=${reg.sessionName ?? "-"}`)
+    .join(" | ")
 }
 
 function describeHookLine(line: string): string {
@@ -1154,10 +1264,16 @@ async function handleHookSocketLine(
 
   log(`ask-forward arrived: ${describeAskRequest(req)}`)
 
-  const registration = readRegistration(ctx.paths)
-  if (!hookMatchesRegistration(registration, req)) {
+  // The per-pane registration SET: the question forwards when ITS pane matches
+  // ANY registered entry, so EVERY concurrently-registered session forwards
+  // (tg-cli#67), not only the single global last-writer. No liveness pruning
+  // here — the asking pane is itself live (it is blocking on this very question),
+  // and an unrelated dead-pane entry can never match this req's paneId, so a
+  // prune would only cost an extra tmux read on the hot forward path.
+  const registrations = readRegistrations(ctx.paths)
+  if (!hookMatchesRegistration(registrations, req)) {
     log(
-      `ask-forward dropped: reason=not-registered ${describeAskRequest(req)} reg=${describeRegistration(registration)}`,
+      `ask-forward dropped: reason=not-registered ${describeAskRequest(req)} reg=${describeRegistration(registrations)}`,
     )
     socket.end("null\n")
     return

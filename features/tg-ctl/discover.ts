@@ -188,6 +188,57 @@ export function pickTargetPane(
   return { ok: false, reason: 'no-agent', candidates: [] };
 }
 
+// Set-aware target picker (tg-cli#67): the same §10 priority chain, but tier 1
+// ("registration paneId") and tier 3 ("registration cwd") match against the
+// per-pane registration SET instead of a single global slot. Behavior with ONE
+// registered entry is byte-identical to pickTargetPane(reg); with SEVERAL
+// registered live agent panes a tier returns 'ambiguous' (its narrowed
+// candidates) rather than silently picking — a FRESH non-reply inbound to
+// multiple registered agents is genuinely ambiguous, and disambiguating it is
+// forum-topics' job, not this picker's (#67 scope note). The recognized-reply
+// path (#55) and the unscoped fail-closed (#49) live in the daemon's routing
+// above this and are unaffected.
+export function pickTargetPaneFromSet(
+  panes: PaneInfo[],
+  procs: ProcInfo[],
+  regs: Registration[],
+  fixedSession?: string,
+): DiscoverResult {
+  const candidates: TargetPane[] = [];
+  for (const pane of panes) {
+    const found = findAgentInPane(pane, procs);
+    if (found) candidates.push({ pane, agent: found.agent, agentPid: found.pid });
+  }
+
+  // Tier 1: live agent panes that ARE registered (paneId in the set). One → pick;
+  // several → ambiguous among exactly those (never auto-collapse onto one).
+  const registeredPaneIds = new Set(regs.map((r) => r.paneId).filter((p): p is string => !!p));
+  if (registeredPaneIds.size > 0) {
+    const hits = candidates.filter((c) => registeredPaneIds.has(c.pane.paneId));
+    if (hits.length === 1) return { ok: true, target: hits[0] };
+    if (hits.length > 1) return { ok: false, reason: 'ambiguous', candidates: hits };
+  }
+
+  if (fixedSession) {
+    const inSession = candidates.filter((c) => c.pane.sessionName === fixedSession);
+    if (inSession.length === 1) return { ok: true, target: inSession[0] };
+    if (inSession.length > 1) return { ok: false, reason: 'ambiguous', candidates: inSession };
+  }
+
+  // Tier 3: panes whose path matches ANY registered entry's cwd (the paneless /
+  // legacy fallback entries route here).
+  const registeredCwds = new Set(regs.map((r) => r.cwd).filter((c): c is string => !!c));
+  if (registeredCwds.size > 0) {
+    const byCwd = candidates.filter((c) => registeredCwds.has(c.pane.panePath));
+    if (byCwd.length === 1) return { ok: true, target: byCwd[0] };
+    if (byCwd.length > 1) return { ok: false, reason: 'ambiguous', candidates: byCwd };
+  }
+
+  if (candidates.length === 1) return { ok: true, target: candidates[0] };
+  if (candidates.length > 1) return { ok: false, reason: 'ambiguous', candidates };
+  return { ok: false, reason: 'no-agent', candidates: [] };
+}
+
 // Resilient pane query (tg-ctl discovery): run `tmux list-panes -a` and parse, RETRYING the one
 // transient flake. In the daemon's long-running launchd runtime the tmux query was observed to
 // intermittently exit 0 with an EMPTY pane list (a momentary connect to the wrong/empty server) —

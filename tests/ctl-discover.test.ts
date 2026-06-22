@@ -5,6 +5,7 @@ import {
   findAgentInPane,
   findAgentInAncestry,
   pickTargetPane,
+  pickTargetPaneFromSet,
   panesWithRetry,
 } from '../features/tg-ctl/discover';
 import type { PaneInfo, ProcInfo } from '../features/tg-ctl/types';
@@ -309,6 +310,72 @@ test('no agent anywhere → no-agent with empty candidates', () => {
   const panes = [pane('work', 0, '%2', 300, '-zsh', '/Users/ultra')];
   const r = pickTargetPane(panes, PROCS, { paneId: '%2', cwd: '/Users/ultra' }, 'work');
   expect(r).toEqual({ ok: false, reason: 'no-agent', candidates: [] });
+});
+
+// --- pickTargetPaneFromSet (tg-cli#67 — the per-pane registration SET) ---
+
+test('set tier 1: exactly ONE registered pane still hosting an agent wins', () => {
+  // %0 (claude) registered, %1 (opencode) NOT — the single live registered pane wins
+  // even though two agent panes exist (the single-session happy path, unchanged).
+  const r = pickTargetPaneFromSet(PANES, PROCS, [{ paneId: '%0', cwd: '/Users/ultra/repo-a' }]);
+  expect(r).toEqual({ ok: true, target: { pane: PANES[0], agent: 'claude', agentPid: 150 } });
+});
+
+test('set tier 1: SEVERAL registered live agent panes → ambiguous (never silently pick)', () => {
+  // Both agent panes registered concurrently — a FRESH non-reply inbound is
+  // genuinely ambiguous; the picker must NOT auto-collapse onto one.
+  const r = pickTargetPaneFromSet(PANES, PROCS, [
+    { paneId: '%0', cwd: '/Users/ultra/repo-a' },
+    { paneId: '%1', cwd: '/Users/ultra/repo-b' },
+  ]);
+  expect(r.ok).toBe(false);
+  if (!r.ok) {
+    expect(r.reason).toBe('ambiguous');
+    expect(r.candidates.map((c) => c.pane.paneId)).toEqual(['%0', '%1']);
+  }
+});
+
+test('set tier 1 falls through when no registered pane still hosts an agent', () => {
+  // The only registered pane is a bare shell now; two OTHER agent panes remain →
+  // ambiguous via the sole-agent tier (matches single-reg fall-through behavior).
+  const r = pickTargetPaneFromSet(PANES, PROCS, [{ paneId: '%2', cwd: '/Users/ultra' }]);
+  expect(r.ok).toBe(false);
+  if (!r.ok) expect(r.reason).toBe('ambiguous');
+});
+
+test('set tier 3: a paneless (cwd-only) entry routes by pane_current_path', () => {
+  const r = pickTargetPaneFromSet(PANES, PROCS, [{ cwd: '/Users/ultra/repo-b' }]);
+  expect(r).toEqual({ ok: true, target: { pane: PANES[1], agent: 'opencode', agentPid: 200 } });
+});
+
+test('set: empty registration set → sole-agent tier still applies', () => {
+  const panes = [
+    pane('work', 0, '%0', 100, '2.1.150', '/Users/ultra/repo-a'),
+    pane('work', 1, '%2', 300, '-zsh', '/Users/ultra'),
+  ];
+  const r = pickTargetPaneFromSet(panes, PROCS, []);
+  expect(r).toEqual({ ok: true, target: { pane: panes[0], agent: 'claude', agentPid: 150 } });
+});
+
+test('set tier 2: fixedSession picks the sole agent pane when no pane is registered', () => {
+  // No registered paneId/cwd matches; the session pin narrows to the sole agent
+  // pane in that session (the fixedSession tier, shared with single-reg).
+  const r = pickTargetPaneFromSet(PANES, PROCS, [], 'work');
+  expect(r).toEqual({ ok: true, target: { pane: PANES[0], agent: 'claude', agentPid: 150 } });
+});
+
+test('set: a registered pane whose agent is gone, plus a sole OTHER agent → that other wins', () => {
+  // %5 is registered but its pane process (pid 500) has no agent descendant — a
+  // bare shell; %1 is the only live agent and is NOT registered → tier 1 finds
+  // nothing live, tier 3 cwd matches no AGENT pane, sole-agent (%1) wins.
+  const panes = [
+    pane('work', 0, '%5', 500, '-zsh', '/Users/ultra/repo-a'),
+    pane('side', 0, '%1', 200, 'opencode', '/Users/ultra/repo-b'),
+  ];
+  const procs = [proc(500, 1, '-zsh'), proc(200, 1, 'opencode')];
+  const r = pickTargetPaneFromSet(panes, procs, [{ paneId: '%5', cwd: '/Users/ultra/repo-a' }]);
+  expect(r.ok).toBe(true);
+  if (r.ok) expect(r.target.pane.paneId).toBe('%1');
 });
 
 // --- panesWithRetry (tg-ctl discovery resilience) ---
