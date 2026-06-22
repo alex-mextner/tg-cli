@@ -106,11 +106,15 @@ two button systems never collide.
 ## Discovery (daemon)
 
 `listAgentCandidates()` runs the same `snapshot()` (panes + process tree) the
-target picker uses, finds every pane hosting an agent (`findAgentInPane`), and
-fetches window names in a **separate** `tmux list-panes -F '#{pane_id}\t#{window_name}'`
-call. The core `PANE_FORMAT` / `parsePaneList` (relied on by inject + q→buttons)
-is intentionally left untouched; a pane with no name falls back to its session
-name.
+target picker uses and finds every pane hosting an agent (`findAgentInPane`). The
+window name comes from the core `PANE_FORMAT` itself — `#{window_name}` is a fixed
+field carried through `parsePaneList` alongside the pane id (tg-cli#75). It used to
+be a **separate** `tmux list-panes -F '#{pane_id}\t#{window_name}'` call, but that
+call skipped the UTF-8 locale env, so under launchd the tab-mangle blanked every
+name and the picker fell back to the cwd basename; folding it into the locale-safe,
+retried core snapshot fixed that. A pane with no name falls back to its session
+name; a bare default (a number, a shell/launcher command, or a version string) is
+treated as non-distinguishing and the label leans on the cwd project dir instead.
 
 ## Edge cases
 

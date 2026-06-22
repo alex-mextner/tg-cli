@@ -327,6 +327,45 @@ test('labels: empty window name + no cwd → no leading separator', () => {
   expect(distinctLabels(c)).toEqual(['claude']);
 });
 
+// --- tg-cli#75 fix C: user-set WINDOW NAMES beat the cwd basename ---
+
+// The CTO's exact setup: three claude panes in numeric window "4", but each with
+// a DISTINCT user-set window name (rig / 3d / ext). The label must read the WINDOW
+// NAME, NOT the cwd basename — `ext` proves it: its cwd basename is "hyperide", so
+// a cwd-derived label would wrongly say "hyperide".
+test('labels: distinct user-set window names are used verbatim, NOT the cwd basenames', () => {
+  const fleet = [
+    cand('%1', '4', 0, 'rig', 'claude', '/Users/u/xp/agent-tools'),
+    cand('%2', '4', 1, '3d', 'claude', '/Users/u/xp/3d-cli'),
+    cand('%3', '4', 2, 'ext', 'claude', '/Users/u/work/hyperide'),
+  ];
+  expect(distinctLabels(fleet)).toEqual(['rig · claude', '3d · claude', 'ext · claude']);
+});
+
+// tmux `automatic-rename` ON sets the window name to the running command — a shell
+// (zsh/node) or the cc VERSION string ("2.1.181"). None is a user label, so each
+// is treated as BARE and the label falls back to the cwd project dir.
+test('labels: a shell-command auto-rename default (node) falls back to the cwd', () => {
+  const fleet = [
+    cand('%1', '4', 0, 'node', 'claude', '/Users/u/xp/rig'),
+    cand('%2', '4', 1, 'node', 'claude', '/Users/u/xp/3d-cli'),
+  ];
+  expect(distinctLabels(fleet)).toEqual(['rig · claude', '3d-cli · claude']);
+});
+
+test('labels: a bare version-string window name (cc command) falls back to the cwd', () => {
+  const fleet = [
+    cand('%1', '4', 0, '2.1.181', 'claude', '/Users/u/work/hyperide'),
+    cand('%2', '4', 1, '2.1.185', 'claude', '/Users/u/xp/3d-cli'),
+  ];
+  expect(distinctLabels(fleet)).toEqual(['hyperide · claude', '3d-cli · claude']);
+});
+
+test('labels: a single zsh default falls back to its project dir, not "zsh · claude"', () => {
+  const fleet = [cand('%1', 'main', 0, 'zsh', 'claude', '/Users/u/work/svc')];
+  expect(distinctLabels(fleet)).toEqual(['svc · claude']);
+});
+
 // --- dedupe ---
 
 test('dedupe: drops a pane id listed twice, keeps first-seen order', () => {

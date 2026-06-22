@@ -204,12 +204,36 @@ function cwdBasename(path: string | undefined): string {
   return idx === -1 ? trimmed : trimmed.slice(idx + 1);
 }
 
-// A window name that does NOT distinguish a pane: empty, or the bare numeric
-// fallback tmux hands back when no name is set (the candidate builder falls back
-// to the session name, which is often just the window index like "4"). Such a
-// name can't tell two panes apart — the label must lean on the cwd instead.
-function isBareWindowName(name: string): boolean {
-  return name.trim() === '' || /^\d+$/.test(name.trim());
+// Default window names tmux hands back when `automatic-rename` is ON: it sets the
+// window name to the running command, so an un-renamed pane shows the SHELL or the
+// agent's launcher rather than a user-chosen label. The cc pane reports a VERSION
+// string (e.g. "2.1.181") as its command, which surfaces as the window name too.
+// None of these distinguishes a project — the label must lean on the cwd instead.
+//
+// Deliberately ONLY the common shells + the `node` cc-launcher: these are nearly
+// always an auto-rename artifact, never a window a user would deliberately name.
+// `tmux`/`login`/etc. are EXCLUDED — they are far more likely a deliberate user
+// label than an auto-rename default, so treating them as bare would wrongly drop a
+// real name (review tradeoff, tg-cli#75). A user who names a window literally "zsh"
+// loses it to the cwd; that's the accepted edge.
+const DEFAULT_SHELL_NAMES = new Set(['zsh', 'bash', 'sh', 'fish', 'node']);
+
+// A window name that does NOT distinguish a pane and so must not lead the label:
+//   - empty;
+//   - the bare numeric session/window fallback ("4");
+//   - a tmux auto-rename DEFAULT — a shell/launcher command name (zsh, node, …) or
+//     a bare version string ("2.1.181", the cc pane_current_command). The CTO set
+//     real window names ("rig", "3d"); only these un-renamed defaults fall through
+//     to the cwd basename.
+// A genuine user label ("rig", "ext", "api-bot") is NOT bare and leads the label.
+// Exported so the daemon's diagnostic `formatCandidates` reply leads with the same
+// names the picker buttons show (no leading "node"/"4"/version-string mismatch).
+export function isBareWindowName(name: string): boolean {
+  const t = name.trim().toLowerCase();
+  if (t === '') return true;
+  if (/^\d+$/.test(t)) return true; // session/window index fallback
+  if (/^\d+(\.\d+)+$/.test(t)) return true; // dotted version string (cc command)
+  return DEFAULT_SHELL_NAMES.has(t);
 }
 
 // Distinct, human-meaningful labels — one per candidate, SAME index order.

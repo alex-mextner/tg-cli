@@ -46,21 +46,17 @@ sub="$1"; shift
 mode=$(cat '${join(cfgDir, 'tmux-mode')}' 2>/dev/null || echo both)
 case "$sub" in
   list-panes)
-    name_format=0
-    for a in "$@"; do case "$a" in *window_name*) name_format=1;; esac; done
     show_hyper=0; show_tools=0
     case "$mode" in
       both)  show_hyper=1; show_tools=1;;
       tools) show_tools=1;;
       hyper) show_hyper=1;;
     esac
-    if [ "$name_format" = "1" ]; then
-      [ "$show_hyper" = "1" ] && printf '%s\\t%s\\n' '${PANE_HYPER}' 'hyperide'
-      [ "$show_tools" = "1" ] && printf '%s\\t%s\\n' '${PANE_TOOLS}' 'agent-tools'
-    else
-      [ "$show_hyper" = "1" ] && printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'shyper' '4' '${PANE_HYPER}' '${PID_HYPER}' 'claude' '${dirHyper}'
-      [ "$show_tools" = "1" ] && printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'stools' '4' '${PANE_TOOLS}' '${PID_TOOLS}' 'claude' '${dirTools}'
-    fi
+    # 7-field core PANE_FORMAT carries #{window_name} (field 6, before the path) —
+    # the daemon reads window names from the core snapshot now (tg-cli#75), not a
+    # separate call. The CTO's screenshot window names: 'hyperide', 'agent-tools'.
+    [ "$show_hyper" = "1" ] && printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'shyper' '4' '${PANE_HYPER}' '${PID_HYPER}' 'claude' 'hyperide' '${dirHyper}'
+    [ "$show_tools" = "1" ] && printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'stools' '4' '${PANE_TOOLS}' '${PID_TOOLS}' 'claude' 'agent-tools' '${dirTools}'
     ;;
   display-message)
     pane=""

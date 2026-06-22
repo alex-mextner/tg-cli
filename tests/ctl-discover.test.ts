@@ -7,8 +7,9 @@ import {
   pickTargetPane,
   pickTargetPaneFromSet,
   panesWithRetry,
+  resolveAmbiguousByActivity,
 } from '../features/tg-ctl/discover';
-import type { PaneInfo, ProcInfo } from '../features/tg-ctl/types';
+import type { DiscoverResult, PaneInfo, ProcInfo, TargetPane } from '../features/tg-ctl/types';
 
 // --- fixtures ---
 
@@ -19,8 +20,9 @@ function pane(
   panePid: number,
   paneCommand: string,
   panePath: string,
+  windowName = '',
 ): PaneInfo {
-  return { sessionName, windowIndex, paneId, panePid, paneCommand, panePath };
+  return { sessionName, windowIndex, paneId, panePid, paneCommand, windowName, panePath };
 }
 
 function proc(pid: number, ppid: number, command: string): ProcInfo {
@@ -29,31 +31,35 @@ function proc(pid: number, ppid: number, command: string): ProcInfo {
 
 // --- parsePaneList ---
 
-test('parsePaneList parses tab-separated pane lines', () => {
-  const out = 'main\t0\t%0\t100\t-zsh\t/Users/ultra/work\nside\t2\t%5\t200\topencode\t/tmp/x\n';
+test('parsePaneList parses tab-separated pane lines (incl. window_name)', () => {
+  // 7 fields: …command \t window_name \t path. The window name carries the
+  // user-set label ("rig", "3d") used by the /agent picker (tg-cli#75 fix C).
+  const out = 'main\t0\t%0\t100\t-zsh\trig\t/Users/ultra/work\nside\t2\t%5\t200\topencode\t3d\t/tmp/x\n';
   expect(parsePaneList(out)).toEqual([
-    pane('main', 0, '%0', 100, '-zsh', '/Users/ultra/work'),
-    pane('side', 2, '%5', 200, 'opencode', '/tmp/x'),
+    pane('main', 0, '%0', 100, '-zsh', '/Users/ultra/work', 'rig'),
+    pane('side', 2, '%5', 200, 'opencode', '/tmp/x', '3d'),
   ]);
 });
 
 test('parsePaneList keeps paths with spaces intact (tabs protect them)', () => {
-  const out = 'main\t1\t%3\t4242\t2.1.150\t/Users/ultra/my project/sub dir\n';
+  const out = 'main\t1\t%3\t4242\t2.1.150\tapi-bot\t/Users/ultra/my project/sub dir\n';
   const panes = parsePaneList(out);
   expect(panes).toHaveLength(1);
   expect(panes[0].panePath).toBe('/Users/ultra/my project/sub dir');
   expect(panes[0].paneCommand).toBe('2.1.150'); // cc reports its VERSION here
+  expect(panes[0].windowName).toBe('api-bot'); // a fixed field BEFORE the greedy path
 });
 
 test('parsePaneList skips malformed lines', () => {
   const out = [
     '', // blank
     'too\tfew\tfields',
-    'main\tNaN\t%1\t100\t-zsh\t/home', // non-numeric window index
-    'main\t0\t%1\tnope\t-zsh\t/home', // non-numeric pane pid
-    'good\t0\t%9\t900\tbash\t/srv',
+    'main\tNaN\t%1\t100\t-zsh\trig\t/home', // non-numeric window index
+    'main\t0\t%1\tnope\t-zsh\trig\t/home', // non-numeric pane pid
+    'now\t0\t%2\t100\t-zsh\t/home', // only 6 fields (no window_name) — rejected
+    'good\t0\t%9\t900\tbash\trig\t/srv',
   ].join('\n');
-  expect(parsePaneList(out)).toEqual([pane('good', 0, '%9', 900, 'bash', '/srv')]);
+  expect(parsePaneList(out)).toEqual([pane('good', 0, '%9', 900, 'bash', '/srv', 'rig')]);
 });
 
 // --- parseProcList ---
@@ -380,7 +386,7 @@ test('set: a registered pane whose agent is gone, plus a sole OTHER agent → th
 
 // --- panesWithRetry (tg-ctl discovery resilience) ---
 
-const ONE_PANE = '4\t1\t%0\t10481\t2.1.181\t/Users/ultra/work/hyperide';
+const ONE_PANE = '4\t1\t%0\t10481\t2.1.181\text\t/Users/ultra/work/hyperide';
 
 test('panesWithRetry: returns panes on the first successful non-empty read (no retry)', () => {
   let calls = 0;
@@ -456,4 +462,63 @@ test('panesWithRetry: a null run (tmux binary missing) breaks immediately — no
   );
   expect(panes).toEqual([]);
   expect(calls).toBe(1);
+});
+
+// --- resolveAmbiguousByActivity (tg-cli#75 fix B: no-reply auto-bind) ---
+
+function target(paneId: string): TargetPane {
+  return { pane: pane('s', 0, paneId, 100, 'claude', '/p', 'win'), agent: 'claude' };
+}
+
+function ambiguous(...paneIds: string[]): DiscoverResult {
+  return { ok: false, reason: 'ambiguous', candidates: paneIds.map(target) };
+}
+
+test('resolveAmbiguousByActivity: binds an ambiguous result to the MOST-RECENT active pane', () => {
+  // %5 spoke last (ts 200) → a non-reply inbound auto-binds there instead of asking.
+  const usage = new Map([
+    ['%2', 100],
+    ['%5', 200],
+  ]);
+  const r = resolveAmbiguousByActivity(ambiguous('%2', '%5'), usage);
+  expect(r.ok).toBe(true);
+  if (r.ok) expect(r.target.pane.paneId).toBe('%5');
+});
+
+test('resolveAmbiguousByActivity: a partial-history candidate set still binds the only-known pane', () => {
+  // Only %2 has activity; %5 never spoke. The "last agent" is unambiguously %2.
+  const usage = new Map([['%2', 100]]);
+  const r = resolveAmbiguousByActivity(ambiguous('%2', '%5'), usage);
+  expect(r.ok).toBe(true);
+  if (r.ok) expect(r.target.pane.paneId).toBe('%2');
+});
+
+test('resolveAmbiguousByActivity: NO history for any candidate → stays ambiguous (picker fires)', () => {
+  const r = resolveAmbiguousByActivity(ambiguous('%2', '%5'), new Map());
+  expect(r.ok).toBe(false);
+  if (!r.ok) expect(r.reason).toBe('ambiguous');
+});
+
+test('resolveAmbiguousByActivity: a TIE at the most-recent ts stays ambiguous (no "last agent")', () => {
+  const usage = new Map([
+    ['%2', 200],
+    ['%5', 200], // identical most-recent ts → genuinely ambiguous
+  ]);
+  const r = resolveAmbiguousByActivity(ambiguous('%2', '%5'), usage);
+  expect(r.ok).toBe(false);
+  if (!r.ok) expect(r.reason).toBe('ambiguous');
+});
+
+test('resolveAmbiguousByActivity: a no-agent result is passed through untouched (no false bind)', () => {
+  const noAgent: DiscoverResult = { ok: false, reason: 'no-agent', candidates: [] };
+  const r = resolveAmbiguousByActivity(noAgent, new Map([['%2', 100]]));
+  expect(r.ok).toBe(false);
+  if (!r.ok) expect(r.reason).toBe('no-agent');
+});
+
+test('resolveAmbiguousByActivity: an already-resolved (ok) result is returned unchanged', () => {
+  const ok: DiscoverResult = { ok: true, target: target('%7') };
+  const r = resolveAmbiguousByActivity(ok, new Map([['%2', 999]]));
+  expect(r.ok).toBe(true);
+  if (r.ok) expect(r.target.pane.paneId).toBe('%7');
 });

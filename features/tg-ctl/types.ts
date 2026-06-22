@@ -227,6 +227,11 @@ export interface PaneInfo {
   paneId: string; // "%N"
   panePid: number;
   paneCommand: string; // pane_current_command — VERSION string for cc!
+  // pane's window NAME (#{window_name}) — the user-set tmux window label
+  // ("rig", "3d"). Carried in the core snapshot so the /agent picker labels it
+  // reliably (tg-cli#75 fix C); a separate tmux call mis-aligned/blanked under
+  // the launchd no-locale tab-mangle. Empty when tmux gives no name.
+  windowName: string;
   panePath: string; // pane_current_path
 }
 

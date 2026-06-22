@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.15.0
+
+Two `tg-ctl` routing/picker fixes (tg-cli#75): no-reply auto-bind to the
+most-recently-active agent, and `/agent` picker labels by the real tmux window
+name instead of the cwd basename.
+
+- **No-reply auto-bind to the last-active agent.** A plain (non-reply) message to
+  a multi-agent fleet used to fall to `ambiguous target — candidates: …`. It now
+  binds to the **most-recently-active agent** — the pane whose last outbound `tg`
+  send is newest (the same `aggregateUsage` LRU/MRU signal the reply picker ranks
+  by). A recognized reply route still wins first; the auto-bind only resolves an
+  otherwise-ambiguous non-reply; and with no activity history or a tie at the
+  most-recent timestamp it stays ambiguous so the button picker still fires (the
+  unscoped fail-closed). New pure `resolveAmbiguousByActivity`
+  (`features/tg-ctl/discover.ts`).
+- **`/agent` picker uses the tmux WINDOW NAME, not the cwd.** The picker labelled
+  agents by the cwd basename ("hyperide · claude") instead of the user-set window
+  name ("ext"). Root cause: window names were fetched in a SEPARATE `tmux
+  list-panes` call that skipped the UTF-8 locale env, so under launchd the
+  tab-mangle blanked every name and the label fell back to the cwd. `#{window_name}`
+  is now a fixed field in the core, locale-safe `PANE_FORMAT` (`PaneInfo.windowName`,
+  carried through `parsePaneList`). A bare default — a number, a shell/launcher
+  command (`zsh`/`node`), or a cc version string (`2.1.181`) — is treated as
+  non-distinguishing and the label leans on the cwd project dir.
+
 ## 1.14.0
 
 Help-UX cleanup: deduped usage, standard topic-help, and a configured-vs-pending

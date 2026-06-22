@@ -1,7 +1,7 @@
 // tmux pane discovery for tg-ctl (spec §5.2 target discovery, §10 ambiguity).
 //
 // Everything here is PURE — the tg-ctl entrypoint runs
-//   tmux list-panes -a -F '#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}'
+//   tmux list-panes -a -F '#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{window_name}\t#{pane_current_path}'
 //   ps -axo pid=,ppid=,command=
 // and hands the raw stdout to these parsers. Picking the injection target from
 // the parsed snapshots is plain data work, trivially unit-testable.
@@ -24,7 +24,7 @@ export function parsePaneList(out: string): PaneInfo[] {
     const line = rawLine.replace(/\r$/, '');
     if (!line.trim()) continue;
     const parts = line.split('\t');
-    if (parts.length < 6) continue;
+    if (parts.length < 7) continue;
     const windowIndex = Number(parts[1]);
     const panePid = Number(parts[3]);
     if (!Number.isInteger(windowIndex) || !Number.isInteger(panePid)) continue;
@@ -34,8 +34,10 @@ export function parsePaneList(out: string): PaneInfo[] {
       paneId: parts[2],
       panePid,
       paneCommand: parts[4],
-      // A path could itself contain a tab; rejoin the tail instead of dropping it.
-      panePath: parts.slice(5).join('\t'),
+      // window_name is a fixed field (tmux names never contain tabs); the path is
+      // the greedy tail (it CAN contain a tab) so it stays LAST and rejoins parts[6..].
+      windowName: parts[5],
+      panePath: parts.slice(6).join('\t'),
     });
   }
   return panes;
@@ -237,6 +239,51 @@ export function pickTargetPaneFromSet(
   if (candidates.length === 1) return { ok: true, target: candidates[0] };
   if (candidates.length > 1) return { ok: false, reason: 'ambiguous', candidates };
   return { ok: false, reason: 'no-agent', candidates: [] };
+}
+
+// No-reply auto-bind (tg-cli#75 fix B): when a NON-reply inbound would otherwise
+// be `ambiguous` (several live agent panes, no reply anchor to disambiguate), bind
+// it to the MOST-RECENTLY-ACTIVE agent instead of declaring ambiguity. "Active" =
+// the pane whose last OUTBOUND `tg` send is most recent — exactly the LRU/MRU
+// signal the reply picker already ranks by (routes.json → aggregateUsage). The CTO
+// almost always means "the agent I was just talking to", and a fresh message after
+// a burst of activity from one agent should land there without a tap.
+//
+// This is layered ON TOP of pickTargetPane(FromSet), NOT inside it: the picker
+// stays the honest fallback. It fires only when (a) the picker said `ambiguous`
+// AND (b) exactly one of those ambiguous candidates is the unique most-recent by
+// `lastTs`. A tie at the top (two panes with the identical most-recent ts, or NO
+// usage history at all for any candidate) is left ambiguous on purpose — there is
+// no "last agent" to prefer, so the button picker is the correct outcome. This
+// preserves the unscoped fail-closed (#49): a bind we genuinely can't determine is
+// never guessed.
+//
+// PURE: `lastActiveByPane` is a paneId→last-send-unix-seconds map the caller
+// builds from routes (aggregateUsage). Returns the resolved `{ ok: true, target }`
+// when a unique most-recent candidate exists, else the input result unchanged.
+export function resolveAmbiguousByActivity(
+  result: DiscoverResult,
+  lastActiveByPane: Map<string, number>,
+): DiscoverResult {
+  if (result.ok || result.reason !== 'ambiguous') return result;
+  let best: TargetPane | null = null;
+  let bestTs = -Infinity;
+  let tiedAtBest = false;
+  for (const cand of result.candidates) {
+    const ts = lastActiveByPane.get(cand.pane.paneId);
+    if (ts === undefined) continue; // no activity history → not a "last agent" choice
+    if (ts > bestTs) {
+      bestTs = ts;
+      best = cand;
+      tiedAtBest = false;
+    } else if (ts === bestTs) {
+      tiedAtBest = true;
+    }
+  }
+  // A unique most-recent candidate → auto-bind. No history, or a tie at the most
+  // recent ts → leave it ambiguous (the button picker decides).
+  if (best && !tiedAtBest) return { ok: true, target: best };
+  return result;
 }
 
 // Resilient pane query (tg-ctl discovery): run `tmux list-panes -a` and parse, RETRYING the one

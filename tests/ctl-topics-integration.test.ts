@@ -49,8 +49,8 @@ function fakeTmux(cwd: string, injectLog: string): string {
 sub="$1"; shift
 case "$sub" in
   list-panes)
-    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '${FLAT_PANE}' '${FLAT_PID}' 'claude' '${cwd}'
-    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '1' '${TOPIC_PANE}' '${TOPIC_PID}' 'claude' '${cwd}'
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '${FLAT_PANE}' '${FLAT_PID}' 'claude' 'main' '${cwd}'
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '1' '${TOPIC_PANE}' '${TOPIC_PID}' 'claude' 'main' '${cwd}'
     ;;
   display-message)
     printf 'main\\n'
