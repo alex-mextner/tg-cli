@@ -103,7 +103,11 @@ function daemonLogText(cfgDir: string): string {
   return existsSync(p) ? readFileSync(p, 'utf8') : '';
 }
 
-async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess> {
+async function startDaemon(
+  cfgDir: string,
+  apiPort: number,
+  extraEnv: Record<string, string> = {},
+): Promise<Subprocess> {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
   const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: {
@@ -112,6 +116,7 @@ async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess>
       HOME: cfgDir,
       TG_CTL_CONFIG_DIR: cfgDir,
       TG_API_BASE: `http://127.0.0.1:${apiPort}`,
+      ...extraEnv,
     },
     stdio: ['ignore', logFd, logFd],
   });
@@ -889,3 +894,273 @@ test('tg#30: an UNSCOPED question (hook had no TMUX_PANE) still DEFERS inbound, 
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 30_000);
+
+// --- "wait indefinitely" (#N): a SCOPED forwarded question must not expire on a timer ---
+//
+// The CTO's daily lifeline: a forwarded question whose pane is known (the normal,
+// answerable case) must stay open until the human taps an answer in Telegram OR
+// the agent process dies (socket close) — it must NEVER auto-expire to
+// "expired — answer in terminal". The no-wedge guarantee is preserved by keeping
+// the abandon timer for the UNSCOPED case only (an unscoped question defers ALL
+// panes; a scoped one defers only its own pane, whose agent is itself blocked on
+// this very question, so waiting forever there starves nothing).
+//
+// We shorten the unscoped bound to 1.5s via TG_CTL_UNSCOPED_TIMEOUT_MS so the
+// tests exercise the expiry/no-expiry split without a real 110s wait; production
+// never sets that env, so the bound stays 110s there.
+const SHORT_UNSCOPED_MS = '1500';
+
+// A Telegram server that records editMessageText bodies (so a test can assert the
+// prompt was — or was NOT — rewritten to "expired"), tracks the question's
+// callback data, and feeds getUpdates from a caller-owned queue.
+function recordingServer(updateQueue: unknown[][], reactions: Array<Record<string, unknown>>, edits: string[]): {
+  port: number;
+  cb: () => string;
+  stop: (closeActiveConnections?: boolean) => Promise<void> | void;
+} {
+  let questionCallbackData = '';
+  let buttonMessageId = 0;
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        const batch = updateQueue.shift();
+        if (batch) return Response.json({ ok: true, result: batch });
+        await Bun.sleep(80);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as Record<string, unknown>;
+        const kb = (body.reply_markup as { inline_keyboard?: Array<Array<{ callback_data: string }>> } | undefined)
+          ?.inline_keyboard;
+        if (kb?.length) {
+          buttonMessageId += 1;
+          questionCallbackData = kb[0][0].callback_data;
+          return Response.json({ ok: true, result: { message_id: buttonMessageId } });
+        }
+        return Response.json({ ok: true, result: { message_id: 900 } });
+      }
+      if (url.pathname.endsWith('/setMessageReaction')) {
+        reactions.push((await req.json()) as Record<string, unknown>);
+        return Response.json({ ok: true, result: true });
+      }
+      if (url.pathname.endsWith('/editMessageText')) {
+        const body = (await req.json()) as Record<string, unknown>;
+        edits.push(String(body.text ?? ''));
+        return Response.json({ ok: true, result: true });
+      }
+      if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+    },
+  });
+  return { port: server.port, cb: () => questionCallbackData, stop: (c) => server.stop(c) };
+}
+
+test('a SCOPED question stays open PAST the abandon bound — no "expired", the callback still answers it, deferred inbound flushes', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits);
+  servers.push(server);
+
+  // 1.5s unscoped bound — if a SCOPED question were (wrongly) armed with it, it
+  // would expire well within this test. It must not.
+  const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
+  procs.push(daemon);
+
+  // Scoped question on %1 (startAsk pins TMUX_PANE=%1 by default).
+  const ask = startAsk(cfgDir, server.port, {
+    requestId: 'q_scoped_forever',
+    agent: 'claude',
+    kind: 'question',
+    question: 'Proceed?',
+    options: [{ label: 'Yes' }, { label: 'No' }],
+  });
+  procs.push(ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  // Inbound arrives while the question is open → DEFERRED (not pasted).
+  updateQueue.push([
+    { update_id: 30, message: { message_id: 31, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'queued while waiting' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+  expect(injected(cfgDir)).toEqual([]);
+  expect(reactions.at(-1)).toMatchObject({ message_id: 31, reaction: [{ type: 'emoji', emoji: '✍️' }] });
+
+  // Wait WELL past the (shortened) unscoped bound. A scoped question has NO timer,
+  // so it must still be open: no "expired" edit, the ask subprocess still blocked,
+  // the inbound still NOT pasted.
+  await Bun.sleep(Number(SHORT_UNSCOPED_MS) + 1500);
+  expect(edits).not.toContain('expired — answer in terminal');
+  expect(ask.exitCode).toBeNull(); // ask is still blocked — the question never expired
+  expect(injected(cfgDir)).toEqual([]); // nothing pasted into the still-open prompt
+
+  // NOW the human answers via the inline button → the question resolves and the
+  // deferred inbound flushes (proves the wait-forever path still reaches the
+  // normal answer/flush machinery).
+  updateQueue.push([
+    { update_id: 31, callback_query: { id: 'cb1', from: { id: 1, first_name: 'Alex' }, message: { message_id: 1, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) }, data: server.cb() } },
+  ]);
+  const askOut = await new Response(ask.stdout).text();
+  await ask.exited;
+  expect(askOut.length).toBeGreaterThan(0); // the hook got its answer, not "expired"
+
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && injected(cfgDir).length < 1) await Bun.sleep(100);
+  }
+  expect(injected(cfgDir)).toHaveLength(1);
+  expect(injected(cfgDir)[0]).toContain('queued while waiting');
+  expect(edits.at(-1)).toContain('answered'); // prompt rewritten to the answer, never "expired"
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('a SCOPED question that waits forever still cleans up on socket close (agent process dies) — backlog dead-lettered, pane freed', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
+  procs.push(daemon);
+
+  const ask = startAsk(cfgDir, server.port, {
+    requestId: 'q_scoped_diesocket',
+    agent: 'claude',
+    kind: 'question',
+    question: 'Proceed?',
+    options: [{ label: 'Yes' }],
+  });
+  procs.push(ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  // Queue an inbound behind the (scoped) open question.
+  updateQueue.push([
+    { update_id: 40, message: { message_id: 41, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'orphan me' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+
+  // The agent process dies (hook socket closes) with NO Telegram answer. The
+  // scoped question has no timer, so socket close is the ONLY cleanup path — it
+  // must still fire: remove the entry and dead-letter the pane's backlog so a
+  // later message on %1 is not wedged behind a ghost question.
+  ask.kill(9);
+  await ask.exited;
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !daemonLogText(cfgDir).includes('dead-lettered')) await Bun.sleep(50);
+  }
+  expect(daemonLogText(cfgDir)).toContain('dead-lettered');
+  expect(injected(cfgDir)).toEqual([]); // orphaned message NEVER pasted into the dead prompt
+
+  // Pane is free again: a fresh inbound on %1 injects directly (no ghost defer).
+  updateQueue.push([
+    { update_id: 41, message: { message_id: 42, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'after the death' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && injected(cfgDir).length < 1) await Bun.sleep(100);
+  }
+  expect(injected(cfgDir)).toHaveLength(1);
+  expect(injected(cfgDir)[0]).toContain('after the death');
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('NO-WEDGE guard: an UNSCOPED question never answered still self-clears at the bound, freeing ALL-pane routing', async () => {
+  // The safety invariant the timer protects. An unscoped question defers EVERY
+  // pane (fail-closed Layer-2 match). If it could wait forever it would wedge
+  // routing for the whole daemon. The bound MUST still fire for the unscoped case:
+  // after it elapses the question is gone, the prompt is rewritten to "expired",
+  // and inbound flows again. This is the mutation that would catch a regression
+  // removing the unscoped bound (it would hang here, injected stays empty).
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
+  procs.push(daemon);
+
+  // Unscoped question (hook had no TMUX_PANE) → defers ANY pane.
+  const ask = startAsk(
+    cfgDir,
+    server.port,
+    { requestId: 'q_unscoped_wedge', agent: 'claude', kind: 'question', question: 'Proceed?', options: [{ label: 'Yes' }] },
+    { unscoped: true },
+  );
+  procs.push(ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  // Inbound arrives — deferred while the unscoped question is open (correct; the
+  // tg#30 fail-closed backstop). It must NOT stay deferred forever.
+  updateQueue.push([
+    { update_id: 50, message: { message_id: 51, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'unwedge me' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+  expect(injected(cfgDir)).toEqual([]); // deferred for now (question still open)
+
+  // NO answer is ever sent. The unscoped bound elapses → the question self-clears
+  // (prompt → "expired"), the ask subprocess unblocks with null, and routing is
+  // free again. A regression that drops the unscoped bound would never reach here.
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 12000 && !edits.includes('expired — answer in terminal')) await Bun.sleep(50);
+  }
+  expect(edits).toContain('expired — answer in terminal');
+  await ask.exited; // the blocked hook is released (null) when its question expires
+
+  // Routing un-wedged: a NEW inbound now injects directly (no ghost defer).
+  updateQueue.push([
+    { update_id: 51, message: { message_id: 52, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'routing alive' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && injected(cfgDir).length < 1) await Bun.sleep(100);
+  }
+  expect(injected(cfgDir).some((l) => l.includes('routing alive'))).toBe(true);
+
+  // Fate of the message deferred behind the EXPIRED unscoped question ('unwedge
+  // me'): it is silently LOST. flushDeferred only fires on a real ANSWER, and an
+  // unscoped expiry has no paneId to dead-letter, so the entry is dropped without
+  // flushing OR dead-lettering its backlog; the later direct inject does not drain
+  // it either. This is a deliberate, asserted DATA-LOSS gap (the user gets no
+  // dead-letter notice), NOT mere "asymmetry" — distinct from the scoped
+  // socket-close path which DOES dead-letter via onAbandon + notify. It is
+  // PRE-EXISTING (the old 110s timer never dead-lettered an unscoped backlog —
+  // onAbandon was gated on req.paneId) and tracked for a real fix in #58. Pinned
+  // here so a future change can't silently regress it; the no-wedge guarantee —
+  // the point of this test — holds regardless: 'routing alive' got through.
+  expect(injected(cfgDir).some((l) => l.includes('unwedge me'))).toBe(false);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 40_000);
