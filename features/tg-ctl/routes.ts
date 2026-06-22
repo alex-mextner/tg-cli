@@ -293,6 +293,20 @@ export interface PaneUsage {
   count: number; // number of sends to this pane in the window (MFU)
 }
 
+// The origin pane of the LAST MESSAGE in the chat (tg-cli#78): the pane that
+// produced the most-recently-recorded outbound `tg` send. This is the single
+// "who posted last" value the no-reply bind uses (resolveByLastMessage) — NOT a
+// per-pane aggregate.
+//
+// "Last" = the LAST entry by POSITION, not the max `ts`. appendRoute keeps the
+// file strictly chronological (each send is pushed onto the tail), so the final
+// element IS the last message — and position is robust to a clock that steps
+// backward (NTP correction) between two sends, where a max-`ts` scan would wrongly
+// prefer the earlier-but-higher-ts send. Returns null when there are no routes. PURE.
+export function lastMessagePane(routes: Route[]): string | null {
+  return routes.length > 0 ? routes[routes.length - 1].paneId : null;
+}
+
 // Aggregate the routes per pane into recency + frequency.
 export function aggregateUsage(routes: Route[]): Map<string, PaneUsage> {
   const usage = new Map<string, PaneUsage>();

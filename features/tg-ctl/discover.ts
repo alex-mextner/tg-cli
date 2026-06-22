@@ -241,49 +241,35 @@ export function pickTargetPaneFromSet(
   return { ok: false, reason: 'no-agent', candidates: [] };
 }
 
-// No-reply auto-bind (tg-cli#75 fix B): when a NON-reply inbound would otherwise
-// be `ambiguous` (several live agent panes, no reply anchor to disambiguate), bind
-// it to the MOST-RECENTLY-ACTIVE agent instead of declaring ambiguity. "Active" =
-// the pane whose last OUTBOUND `tg` send is most recent — exactly the LRU/MRU
-// signal the reply picker already ranks by (routes.json → aggregateUsage). The CTO
-// almost always means "the agent I was just talking to", and a fresh message after
-// a burst of activity from one agent should land there without a tap.
+// No-reply bind to the LAST MESSAGE in the chat (tg-cli#78). When a NON-reply
+// inbound would otherwise be `ambiguous` (several live agent panes, no reply anchor
+// to disambiguate), bind it to the agent whose message is the MOST RECENT in the
+// chat — i.e. the pane that produced the newest outbound `tg` send. The CTO almost
+// always means "the agent I was just talking to", and a fresh message after a burst
+// from one agent should land there without a tap.
 //
-// This is layered ON TOP of pickTargetPane(FromSet), NOT inside it: the picker
-// stays the honest fallback. It fires only when (a) the picker said `ambiguous`
-// AND (b) exactly one of those ambiguous candidates is the unique most-recent by
-// `lastTs`. A tie at the top (two panes with the identical most-recent ts, or NO
-// usage history at all for any candidate) is left ambiguous on purpose — there is
-// no "last agent" to prefer, so the button picker is the correct outcome. This
-// preserves the unscoped fail-closed (#49): a bind we genuinely can't determine is
-// never guessed.
+// This replaces the earlier per-pane LRU/MRU machinery (#77's resolveAmbiguousByActivity
+// over aggregateUsage): there is exactly ONE "last message", so the caller passes its
+// origin pane id directly (the newest route — see lastMessagePane). No per-pane
+// aggregation, no "unique most-recent" tie logic — the last message is a single,
+// unambiguous value.
 //
-// PURE: `lastActiveByPane` is a paneId→last-send-unix-seconds map the caller
-// builds from routes (aggregateUsage). Returns the resolved `{ ok: true, target }`
-// when a unique most-recent candidate exists, else the input result unchanged.
-export function resolveAmbiguousByActivity(
-  result: DiscoverResult,
-  lastActiveByPane: Map<string, number>,
-): DiscoverResult {
+// It is layered ON TOP of pickTargetPane(FromSet), NOT inside it: the picker stays the
+// honest fallback. It fires only when (a) the picker said `ambiguous` AND (b) the
+// last-message pane is one of those ambiguous candidates (still a live agent). If there
+// is NO last message, or its pane has gone / isn't a candidate, the result is left
+// ambiguous → the button picker decides (preserving the unscoped fail-closed, #49: a
+// bind we genuinely can't determine is never guessed).
+//
+// PURE: `lastMessagePaneId` is the origin pane of the newest route (or null when
+// routes.json is empty), built by the caller from routes (see lastMessagePane below).
+// Returns the resolved `{ ok: true, target }` when that pane is a candidate, else the
+// input result unchanged.
+export function resolveByLastMessage(result: DiscoverResult, lastMessagePaneId: string | null): DiscoverResult {
   if (result.ok || result.reason !== 'ambiguous') return result;
-  let best: TargetPane | null = null;
-  let bestTs = -Infinity;
-  let tiedAtBest = false;
-  for (const cand of result.candidates) {
-    const ts = lastActiveByPane.get(cand.pane.paneId);
-    if (ts === undefined) continue; // no activity history → not a "last agent" choice
-    if (ts > bestTs) {
-      bestTs = ts;
-      best = cand;
-      tiedAtBest = false;
-    } else if (ts === bestTs) {
-      tiedAtBest = true;
-    }
-  }
-  // A unique most-recent candidate → auto-bind. No history, or a tie at the most
-  // recent ts → leave it ambiguous (the button picker decides).
-  if (best && !tiedAtBest) return { ok: true, target: best };
-  return result;
+  if (!lastMessagePaneId) return result; // no last message → picker decides
+  const hit = result.candidates.find((c) => c.pane.paneId === lastMessagePaneId);
+  return hit ? { ok: true, target: hit } : result;
 }
 
 // Resilient pane query (tg-ctl discovery): run `tmux list-panes -a` and parse, RETRYING the one
