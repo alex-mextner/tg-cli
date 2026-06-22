@@ -235,8 +235,37 @@ test('buttons: one per candidate, callback round-trips to the right pane', () =>
   const parsed = parseAgentCallback(flat[2].callback_data);
   expect(parsed).toEqual({ token: 'tok1', index: 2 });
   expect(fleet[parsed!.index].paneId).toBe('%3');
-  expect(msg.text).toContain('▸ work');
+  // The route-picker prompt keeps the message preview, but the text body must NOT
+  // duplicate the buttons: no `▸ <session>` group header, no per-agent label lines.
   expect(msg.text).toContain('deploy the thing');
+  expect(msg.text).not.toContain('▸');
+});
+
+// --- buttons-only: the text body never duplicates the buttons (#63) ---
+
+// The CTO complaint: the picker rendered a `▸ <window>` group header AND a
+// per-agent text list ON TOP of the inline-keyboard buttons. The text must be a
+// minimal prompt only; the distinct labels live exclusively on the buttons.
+test('buttons-only: no ▸ group header and no per-agent label line in the text', () => {
+  const dup = [
+    cand('%1', '4', 0, '4', 'claude', '/Users/u/xp/rig'),
+    cand('%2', '4', 0, '4', 'claude', '/Users/u/xp/3d-cli'),
+    cand('%3', '4', 0, '4', 'claude', '/Users/u/work/hyperide'),
+  ];
+  const labels = distinctLabels(dup);
+  const bare = buildAgentSelectMessage(7, dup, 'tok', ''); // bare /agent picker
+  // exactly the minimal prompt — nothing more
+  expect(bare.text).toBe('Pick an agent:');
+  expect(bare.text).not.toContain('▸');
+  // the distinct labels appear ONLY on the buttons, never duplicated in the text
+  for (const label of labels) expect(bare.text).not.toContain(label);
+  expect(bare.reply_markup.inline_keyboard.flat().map((b) => b.text)).toEqual(labels);
+
+  // the reply/route picker (non-empty preview) is equally buttons-only
+  const route = buildAgentSelectMessage(7, dup, 'tok', 'ship it');
+  expect(route.text).not.toContain('▸');
+  for (const label of labels) expect(route.text).not.toContain(label);
+  expect(route.reply_markup.inline_keyboard.flat().map((b) => b.text)).toEqual(labels);
 });
 
 test('parseAgentCallback: rejects malformed data', () => {
