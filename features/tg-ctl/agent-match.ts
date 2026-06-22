@@ -329,12 +329,19 @@ export interface AgentSelectPayload {
 // noise duplicating the buttons; see #63). Buttons stay grouped by session for a
 // stable row order. `token` keys the daemon's pending-message store; callback
 // data is `tga:<token>:<index>` where index is into `candidates` (button order).
+//
+// `notice` (optional) prepends a one-line context message ABOVE the prompt — used
+// when the originally-addressed agent is GONE ("That agent … is no longer running")
+// so the picker explains WHY it appeared instead of silently re-asking. It replaces
+// the old plain-text `formatCandidates` dump: the live candidates are the BUTTONS,
+// not a text list (tg-cli#72).
 export function buildAgentSelectMessage(
   chatId: number,
   candidates: AgentCandidate[],
   token: string,
   messagePreview: string,
   preserveOrder = false,
+  notice?: string,
 ): AgentSelectPayload & { chat_id: number } {
   const groups = groupBySession(candidates, preserveOrder);
   const indexOf = new Map(candidates.map((c, i) => [c, i] as const));
@@ -357,9 +364,13 @@ export function buildAgentSelectMessage(
   // agent first, then send the message. With a preview it's the route picker.
   // `.trim()` so the header matches the daemon's `selectOnly` (message.trim()
   // === '') decision exactly — a whitespace-only message is select-only too.
-  const text = messagePreview.trim()
+  const prompt = messagePreview.trim()
     ? `Route to which agent?\n“${truncate(messagePreview, 80)}”`
     : 'Pick an agent:';
+  // A gone-target notice (if any) goes ABOVE the prompt so the human reads "the
+  // agent you meant is gone" first, then the choice. Empty/whitespace notice is
+  // ignored — never an orphan blank line.
+  const text = notice?.trim() ? `${notice.trim()}\n${prompt}` : prompt;
   return {
     chat_id: chatId,
     text,
