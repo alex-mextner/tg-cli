@@ -123,21 +123,30 @@ async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess>
   return daemon;
 }
 
-function startAsk(cfgDir: string, apiPort: number, request: Record<string, unknown>): Subprocess {
+function startAsk(
+  cfgDir: string,
+  apiPort: number,
+  request: Record<string, unknown>,
+  opts: { unscoped?: boolean } = {},
+): Subprocess {
+  const env: Record<string, string> = {
+    PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+    HOME: cfgDir,
+    TG_CTL_CONFIG_DIR: cfgDir,
+    TG_API_BASE: `http://127.0.0.1:${apiPort}`,
+  };
+  // ask reads TMUX_PANE for the request's paneId; pin it to our pane — UNLESS we're
+  // simulating the tg#30 case where the hook runs WITHOUT TMUX_PANE (paneId arrives
+  // undefined and the daemon must resolve it via discovery).
+  if (!opts.unscoped) env.TMUX_PANE = PANE_ID;
   const ask = Bun.spawn([process.execPath, TG_CTL, 'ask'], {
-    env: {
-      PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
-      HOME: cfgDir,
-      TG_CTL_CONFIG_DIR: cfgDir,
-      TG_API_BASE: `http://127.0.0.1:${apiPort}`,
-      // ask reads TMUX_PANE for the request's paneId; pin it to our pane.
-      TMUX_PANE: PANE_ID,
-    },
+    env,
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
   });
-  ask.stdin.write(JSON.stringify({ cwd: cfgDir, paneId: PANE_ID, ...request }) + '\n');
+  const payload = opts.unscoped ? { cwd: cfgDir, ...request } : { cwd: cfgDir, paneId: PANE_ID, ...request };
+  ask.stdin.write(JSON.stringify(payload) + '\n');
   ask.stdin.end();
   return ask;
 }
@@ -800,6 +809,82 @@ test('a question removed WITHOUT an answer (hook socket closes) does not wedge l
   // Give a would-be stale flush ample time to (wrongly) fire, then assert it did not.
   await Bun.sleep(1500);
   expect(injected(cfgDir).some((l) => l.includes('deferred one'))).toBe(false);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+// tg#30 regression: a question forwarded from a hook WITHOUT TMUX_PANE arrives with paneId
+// undefined. Before the fix the defer guard (keyed on exact pane) never matched it, so inbound
+// text was send-keys'd straight into the open prompt (fail OPEN). The daemon now resolves the
+// pane via discovery (Layer 1) — and an unscoped question defers ANY pane as a backstop (Layer 2)
+// — so the inbound is DEFERRED, not pasted into the prompt.
+test('tg#30: an UNSCOPED question (hook had no TMUX_PANE) still DEFERS inbound, never pastes it', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  let questionCallbackData = '';
+
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        const batch = updateQueue.shift();
+        if (batch) return Response.json({ ok: true, result: batch });
+        await Bun.sleep(80);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as Record<string, unknown>;
+        const kb = (body.reply_markup as { inline_keyboard?: Array<Array<{ callback_data: string }>> } | undefined)
+          ?.inline_keyboard;
+        if (kb?.length) {
+          questionCallbackData = kb[0][0].callback_data;
+          return Response.json({ ok: true, result: { message_id: 1 } });
+        }
+        return Response.json({ ok: true, result: { message_id: 900 } });
+      }
+      if (url.pathname.endsWith('/setMessageReaction')) {
+        reactions.push((await req.json()) as Record<string, unknown>);
+        return Response.json({ ok: true, result: true });
+      }
+      if (url.pathname.endsWith('/answerCallbackQuery') || url.pathname.endsWith('/editMessageText')) {
+        return Response.json({ ok: true, result: true });
+      }
+      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+    },
+  });
+  servers.push(server);
+
+  const daemon = await startDaemon(cfgDir, server.port);
+  procs.push(daemon);
+
+  // Open a question with NO TMUX_PANE and NO paneId in the payload — the daemon must resolve the
+  // pane itself (the registration + fake tmux both point at PANE_ID).
+  const ask = startAsk(
+    cfgDir,
+    server.port,
+    { requestId: 'q_unscoped', agent: 'claude', kind: 'question', question: 'Proceed?', options: [{ label: 'Yes' }] },
+    { unscoped: true },
+  );
+  procs.push(ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && questionCallbackData === '') await Bun.sleep(50);
+    expect(questionCallbackData).not.toBe('');
+  }
+
+  // Inbound arrives WHILE the unscoped question is open → must be DEFERRED, not pasted.
+  updateQueue.push([
+    { update_id: 20, message: { message_id: 21, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'inject me' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+  expect(injected(cfgDir)).toEqual([]); // NOT send-keys'd into the open prompt (the fail-open bug)
+  expect(reactions.at(-1)).toMatchObject({ message_id: 21, reaction: [{ type: 'emoji', emoji: '✍️' }] });
 
   daemon.kill('SIGTERM');
   await daemon.exited;

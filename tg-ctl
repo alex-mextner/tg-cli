@@ -1295,7 +1295,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const abandonedDuringFlush = new Set<string>()
   let lastWasDeferred = false
   const paneHasPendingQuestion = (paneId: string): boolean => {
-    for (const pb of pendingButtons.values()) if (pb.req.paneId && pb.req.paneId === paneId) return true
+    for (const pb of pendingButtons.values()) {
+      // tg#30: an UNSCOPED question — paneId undefined because the hook subprocess ran WITHOUT
+      // TMUX_PANE (the common Claude Code case) — defers inbound for ANY pane (fail CLOSED). The
+      // old guard required `pb.req.paneId && === paneId`, so a paneId-less question matched NO pane,
+      // inbound was NOT deferred, and the next message was send-keys'd into the open prompt. We
+      // can't prove an unscoped question is a DIFFERENT pane than the inject target, so don't paste.
+      // This can NEVER wedge routing: every entry self-clears in ≤110s (the abandon timer above),
+      // unlike a stale queue (which is intentionally NOT treated as a defer).
+      if (!pb.req.paneId) return true
+      if (pb.req.paneId === paneId) return true
+    }
     return false
   }
   // A live inbound message defers behind an OPEN question OR an in-flight flush
