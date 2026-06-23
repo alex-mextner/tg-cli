@@ -196,9 +196,13 @@ export type Action =
   // --- forum topics (docs/specs/tg-forum-topics.md) ---
   // A new topic was created → start the per-topic /new flow (ask path, then model).
   | { kind: 'topic-new'; threadId: number; name: string; from: string }
-  // A user message inside a topic still in the /new flow → feed the path/model answer
-  // to the state machine. `text` is the raw user text (a path, or unused once buttons land).
+  // A user message inside a topic still in the /new flow → feed the path answer (a working
+  // directory) to the state machine. `text` is the raw user text (the path the user typed).
   | { kind: 'topic-answer'; threadId: number; text: string; from: string; messageId: number }
+  // A tap on a model button (tgm:<threadId>:<modelId>) inside an awaiting-model topic → spawn
+  // the agent with that model. callbackQueryId answers the tap; messageId is the prompt message
+  // (carried for a future editMessageReplyMarkup that clears the buttons on bind — increment 4).
+  | { kind: 'topic-model'; callbackQueryId: string; threadId: number; modelId: string; messageId: number | null }
   // A user message inside a BOUND topic → inject into that topic's pane. injectText is
   // already wrapped; the entrypoint maps threadId→paneId and threads the ack with threadId.
   | { kind: 'topic-route'; threadId: number; injectText: string; from: string; messageId: number }

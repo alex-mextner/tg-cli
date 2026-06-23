@@ -14,7 +14,7 @@
 
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
-import { dirname, join, resolve } from "path"
+import { dirname, isAbsolute, join, resolve } from "path"
 import {
   buildAgentSelectMessage,
   dedupeCandidates,
@@ -78,7 +78,21 @@ import {
 import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
 import { inboundHistoryRecords } from "./features/replies/inbound"
 import { stepUpdates } from "./features/tg-ctl/updates"
-import { appendTopic, findTopic, markClosed, markReopened, parseTopics, serializeTopics } from "./features/tg-ctl/topics"
+import {
+  appendTopic,
+  applyModelAnswer,
+  applyPathAnswer,
+  buildModelKeyboard,
+  createTopic,
+  findTopic,
+  markBound,
+  markClosed,
+  markReopened,
+  parseTopics,
+  serializeTopics,
+  slugifyTopicName,
+} from "./features/tg-ctl/topics"
+import { MODEL_CATALOG, spawnArgv } from "./features/tg-ctl/models"
 import {
   buildFasterWhisperArgv,
   buildFfmpegArgv,
@@ -2340,6 +2354,188 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
+  // --- forum-topics SPAWN executor (docs/specs/tg-forum-topics.md §5, increment 2) ---
+  // The /new flow that creates a binding and launches a fresh agent into its own tmux window.
+  // SAFETY (this is the CTO's daily lifeline daemon): every step is exception-guarded — a bad
+  // path, a missing tmux, an unknown model, or a spawn error NEVER throws into the poll loop;
+  // it logs, posts a human-readable error INTO the topic, and leaves the binding mid-flow so the
+  // human can retry. The whole feature only runs when ctx.cfg.topics is on (the flag default-off
+  // keeps 1:1 behaviour byte-identical), and the spawn refuses for an already-bound topic, so a
+  // duplicate forum_topic_created or a daemon restart can never double-spawn into a live topic.
+
+  // statSync throws on a broken symlink / EACCES — guard so a malformed path answer can never
+  // bubble into the poll loop. A non-existent or non-directory path → false (re-ask the human).
+  const isExistingDirectory = (path: string): boolean => {
+    try {
+      return statSync(path).isDirectory()
+    } catch {
+      return false
+    }
+  }
+
+  // The tmux session to spawn the new window into: the configured pin, else the session a live
+  // agent already runs in (so the new window lands beside the existing agents), else undefined
+  // (tmux new-window without -t targets the current/only session). Best-effort, never throws.
+  const sessionForSpawn = (): string | undefined => {
+    if (ctx.cfg.session) return ctx.cfg.session
+    const { panes, procs } = snapshot()
+    for (const p of panes) {
+      if (findAgentInPane(p, procs) !== null) return p.sessionName
+    }
+    return panes[0]?.sessionName
+  }
+
+  // Run `tmux new-window … -- <agent argv>` and return the created pane id, or an error.
+  // -P -F '#{pane_id}' prints the new pane id on stdout → bound immediately (no discovery race,
+  // spec §5). Fully guarded: a spawn throw (tmux missing) or a non-zero exit becomes a typed
+  // error, never an exception. The path + argv are discrete argv elements (never shell-split),
+  // so a directory with spaces is safe.
+  const spawnTopicWindow = (windowSlug: string, path: string, model: string): { ok: true; paneId: string } | { ok: false; error: string } => {
+    const argv = spawnArgv(model, path)
+    if (!argv) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
+    try {
+      // sessionForSpawn() runs snapshot() (tmux list-panes / ps), which CAN throw if a binary is
+      // missing — it MUST be inside this try, else the throw escapes the local guard, past
+      // handleTopicModel, into the poll loop (exactly the "never throws" guarantee this defends).
+      const session = sessionForSpawn()
+      const tmuxArgv = [
+        "tmux",
+        "new-window",
+        ...(session ? ["-t", session] : []),
+        "-n",
+        windowSlug,
+        "-c",
+        path,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "--",
+        ...argv,
+      ]
+      const proc = Bun.spawnSync(tmuxArgv, { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+      if (proc.exitCode !== 0) {
+        return { ok: false, error: `couldn't start the agent (tmux: ${proc.stderr.toString().trim() || `exit ${proc.exitCode}`})` }
+      }
+      const paneId = proc.stdout.toString().trim()
+      if (!paneId) return { ok: false, error: "tmux did not return a pane id — agent not started" }
+      return { ok: true, paneId }
+    } catch (err) {
+      return { ok: false, error: `couldn't start the agent (${err})` }
+    }
+  }
+
+  // A new forum topic was created → begin the /new flow: persist an awaiting-path binding and
+  // ask for the working directory (free-text path, per spec §5; the recent-repo button picker is
+  // increment-4 polish). stepUpdates already filtered a duplicate create for an in-flight/bound
+  // topic, so reaching here means an untracked or previously-closed topic; the createTopic upsert
+  // resets it to awaiting-path either way (a fresh /new flow).
+  const handleTopicNew = async (action: Extract<Action, { kind: "topic-new" }>): Promise<boolean> => {
+    const topics = loadTopics()
+    persistTopics(appendTopic(topics, createTopic(action.threadId, action.name, Math.floor(Date.now() / 1000))))
+    await sendToTopic(
+      action.threadId,
+      "New agent for this topic. Which directory should it work in? Send an absolute path (e.g. /Users/you/project).",
+    )
+    return true
+  }
+
+  // Post the awaiting-model prompt with one inline button per catalog model. The callback data
+  // (tgm:<threadId>:<modelId>) routes the tap back to handleTopicModel. Reused by handleTopicNew's
+  // path step AND by a reopen that resumed at awaiting-model.
+  const askTopicModel = (threadId: number): Promise<number | null> =>
+    sendMessage(ctx, "Which model should this agent run?", {
+      message_thread_id: threadId,
+      reply_markup: { inline_keyboard: buildModelKeyboard(threadId, MODEL_CATALOG) },
+    })
+
+  // A user message inside an awaiting-* topic → the path answer. Validate the directory (must
+  // exist + be a dir, spec §10) before advancing; a bad path re-asks WITHOUT advancing so the
+  // human just resends. On a good path → awaiting-model + the model button prompt.
+  const handleTopicAnswer = async (action: Extract<Action, { kind: "topic-answer" }>): Promise<boolean> => {
+    const topics = loadTopics()
+    const binding = findTopic(topics, action.threadId)
+    if (!binding) return false // untracked — defensive (stepUpdates only emits for awaiting-*)
+    if (binding.status === "awaiting-model") {
+      // The model is chosen by BUTTON, not text — a stray message here just re-shows the buttons
+      // rather than mis-reading prose as a model id.
+      await askTopicModel(action.threadId)
+      return true
+    }
+    // ONLY awaiting-path text is a path answer. The binding is reloaded fresh here, so a status
+    // that already advanced past awaiting-path must be respected: a model tap + a text message in
+    // the SAME getUpdates batch emits topic-model (→ bound) THEN this stale topic-answer; without
+    // this guard the else-branch would call applyPathAnswer on the now-`bound` binding and move it
+    // back to awaiting-model — stranding the live spawned pane (codex P2, real race). For a bound
+    // (or closed) topic the stale answer is ignored: a message to a bound topic routes via
+    // topic-route, not here, so dropping this stale one loses nothing.
+    if (binding.status !== "awaiting-path") return false
+    const path = action.text.trim()
+    // Require an ABSOLUTE path: isExistingDirectory (statSync) resolves a relative path against the
+    // DAEMON's cwd, but `tmux new-window -c <path>` resolves it against the tmux SERVER's cwd — a
+    // relative path could validate here yet spawn the agent in a different directory (or fail). An
+    // absolute path resolves identically for both, so validation and spawn always see the same dir.
+    if (!path || !isAbsolute(path) || !isExistingDirectory(path)) {
+      await sendToTopic(action.threadId, `\`${path || "(empty)"}\` is not an absolute path to an existing directory — send a full path like /Users/you/project.`)
+      return false
+    }
+    persistTopics(appendTopic(topics, applyPathAnswer(binding, path, Math.floor(Date.now() / 1000))))
+    await askTopicModel(action.threadId)
+    return true
+  }
+
+  // A model button tap → spawn the agent and bind the topic. Refuses a second spawn for an
+  // already-bound topic (idempotency: a late/duplicate tap can't launch a second agent), and
+  // re-asks on an unknown model id. On success the new pane is bound immediately and a
+  // confirmation posts into the topic; on a spawn failure the binding stays awaiting-model so
+  // the human can re-pick (no half-state, no crash).
+  const handleTopicModel = async (action: Extract<Action, { kind: "topic-model" }>): Promise<boolean> => {
+    // Answer the tap with a CONTEXT toast — not a blanket "starting…" that misleads on a refuse
+    // branch (already-bound / wrong state / unknown model). Each early return answers its own.
+    const topics = loadTopics()
+    const binding = findTopic(topics, action.threadId)
+    if (!binding) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "not in setup")
+      await sendToTopic(action.threadId, "this topic isn't in setup — recreate it to spawn an agent")
+      return false
+    }
+    if (binding.status === "bound") {
+      // The model keyboard stays live after bind (clearing it is increment-4 polish), so a human
+      // can tap it repeatedly. Answer ONLY the transient callback toast — NOT a fresh sendToTopic
+      // per tap — so multi-tapping a dangling button can't flood the topic with messages.
+      await answerCallbackQuery(ctx, action.callbackQueryId, "an agent is already running here")
+      return false
+    }
+    if (binding.status !== "awaiting-model" || !binding.path) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "send a directory first")
+      await sendToTopic(action.threadId, "send the working directory first, then pick a model")
+      return false
+    }
+    // Validate the model id ONCE, up front (applyModelAnswer and spawnArgv both resolve against
+    // MODEL_CATALOG — the single source of truth). An unknown id can only arrive via a stale/forged
+    // callback (the keyboard emits valid ids); reject it BEFORE the "starting…" toast so the user
+    // never sees "starting…" followed by "unknown model", and BEFORE persisting — so a bad id can't
+    // strand the binding at awaiting-model with a model that spawn would forever reject.
+    const ts = Math.floor(Date.now() / 1000)
+    const withModel = applyModelAnswer(binding, action.modelId, ts)
+    if (!withModel) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "unknown model")
+      await sendToTopic(action.threadId, `unknown model \`${action.modelId}\` — pick a model again`)
+      return false
+    }
+    await answerCallbackQuery(ctx, action.callbackQueryId, "starting…")
+    persistTopics(appendTopic(topics, withModel))
+    const slug = slugifyTopicName(binding.name, action.threadId)
+    const spawned = spawnTopicWindow(slug, binding.path, action.modelId)
+    if (!spawned.ok) {
+      // Leave the binding at awaiting-model (withModel) so a re-tap retries without losing the path.
+      await sendToTopic(action.threadId, spawned.error)
+      return false
+    }
+    persistTopics(appendTopic(loadTopics(), markBound(withModel, spawned.paneId, Math.floor(Date.now() / 1000))))
+    await sendToTopic(action.threadId, `spawned \`${action.modelId}\` in \`${binding.path}\` (window \`${slug}\`) — send a message to talk to it`)
+    return true
+  }
+
   // getFile → /file/ download into ~/.cache/tg-cli/inbound under the daemon-
   // chosen name (never the Telegram basename, spec §5.2). Returns the local path
   // or null (already logged + replied). Shared by media + voice download. The
@@ -2625,15 +2821,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "topic-reopen":
         return handleTopicLifecycle(action)
       case "topic-new":
+        return handleTopicNew(action)
       case "topic-answer":
-        // SEAM for increment 2 (spawn + bind executor, spec §9.2): the /new flow that asks
-        // the path + model and runs `tmux new-window`. Until that lands, a topic-create /
-        // in-flight answer is a logged no-op — no binding is created, so a later message in
-        // the topic stays UNTRACKED (topicStatusOf → null) and is ACKed-only by stepUpdates,
-        // never leaking into a flat agent. The flag default-off means this branch is dead for
-        // every existing 1:1 user.
-        log(`topic ${action.threadId}: ${action.kind} (spawn executor not yet wired — increment 2)`)
-        return true
+        return handleTopicAnswer(action)
+      case "topic-model":
+        return handleTopicModel(action)
       case "ack":
         if (lastWasDeferred) {
           lastWasDeferred = false
@@ -2785,6 +2977,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         )
       }
 
+      // STRICTLY SEQUENTIAL — one action fully completes (its persist + spawn) before the next
+      // starts. The forum-topics no-double-spawn guarantee relies on this: two `topic-model` taps
+      // in one batch are handled one-after-another, so the first reaches `bound` before the second's
+      // bound-guard reads the store. Parallelizing this (Promise.all) would let both load
+      // `awaiting-model` and both spawn — do NOT make action dispatch concurrent.
       for (const action of step.actions) {
         lastActionOk = await executeAction(action)
       }
