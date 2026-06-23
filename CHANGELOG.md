@@ -3,6 +3,25 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.17.0
+
+Forum-topics: spawn an agent on topic creation (the `/new` flow trigger, spec
+increment 2; tg-cli#85, refs #27). When a Telegram forum topic is created the daemon
+runs an interactive `/new` flow and launches a fresh agent bound to that topic — one
+topic = one agent. The routing half (#56/#61) and the pure foundation already shipped;
+this wires the `topic-new`/`topic-answer` entrypoint actions to a real `tmux new-window`
+spawn plus a model-pick button.
+
+- **Flow:** `forum_topic_created` → ask for a working directory → validate it
+  (absolute + existing dir) → post model-catalog buttons → on a tap, spawn
+  `tmux new-window -P -F '#{pane_id}' -- <model argv>` and bind the returned pane. The
+  topic name is only the tmux-window slug; path + model come from the interactive flow.
+- **Safety:** every spawn step is exception-guarded (a bad path / missing tmux / spawn
+  error posts an error into the topic and never throws into the poll loop); no
+  double-spawn (duplicate create filtered, already-bound refused, model validated once,
+  sequential action dispatch); gated behind `control.topics` (default OFF → 1:1
+  behaviour byte-identical).
+
 ## 1.16.0
 
 Single-source the tool version (tg-cli#80). `tg --version` now reads the version
