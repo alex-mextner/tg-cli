@@ -3,6 +3,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
 import { BOT_COMMANDS } from '../features/tg-ctl/bot-commands';
 
 // The daemon must self-provision its command menu on startup: POST setMyCommands
@@ -61,6 +62,10 @@ function spawnDaemon(cfgDir: string, shimDir: string, port: number): Subprocess 
     },
     stdio: ['ignore', logFd, logFd],
   });
+  // Track BEFORE returning so teardown reaps it even if the caller throws before
+  // it pushes; record the temp cfgDir for the scoped backstop sweep.
+  trackProc(reg, daemon);
+  trackCfgDir(reg, cfgDir);
   closeSync(logFd);
   return daemon;
 }
@@ -76,16 +81,11 @@ function setupConfigDir(): { cfgDir: string; shimDir: string } {
   return { cfgDir, shimDir };
 }
 
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
 const servers: { stop: (force?: boolean) => void }[] = [];
 
 afterAll(async () => {
-  for (const p of procs) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
+  await reapDaemons(reg);
   for (const s of servers) s.stop(true);
 });
 
@@ -103,7 +103,6 @@ test('startup POSTs setMyCommands with the published command list', async () => 
   const fake = makeFake({ failSetMyCommands: false });
   servers.push(fake.server);
   const daemon = spawnDaemon(cfgDir, shimDir, fake.server.port);
-  procs.push(daemon);
 
   const got = await waitFor(() => fake.setMyCommandsBodies.length >= 1, 10_000);
   expect(got).toBe(true);
@@ -143,7 +142,6 @@ test('a failing setMyCommands does NOT crash or block startup', async () => {
   const fake = makeFake({ failSetMyCommands: true });
   servers.push(fake.server);
   const daemon = spawnDaemon(cfgDir, shimDir, fake.server.port);
-  procs.push(daemon);
 
   // setMyCommands was attempted (and rejected by the fake)...
   const attempted = await waitFor(() => fake.setMyCommandsBodies.length >= 1, 10_000);
@@ -175,7 +173,6 @@ test('a transport failure (Telegram unreachable) does NOT crash startup', async 
   probe.stop(true);
 
   const daemon = spawnDaemon(cfgDir, shimDir, deadPort);
-  procs.push(daemon);
 
   // Wait on a POSITIVE liveness signal, not a blind sleep (review #68): runDaemon
   // writes its pidfile early — BEFORE publishBotCommands — so the file appearing

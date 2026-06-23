@@ -3,19 +3,15 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
 const servers: Array<{ stop: (closeActiveConnections?: boolean) => void }> = [];
 
 afterEach(async () => {
-  for (const p of procs.splice(0)) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
+  await reapDaemons(reg);
   for (const s of servers.splice(0)) s.stop(true);
 });
 
@@ -34,7 +30,6 @@ test('tg-ctl ask returns no decision immediately when the Telegram prompt cannot
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const ask = startAsk(cfgDir, server.port, {
     requestId: 'q_fail',
@@ -42,7 +37,6 @@ test('tg-ctl ask returns no decision immediately when the Telegram prompt cannot
     kind: 'question',
     question: 'Continue?',
   });
-  procs.push(ask);
   const stdout = await new Response(ask.stdout).text();
   await ask.exited;
 
@@ -60,7 +54,7 @@ test('tg-ctl ask exits 0 with no output when credentials are absent', async () =
     stdout: 'pipe',
     stderr: 'pipe',
   });
-  procs.push(ask);
+  trackProc(reg, ask);
   ask.stdin.write(JSON.stringify({
     requestId: 'q_no_creds',
     agent: 'claude',
@@ -95,7 +89,6 @@ test('tg-ctl ask does not create inline buttons for unsupported Codex question h
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const ask = startAsk(cfgDir, server.port, {
     requestId: 'codex_question',
@@ -104,7 +97,6 @@ test('tg-ctl ask does not create inline buttons for unsupported Codex question h
     question: 'Pick a value',
     options: [{ label: 'A' }],
   });
-  procs.push(ask);
   const stdout = await new Response(ask.stdout).text();
   await ask.exited;
 
@@ -121,13 +113,19 @@ test('tg-ctl ask does not create inline buttons for unsupported Codex question h
 
 test('tg-ctl ask fast-passes unsupported hooks before slow Telegram notices finish', async () => {
   const cfgDir = makeCfgDir();
+  let noticeDone = false;
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname.endsWith('/getUpdates')) return Response.json({ ok: true, result: [] });
       if (url.pathname.endsWith('/sendMessage')) {
+        // The notice send is deliberately slow. The ask MUST return before it
+        // resolves — `noticeDone` flips only after this 3s block completes, so
+        // asserting it's still false at ask-exit is a deterministic proof the
+        // ask did not wait for the send (no wall-clock budget to flake under load).
         await Bun.sleep(3000);
+        noticeDone = true;
         return Response.json({ ok: true, result: { message_id: 92 } });
       }
       return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
@@ -135,9 +133,7 @@ test('tg-ctl ask fast-passes unsupported hooks before slow Telegram notices fini
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
-  const t0 = Date.now();
   const ask = startAsk(cfgDir, server.port, {
     requestId: 'codex_question_slow_notice',
     agent: 'codex',
@@ -145,11 +141,10 @@ test('tg-ctl ask fast-passes unsupported hooks before slow Telegram notices fini
     question: 'Pick a value',
     options: [{ label: 'A' }],
   });
-  procs.push(ask);
   const stdout = await new Response(ask.stdout).text();
   await ask.exited;
 
-  expect(Date.now() - t0).toBeLessThan(1500);
+  expect(noticeDone).toBe(false);
   expect(stdout).toBe('');
 }, 10_000);
 
@@ -170,7 +165,6 @@ test('tg-ctl ask fast-passes when the hook cwd does not match the active registr
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const ask = startAsk(cfgDir, server.port, {
     requestId: 'q_wrong_cwd',
@@ -180,7 +174,6 @@ test('tg-ctl ask fast-passes when the hook cwd does not match the active registr
     question: 'Continue?',
     options: [{ label: 'A' }],
   });
-  procs.push(ask);
   const stdout = await new Response(ask.stdout).text();
   await ask.exited;
 
@@ -205,7 +198,6 @@ test('tg-ctl ask rejects duplicate active callback ids without replacing the fir
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const first = startAsk(cfgDir, server.port, {
     requestId: 'q_duplicate',
@@ -213,7 +205,6 @@ test('tg-ctl ask rejects duplicate active callback ids without replacing the fir
     kind: 'question',
     question: 'Continue?',
   });
-  procs.push(first);
   const t0 = Date.now();
   while (Date.now() - t0 < 5000 && sendCount === 0) await Bun.sleep(50);
   expect(sendCount).toBe(1);
@@ -225,7 +216,6 @@ test('tg-ctl ask rejects duplicate active callback ids without replacing the fir
     kind: 'question',
     question: 'Continue again?',
   });
-  procs.push(second);
   const stdout = await new Response(second.stdout).text();
   await second.exited;
 
@@ -253,7 +243,6 @@ test('tg-ctl ask reserves callback ids while sendMessage is still in flight', as
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const first = startAsk(cfgDir, server.port, {
     requestId: 'q_duplicate_inflight',
@@ -261,7 +250,6 @@ test('tg-ctl ask reserves callback ids while sendMessage is still in flight', as
     kind: 'question',
     question: 'Continue?',
   });
-  procs.push(first);
   const t0 = Date.now();
   while (Date.now() - t0 < 5000 && !firstSendStarted) await Bun.sleep(25);
   expect(firstSendStarted).toBe(true);
@@ -272,7 +260,6 @@ test('tg-ctl ask reserves callback ids while sendMessage is still in flight', as
     kind: 'question',
     question: 'Continue again?',
   });
-  procs.push(second);
   const stdout = await new Response(second.stdout).text();
   await second.exited;
 
@@ -326,7 +313,6 @@ test('daemon resolves a callback that arrives before sendMessage returns', async
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const ask = startAsk(cfgDir, server.port, {
     requestId: 'q_fast_callback',
@@ -335,7 +321,6 @@ test('daemon resolves a callback that arrives before sendMessage returns', async
     question: 'Continue?',
     options: [{ label: 'A' }],
   });
-  procs.push(ask);
   const stdout = await new Response(ask.stdout).text();
   await ask.exited;
 
@@ -419,7 +404,6 @@ test('daemon rejects a stale tap from a different Telegram message and accepts t
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const ask = startAsk(cfgDir, server.port, {
     requestId: 'q_stale_tap',
@@ -428,7 +412,6 @@ test('daemon rejects a stale tap from a different Telegram message and accepts t
     question: 'Continue?',
     options: [{ label: 'A' }],
   });
-  procs.push(ask);
   const stdout = await new Response(ask.stdout).text();
   await ask.exited;
 
@@ -451,6 +434,7 @@ test('daemon returns hook output before slow Telegram callback cleanup finishes'
   const cfgDir = makeCfgDir();
   let callbackData: string | null = null;
   let callbackServed = false;
+  let cleanupDone = false;
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -482,7 +466,12 @@ test('daemon returns hook output before slow Telegram callback cleanup finishes'
         return Response.json({ ok: true, result: { message_id: 102 } });
       }
       if (url.pathname.endsWith('/answerCallbackQuery')) {
+        // The callback cleanup (acking the tap) is deliberately slow. The ask
+        // MUST return the hook answer before this resolves — `cleanupDone` flips
+        // only after the 3s block, so asserting it's still false at ask-exit is a
+        // deterministic proof the ask did not block on cleanup (no flaky budget).
         await Bun.sleep(3000);
+        cleanupDone = true;
         return Response.json({ ok: true, result: true });
       }
       if (url.pathname.endsWith('/editMessageText')) return Response.json({ ok: true, result: true });
@@ -491,9 +480,7 @@ test('daemon returns hook output before slow Telegram callback cleanup finishes'
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
-  const t0 = Date.now();
   const ask = startAsk(cfgDir, server.port, {
     requestId: 'q_slow_cleanup',
     agent: 'claude',
@@ -501,11 +488,10 @@ test('daemon returns hook output before slow Telegram callback cleanup finishes'
     question: 'Continue?',
     options: [{ label: 'A' }],
   });
-  procs.push(ask);
   const stdout = await new Response(ask.stdout).text();
   await ask.exited;
 
-  expect(Date.now() - t0).toBeLessThan(1500);
+  expect(cleanupDone).toBe(false);
   expect(JSON.parse(stdout)).toMatchObject({
     hookSpecificOutput: {
       updatedInput: {
@@ -537,7 +523,6 @@ test('daemon edits the Telegram prompt when the hook client disconnects before a
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const ask = startAsk(cfgDir, server.port, {
     requestId: 'q_disconnect',
@@ -545,7 +530,6 @@ test('daemon edits the Telegram prompt when the hook client disconnects before a
     kind: 'question',
     question: 'Continue?',
   });
-  procs.push(ask);
 
   const t0 = Date.now();
   while (Date.now() - t0 < 5000 && !sent) await Bun.sleep(50);
@@ -583,7 +567,6 @@ test('daemon expires the Telegram prompt when hook disconnects while sendMessage
   });
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const ask = startAsk(cfgDir, server.port, {
     requestId: 'q_race',
@@ -591,7 +574,6 @@ test('daemon expires the Telegram prompt when hook disconnects while sendMessage
     kind: 'question',
     question: 'Continue?',
   });
-  procs.push(ask);
 
   const t0 = Date.now();
   while (Date.now() - t0 < 5000 && !sendStarted) await Bun.sleep(25);
@@ -618,20 +600,21 @@ function makeCfgDir(): string {
 
 async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess> {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  // spawnDaemon tracks the proc + cfgDir BEFORE the socket wait, so a missing
+  // socket can never leak the spawned daemon.
+  const daemon = await spawnDaemon(reg, {
+    tgCtlPath: TG_CTL,
+    cfgDir,
     env: {
       PATH: `${join(cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
       HOME: cfgDir,
       TG_CTL_CONFIG_DIR: cfgDir,
       TG_API_BASE: `http://127.0.0.1:${apiPort}`,
     },
-    stdio: ['ignore', logFd, logFd],
+    logFd,
   });
   closeSync(logFd);
-  const socket = join(cfgDir, 'tg-ctl.123.sock');
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !existsSync(socket)) await Bun.sleep(50);
-  expect(existsSync(socket)).toBe(true);
+  expect(existsSync(join(cfgDir, 'tg-ctl.123.sock'))).toBe(true);
   return daemon;
 }
 
@@ -649,6 +632,7 @@ function startAsk(cfgDir: string, apiPort: number, request: unknown): Subprocess
     stdout: 'pipe',
     stderr: 'pipe',
   });
+  trackProc(reg, ask);
   ask.stdin.write(JSON.stringify(body) + '\n');
   ask.stdin.end();
   return ask;

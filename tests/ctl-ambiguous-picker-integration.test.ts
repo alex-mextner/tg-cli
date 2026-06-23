@@ -3,6 +3,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 
 // tg-cli#72: an ambiguous route / a reply to a GONE agent must post the inline-
 // keyboard PICKER (tappable buttons, like /agent) — NOT the old plain-text
@@ -21,16 +22,11 @@ const PID_HYPER = 9000;
 const PANE_TOOLS = '%2';
 const PID_TOOLS = 2002;
 
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
 const servers: Array<{ stop: (c?: boolean) => Promise<void> | void }> = [];
 
 afterEach(async () => {
-  for (const p of procs.splice(0)) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
+  await reapDaemons(reg);
   for (const s of servers.splice(0)) await s.stop(true);
 });
 
@@ -133,20 +129,19 @@ function injectedLines(injectLog: string): string[] {
 
 async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess> {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const daemon = await spawnDaemon(reg, {
+    tgCtlPath: TG_CTL,
+    cfgDir,
     env: {
       PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
       HOME: cfgDir,
       TG_CTL_CONFIG_DIR: cfgDir,
       TG_API_BASE: `http://127.0.0.1:${apiPort}`,
     },
-    stdio: ['ignore', logFd, logFd],
+    logFd,
   });
   closeSync(logFd);
-  const socket = join(cfgDir, 'tg-ctl.123.sock');
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !existsSync(socket)) await Bun.sleep(50);
-  expect(existsSync(socket)).toBe(true);
+  expect(existsSync(join(cfgDir, 'tg-ctl.123.sock'))).toBe(true);
   return daemon;
 }
 
@@ -282,7 +277,6 @@ test('AMBIGUOUS plain message, NO last message → inline-keyboard picker (butto
   const tg = startFakeTg();
   h.setMode('both');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushText(700, 20, 'do the thing');
 
@@ -323,7 +317,6 @@ test('NO-REPLY plain message → binds DIRECTLY to the last-message agent, NO pi
   const tg = startFakeTg();
   h.setMode('both');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushText(706, 30, 'continue where we left off');
 
@@ -356,7 +349,6 @@ test('NO-REPLY bind FLIPS to whoever posted last (a newer post from the other ag
   const tg = startFakeTg();
   h.setMode('both');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushText(707, 32, 'ship it');
 
@@ -388,7 +380,6 @@ test('NO-REPLY bind: last-message agent GONE → never guesses into the gone pan
   const tg = startFakeTg();
   h.setMode('tools'); // %0 gone, only %2 live
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushText(708, 34, 'where did everyone go');
 
@@ -412,7 +403,6 @@ test('TAP a button → routes the pending message to the chosen pane', async () 
   const tg = startFakeTg();
   h.setMode('both');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushText(700, 20, 'route me');
   await waitFor(() => pickerOf(tg.sends) !== undefined);
@@ -455,7 +445,6 @@ test('REPLY to a now-GONE agent → picker WITH "no longer running" notice namin
   const tg = startFakeTg();
   h.setMode('tools'); // hyperide gone, agent-tools live
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushReply(702, 22, 500, 'reply meant for the now-gone hyperide agent');
 
@@ -481,7 +470,6 @@ test('HAPPY PATH: a single registered live agent → direct inject, NO picker', 
   const tg = startFakeTg();
   h.setMode('hyper');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushText(703, 24, 'just do it');
 
@@ -507,7 +495,6 @@ test('AMBIGUOUS control verb (/stop, no routable text) → select-only picker, N
   const tg = startFakeTg();
   h.setMode('both');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   const stopMsgId = 26;
   tg.pushText(704, stopMsgId, '/stop');
@@ -544,7 +531,6 @@ test('DESTRUCTIVE /kill NEVER auto-binds to the last-message agent (asks even WI
   const tg = startFakeTg();
   h.setMode('both');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   const killMsgId = 36;
   tg.pushText(709, killMsgId, '/kill');
@@ -574,7 +560,6 @@ test('candidatesForPicker drops a discovery pane that is NOT a live agent (no sy
   const tg = startFakeTg();
   h.setMode('tools'); // only %2 (agent-tools) is a live agent pane
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushText(705, 28, 'do the thing with one gone');
 

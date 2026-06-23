@@ -2,7 +2,7 @@ import { afterAll, expect, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { NO_AGENT_REPLY } from '../tg-ctl';
 
 // Full daemon round-trip against a local Bot-API fake (spec §11: "the daemon
@@ -105,34 +105,35 @@ const shimLog = join(cfgDir, 'tmux-calls.log');
 mkdirSync(shimDir);
 writeFileSync(join(shimDir, 'tmux'), `#!/bin/sh\necho "$@" >> '${shimLog}'\nexit 0\n`, { mode: 0o755 });
 
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
 
 afterAll(async () => {
-  for (const p of procs) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
-  for (const p of procs) {
-    expect(() => process.kill(p.pid, 0)).toThrow();
+  // Snapshot tracked pids before reapDaemons drains the registry, so the
+  // post-teardown "nothing survived" assertion still has them.
+  const pids = reg.procs.map((p) => p.pid);
+  await reapDaemons(reg);
+  for (const pid of pids) {
+    expect(() => process.kill(pid, 0)).toThrow();
   }
   server.stop(true);
 });
 
 test('daemon round-trip: stale notice, guard replies, /status, allowlist drop, media download', async () => {
   // Daemon stderr goes to a file, not a pipe — post-mortem readable, can't block.
+  // spawnDaemon tracks the proc + cfgDir BEFORE waiting on the socket, so a
+  // missing socket can never leak the spawned daemon.
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const daemon = await spawnDaemon(reg, {
+    tgCtlPath: TG_CTL,
+    cfgDir,
     env: {
       PATH: `${shimDir}:${process.env.PATH ?? ''}`,
       HOME: cfgDir, // media lands under $HOME/.cache/tg-cli/inbound
       TG_CTL_CONFIG_DIR: cfgDir,
       TG_API_BASE: `http://127.0.0.1:${server.port}`,
     },
-    stdio: ['ignore', logFd, logFd],
+    logFd,
   });
-  procs.push(daemon);
   closeSync(logFd);
 
   // Wait until the whole batch is processed: 4 sends captured AND the next

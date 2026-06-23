@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
 
 // Process-level singleton check (spec §6, §11): two REAL `tg-ctl run` daemons
 // race for the same per-bot flock; exactly one survives, the loser exits 0
@@ -12,7 +13,7 @@ import type { Subprocess } from 'bun';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
 
 // Fake Bot API: hold ~2s then answer empty. An INSTANT empty response would
 // make the daemon loop spin hot (real Telegram paces via the 50s hold).
@@ -52,20 +53,19 @@ function spawnDaemon(): Subprocess {
     stdout: 'ignore',
     stderr: 'ignore',
   });
-  procs.push(proc);
+  trackProc(reg, proc);
+  trackCfgDir(reg, cfgDir);
   return proc;
 }
 
 afterAll(async () => {
-  for (const p of procs) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
+  // Snapshot the tracked pids before reapDaemons drains the registry, so we can
+  // still assert nothing survived after teardown.
+  const pids = reg.procs.map((p) => p.pid);
+  await reapDaemons(reg);
   // Double-check nothing survived: kill(pid, 0) must throw once reaped.
-  for (const p of procs) {
-    expect(() => process.kill(p.pid, 0)).toThrow();
+  for (const pid of pids) {
+    expect(() => process.kill(pid, 0)).toThrow();
   }
   server.stop(true);
 });

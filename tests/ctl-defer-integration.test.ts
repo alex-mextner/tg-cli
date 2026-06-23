@@ -3,6 +3,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, spawnDaemon, trackProc } from './helpers/daemon-lifecycle';
 
 // End-to-end defer-while-waiting (spec tg#30): the real daemon, a fake Telegram
 // server, and a fake tmux/ps that reports ONE claude pane (%1) and LOGS every
@@ -12,16 +13,11 @@ import type { Subprocess } from 'bun';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
 const servers: Array<{ stop: (closeActiveConnections?: boolean) => Promise<void> | void }> = [];
 
 afterEach(async () => {
-  for (const p of procs.splice(0)) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
+  await reapDaemons(reg);
   // await stop: with active connections Bun returns a Promise; not awaiting it
   // leaks the listener into the next test (port/listener race).
   for (const s of servers.splice(0)) await s.stop(true);
@@ -109,7 +105,9 @@ async function startDaemon(
   extraEnv: Record<string, string> = {},
 ): Promise<Subprocess> {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const daemon = await spawnDaemon(reg, {
+    tgCtlPath: TG_CTL,
+    cfgDir,
     env: {
       // ONLY the fake bin dir on PATH for tmux/ps; node/bun resolve via execPath.
       PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
@@ -118,13 +116,10 @@ async function startDaemon(
       TG_API_BASE: `http://127.0.0.1:${apiPort}`,
       ...extraEnv,
     },
-    stdio: ['ignore', logFd, logFd],
+    logFd,
   });
   closeSync(logFd);
-  const socket = join(cfgDir, 'tg-ctl.123.sock');
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !existsSync(socket)) await Bun.sleep(50);
-  expect(existsSync(socket)).toBe(true);
+  expect(existsSync(join(cfgDir, 'tg-ctl.123.sock'))).toBe(true);
   return daemon;
 }
 
@@ -200,7 +195,6 @@ test('inbound text deferred while a question is open, flushed (and not lost) aft
   servers.push(server);
 
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   // 1) Open a question on pane %1 (hook → inline buttons). It blocks until the
   //    callback answers it.
@@ -211,7 +205,7 @@ test('inbound text deferred while a question is open, flushed (and not lost) aft
     question: 'Proceed?',
     options: [{ label: 'Yes' }, { label: 'No' }],
   });
-  procs.push(ask);
+  trackProc(reg, ask);
 
   // Wait for the button message to be posted.
   {
@@ -354,7 +348,6 @@ test('a follow-up question ABANDONED mid-flush dead-letters its backlog instead 
   servers.push(server);
 
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   // 1) Open Q1 and defer one message behind it so the flush has a backlog to
   //    drain when Q1 is answered (flushDeferred early-returns on an empty queue).
@@ -365,7 +358,7 @@ test('a follow-up question ABANDONED mid-flush dead-letters its backlog instead 
     question: 'First?',
     options: [{ label: 'Yes' }],
   });
-  procs.push(ask1);
+  trackProc(reg, ask1);
   {
     const t0 = Date.now();
     while (Date.now() - t0 < 5000 && questionCallbackData === '') await Bun.sleep(50);
@@ -413,7 +406,7 @@ test('a follow-up question ABANDONED mid-flush dead-letters its backlog instead 
     question: 'Second?',
     options: [{ label: 'Ok' }],
   });
-  procs.push(ask2);
+  trackProc(reg, ask2);
   {
     const t0 = Date.now();
     while (Date.now() - t0 < 4000 && questionCallbackData === '') await Bun.sleep(50);
@@ -479,7 +472,7 @@ test('a follow-up question ABANDONED mid-flush dead-letters its backlog instead 
     question: 'Third?',
     options: [{ label: 'Go' }],
   });
-  procs.push(ask3);
+  trackProc(reg, ask3);
   {
     const t0 = Date.now();
     while (Date.now() - t0 < 5000 && questionCallbackData === '') await Bun.sleep(50);
@@ -575,7 +568,6 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
   servers.push(server);
 
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const waitForButton = async (): Promise<void> => {
     const t0 = Date.now();
@@ -591,7 +583,7 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
 
   // Q1 + its backlog so the flush has work.
   const ask1 = startAsk(cfgDir, server.port, { requestId: 'q1', agent: 'claude', kind: 'question', question: 'First?', options: [{ label: 'Y' }] });
-  procs.push(ask1);
+  trackProc(reg, ask1);
   await waitForButton();
   const q1Cb = questionCallbackData;
   const q1Msg = buttonMessageId;
@@ -606,7 +598,7 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
 
   // During the settle: Q2 opens, m2 defers, Q2 abandoned.
   const ask2 = startAsk(cfgDir, server.port, { requestId: 'q2', agent: 'claude', kind: 'question', question: 'Second?', options: [{ label: 'Y' }] });
-  procs.push(ask2);
+  trackProc(reg, ask2);
   await waitForButton();
   questionCallbackData = '';
   updateQueue.push([{ update_id: 42, message: { message_id: 43, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q2 orphan' } }]);
@@ -615,7 +607,7 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
   // Q3 opens (a real, still-pending question) and m3 defers behind it — BEFORE we
   // abandon Q2, so the flush is guaranteed to see Q3 pending when it wakes.
   const ask3 = startAsk(cfgDir, server.port, { requestId: 'q3', agent: 'claude', kind: 'question', question: 'Third?', options: [{ label: 'Go' }] });
-  procs.push(ask3);
+  trackProc(reg, ask3);
   await waitForButton();
   const q3Cb = questionCallbackData;
   const q3Msg = buttonMessageId;
@@ -703,7 +695,6 @@ test('a question removed WITHOUT an answer (hook socket closes) does not wedge l
   servers.push(server);
 
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   // Open a question; an inbound arrives and is deferred behind it.
   const ask = startAsk(cfgDir, server.port, {
@@ -713,7 +704,7 @@ test('a question removed WITHOUT an answer (hook socket closes) does not wedge l
     question: 'Proceed?',
     options: [{ label: 'Yes' }],
   });
-  procs.push(ask);
+  trackProc(reg, ask);
   {
     const t0 = Date.now();
     while (Date.now() - t0 < 5000 && questionCallbackData === '') await Bun.sleep(50);
@@ -792,7 +783,7 @@ test('a question removed WITHOUT an answer (hook socket closes) does not wedge l
     question: 'Second?',
     options: [{ label: 'Ok' }],
   });
-  procs.push(ask2);
+  trackProc(reg, ask2);
   {
     const t0 = Date.now();
     while (Date.now() - t0 < 5000 && questionCallbackData === '') await Bun.sleep(50);
@@ -863,7 +854,6 @@ test('tg#30: an UNSCOPED question (hook had no TMUX_PANE) still DEFERS inbound, 
   servers.push(server);
 
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   // Open a question with NO TMUX_PANE and NO paneId in the payload — the daemon must resolve the
   // pane itself (the registration + fake tmux both point at PANE_ID).
@@ -873,7 +863,7 @@ test('tg#30: an UNSCOPED question (hook had no TMUX_PANE) still DEFERS inbound, 
     { requestId: 'q_unscoped', agent: 'claude', kind: 'question', question: 'Proceed?', options: [{ label: 'Yes' }] },
     { unscoped: true },
   );
-  procs.push(ask);
+  trackProc(reg, ask);
   {
     const t0 = Date.now();
     while (Date.now() - t0 < 5000 && questionCallbackData === '') await Bun.sleep(50);
@@ -968,7 +958,6 @@ test('a SCOPED question stays open PAST the abandon bound — no "expired", the 
   // 1.5s unscoped bound — if a SCOPED question were (wrongly) armed with it, it
   // would expire well within this test. It must not.
   const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
-  procs.push(daemon);
 
   // Scoped question on %1 (startAsk pins TMUX_PANE=%1 by default).
   const ask = startAsk(cfgDir, server.port, {
@@ -978,7 +967,7 @@ test('a SCOPED question stays open PAST the abandon bound — no "expired", the 
     question: 'Proceed?',
     options: [{ label: 'Yes' }, { label: 'No' }],
   });
-  procs.push(ask);
+  trackProc(reg, ask);
   {
     const t0 = Date.now();
     while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
@@ -1034,7 +1023,6 @@ test('a SCOPED question that waits forever still cleans up on socket close (agen
   const server = recordingServer(updateQueue, reactions, edits);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
-  procs.push(daemon);
 
   const ask = startAsk(cfgDir, server.port, {
     requestId: 'q_scoped_diesocket',
@@ -1043,7 +1031,7 @@ test('a SCOPED question that waits forever still cleans up on socket close (agen
     question: 'Proceed?',
     options: [{ label: 'Yes' }],
   });
-  procs.push(ask);
+  trackProc(reg, ask);
   {
     const t0 = Date.now();
     while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
@@ -1101,7 +1089,6 @@ test('NO-WEDGE guard: an UNSCOPED question never answered still self-clears at t
   const server = recordingServer(updateQueue, reactions, edits);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
-  procs.push(daemon);
 
   // Unscoped question (hook had no TMUX_PANE) → defers ANY pane.
   const ask = startAsk(
@@ -1110,7 +1097,7 @@ test('NO-WEDGE guard: an UNSCOPED question never answered still self-clears at t
     { requestId: 'q_unscoped_wedge', agent: 'claude', kind: 'question', question: 'Proceed?', options: [{ label: 'Yes' }] },
     { unscoped: true },
   );
-  procs.push(ask);
+  trackProc(reg, ask);
   {
     const t0 = Date.now();
     while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);

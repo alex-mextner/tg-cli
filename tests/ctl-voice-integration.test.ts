@@ -4,6 +4,7 @@ import { createConnection } from 'net';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, trackCfgDir, trackProc } from './helpers/daemon-lifecycle';
 
 // Full inbound-VOICE round-trip against a Bot-API fake (mirrors
 // ctl-daemon-integration.test.ts). The Whisper + ffmpeg binaries are PATH shims
@@ -196,16 +197,11 @@ function makeCfgDir(opts: {
   return { cfgDir, shimDir, tmuxLog, whisperBin, modelPath };
 }
 
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
 const servers: { stop: (force?: boolean) => void }[] = [];
 
 afterAll(async () => {
-  for (const p of procs) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
+  await reapDaemons(reg);
   for (const s of servers) s.stop(true);
 });
 
@@ -224,7 +220,10 @@ async function runDaemon(
     env: { PATH, HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: apiBase },
     stdio: ['ignore', logFd, logFd],
   });
-  procs.push(daemon);
+  // Track immediately (before the caller's first assertion) + record the temp
+  // cfgDir for the scoped backstop sweep.
+  trackProc(reg, daemon);
+  trackCfgDir(reg, cfgDir);
   closeSync(logFd);
   return daemon;
 }
