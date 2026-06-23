@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.16.0
+
+Single-source the tool version (tg-cli#80). `tg --version` now reads the version
+from `package.json` at runtime instead of a hardcoded `VERSION` literal, so the
+two can no longer drift. The literal had already diverged (`1.15.0` in source vs
+`1.0.0` in `package.json`); `package.json` is now the sole declaration and is the
+field the ship version-bump gate tracks.
+
+- **`package.json` is the single source of truth.** New `resolveVersion(scriptDir)`
+  reads `package.json`'s `version` relative to the running script's directory (the
+  tool runs directly via bun from the repo root, so `package.json` sits next to the
+  `tg` entrypoint). `VERSION` is now sourced from it at module load rather than a
+  literal; `versionOutput` resolves the version the same way. The runtime git-hash
+  suffix is unchanged. A drift-guard test pins `tg --version`'s numeric part to
+  `package.json`'s `version` so they can never diverge again.
+
 ## 1.15.0
 
 Two `tg-ctl` routing/picker fixes (tg-cli#75): no-reply auto-bind to the
