@@ -3,6 +3,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 
 // End-to-end forum-topics ROUTING (docs/specs/tg-forum-topics.md §8, increment 3 minus
 // spawn): the real daemon, a fake Telegram server, and a fake tmux/ps reporting TWO claude
@@ -22,16 +23,11 @@ import type { Subprocess } from 'bun';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
 const servers: Array<{ stop: (closeActiveConnections?: boolean) => Promise<void> | void }> = [];
 
 afterEach(async () => {
-  for (const p of procs.splice(0)) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
+  await reapDaemons(reg);
   for (const s of servers.splice(0)) await s.stop(true);
 });
 
@@ -127,20 +123,19 @@ function topicsStore(cfgDir: string): Array<Record<string, unknown>> {
 
 async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess> {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const daemon = await spawnDaemon(reg, {
+    tgCtlPath: TG_CTL,
+    cfgDir,
     env: {
       PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
       HOME: cfgDir,
       TG_CTL_CONFIG_DIR: cfgDir,
       TG_API_BASE: `http://127.0.0.1:${apiPort}`,
     },
-    stdio: ['ignore', logFd, logFd],
+    logFd,
   });
   closeSync(logFd);
-  const socket = join(cfgDir, 'tg-ctl.123.sock');
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !existsSync(socket)) await Bun.sleep(50);
-  expect(existsSync(socket)).toBe(true);
+  expect(existsSync(join(cfgDir, 'tg-ctl.123.sock'))).toBe(true);
   return daemon;
 }
 
@@ -211,7 +206,6 @@ test('topics OFF: a plain (non-topic) message injects into the flat %1 pane — 
   const { server, reactions } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const nowSec = Math.floor(Date.now() / 1000);
   updateQueue.push([plainMsg(10, 'flat hello', nowSec)]);
@@ -241,7 +235,6 @@ test('topics ON: a plain (General / no thread) message STILL injects into the fl
   const { server } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const nowSec = Math.floor(Date.now() / 1000);
   updateQueue.push([plainMsg(11, 'general msg', nowSec)]);
@@ -267,7 +260,6 @@ test('topics ON: a message in a BOUND topic injects into THAT topic pane (%2), n
   const { server, reactions } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const nowSec = Math.floor(Date.now() / 1000);
   updateQueue.push([topicMsg(12, 50, 'deploy now', nowSec)]);
@@ -300,7 +292,6 @@ test('topics ON: a REUSED pane (binding path != live pane path) does NOT leak �
   const { server, sends, reactions } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const nowSec = Math.floor(Date.now() / 1000);
   updateQueue.push([topicMsg(17, 50, 'deploy now', nowSec)]);
@@ -328,7 +319,6 @@ test('topics ON: a BOUND topic whose pane is DEAD does NOT leak to the flat agen
   const { server, sends, reactions } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const nowSec = Math.floor(Date.now() / 1000);
   updateQueue.push([topicMsg(13, 50, 'are you there?', nowSec)]);
@@ -363,7 +353,6 @@ test('topics ON: a message in an UNTRACKED topic (no binding) is ACK-only — ne
   const { server, reactions } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const nowSec = Math.floor(Date.now() / 1000);
   updateQueue.push([topicMsg(15, 77, 'hello untracked topic', nowSec)]);
@@ -389,7 +378,6 @@ test('topics ON: forum_topic_reopened on a tracked closed topic resumes the /new
   const { server } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const nowSec = Math.floor(Date.now() / 1000);
   updateQueue.push([
@@ -425,7 +413,6 @@ test('topics ON: forum_topic_closed on a tracked topic persists status=closed (l
   const { server } = makeServer(updateQueue);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port);
-  procs.push(daemon);
 
   const nowSec = Math.floor(Date.now() / 1000);
   updateQueue.push([

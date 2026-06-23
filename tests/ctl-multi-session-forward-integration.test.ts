@@ -15,6 +15,13 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import {
+  awaitDetachedStartsSettled,
+  createDaemonRegistry,
+  reapDaemons,
+  trackCfgDir,
+  trackProc,
+} from './helpers/daemon-lifecycle';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -57,7 +64,12 @@ const server = Bun.serve({
 });
 
 const logPath = join(cfgDir, 'daemon.log');
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
+// The cfgDir is tracked up front (with detachedStarts) so the scoped backstop
+// settle-reaps the DETACHED `tg-ctl run` grandchildren that `tg-ctl start` spawns
+// (issue #70) — `procs[]` only ever holds the `start` launcher, never its
+// unref'd grandchild.
+trackCfgDir(reg, cfgDir, { detachedStarts: true });
 let daemon: Subprocess;
 
 beforeAll(async () => {
@@ -71,7 +83,7 @@ beforeAll(async () => {
     },
     stdio: ['ignore', logFd, logFd],
   });
-  procs.push(daemon);
+  trackProc(reg, daemon);
   closeSync(logFd);
   const socket = join(cfgDir, 'tg-ctl.123.sock');
   const t0 = Date.now();
@@ -80,12 +92,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  for (const p of procs) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
+  await reapDaemons(reg);
   server.stop(true);
 });
 
@@ -96,7 +103,7 @@ function ask(payload: Record<string, unknown>): Subprocess {
     stdout: 'pipe',
     stderr: 'pipe',
   });
-  procs.push(proc);
+  trackProc(reg, proc);
   proc.stdin.write(JSON.stringify(payload) + '\n');
   proc.stdin.end();
   return proc;
@@ -185,8 +192,11 @@ test('re-registering one session via `tg-ctl start` keeps the other registered',
     env: { HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}` },
     stdio: ['ignore', 'ignore', 'ignore'],
   });
-  procs.push(start);
+  trackProc(reg, start);
   await start.exited;
+  // Let the detached `run` grandchild reach (and lose) the flock while the main
+  // daemon still holds it, so it can't survive a teardown that kills main first.
+  await awaitDetachedStartsSettled(cfgDir, daemon.pid);
 
   // The on-disk store still has BOTH panes.
   const store = JSON.parse(readFileSync(regPath, 'utf8')) as { paneId?: string }[];
@@ -221,13 +231,16 @@ test('two concurrent `tg-ctl start`s both land (lock serializes the upsert)', as
       env: { HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}` },
       stdio: ['ignore', 'ignore', 'ignore'],
     });
-    procs.push(p);
+    trackProc(reg, p);
     return p;
   };
   // Launch both without awaiting between them — they race the RMW.
   const a = startOne('%11', '/proj/a');
   const b = startOne('%12', '/proj/b');
   await Promise.all([a.exited, b.exited]);
+  // Both detached grandchildren must lose the flock to the held main daemon
+  // before teardown — otherwise one grabs it post-kill and leaks (issue #70).
+  await awaitDetachedStartsSettled(cfgDir, daemon.pid);
 
   const store = JSON.parse(readFileSync(regPath, 'utf8')) as { paneId?: string }[];
   const panes = store.map((e) => e.paneId).sort();

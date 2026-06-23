@@ -2,7 +2,7 @@ import { afterAll, expect, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 
 // Integration coverage for the bare-`/agent` inline-keyboard PICKER (the CTO's
 // "где кнопки?" bug). The daemon runs the real `tmux list-panes` + `ps` queries,
@@ -161,21 +161,18 @@ const server = Bun.serve({
   },
 });
 
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
 
 afterAll(async () => {
-  for (const p of procs) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
+  await reapDaemons(reg);
   server.stop(true);
 });
 
 test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and a tap selects (no inject)', async () => {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const daemon = await spawnDaemon(reg, {
+    tgCtlPath: TG_CTL,
+    cfgDir,
     env: {
       // Our fake tmux + ps MUST shadow the real ones → binDir first on PATH.
       PATH: `${binDir}:${process.env.PATH ?? ''}`,
@@ -183,15 +180,10 @@ test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and 
       TG_CTL_CONFIG_DIR: cfgDir,
       TG_API_BASE: `http://127.0.0.1:${server.port}`,
     },
-    stdio: ['ignore', logFd, logFd],
+    logFd,
   });
-  procs.push(daemon);
   closeSync(logFd);
-
-  const socket = join(cfgDir, 'tg-ctl.123.sock');
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !existsSync(socket)) await Bun.sleep(50);
-  expect(existsSync(socket)).toBe(true);
+  expect(existsSync(join(cfgDir, 'tg-ctl.123.sock'))).toBe(true);
 
   // Wait for the picker, the tap answer, AND the follow-up route's inject.
   const tEnd = Date.now() + 10000;

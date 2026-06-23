@@ -3,6 +3,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
+import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 
 // Regression for issue #53: with TWO agents running, a reply to agent-B's (%5)
 // message was mis-delivered to agent-A (%2). Root cause: a RECOGNIZED reply
@@ -25,16 +26,11 @@ const PID_3D = 5005;
 const PANE_RIG = '%2';
 const PID_RIG = 2002;
 
-const procs: Subprocess[] = [];
+const reg = createDaemonRegistry();
 const servers: Array<{ stop: (c?: boolean) => Promise<void> | void }> = [];
 
 afterEach(async () => {
-  for (const p of procs.splice(0)) {
-    if (p.exitCode === null) {
-      p.kill(9);
-      await p.exited;
-    }
-  }
+  await reapDaemons(reg);
   for (const s of servers.splice(0)) await s.stop(true);
 });
 
@@ -166,20 +162,19 @@ function injectedLines(injectLog: string): string[] {
 
 async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess> {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
-  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+  const daemon = await spawnDaemon(reg, {
+    tgCtlPath: TG_CTL,
+    cfgDir,
     env: {
       PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
       HOME: cfgDir,
       TG_CTL_CONFIG_DIR: cfgDir,
       TG_API_BASE: `http://127.0.0.1:${apiPort}`,
     },
-    stdio: ['ignore', logFd, logFd],
+    logFd,
   });
   closeSync(logFd);
-  const socket = join(cfgDir, 'tg-ctl.123.sock');
-  const t0 = Date.now();
-  while (Date.now() - t0 < 5000 && !existsSync(socket)) await Bun.sleep(50);
-  expect(existsSync(socket)).toBe(true);
+  expect(existsSync(join(cfgDir, 'tg-ctl.123.sock'))).toBe(true);
   return daemon;
 }
 
@@ -280,7 +275,6 @@ test('HAPPY PATH: a reply to agent-B (%5) routes to %5, never to the registratio
   const tg = startFakeTg();
   h.setMode('normal');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushReply(600, 10, 500, 'reply to the 3d agent');
 
@@ -304,7 +298,6 @@ test('THE MISROUTE (#53): origin %5 recognized but only %2 visible → picker, N
   // %2 — the exact misroute. It must now post the picker instead.
   h.setMode('partial');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushReply(600, 10, 500, 'reply meant for the 3d agent');
 
@@ -327,7 +320,6 @@ test('FLAKE empty snapshot: recognized reply does NOT misroute into %2 (no-agent
   // into the registration pane %2; a no-agent reply is the safe outcome.
   h.setMode('empty');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushReply(600, 10, 500, 'reply while everything is invisible');
 
@@ -345,7 +337,6 @@ test('REGRESSION unrecognized + multi-agent: posts the picker (can\'t guess the 
   const tg = startFakeTg();
   h.setMode('normal'); // both agents visible
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   // Reply to an id NOT in routes.json → unrecognized. Two agents visible, so an
   // unrecognized reply correctly posts the picker (can't guess the origin).
@@ -373,7 +364,6 @@ test('REGRESSION single-agent: an UNRECOGNIZED reply with ONE visible agent inje
   // branch the fix would have over-corrected every single-agent reply into a tap.
   h.setMode('partial');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushReply(602, 12, 888888, 'unrecognized reply, one agent here');
   await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.length > 0);
@@ -395,7 +385,6 @@ test('NO-REPLY AUTO-BIND: an ambiguous non-reply message binds to the most-recen
   const tg = startFakeTg();
   h.setMode('normal'); // both agents visible
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushText(700, 20, 'a plain message, no reply');
 
@@ -422,7 +411,6 @@ test('NO-REPLY AUTO-BIND respects recency: %2 most-recent → binds to %2', asyn
   const tg = startFakeTg();
   h.setMode('normal');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushText(701, 21, 'another plain message');
 
@@ -444,7 +432,6 @@ test('NO-REPLY no-history: an ambiguous non-reply with NO activity stays ambiguo
   const tg = startFakeTg();
   h.setMode('normal');
   const daemon = await startDaemon(h.cfgDir, tg.port);
-  procs.push(daemon);
 
   tg.pushText(702, 22, 'plain message, nobody spoke yet');
 
