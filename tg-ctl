@@ -2461,6 +2461,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await askTopicModel(action.threadId)
       return true
     }
+    // ONLY awaiting-path text is a path answer. The binding is reloaded fresh here, so a status
+    // that already advanced past awaiting-path must be respected: a model tap + a text message in
+    // the SAME getUpdates batch emits topic-model (→ bound) THEN this stale topic-answer; without
+    // this guard the else-branch would call applyPathAnswer on the now-`bound` binding and move it
+    // back to awaiting-model — stranding the live spawned pane (codex P2, real race). For a bound
+    // (or closed) topic the stale answer is ignored: a message to a bound topic routes via
+    // topic-route, not here, so dropping this stale one loses nothing.
+    if (binding.status !== "awaiting-path") return false
     const path = action.text.trim()
     // Require an ABSOLUTE path: isExistingDirectory (statSync) resolves a relative path against the
     // DAEMON's cwd, but `tmux new-window -c <path>` resolves it against the tmux SERVER's cwd — a

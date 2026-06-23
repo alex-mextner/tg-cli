@@ -614,3 +614,37 @@ test('topics ON: a model tap in awaiting-PATH (no dir yet) → "send the working
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 30_000);
+
+test('topics ON: a model tap + a text message in ONE batch does NOT strand the bound pane (stale topic-answer race)', async () => {
+  // codex P2 race: in awaiting-model, a model tap (-> topic-model) and a text message
+  // (-> topic-answer) can land in the SAME getUpdates batch. topic-model runs first -> bound;
+  // the stale topic-answer then reloads a BOUND binding. Without the awaiting-path guard,
+  // applyPathAnswer would move the bound topic BACK to awaiting-model and strand the spawned
+  // pane. The guard must drop the stale answer: the topic stays bound, pane intact.
+  const paths = makeCfgDir({ topics: true });
+  const { cfgDir } = paths;
+  const updateQueue: unknown[][] = [];
+  const { server } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(paths, server.port);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([topicCreated(160, 104, 'race', nowSec)]);
+  await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 104 && t.status === 'awaiting-path'));
+  updateQueue.push([topicTextMsg(161, 104, cfgDir, nowSec + 1)]);
+  await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 104 && t.status === 'awaiting-model'));
+
+  // The model tap AND a text message (a valid absolute existing dir — the dangerous case) in ONE
+  // batch. The tap binds; the stale answer must be ignored, NOT reset the binding.
+  updateQueue.push([modelTap(162, 104, 'claude-opus'), topicTextMsg(163, 104, cfgDir, nowSec + 2)]);
+  await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 104 && t.status === 'bound'));
+  await Bun.sleep(300);
+
+  const binding = topicsStore(cfgDir).find((t) => t.threadId === 104);
+  expect(binding?.status).toBe('bound'); // NOT reset to awaiting-model
+  expect(binding?.paneId).toBe(SPAWNED_PANE); // pane preserved, not stranded
+  expect(spawnArgvLog(paths.spawnLog)).toHaveLength(1); // exactly one spawn
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
