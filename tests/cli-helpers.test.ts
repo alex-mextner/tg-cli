@@ -1,9 +1,14 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { expandHome, hasRealExtension, isImagePath } from '../features/cli/args';
-import { VERSION, latestChangelogSection, versionOutput } from '../features/cli/version';
+import {
+  VERSION,
+  latestChangelogSection,
+  resolveVersion,
+  versionOutput,
+} from '../features/cli/version';
 
 // Focused unit tests for the pure CLI helpers extracted from the `tg`
 // entrypoint (decomposition Stages 0c/0d). parseArgs itself is covered
@@ -76,18 +81,57 @@ test('latestChangelogSection degrades to "" with no changelog / no version headi
   expect(latestChangelogSection(d)).toBe('');
 });
 
+// --- resolveVersion ---
+test('resolveVersion reads the version field from package.json in scriptDir', () => {
+  const d = tmp();
+  writeFileSync(join(d, 'package.json'), '{"name":"x","version":"2.3.4"}');
+  expect(resolveVersion(d)).toBe('2.3.4');
+});
+
+test('resolveVersion degrades to "unknown" with no/malformed package.json', () => {
+  expect(resolveVersion(tmp())).toBe('unknown');
+  const d = tmp();
+  writeFileSync(join(d, 'package.json'), '{ not json');
+  expect(resolveVersion(d)).toBe('unknown');
+  const e = tmp();
+  writeFileSync(join(e, 'package.json'), '{"name":"x"}'); // no version field
+  expect(resolveVersion(e)).toBe('unknown');
+});
+
 // --- versionOutput ---
 test('versionOutput composes the version+hash head and appends the changelog', () => {
   const d = tmp();
+  writeFileSync(join(d, 'package.json'), '{"version":"6.6.6"}');
   writeFileSync(join(d, 'CHANGELOG.md'), '## 1.6.0\n\n- the latest\n');
   const out = versionOutput(d);
-  // a non-git temp dir resolves the hash to "unknown" (never throws)
-  expect(out.startsWith(`tg ${VERSION} (`)).toBe(true);
+  // a non-git temp dir resolves the hash to "unknown" (never throws);
+  // the version comes from the temp dir's package.json, not the literal.
+  expect(out.startsWith('tg 6.6.6 (')).toBe(true);
   expect(out).toContain('## 1.6.0');
   expect(out).toContain('- the latest');
 });
 
 test('versionOutput without a changelog is just the head line', () => {
-  const out = versionOutput(tmp());
-  expect(out).toBe(`tg ${VERSION} (unknown)`);
+  const d = tmp();
+  writeFileSync(join(d, 'package.json'), '{"version":"6.6.6"}');
+  expect(versionOutput(d)).toBe('tg 6.6.6 (unknown)');
+});
+
+// --- drift guard: package.json is the SINGLE SOURCE OF TRUTH (tg-cli#80) ---
+// Pins the numeric part of the real `tg --version` to package.json's `version`
+// so a future hardcoded literal (or a missed package.json bump) can never let
+// the two diverge again. Also asserts the runtime git-hash suffix still appends.
+test('tg --version numeric part equals package.json version (no drift)', () => {
+  const repoRoot = join(import.meta.dir, '..');
+  const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
+    version: string;
+  };
+  // the exported VERSION must equal package.json (single source)
+  expect(VERSION).toBe(pkg.version);
+  // and the rendered --version head must carry exactly that version + a hash suffix
+  const head = versionOutput(repoRoot).split('\n')[0];
+  const m = head.match(/^tg (\S+) \((\S+)\)$/);
+  expect(m).not.toBeNull();
+  expect(m![1]).toBe(pkg.version); // numeric/version part == package.json
+  expect(m![2].length).toBeGreaterThan(0); // git-hash suffix still appends
 });
