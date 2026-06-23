@@ -149,14 +149,33 @@ mirroring how `routes.cwd` already flows).
    (increment 4): the DAEMON auto-stamping `TG_TOPIC` into the bound pane's env so the agent need
    not pass `--topic` — that touches the spawn/inject path and lands with the spawn executor (the
    advisory fallback above is what keeps that future auto-stamp safe against a since-closed topic).
-2. **Spawn + bind executor (the remaining seam)** — entrypoint handles `topic-new`/`topic-answer`:
-   the `/new` button flow + `tmux new-window` spawn + persistence. Until this lands those two Actions
-   are logged no-ops, so no binding is ever created from inside the daemon — a topic only routes if a
-   binding already exists in the store (e.g. seeded by a future spawn step). This is the clean seam.
+2. **Spawn + bind executor (the remaining seam)** — LANDED: the entrypoint handles
+   `topic-new`/`topic-answer` plus a new `topic-model` model-button callback. `forum_topic_created`
+   → an `awaiting-path` binding + a "which directory?" prompt; a path message → validated (must
+   exist + be a dir) → `awaiting-model` + the model-catalog button keyboard
+   (`tgm:<threadId>:<modelId>`); a model tap → `tmux new-window -c <path> -P -F '#{pane_id}' -- <argv>`
+   (the catalog argv) → bind the returned pane → `bound` + a confirmation into the topic. SAFETY: every
+   spawn step is exception-guarded so a bad path / missing tmux / spawn error never throws into the poll
+   loop — it posts a human-readable error into the topic and leaves the binding mid-flow for a retry;
+   an already-`bound` topic refuses a second spawn (a duplicate `forum_topic_created` is already filtered
+   in `stepUpdates`, so a restart/dup can't double-spawn); the whole path only runs when `control.topics`
+   is on (default OFF → 1:1 byte-identical). Tests: `tests/ctl-topic-spawn-integration.test.ts` (valid
+   spawn, malformed path, spawn failure survives, no double-spawn, flag-off no-op) + the pure
+   parser/keyboard/callback-emission units in `tests/ctl-topics.test.ts`. Still deferred to increment 4:
+   the recent-repo path BUTTONS (today the path is free-text only), and re-spawn on a dead/closed pane.
 4. **Lifecycle polish** — re-spawn on a dead/closed pane (today it marks closed + asks the human to
    recreate the topic), daemon-restart re-bind, General-vs-topic edge cases, admin-permission
    onboarding error, and the DAEMON auto-stamping a bound pane's `TG_TOPIC` env (so the agent's `tg`
    threads automatically without `--topic`; the explicit flag/env already landed in increment 2).
+   Two narrow gaps the increment-2 spawn executor leaves for here (review-flagged, low-risk):
+   (a) **crash-window orphan** — `handleTopicModel` persists `awaiting-model` → `tmux new-window`
+   → persists `bound`; a daemon crash BETWEEN a successful `new-window` and the `bound` write
+   leaves a live orphan pane + an `awaiting-model` binding, and a re-tap then spawns a second
+   agent (the "restart can't double-spawn" guarantee covers `bound` topics, not this sliver).
+   Close it by detecting the topic-slug window before re-spawning. (b) **dangling model buttons**
+   — the `topic-model` callback carries the prompt `messageId` but doesn't `editMessageReplyMarkup`
+   it away after binding, so the model buttons stay tappable (harmless — the `bound`-guard refuses
+   them with "already running"). Edit/remove the keyboard on bind.
 
 ## 10. Edge cases / decisions
 

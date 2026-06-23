@@ -143,3 +143,44 @@ export function slugifyTopicName(name: string, threadId: number): string {
     .replace(/^-+|-+$/g, '');
   return slug || `topic-${threadId}`;
 }
+
+// --- model-pick button (the awaiting-model step of the /new flow) ---
+
+// Callback-data prefix for a model button inside a forum topic. Distinct from the `tgq:`
+// (question) and `tga:` (/agent picker) prefixes so the daemon routes a model tap to the
+// spawn flow. Shape: `tgm:<threadId>:<modelId>` (modelId is a catalog id like `claude-opus`).
+export const TOPIC_MODEL_CALLBACK_PREFIX = 'tgm';
+
+export interface ParsedTopicModelCallback {
+  threadId: number;
+  modelId: string;
+}
+
+// Parse `tgm:<threadId>:<modelId>`. Returns null on any mismatch. The modelId is NOT
+// validated against the catalog here (the entrypoint does, re-asking on an unknown id) —
+// this only recovers the two routing fields from the button payload.
+export function parseTopicModelCallback(data: string | undefined): ParsedTopicModelCallback | null {
+  if (!data) return null;
+  const parts = data.split(':');
+  // Require a POSITIVE-integer threadId. A message_thread_id is always >= 1, so reject `0`/empty
+  // (Number('') would coerce to 0 — a valid-looking but wrong binding), `-5`, `1e2`, `0x10`. The
+  // `[1-9]\d*` shape rejects a leading-zero / all-zero id outright.
+  if (parts.length !== 3 || parts[0] !== TOPIC_MODEL_CALLBACK_PREFIX || !parts[1] || !parts[2]) return null;
+  if (!/^[1-9]\d*$/.test(parts[1])) return null;
+  const threadId = Number(parts[1]);
+  if (!Number.isInteger(threadId)) return null;
+  return { threadId, modelId: parts[2] };
+}
+
+// The inline keyboard for the awaiting-model prompt: one button per catalog model, the
+// callback carrying the threadId + the model's catalog id. PURE — the entrypoint posts it
+// with sendMessage(reply_markup). Returned as the Bot API `inline_keyboard` shape (rows of
+// one button) so the entrypoint hands it straight through.
+export function buildModelKeyboard(
+  threadId: number,
+  catalog: ReadonlyArray<{ id: string; label: string }>,
+): Array<Array<{ text: string; callback_data: string }>> {
+  return catalog.map((m) => [
+    { text: m.label, callback_data: `${TOPIC_MODEL_CALLBACK_PREFIX}:${threadId}:${m.id}` },
+  ]);
+}

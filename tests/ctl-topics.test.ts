@@ -12,6 +12,7 @@ import {
   appendTopic,
   applyModelAnswer,
   applyPathAnswer,
+  buildModelKeyboard,
   createTopic,
   findTopic,
   isAwaitingAnswer,
@@ -20,6 +21,7 @@ import {
   markReopened,
   MAX_TOPICS,
   parseTopics,
+  parseTopicModelCallback,
   serializeTopics,
   slugifyTopicName,
 } from '../features/tg-ctl/topics';
@@ -344,4 +346,65 @@ test('topics ON: General (no message_thread_id) is unaffected', () => {
     { kind: 'inject-text', text: '[TG from Alex #3] plain' },
     { kind: 'ack', messageId: 3 },
   ]);
+});
+
+// --- model-pick button (the awaiting-model spawn step) ---
+
+function cbUpd(id: number, data: string): TgUpdate {
+  return {
+    update_id: id,
+    callback_query: {
+      id: `cb${id}`,
+      from: { id: CHAT_ID, first_name: 'Alex' },
+      message: { message_id: id, chat: { id: CHAT_ID }, date: NOW },
+      data,
+    },
+  };
+}
+
+test('parseTopicModelCallback: parses tgm:<threadId>:<modelId>, rejects malformed', () => {
+  expect(parseTopicModelCallback('tgm:50:claude-opus')).toEqual({ threadId: 50, modelId: 'claude-opus' });
+  expect(parseTopicModelCallback('tgm:1:claude-default')).toEqual({ threadId: 1, modelId: 'claude-default' });
+  expect(parseTopicModelCallback('tgm:0:claude-default')).toBeNull(); // a thread id is always >= 1
+  expect(parseTopicModelCallback('tga:50:0')).toBeNull(); // wrong prefix (/agent picker)
+  expect(parseTopicModelCallback('tgq:abc:o0')).toBeNull(); // wrong prefix (question)
+  expect(parseTopicModelCallback('tgm:notanum:m')).toBeNull();
+  expect(parseTopicModelCallback('tgm:50:')).toBeNull();
+  expect(parseTopicModelCallback('tgm:50')).toBeNull();
+  expect(parseTopicModelCallback('tgm::claude-opus')).toBeNull(); // empty threadId must NOT coerce to 0
+  expect(parseTopicModelCallback('tgm:1e2:m')).toBeNull(); // Number() exotica rejected
+  expect(parseTopicModelCallback('tgm:0x10:m')).toBeNull();
+  expect(parseTopicModelCallback('tgm:-5:m')).toBeNull(); // a thread id is always positive
+  expect(parseTopicModelCallback(undefined)).toBeNull();
+});
+
+test('buildModelKeyboard: one button per catalog model, callback carries threadId + id', () => {
+  const kb = buildModelKeyboard(50, MODEL_CATALOG);
+  expect(kb).toHaveLength(MODEL_CATALOG.length);
+  expect(kb[0][0]).toEqual({ text: MODEL_CATALOG[0].label, callback_data: `tgm:50:${MODEL_CATALOG[0].id}` });
+  // every row is a single button whose callback round-trips through the parser
+  for (const row of kb) {
+    expect(row).toHaveLength(1);
+    expect(parseTopicModelCallback(row[0].callback_data)?.threadId).toBe(50);
+  }
+});
+
+test('topics ON: a tgm: model tap emits a topic-model action (routed to the spawn flow)', () => {
+  const r = stepUpdates([cbUpd(7, 'tgm:50:claude-opus')], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'awaiting-model' }));
+  expect(r.actions).toEqual([
+    {
+      kind: 'topic-model',
+      callbackQueryId: 'cb7',
+      threadId: 50,
+      modelId: 'claude-opus',
+      messageId: 7,
+    },
+  ]);
+});
+
+test('topics OFF: a tgm: tap does NOT emit topic-model — falls through to the question parser (expired)', () => {
+  const r = stepUpdates([cbUpd(8, 'tgm:50:claude-opus')], makeOpts({ topicsEnabled: false }));
+  // With topics off the model tap is not recognized as a spawn action; it falls to the
+  // button-callback parser which rejects the non-tgq data as an expired callback.
+  expect(r.actions).toEqual([{ kind: 'answer-callback', callbackQueryId: 'cb8', text: 'expired' }]);
 });

@@ -13,6 +13,7 @@
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
 import { parseButtonCallback } from './questions';
 import { parseAgentCallback, parseAgentCommand } from './agent-match';
+import { parseTopicModelCallback } from './topics';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
 const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -85,6 +86,22 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       if (!senderAllowed(cb.from?.id, opts)) {
         callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' });
         continue;
+      }
+      // A model-pick tap (tgm:…) inside a forum topic routes the spawn flow — checked first
+      // and only when topics mode is on (with the flag off a stray tgm: tap falls through to
+      // the question/agent parsers, which reject it as expired — never spawns).
+      if (opts.topicsEnabled) {
+        const modelCb = parseTopicModelCallback(cb.data);
+        if (modelCb) {
+          callbackActions.push({
+            kind: 'topic-model',
+            callbackQueryId: cb.id,
+            threadId: modelCb.threadId,
+            modelId: modelCb.modelId,
+            messageId: cb.message?.message_id ?? null,
+          });
+          continue;
+        }
       }
       // /agent selection taps (tga:…) route first; q→buttons taps (tgq:…) next.
       const agentCb = parseAgentCallback(cb.data);
@@ -269,8 +286,9 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // Re-attach/re-spawn is the entrypoint's job (increment 2). For now: ack, never leak to flat.
     return [];
   }
-  // awaiting-path / awaiting-model: an answer to the /new flow (the path; the model arrives as
-  // a button callback in increment 2).
+  // awaiting-path / awaiting-model: a text answer to the /new flow. A path message advances the
+  // flow (the model is picked by the `tgm:` button callback handled in the callback branch above,
+  // NOT as text — an awaiting-model text message just re-shows the buttons in the entrypoint).
   return [{ kind: 'topic-answer', threadId, text: m.text ?? '', from: name, messageId: m.message_id }];
 }
 
