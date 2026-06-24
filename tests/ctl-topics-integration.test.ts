@@ -327,13 +327,18 @@ test('topics ON: a BOUND topic whose pane is DEAD does NOT leak to the flat agen
   await waitFor(() => sends.length >= 1);
   // CRITICAL safety: nothing was injected anywhere (no leak into the flat %1 agent).
   expect(injected(cfgDir)).toEqual([]);
-  // The error reply is threaded into the topic (message_thread_id = T), not General.
-  expect(sends[0].message_thread_id).toBe(50);
-  expect(String(sends[0].text)).toContain('exited');
-  // The dead binding flipped to closed (re-spawn is increment 2's job).
-  await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 50 && t.status === 'closed'));
+  // The replies are threaded into the topic (message_thread_id = T), not General. The restart flow
+  // (no path/model seed) posts the path prompt AND an "exited — set it up again" notice into T.
+  await waitFor(() => sends.some((s) => s.message_thread_id === 50 && String(s.text).includes('exited')));
+  expect(sends.every((s) => s.message_thread_id === 50)).toBe(true);
+  expect(sends.some((s) => String(s.text).includes('exited'))).toBe(true);
+  // The dead binding flips to closed, then increment 4 recovers: this seed has NO path/model, so
+  // the entrypoint restarts the /new flow (back to awaiting-path) rather than a one-tap re-spawn —
+  // the human is never left at a dead-end. (A seed WITH path+model would offer a Re-spawn button;
+  // see the dedicated re-spawn test below.)
+  await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 50 && t.status === 'awaiting-path'));
   const binding = topicsStore(cfgDir).find((t) => t.threadId === 50);
-  expect(binding?.status).toBe('closed');
+  expect(binding?.status).toBe('awaiting-path');
   // A FAILED route earns NO 👀 receipt — the trailing ack reads the route's false verdict
   // (lastActionOk), so a dead-pane message must not also be marked "seen by the agent". Give
   // the ack a beat to run after the error sendMessage, then assert no reaction was set.

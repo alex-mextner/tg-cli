@@ -83,16 +83,22 @@ import {
   applyModelAnswer,
   applyPathAnswer,
   buildModelKeyboard,
+  buildPathKeyboard,
+  buildRespawnKeyboard,
   createTopic,
   findTopic,
+  clearSpawnPending,
   markBound,
   markClosed,
   markReopened,
+  markRespawnOffered,
+  markSpawnPending,
   parseTopics,
+  recentPathChoices,
   serializeTopics,
   slugifyTopicName,
 } from "./features/tg-ctl/topics"
-import { MODEL_CATALOG, spawnArgv } from "./features/tg-ctl/models"
+import { findModel, MODEL_CATALOG, spawnArgv } from "./features/tg-ctl/models"
 import {
   buildFasterWhisperArgv,
   buildFfmpegArgv,
@@ -331,6 +337,14 @@ async function editMessageText(ctx: Ctx, messageId: number, text: string): Promi
   await botPost(ctx, "editMessageText", { chat_id: ctx.chatId, message_id: messageId, text })
 }
 
+// Remove the inline keyboard from a previously-sent message (forum-topics increment 4): after a
+// topic binds we clear the now-stale model buttons so they can't be re-tapped. Omitting
+// reply_markup detaches the keyboard. Best-effort — botPost swallows failures (a deleted prompt
+// message, a transient API error), never throwing into the poll loop.
+async function clearMessageKeyboard(ctx: Ctx, messageId: number): Promise<void> {
+  await botPost(ctx, "editMessageReplyMarkup", { chat_id: ctx.chatId, message_id: messageId })
+}
+
 // Publish the bot's own slash-commands to Telegram's "/" autocomplete + menu
 // button (setMyCommands), so `/agent` and the rest are discoverable instead of
 // blind-typed. Best-effort and idempotent: a network/API failure is logged and
@@ -364,12 +378,12 @@ async function publishBotCommands(ctx: Ctx): Promise<void> {
 // UTF-8 locale env, so under launchd the tab-mangle blanked every name and the
 // picker fell back to the cwd basename.
 const PANE_FORMAT =
-  "#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{window_name}\t#{pane_current_path}"
+  "#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{window_name}\t#{@tg_spawn_token}\t#{pane_current_path}"
 
 // Subprocess env with a GUARANTEED UTF-8 locale. THE root cause of the "Claude Code not in tmux"
 // saga: under launchd the daemon inherits NO locale (LANG/LC_* unset), and tmux then classifies the
 // TAB separator in PANE_FORMAT as non-printable and ESCAPES it to `_` in its `-F` output. Every line
-// then collapses to a single field, parsePaneList drops it (<7 fields), snapshot() returns ZERO
+// then collapses to a single field, parsePaneList drops it (<8 fields), snapshot() returns ZERO
 // panes, and the daemon reports "not in tmux" for every message despite live agent panes. A UTF-8
 // locale makes tmux emit real tabs. It MUST be passed explicitly on the spawn — Bun.spawnSync does
 // NOT pick up a runtime `process.env` mutation — so this env is handed to every discovery subprocess.
@@ -2266,6 +2280,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // store stays empty and topicStatusOf below is never wired into stepUpdates, so the flat
   // 1:1 path is byte-identical.
   const loadTopics = (): TopicBinding[] => parseTopics(readFileOrNull(ctx.paths.topics))
+  // A strictly-monotonic nonce for path-button prompts (codex r4 P1): each awaiting-path prompt gets
+  // a UNIQUE value so a button from a superseded prompt can be told apart. A wall-clock second is NOT
+  // unique enough — two restarts in the same second would reuse it. Seed above `Date.now()` ms so a
+  // restart of the DAEMON itself can't collide with a nonce already baked into a live keyboard.
+  let pathNonceSeq = Date.now()
+  const nextPathNonce = (): number => ++pathNonceSeq
   const persistTopics = (topics: TopicBinding[]): void => {
     // Best-effort, off the inject path: a write error must never break the poll loop — it is
     // logged, not thrown. A lost close/reopen transition leaves the binding at its prior status
@@ -2297,18 +2317,36 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const topics = loadTopics()
     const binding = findTopic(topics, action.threadId)
     if (!binding || binding.status !== "bound" || !binding.paneId) {
-      // stepUpdates only emits topic-route for a status it saw as 'bound'; a race that lost the
-      // pane between the status read and here closes it rather than mis-routing.
-      await sendToTopic(action.threadId, "this topic's agent is no longer bound — recreate the topic")
+      // stepUpdates saw this topic as 'bound', but a PRIOR action in the SAME batch (a first message
+      // to a dead pane) may have already transitioned it. Route this stale second message through the
+      // recovery rather than the old "recreate the topic" dead-end (codex r2#1):
+      //   - closed → the throttled re-spawn offer (recoverDeadTopic);
+      //   - awaiting-* → the first action ALREADY restarted the /new flow (no path/model case), so
+      //     the prompt is up; stay quiet (codex r3 P2 — don't re-post the dead-end on top of it).
+      // Only a genuinely untracked binding (none) gets the legacy "recreate" hint.
+      if (binding && binding.status === "closed") await recoverDeadTopic(binding)
+      else if (!binding) await sendToTopic(action.threadId, "this topic's agent is no longer bound — recreate the topic")
       return false
     }
     const { panes, procs } = snapshot()
     const pane = panes.find((p) => p.paneId === binding.paneId)
     if (!pane || findAgentInPane(pane, procs) === null) {
-      // The agent's pane is genuinely GONE (closed / no agent there) → terminal. Mark the binding
-      // closed (increment 2's re-spawn picks it up), tell the human, inject nothing.
-      persistTopics(appendTopic(topics, markClosed(binding, Math.floor(Date.now() / 1000))))
-      await sendToTopic(action.threadId, "this topic's agent has exited — recreate the topic to respawn it")
+      // FLAKE GUARD (codex r24 P1a, narrowed r26): the flake signature is an EMPTY `procs` read (ps
+      // failed/flaked) while the pane IS still visible — findAgentInPane then returns null for a
+      // STILL-RUNNING agent, and closing + offering a re-spawn off that blind read would let a tap
+      // DUPLICATE the live agent. Gate ONLY on `procs.length === 0` (the actual flake), NOT on "no
+      // agent found anywhere": when ps DID return processes but none under this pane is an agent, the
+      // agent GENUINELY exited (back to a shell) — that's the real-death case and must still close +
+      // offer, even if no other agent happens to be live (codex r26). A gone pane also closes.
+      if (pane && procs.length === 0) {
+        await sendToTopic(action.threadId, "couldn't confirm this topic's agent right now — try again")
+        return false
+      }
+      // The agent's pane is genuinely GONE / the agent exited → terminal. Mark the binding closed and
+      // OFFER A RE-SPAWN (increment 4) — a one-tap re-launch with the retained path + model.
+      const closed = markClosed(binding, Math.floor(Date.now() / 1000))
+      persistTopics(appendTopic(topics, closed))
+      await recoverDeadTopic(closed)
       return false
     }
     // The pane hosts an agent but its path no longer matches the binding's recorded project
@@ -2387,10 +2425,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
   // Run `tmux new-window … -- <agent argv>` and return the created pane id, or an error.
   // -P -F '#{pane_id}' prints the new pane id on stdout → bound immediately (no discovery race,
-  // spec §5). Fully guarded: a spawn throw (tmux missing) or a non-zero exit becomes a typed
-  // error, never an exception. The path + argv are discrete argv elements (never shell-split),
-  // so a directory with spaces is safe.
-  const spawnTopicWindow = (windowSlug: string, path: string, model: string): { ok: true; paneId: string } | { ok: false; error: string } => {
+  // spec §5). `-e TG_TOPIC=<threadId>` stamps the topic id into the NEW window's environment so the
+  // spawned agent's plain `tg "reply"` threads back INTO this topic automatically — no `--topic`
+  // needed (spec §9.4 deferral; codex r8 #1). The `tg` send side already reads TG_TOPIC and fails
+  // soft on a stale/closed topic. Fully guarded: a spawn throw (tmux missing) or a non-zero exit
+  // becomes a typed error, never an exception. The path + argv are discrete argv elements (never
+  // shell-split), so a directory with spaces is safe.
+  const spawnTopicWindow = (
+    threadId: number,
+    windowSlug: string,
+    path: string,
+    model: string,
+  ): { ok: true; paneId: string } | { ok: false; error: string } => {
     const argv = spawnArgv(model, path)
     if (!argv) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
     try {
@@ -2402,6 +2448,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         "tmux",
         "new-window",
         ...(session ? ["-t", session] : []),
+        // -e sets the spawned PROCESS env so the agent's plain `tg` threads back into this topic.
+        "-e",
+        `TG_TOPIC=${threadId}`,
         "-n",
         windowSlug,
         "-c",
@@ -2424,18 +2473,123 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   }
 
-  // A new forum topic was created → begin the /new flow: persist an awaiting-path binding and
-  // ask for the working directory (free-text path, per spec §5; the recent-repo button picker is
-  // increment-4 polish). stepUpdates already filtered a duplicate create for an in-flight/bound
-  // topic, so reaching here means an untracked or previously-closed topic; the createTopic upsert
-  // resets it to awaiting-path either way (a fresh /new flow).
-  const handleTopicNew = async (action: Extract<Action, { kind: "topic-new" }>): Promise<boolean> => {
-    const topics = loadTopics()
-    persistTopics(appendTopic(topics, createTopic(action.threadId, action.name, Math.floor(Date.now() / 1000))))
-    await sendToTopic(
-      action.threadId,
-      "New agent for this topic. Which directory should it work in? Send an absolute path (e.g. /Users/you/project).",
+  // Stamp the per-spawn token as a WINDOW USER OPTION on the just-created pane (codex r11): a
+  // `@user_option` IS queryable after a restart via `#{@tg_spawn_token}` in PANE_FORMAT, unlike
+  // `new-window -e` process env. Best-effort — a failure only weakens token-based orphan adoption
+  // (the recorded paneId is the fallback proof — codex r12 P1), never the spawn. Never throws.
+  const stampSpawnToken = (paneId: string, spawnToken: string): void => {
+    try {
+      const proc = Bun.spawnSync(["tmux", "set-option", "-w", "-t", paneId, "@tg_spawn_token", spawnToken], {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: SUBPROC_ENV,
+      })
+      // LOG a non-zero exit (codex r19 P2): the stamp is best-effort (the recorded paneId is the
+      // fallback proof), but a silent failure would quietly weaken token-based orphan adoption — so
+      // surface it for observability rather than swallowing it.
+      if (proc.exitCode !== 0) {
+        log(`set @tg_spawn_token for ${paneId} exited ${proc.exitCode}: ${proc.stderr.toString().trim()}`)
+      }
+    } catch (err) {
+      log(`set @tg_spawn_token failed for ${paneId}: ${err}`)
+    }
+  }
+
+  // (The per-spawn token is now read directly from each pane's snapshot `spawnToken` field — the
+  // `@tg_spawn_token` window user option in PANE_FORMAT — so no extra per-candidate tmux call.)
+
+  // The recent project paths to offer as awaiting-path buttons (increment 4), most-recent first.
+  // Source: the routes store (every `tg` send stamps its pane's cwd) + the per-pane registrations
+  // (every live agent session's cwd), newest first. recentPathChoices dedupes and keeps only
+  // absolute existing dirs (a button must point at a spawn-able cwd). Best-effort — any read error
+  // degrades to an empty list (free-text only), never throwing into the flow.
+  const gatherRecentPaths = (): string[] => {
+    try {
+      // MERGE routes + registrations by their OWN timestamps and sort newest-first GLOBALLY (codex
+      // r25): concatenating all-routes-then-all-registrations let an old route crowd out a newer
+      // registration past MAX_PATH_CHOICES. Routes carry `ts` (send time); registrations carry
+      // `registeredAt` (start time, optional → 0 = oldest). Stable sort, then recentPathChoices
+      // dedupes (first-seen wins) and keeps absolute existing dirs.
+      const stamped: Array<{ cwd: string | undefined; ts: number }> = [
+        ...parseRoutes(readFileOrNull(ctx.paths.routes)).map((r) => ({ cwd: r.cwd, ts: r.ts })),
+        ...parseRegistrations(readFileOrNull(ctx.paths.registration)).map((r) => ({ cwd: r.cwd, ts: r.registeredAt ?? 0 })),
+      ]
+      stamped.sort((a, b) => b.ts - a.ts) // newest first
+      return recentPathChoices(stamped.map((s) => s.cwd), (p) => isAbsolute(p) && isExistingDirectory(p))
+    } catch (err) {
+      log(`gatherRecentPaths failed: ${err}`)
+      return []
+    }
+  }
+
+  // Begin (or restart) the /new flow for a topic: PERSIST a fresh awaiting-path binding FIRST,
+  // THEN post the prompt. Persisting before the async send closes the crash window (review #4) —
+  // a crash after the send but before a persist would otherwise leave a prompt with no binding, so
+  // the user's path answer wouldn't be recognized. When recent repos are known they're offered as
+  // one-tap buttons (callback tgp:<threadId>:<index>) and the chosen list is stored on the binding
+  // so the tap recovers the path by index. Free-text always remains a fallback. Shared by
+  // handleTopicNew and both restart branches (no-path/model re-spawn).
+  const startTopicPathFlow = async (threadId: number, name: string): Promise<void> => {
+    const choices = gatherRecentPaths()
+    // A UNIQUE per-prompt NONCE (codex r4 P1 — NOT the wall-clock second, which collides on two
+    // restarts in one second): a button from a SUPERSEDED prompt carries an old nonce and is rejected.
+    const nonce = nextPathNonce()
+    const created = createTopic(threadId, name, Math.floor(Date.now() / 1000))
+    persistTopics(
+      appendTopic(loadTopics(), choices.length > 0 ? { ...created, pathChoices: choices, pathChoicesNonce: nonce } : created),
     )
+    const extra: Record<string, unknown> =
+      choices.length > 0
+        ? { message_thread_id: threadId, reply_markup: { inline_keyboard: buildPathKeyboard(threadId, choices, nonce) } }
+        : { message_thread_id: threadId }
+    const prompt =
+      choices.length > 0
+        ? "New agent for this topic. Pick a recent project below, or send an absolute path (e.g. /Users/you/project)."
+        : "New agent for this topic. Which directory should it work in? Send an absolute path (e.g. /Users/you/project)."
+    await sendMessage(ctx, prompt, extra)
+  }
+
+  // A new forum topic was created → begin the /new flow. stepUpdates already filtered a duplicate
+  // create for an in-flight/bound topic, so reaching here means an untracked or previously-closed
+  // topic; startTopicPathFlow's createTopic upsert resets it to awaiting-path either way.
+  const handleTopicNew = async (action: Extract<Action, { kind: "topic-new" }>): Promise<boolean> => {
+    await startTopicPathFlow(action.threadId, action.name)
+    return true
+  }
+
+  // A recent-path button tap (tgp:<threadId>:<index>:<nonce>) → resolve the index against the
+  // binding's persisted pathChoices and advance exactly like a typed path. A stale/forged index
+  // (out of range, or the topic no longer awaiting-path) re-asks rather than spawning into a guessed
+  // dir. The path is RE-VALIDATED (a repo can vanish between the prompt and the tap) before advancing.
+  const handleTopicPath = async (action: Extract<Action, { kind: "topic-path" }>): Promise<boolean> => {
+    const topics = loadTopics()
+    const binding = findTopic(topics, action.threadId)
+    if (!binding || binding.status !== "awaiting-path") {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "send a directory")
+      return false
+    }
+    // STALE-BUTTON guard (codex r3 P1): the tap's nonce MUST match the binding's current
+    // pathChoicesNonce. A mismatch means the button came from a SUPERSEDED prompt (a setup restart
+    // replaced pathChoices) — its index would resolve against the wrong list. Reject + re-ask.
+    if (action.nonce !== binding.pathChoicesNonce) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "that menu expired — pick again")
+      return false
+    }
+    const path = binding.pathChoices?.[action.index]
+    if (!path || !isAbsolute(path) || !isExistingDirectory(path)) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "that path is gone — send one")
+      await sendToTopic(action.threadId, `\`${path ?? "(unknown)"}\` is no longer an existing directory — send an absolute path.`)
+      return false
+    }
+    await answerCallbackQuery(ctx, action.callbackQueryId, "ok")
+    // PERSIST the awaiting-model transition FIRST, THEN do cosmetic cleanup (codex r15 #2): the poll
+    // loop persists the Telegram offset BEFORE running actions, so a crash/kill during the async
+    // editMessageReplyMarkup would otherwise lose this tap permanently AND leave the buttons cleared
+    // (un-retappable). Persisting the state first makes the tap durable; clearing the keyboard is
+    // best-effort after.
+    persistTopics(appendTopic(loadTopics(), applyPathAnswer(binding, path, Math.floor(Date.now() / 1000))))
+    if (action.messageId !== null) await clearMessageKeyboard(ctx, action.messageId)
+    await askTopicModel(action.threadId)
     return true
   }
 
@@ -2499,15 +2653,30 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     if (binding.status === "bound") {
-      // The model keyboard stays live after bind (clearing it is increment-4 polish), so a human
-      // can tap it repeatedly. Answer ONLY the transient callback toast — NOT a fresh sendToTopic
-      // per tap — so multi-tapping a dangling button can't flood the topic with messages.
+      // Answer ONLY the transient callback toast — NOT a fresh sendToTopic per tap — so even a
+      // dangling button (e.g. cleared a beat too late) can't flood the topic with messages.
       await answerCallbackQuery(ctx, action.callbackQueryId, "an agent is already running here")
       return false
     }
     if (binding.status !== "awaiting-model" || !binding.path) {
       await answerCallbackQuery(ctx, action.callbackQueryId, "send a directory first")
       await sendToTopic(action.threadId, "send the working directory first, then pick a model")
+      return false
+    }
+    // A spawn for this binding is ALREADY in flight (spawnPending) with its own model — a crash may
+    // have left a live orphan the JIT probe will adopt. A tap of a DIFFERENT model now must NOT
+    // overwrite the model the orphan was actually launched with (codex r16 #1): reject it and keep
+    // the in-flight model. Re-tapping the SAME model is fine (it just re-drives the spawn/adopt).
+    // BUT FIRST (codex r31): if the pending model is no longer in the catalog (removed/renamed since
+    // it was chosen), the mismatch guard would reject EVERY other valid tap and trap the binding. So
+    // when the pending model is invalid, RESTART the /new flow so the user re-picks a live model.
+    if (binding.spawnPending && binding.model && !findModel(binding.model)) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "that model is gone — set the topic up again")
+      await startTopicPathFlow(action.threadId, binding.name)
+      return false
+    }
+    if (binding.spawnPending && binding.model && binding.model !== action.modelId) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, `already starting \`${binding.model}\` — wait`)
       return false
     }
     // Validate the model id ONCE, up front (applyModelAnswer and spawnArgv both resolve against
@@ -2524,16 +2693,387 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     await answerCallbackQuery(ctx, action.callbackQueryId, "starting…")
     persistTopics(appendTopic(topics, withModel))
-    const slug = slugifyTopicName(binding.name, action.threadId)
-    const spawned = spawnTopicWindow(slug, binding.path, action.modelId)
-    if (!spawned.ok) {
-      // Leave the binding at awaiting-model (withModel) so a re-tap retries without losing the path.
-      await sendToTopic(action.threadId, spawned.error)
+    return spawnAndBindTopic(withModel, action.modelId, action.messageId)
+  }
+
+  // Spawn the agent for an awaiting-model binding and bind the returned pane. Shared by the model
+  // tap (handleTopicModel) AND the re-spawn tap (handleTopicRespawn) so the spawn/bind/confirm/
+  // clear-keyboard logic lives in ONE place. On success: bound + confirmation + (increment 4) the
+  // stale model keyboard is cleared so it can't be re-tapped. On failure: the binding stays
+  // awaiting-model (retryable) and the error posts into the topic — never half-bound, never throws.
+  const spawnAndBindTopic = async (
+    binding: TopicBinding,
+    modelId: string,
+    promptMessageId: number | null,
+  ): Promise<boolean> => {
+    // RE-VALIDATE the path here (review #5): on a re-spawn the recorded dir can have vanished since
+    // it was first chosen. RESTART the /new flow (back to awaiting-path) rather than leaving the
+    // binding stuck at awaiting-model — where a follow-up text would only re-show model buttons and
+    // never let the user fix the path (codex #1). startTopicPathFlow persists awaiting-path + asks.
+    if (!binding.path || !isAbsolute(binding.path) || !isExistingDirectory(binding.path)) {
+      // Require ABSOLUTE here too (codex r9 #2): a corrupt/old binding with a relative `path` (e.g.
+      // ".") would otherwise spawn with `tmux new-window -c .`, resolving against the tmux SERVER's
+      // cwd, NOT the daemon-validated dir. Restart the /new flow so the human picks a real abs path.
+      // PERSIST the awaiting-path recovery state FIRST (codex r19 P1) — startTopicPathFlow writes it
+      // before its own prompt send, so a crash during the COSMETIC clear/notice below can't strand
+      // the binding at awaiting-model with the bad path. Then clear the stale model keyboard (codex
+      // r10 P2: a live model button would otherwise re-enter handleTopicModel against the bad path).
+      await startTopicPathFlow(binding.threadId, binding.name)
+      if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+      await sendToTopic(binding.threadId, `\`${binding.path ?? "(none)"}\` is not an absolute existing directory — set the topic up again.`)
       return false
     }
-    persistTopics(appendTopic(loadTopics(), markBound(withModel, spawned.paneId, Math.floor(Date.now() / 1000))))
-    await sendToTopic(action.threadId, `spawned \`${action.modelId}\` in \`${binding.path}\` (window \`${slug}\`) — send a message to talk to it`)
+    const slug = slugifyTopicName(binding.name, binding.threadId)
+    // JUST-IN-TIME orphan probe (codex r13 P1): if this binding is ALREADY spawnPending, a prior
+    // spawn may have created an orphan that startup reconcile missed (e.g. a flaky/empty snapshot at
+    // boot made reconcile skip). Re-probe the LIVE snapshot now and ADOPT that orphan instead of
+    // spawning a SECOND agent. Uses the same proof (token OR recorded paneId, same slug + cwd) as
+    // reconcileOneTopic. A fresh tap (no spawnPending) skips this and spawns normally.
+    if (binding.spawnPending) {
+      const { panes, procs } = snapshot()
+      const live = panes.filter((p) => findAgentInPane(p, procs) !== null)
+      // FLAKE GUARD (codex r17, narrowed r29): the flake signature is an EMPTY `panes` (tmux flaked)
+      // or EMPTY `procs` (ps flaked) — the probe is then BLIND and the orphan may be alive but
+      // invisible, so spawning would double-spawn. Refuse + retry ONLY for that signature. When BOTH
+      // reads returned data but no agent is live, the orphan is genuinely GONE (or a crash hit before
+      // new-window) — that's a real no-orphan state, so fall through to a fresh spawn below rather
+      // than looping "couldn't read the session" forever (codex r29). The ambiguous-candidate guard
+      // further down still refuses if a real same-slug/cwd candidate remains.
+      if (panes.length === 0 || procs.length === 0) {
+        await sendToTopic(binding.threadId, "couldn't read the session right now — tap the model again in a moment")
+        return false
+      }
+      // PATH-AWARE claimed set (codex r14 #1): a stale reused-`%N` bound topic must NOT block this
+      // adoption, or the probe falls through to new-window and double-spawns.
+      const claimedNow = legitimatelyClaimedPanes(loadTopics(), live, binding.threadId)
+      const adopted = reconcileOneTopic(binding, live, claimedNow, Math.floor(Date.now() / 1000))
+      if (adopted !== binding && adopted.status === "bound" && adopted.paneId) {
+        persistTopics(appendTopic(loadTopics(), adopted))
+        if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+        await sendToTopic(binding.threadId, `re-attached to the existing agent in \`${binding.path}\` (window \`${slug}\`) — send a message to talk to it`)
+        return true
+      }
+      // The probe did NOT adopt. If a same-slug/same-cwd UNCLAIMED candidate pane STILL exists, an
+      // orphan likely IS there but couldn't be safely adopted (e.g. ambiguous multi-pane token, codex
+      // r28). Spawning now would double-spawn — so REFUSE and ask the user to retry/recreate, never
+      // start a second window. Only when NO such candidate exists (the orphan is genuinely gone) do
+      // we fall through to a fresh spawn below.
+      const candidateRemains = live.some(
+        (p) =>
+          p.windowName === slug &&
+          !claimedNow.has(p.paneId) &&
+          routeMatchesPane({ recognizedCwd: binding.path, panePath: p.panePath }),
+      )
+      if (candidateRemains) {
+        await sendToTopic(binding.threadId, "an agent may already be running for this topic but I can't confirm which pane — tap again, or recreate the topic")
+        return false
+      }
+    }
+    // Arm the spawn-pending marker AND persist it BEFORE new-window, so a crash in the window between
+    // a successful new-window and the `bound` write leaves spawnPending set → startup reconcile knows
+    // a live orphan exists and adopts it. A FAILED spawn clears it below (no orphan window was created
+    // → reconcile must NOT adopt an unrelated same-slug pane after a restart — codex r7 P1).
+    const pendingTs = Math.floor(Date.now() / 1000)
+    // A unique per-spawn token, recorded on the binding BEFORE new-window. Adoption requires either
+    // (a) the orphan window carries this token (the normal case), OR (b) the recorded paneId (set
+    // RIGHT AFTER new-window, below) is a live same-cwd agent — the fallback that closes the
+    // crash-AFTER-new-window-BEFORE-token-stamp window (codex r12 P1).
+    const spawnToken = `${binding.threadId}-${pendingTs}-${nextPathNonce()}`
+    persistTopics(appendTopic(loadTopics(), markSpawnPending(binding, spawnToken, pendingTs)))
+    const spawned = spawnTopicWindow(binding.threadId, slug, binding.path, modelId)
+    if (!spawned.ok) {
+      // Clear the pending marker (no orphan was created) and leave the binding at awaiting-model so a
+      // re-tap retries without losing the path.
+      persistTopics(appendTopic(loadTopics(), clearSpawnPending(binding, Math.floor(Date.now() / 1000))))
+      await sendToTopic(binding.threadId, spawned.error)
+      return false
+    }
+    // STAMP THE TOKEN ONTO THE WINDOW FIRST (codex r15 #1), THEN persist the paneId. The binding's
+    // spawnToken was already persisted before new-window (markSpawnPending), so once the WINDOW also
+    // carries it, the orphan is token-adoptable even if the paneId persist below never runs. Doing
+    // the synchronous set-option before the persist shrinks the unrecoverable gap to the sub-ms
+    // window BETWEEN new-window returning and this set-option call — which tmux can't make atomic
+    // (no `-o` on new-window). That residual is bounded by the JIT probe (a model re-tap on a still-
+    // spawnPending binding re-probes live panes) and is astronomically unlikely; a stranded orphan
+    // is also recoverable by hand.
+    stampSpawnToken(spawned.paneId, spawnToken)
+    const pendingWithPane = { ...markSpawnPending(binding, spawnToken, Math.floor(Date.now() / 1000)), paneId: spawned.paneId }
+    persistTopics(appendTopic(loadTopics(), pendingWithPane))
+    persistTopics(appendTopic(loadTopics(), markBound(binding, spawned.paneId, Math.floor(Date.now() / 1000))))
+    // Clear the stale model/re-spawn keyboard on bind (increment 4) so it can't be re-tapped.
+    if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+    await sendToTopic(binding.threadId, `spawned \`${modelId}\` in \`${binding.path}\` (window \`${slug}\`) — send a message to talk to it`)
     return true
+  }
+
+  // A re-spawn button tap (tgr:<threadId>) for a topic whose agent died → re-launch with the
+  // retained path + model and re-bind. The button is ONLY ever offered for a `closed` topic, so a
+  // tap on a binding in ANY OTHER state is STALE (the topic reopened / a new /new flow started since
+  // the button was posted) — refuse it as expired rather than re-spawning out of band (codex r4 P1).
+  // A model that's no longer in the catalog re-enters the /new flow instead of spawning blind.
+  const handleTopicRespawn = async (action: Extract<Action, { kind: "topic-respawn" }>): Promise<boolean> => {
+    const topics = loadTopics()
+    const binding = findTopic(topics, action.threadId)
+    if (!binding) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "not in setup")
+      return false
+    }
+    if (binding.status !== "closed") {
+      // bound → already running; awaiting-* → the flow already moved on. Either way the button is
+      // stale; answer the toast and do nothing (no double-spawn, no out-of-flow spawn).
+      const toast = binding.status === "bound" ? "an agent is already running here" : "that button expired — continue setup"
+      await answerCallbackQuery(ctx, action.callbackQueryId, toast)
+      return false
+    }
+    // The Re-spawn button is ONLY ever posted alongside setting `respawnOffered` (a dead-pane offer).
+    // A `closed` binding WITHOUT that flag was closed some OTHER way — most importantly an explicit
+    // `forum_topic_closed` (which clears the flag) — so a stale tgr tap there must NOT launch an agent
+    // into a deliberately-closed topic (codex r18 #2). Require the live-offer flag.
+    if (!binding.respawnOffered) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "that button expired — reopen or recreate the topic")
+      return false
+    }
+    if (!binding.path || !binding.model || !findModel(binding.model)) {
+      // Not enough to re-spawn (no path/model, or a model that's no longer in the catalog) →
+      // restart the /new flow so the human re-picks. PERSIST the awaiting-path state FIRST (codex r19
+      // P1) so a crash during the cosmetic keyboard clear can't strand the closed binding; then clear
+      // the now-stale Re-spawn button (codex r13 P2).
+      await answerCallbackQuery(ctx, action.callbackQueryId, "restarting setup")
+      await startTopicPathFlow(action.threadId, binding.name)
+      if (action.messageId !== null) await clearMessageKeyboard(ctx, action.messageId)
+      return false
+    }
+    await answerCallbackQuery(ctx, action.callbackQueryId, "re-spawning…")
+    const ts = Math.floor(Date.now() / 1000)
+    const reArmed = applyModelAnswer({ ...binding, status: "awaiting-model" }, binding.model, ts)
+    if (!reArmed) {
+      await sendToTopic(action.threadId, `model \`${binding.model}\` is no longer available — recreate the topic`)
+      return false
+    }
+    persistTopics(appendTopic(topics, reArmed))
+    const ok = await spawnAndBindTopic(reArmed, binding.model, action.messageId)
+    if (!ok) {
+      // The re-spawn FAILED (tmux error / vanished dir). Restore the topic to `closed` and clear the
+      // throttle flag (codex r5 #2) so the NEXT message re-OFFERS a fresh re-spawn button — otherwise
+      // the binding sits at awaiting-model where the now-stale tgr button is refused with no obvious
+      // retry. (Skip when spawnAndBindTopic already moved it elsewhere — e.g. a vanished dir restarted
+      // the /new flow to awaiting-path; only restore if it's still the awaiting-model we left.)
+      const after = findTopic(loadTopics(), action.threadId)
+      if (after?.status === "awaiting-model") {
+        persistTopics(appendTopic(loadTopics(), markClosed(after, Math.floor(Date.now() / 1000))))
+      }
+    }
+    return ok
+  }
+
+  // A message arrived in a CLOSED topic (its agent died) → offer a one-tap re-spawn instead of a
+  // dead-end. Only when the binding still holds a path + a valid model (a full re-spawn is
+  // possible); otherwise re-enter the /new flow so the human re-picks. Idempotent toast on a
+  // binding that already re-bound (e.g. a queued message after re-spawn) — no false re-offer.
+  const handleTopicDead = async (action: Extract<Action, { kind: "topic-dead" }>): Promise<boolean> => {
+    const binding = findTopic(loadTopics(), action.threadId)
+    if (!binding) return false // untracked — defensive (stepUpdates only emits topic-dead for closed)
+    if (binding.status !== "closed") {
+      // A SAME-BATCH re-spawn tap already RE-BOUND this topic before this action ran (callbacks run
+      // first). Don't drop the user's message (codex r9 #1): if it carried text and the topic is now
+      // bound, route it to the live pane via handleTopicRoute (which re-verifies the pane + threads
+      // the ack). A media-only message (empty injectText) has nothing to route → just skip.
+      if (binding.status === "bound" && action.injectText) {
+        return handleTopicRoute({
+          kind: "topic-route",
+          threadId: action.threadId,
+          injectText: action.injectText,
+          from: "tg",
+          messageId: action.messageId,
+        })
+      }
+      return false
+    }
+    await recoverDeadTopic(binding)
+    // The user's message did NOT reach an agent (the topic is dead) — return false so the trailing
+    // ack does NOT set a 👀 "seen" receipt. The re-spawn offer is the visible acknowledgement.
+    return false
+  }
+
+  // Drive the recovery for a topic that is ALREADY `closed`: offer a re-spawn (or restart the
+  // /new flow), THROTTLED so a burst of messages posts at most ONE offer. Shared by handleTopicDead
+  // (a message to a closed topic), handleTopicRoute's dead-pane branch (after it closes a live-but-
+  // dead bound topic), AND handleTopicRoute's no-longer-bound early branch (a SAME-BATCH second
+  // message after the first closed it — codex round-2 #1, which previously hit the old "recreate the
+  // topic" dead-end). respawnOffered gates the offer; it's stamped ONLY when the button actually
+  // went out (a failed send retries next time — codex #3) AND the topic is still closed (a no-path/
+  // model restart moved it to awaiting-path and must not be stamped).
+  const recoverDeadTopic = async (binding: TopicBinding): Promise<void> => {
+    if (binding.respawnOffered) return // already offered — ack quietly, no spam
+    const offered = await offerRespawnOrRestart(binding)
+    if (!offered) return
+    const after = findTopic(loadTopics(), binding.threadId)
+    if (after?.status === "closed") {
+      persistTopics(appendTopic(loadTopics(), markRespawnOffered(after, Math.floor(Date.now() / 1000))))
+    }
+  }
+
+  // Tell the human a topic's agent is dead and give them the fastest path back: a one-tap
+  // re-spawn button when the binding still holds a usable path + model, else restart the /new
+  // flow (re-ask the path). Shared by handleTopicRoute (a message hit a dead bound pane) and
+  // handleTopicDead (a message hit an already-closed topic) so the recovery UX is identical.
+  // The caller has already persisted the `closed` transition. Returns TRUE only when the re-spawn
+  // BUTTON was actually delivered (a message id came back) — the caller throttles on that, so a
+  // transient send failure does NOT suppress future offers (codex #3). The restart-flow branch
+  // returns false (no button to re-offer; it already moved the topic to awaiting-path).
+  const offerRespawnOrRestart = async (binding: TopicBinding): Promise<boolean> => {
+    // Offer the one-tap re-spawn ONLY when a full re-spawn is actually possible: a valid model AND a
+    // path that STILL EXISTS (codex r6 — a vanished dir would post an UNUSABLE button and, once the
+    // throttle stamps respawnOffered, suppress further messages until the user taps the dead button).
+    // If anything is missing/gone, restart the /new flow instead so the human re-picks a live dir.
+    if (binding.path && isAbsolute(binding.path) && isExistingDirectory(binding.path) && binding.model && findModel(binding.model)) {
+      await sendToTopic(binding.threadId, "this topic's agent has exited — tap to re-spawn it (same project + model).")
+      const messageId = await sendMessage(ctx, "Re-spawn?", {
+        message_thread_id: binding.threadId,
+        reply_markup: { inline_keyboard: buildRespawnKeyboard(binding.threadId) },
+      })
+      return messageId !== null
+    }
+    // No usable path/model → restart the /new flow. PERSIST awaiting-path FIRST (codex r19 P1: a
+    // crash during the notice send must not strand the closed binding), then post the exited notice.
+    await startTopicPathFlow(binding.threadId, binding.name)
+    await sendToTopic(binding.threadId, "this topic's agent has exited — set it up again.")
+    return false
+  }
+
+  // The set of panes a `bound` binding LEGITIMATELY holds (so an orphan adoption never steals one).
+  // Only a bound binding whose live pane STILL MATCHES its recorded project counts: a path-mismatched
+  // (tmux-reused `%N`) bound pane is NOT a legit claim, so it doesn't block a real spawnPending orphan
+  // (codex r8 #2). A pathless bound binding claims by pane id alone. `excludeThreadId` drops the
+  // binding being adopted itself. Shared by startup reconcile AND the just-in-time spawn probe (codex
+  // r14 #1 — both must use the SAME path-aware logic or the JIT probe could be blocked by a stale
+  // reused-pane bound topic and double-spawn).
+  const legitimatelyClaimedPanes = (
+    topics: TopicBinding[],
+    liveAgentPanes: PaneInfo[],
+    excludeThreadId?: number,
+  ): Set<string | undefined> =>
+    new Set(
+      topics
+        .filter((t) => {
+          if (t.threadId === excludeThreadId) return false
+          if (t.status !== "bound" || !t.paneId) return false
+          if (t.path === undefined) return true
+          const live = liveAgentPanes.find((p) => p.paneId === t.paneId)
+          return live !== undefined && routeMatchesPane({ recognizedCwd: t.path, panePath: live.panePath })
+        })
+        .map((t) => t.paneId),
+    )
+
+  // Reconcile ONE binding against the live tmux state on startup. Returns the SAME object when
+  // nothing changes (the caller uses identity to detect a change), else a new transitioned binding:
+  //   - a `bound` binding whose recorded pane is gone → markClosed (agent died while down);
+  //   - an `awaiting-model` binding whose topic-slug window hosts a live UNCLAIMED agent → markBound
+  //     (adopt the crash-orphan, no second spawn). `claimed` excludes panes already bound elsewhere.
+  const reconcileOneTopic = (
+    binding: TopicBinding,
+    liveAgentPanes: PaneInfo[],
+    claimed: Set<string>,
+    ts: number,
+  ): TopicBinding => {
+    if (binding.status === "bound") {
+      // Close the binding ONLY when the recorded pane no longer hosts an agent (genuinely gone). A
+      // mere PATH MISMATCH on a live pane is NOT closed here: it can be a transient empty-path read
+      // (the launchd flake) or a legit `cd`, and closing on that would irreversibly kill a live topic
+      // on a flaky startup read — exactly what the routing-time guard deliberately avoids (see the
+      // ctl-topics-integration "REUSED pane … NOT closed" test). The ROUTING path already prevents a
+      // leak into a reused-pane stranger (it refuses to inject on a mismatch), so a reused-`%N` case
+      // is contained there and self-heals; reconcile must not over-close (codex r4 P2 declined — the
+      // transient-read safety wins over the re-spawn-offer convenience).
+      const stillLive = binding.paneId && liveAgentPanes.some((p) => p.paneId === binding.paneId)
+      if (stillLive) return binding
+      log(`topic ${binding.threadId}: bound pane ${binding.paneId} gone on startup — marking closed`)
+      return markClosed(binding, ts)
+    }
+    // Adopt a crash-orphan ONLY for the EXACT crash-gap state: `awaiting-model` WITH path + model AND
+    // the `spawnPending` marker SET. That marker is armed right before `tmux new-window` and cleared
+    // on spawn FAILURE, so only a binding whose new-window actually RAN (and whose `bound` write was
+    // lost to a crash) is a real orphan. Without it, a normal awaiting-model (no model / never
+    // spawned — codex r5 #1) OR a FAILED spawn left at awaiting-model+model (codex r7 P1) could be
+    // wrongly bound to an unrelated same-slug/cwd pane. A `closed` topic is deliberately closed (never
+    // resurrect — codex r2 #2); awaiting-path has nothing to adopt against.
+    if (
+      binding.status !== "awaiting-model" ||
+      !binding.spawnPending ||
+      !binding.spawnToken ||
+      !binding.path ||
+      !binding.model ||
+      !findModel(binding.model)
+    )
+      return binding
+    // Adopt a live agent pane that is PROVABLY the one we launched. Candidates: an unclaimed pane in
+    // the topic-slug window with the same cwd. Among those, the proof is EITHER the recorded paneId
+    // (set right after new-window — codex r12 P1) OR our per-spawn token. Since `@tg_spawn_token` is a
+    // WINDOW option, EVERY pane in the window exposes it, so a multi-pane window (the user split it)
+    // could token-match more than one pane (codex r23 #2): prefer the EXACT recorded paneId; fall back
+    // to a token match ONLY when it is UNAMBIGUOUS (exactly one). Never bind a guessed pane.
+    const slug = slugifyTopicName(binding.name, binding.threadId)
+    const candidates = liveAgentPanes.filter(
+      (p) =>
+        p.windowName === slug &&
+        !claimed.has(p.paneId) &&
+        routeMatchesPane({ recognizedCwd: binding.path, panePath: p.panePath }),
+    )
+    const byPaneId = binding.paneId !== undefined ? candidates.find((p) => p.paneId === binding.paneId) : undefined
+    const tokenMatches = candidates.filter((p) => p.spawnToken.length > 0 && p.spawnToken === binding.spawnToken)
+    const orphan = byPaneId ?? (tokenMatches.length === 1 ? tokenMatches[0] : undefined)
+    if (!orphan) {
+      if (tokenMatches.length > 1) log(`topic ${binding.threadId}: ambiguous token match (${tokenMatches.length} panes) — not adopting`)
+      return binding
+    }
+    log(`topic ${binding.threadId}: adopting orphan pane ${orphan.paneId} (window ${slug}) on startup`)
+    return markBound(binding, orphan.paneId, ts)
+  }
+
+  // --- crash-window orphan reconcile (docs/specs/tg-forum-topics.md §9 increment 4) ---
+  // CRASH GAP (spec §9.4a): handleTopicModel persists awaiting-model → `tmux new-window` →
+  // persists `bound`. A daemon crash BETWEEN a successful new-window and the `bound` write leaves
+  // a LIVE orphan pane plus an `awaiting-model` binding — and a later re-tap then spawns a SECOND
+  // agent (the "restart can't double-spawn" guarantee only covers `bound` topics). On startup,
+  // reconcile each non-bound binding against the live tmux windows by SLUG: if the topic-slug
+  // window already hosts a live agent, RE-BIND that pane (adopt the orphan, no second spawn);
+  // also mark any `bound` binding whose recorded pane is gone as `closed` (its agent died while
+  // the daemon was down) so the next message offers a re-spawn instead of injecting into nothing.
+  // Runs ONCE at startup, gated behind ctx.cfg.topics, fully guarded (never aborts startup).
+  const reconcileTopicsOnStartup = (): void => {
+    if (!ctx.cfg.topics) return
+    try {
+      const topics = loadTopics()
+      if (topics.length === 0) return
+      const { panes, procs } = snapshot()
+      // An empty/flaky snapshot (the known launchd no-locale read) must NOT trigger reconciliation:
+      // it would mass-close every live binding. Skip when no panes are visible.
+      if (panes.length === 0) return
+      const liveAgentPanes = panes.filter((p) => findAgentInPane(p, procs) !== null)
+      // SECOND flake guard: a non-empty `panes` but ZERO live-agent panes most likely means the
+      // `procs` (ps) read flaked (panesWithRetry resilience is per-source). Closing every `bound`
+      // binding off that empty procs read would falsely kill live topics. So when we have bound
+      // bindings to reconcile yet found NO agent anywhere, treat it as a flaky read and skip — a
+      // genuinely all-dead fleet self-heals on the next message (handleTopicRoute re-probes per pane).
+      const hasBound = topics.some((t) => t.status === "bound")
+      if (liveAgentPanes.length === 0 && hasBound) return
+      const ts = Math.floor(Date.now() / 1000)
+      // Panes a `bound` binding LEGITIMATELY holds — never adopt one for an orphan. Mutated as we
+      // adopt (a pane adopted by one binding can't ALSO be adopted by a slug-colliding sibling).
+      const claimed = legitimatelyClaimedPanes(topics, liveAgentPanes)
+      let changed = false
+      const reconciled = topics.map((binding) => {
+        const next = reconcileOneTopic(binding, liveAgentPanes, claimed, ts)
+        if (next !== binding) {
+          changed = true
+          if (next.status === "bound" && next.paneId) claimed.add(next.paneId) // reserve the adopted pane
+        }
+        return next
+      })
+      if (changed) persistTopics(reconciled)
+    } catch (err) {
+      log(`reconcileTopicsOnStartup failed: ${err}`)
+    }
   }
 
   // getFile → /file/ download into ~/.cache/tg-cli/inbound under the daemon-
@@ -2817,6 +3357,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return transcribeVoice(action)
       case "topic-route":
         return handleTopicRoute(action)
+      case "topic-dead":
+        return handleTopicDead(action)
       case "topic-close":
       case "topic-reopen":
         return handleTopicLifecycle(action)
@@ -2826,6 +3368,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return handleTopicAnswer(action)
       case "topic-model":
         return handleTopicModel(action)
+      case "topic-path":
+        return handleTopicPath(action)
+      case "topic-respawn":
+        return handleTopicRespawn(action)
       case "ack":
         if (lastWasDeferred) {
           lastWasDeferred = false
@@ -2841,6 +3387,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // Best-effort — publishBotCommands swallows every failure so a Telegram
   // hiccup can never block routing.
   await publishBotCommands(ctx)
+
+  // Reconcile forum-topic bindings against the live tmux state once on startup (increment 4):
+  // adopt a crash-orphaned topic-slug window, close a bound binding whose pane died while down.
+  // No-op when topics mode is off (1:1 startup byte-identical) and fully guarded.
+  reconcileTopicsOnStartup()
 
   log(`daemon up — pid ${process.pid}, bot ${ctx.botId}, offset ${offset}`)
 

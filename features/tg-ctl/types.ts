@@ -201,11 +201,25 @@ export type Action =
   | { kind: 'topic-answer'; threadId: number; text: string; from: string; messageId: number }
   // A tap on a model button (tgm:<threadId>:<modelId>) inside an awaiting-model topic → spawn
   // the agent with that model. callbackQueryId answers the tap; messageId is the prompt message
-  // (carried for a future editMessageReplyMarkup that clears the buttons on bind — increment 4).
+  // (carried for editMessageReplyMarkup that clears the buttons on bind — increment 4).
   | { kind: 'topic-model'; callbackQueryId: string; threadId: number; modelId: string; messageId: number | null }
+  // A tap on a recent-path button (tgp:<threadId>:<index>:<nonce>) inside an awaiting-path topic →
+  // resolve the index against the binding's persisted pathChoices (only if the nonce matches the
+  // binding's pathChoicesNonce — else a stale button) and advance like a typed path. callbackQueryId
+  // answers the tap; messageId is the prompt (its keyboard is cleared on advance).
+  | { kind: 'topic-path'; callbackQueryId: string; threadId: number; index: number; nonce: number; messageId: number | null }
+  // A tap on a re-spawn button (tgr:<threadId>) for a topic whose pane died → re-launch the
+  // agent with the retained path + model and re-bind. callbackQueryId answers the tap.
+  | { kind: 'topic-respawn'; callbackQueryId: string; threadId: number; messageId: number | null }
   // A user message inside a BOUND topic → inject into that topic's pane. injectText is
   // already wrapped; the entrypoint maps threadId→paneId and threads the ack with threadId.
   | { kind: 'topic-route'; threadId: number; injectText: string; from: string; messageId: number }
+  // A user message inside a CLOSED topic (its pane died earlier) → the entrypoint offers a
+  // one-tap re-spawn (retained path + model) instead of a silent dead-end (increment 4). Carries
+  // the wrapped text + messageId so that if a SAME-BATCH re-spawn tap already re-bound the topic
+  // before this action runs, the entrypoint routes the message to the now-live pane instead of
+  // dropping it (codex r9 #1). injectText is empty for a media-only message (offer only).
+  | { kind: 'topic-dead'; threadId: number; injectText: string; messageId: number }
   // Topic closed / reopened service messages → mark the binding (entrypoint persists).
   | { kind: 'topic-close'; threadId: number }
   | { kind: 'topic-reopen'; threadId: number };
@@ -236,6 +250,12 @@ export interface PaneInfo {
   // reliably (tg-cli#75 fix C); a separate tmux call mis-aligned/blanked under
   // the launchd no-locale tab-mangle. Empty when tmux gives no name.
   windowName: string;
+  // The `@tg_spawn_token` window user option (forum-topics increment 4): the per-spawn token set
+  // via `tmux set-option -w @tg_spawn_token` right after a topic agent is launched. Empty string
+  // when unset. Startup orphan reconcile matches it against the binding's recorded spawnToken to
+  // PROVE a candidate pane is the one we launched (a queryable alternative to `new-window -e`, which
+  // sets process env not readable via tmux later — codex r11).
+  spawnToken: string;
   panePath: string; // pane_current_path
 }
 
@@ -298,4 +318,32 @@ export interface TopicBinding {
   model?: string; // chosen model id from the catalog (set at spawn)
   paneId?: string; // the spawned tmux pane ("%N"), set at bound
   ts: number; // unix seconds of the last transition
+  // The recent-repo paths OFFERED as awaiting-path buttons (increment 4). Persisted so a
+  // `tgp:<threadId>:<idx>` button tap recovers the chosen path by INDEX — callback_data is
+  // capped at 64 bytes, far too small for an absolute path, and recomputing the candidate
+  // list at tap time could drift if a new route was written meanwhile. Cleared once the path
+  // is chosen (it is only meaningful while awaiting-path).
+  pathChoices?: string[];
+  // The nonce embedded in this prompt's path buttons (the offering binding's ts). A `tgp` tap must
+  // carry a matching nonce or it's a STALE button from a superseded prompt (e.g. after a setup
+  // restart replaced pathChoices) — the entrypoint rejects the mismatch rather than resolving the
+  // index against the wrong list (codex r3 P1). Paired with pathChoices; cleared with it.
+  pathChoicesNonce?: number;
+  // True once a re-spawn button has been offered for this (closed) topic (increment 4). Stops a
+  // burst of messages to a dead topic from posting an offer PER message — the offer is sent once,
+  // then further messages are quietly acked until the user taps Re-spawn (which clears the flag by
+  // re-binding) or recreates the topic. Only meaningful while status === 'closed'.
+  respawnOffered?: boolean;
+  // Set on an awaiting-model binding IMMEDIATELY before `tmux new-window`, cleared on spawn
+  // failure, and dropped on bind. It distinguishes the CRASH-GAP state (a crash hit AFTER a
+  // successful new-window but BEFORE the `bound` write — a live orphan pane exists) from a normal
+  // awaiting-model (model chosen, never spawned) or a FAILED spawn (window never created). Only a
+  // spawnPending binding is an orphan-adoption candidate at startup, so a failed spawn + restart
+  // can't bind the topic to an unrelated same-slug/cwd pane (increment 4 / codex r7 P1).
+  spawnPending?: boolean;
+  // A per-spawn unique token stamped into the new window's env (`TG_SPAWN_TOKEN`) and recorded here
+  // BEFORE `tmux new-window`. Startup orphan adoption requires the candidate window to carry the
+  // MATCHING token, so a same-slug/same-cwd STRANGER pane (or a crash BEFORE new-window ran, where
+  // no window carries the token) is never wrongly adopted (codex r10 P1). Paired with spawnPending.
+  spawnToken?: string;
 }

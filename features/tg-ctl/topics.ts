@@ -37,6 +37,12 @@ export function parseTopics(raw: string | null): TopicBinding[] {
     // make the entrypoint route into nothing. Drop it (it re-binds on the next message) rather
     // than load a binding that claims a live agent it can't reach (review catch).
     if (rec.status === 'bound' && !paneId) continue;
+    // pathChoices: only keep a clean string[] (the awaiting-path button candidates). A malformed
+    // value degrades to undefined (no choices offered) rather than poisoning the binding.
+    const pathChoices =
+      Array.isArray(rec.pathChoices) && rec.pathChoices.every((c) => typeof c === 'string')
+        ? (rec.pathChoices as string[])
+        : undefined;
     out.push({
       threadId: rec.threadId,
       name: typeof rec.name === 'string' ? rec.name : '',
@@ -45,6 +51,13 @@ export function parseTopics(raw: string | null): TopicBinding[] {
       model: typeof rec.model === 'string' ? rec.model : undefined,
       paneId,
       ts: typeof rec.ts === 'number' && Number.isFinite(rec.ts) ? rec.ts : 0,
+      ...(pathChoices ? { pathChoices } : {}),
+      ...(typeof rec.pathChoicesNonce === 'number' && Number.isFinite(rec.pathChoicesNonce)
+        ? { pathChoicesNonce: rec.pathChoicesNonce }
+        : {}),
+      ...(rec.respawnOffered === true ? { respawnOffered: true } : {}),
+      ...(rec.spawnPending === true ? { spawnPending: true } : {}),
+      ...(typeof rec.spawnToken === 'string' && rec.spawnToken.length > 0 ? { spawnToken: rec.spawnToken } : {}),
     });
   }
   return out;
@@ -82,8 +95,10 @@ export function createTopic(threadId: number, name: string, ts: number): TopicBi
 
 // The user supplied a working directory → advance to awaiting-model. Path validity
 // (exists + is a dir) is the entrypoint's job; here we only record the chosen path.
+// pathChoices + its nonce are dropped — they were only the awaiting-path button menu, now stale.
 export function applyPathAnswer(binding: TopicBinding, path: string, ts: number): TopicBinding {
-  return { ...binding, status: 'awaiting-model', path, ts };
+  const { pathChoices: _drop, pathChoicesNonce: _dropNonce, spawnPending: _sp, spawnToken: _st, ...rest } = binding;
+  return { ...rest, status: 'awaiting-model', path, ts };
 }
 
 // The user picked a model → record it so the entrypoint can spawn. Returns null for an
@@ -95,21 +110,50 @@ export function applyModelAnswer(binding: TopicBinding, modelId: string, ts: num
   return { ...binding, model: modelId, ts };
 }
 
-// The spawn succeeded and `paneId` is the new agent's pane → the topic is live.
+// The spawn succeeded and `paneId` is the new agent's pane → the topic is live. Clears the
+// re-spawn-offer + spawn-pending + spawn-token fields (a bound topic is neither dead nor mid-spawn).
 export function markBound(binding: TopicBinding, paneId: string, ts: number): TopicBinding {
-  return { ...binding, status: 'bound', paneId, ts };
+  const { respawnOffered: _ro, spawnPending: _sp, spawnToken: _st, ...rest } = binding;
+  return { ...rest, status: 'bound', paneId, ts };
 }
 
+// Arm the spawn-pending marker + the per-spawn token IMMEDIATELY before `tmux new-window` (so a
+// crash mid-spawn leaves them set → reconcile adopts ONLY a window carrying the matching token);
+// the entrypoint clears them on spawn failure. Stays awaiting-model. CLEARS any stale `paneId`
+// (codex r14 #2): a closed/retry binding can still carry an OLD pane id — keeping it would let a
+// pre-new-window crash leave spawnPending + a stale paneId that reconcile would wrongly accept as
+// proof (binding to a reused/stranger pane). The real paneId is set only AFTER new-window returns.
+export function markSpawnPending(binding: TopicBinding, token: string, ts: number): TopicBinding {
+  const { paneId: _drop, ...rest } = binding;
+  return { ...rest, spawnPending: true, spawnToken: token, ts };
+}
+
+// Clear the spawn-pending marker + token (spawn FAILED → no orphan window exists; never adopt).
+export function clearSpawnPending(binding: TopicBinding, ts: number): TopicBinding {
+  const { spawnPending: _sp, spawnToken: _st, ...rest } = binding;
+  return { ...rest, ts };
+}
+
+// The topic's agent is gone → closed. Drops the re-spawn-offer + spawn-pending + token fields so the
+// FIRST message after a fresh close re-offers (respawnOffered is re-set by markRespawnOffered).
 export function markClosed(binding: TopicBinding, ts: number): TopicBinding {
-  return { ...binding, status: 'closed', ts };
+  const { respawnOffered: _ro, spawnPending: _sp, spawnToken: _st, ...rest } = binding;
+  return { ...rest, status: 'closed', ts };
+}
+
+// Record that a re-spawn button was offered for this closed topic (increment 4) so a burst of
+// messages to a dead topic doesn't post one offer per message — further messages ack quietly.
+export function markRespawnOffered(binding: TopicBinding, ts: number): TopicBinding {
+  return { ...binding, respawnOffered: true, ts };
 }
 
 // A closed topic reopened → drop back into the flow so the next message re-attaches or
 // re-spawns. If a path/model are already known we resume at awaiting-model (re-pick model
-// → re-spawn); otherwise restart at awaiting-path.
+// → re-spawn); otherwise restart at awaiting-path. Clears the re-spawn-offer flag.
 export function markReopened(binding: TopicBinding, ts: number): TopicBinding {
   const status: TopicStatus = binding.path ? 'awaiting-model' : 'awaiting-path';
-  return { ...binding, status, paneId: undefined, ts };
+  const { respawnOffered: _ro, spawnPending: _sp, spawnToken: _st, ...rest } = binding;
+  return { ...rest, status, paneId: undefined, ts };
 }
 
 // --- helpers ---
@@ -183,4 +227,103 @@ export function buildModelKeyboard(
   return catalog.map((m) => [
     { text: m.label, callback_data: `${TOPIC_MODEL_CALLBACK_PREFIX}:${threadId}:${m.id}` },
   ]);
+}
+
+// --- recent-repo path buttons (the awaiting-path step of the /new flow, increment 4) ---
+
+// How many recent-path buttons to offer at most. Telegram caps an inline keyboard generously,
+// but a long menu is noise — the top few recent repos cover the common case; the free-text
+// fallback always remains for anything else.
+export const MAX_PATH_CHOICES = 8;
+
+// Callback-data prefix for a recent-path button. Distinct from `tgm:` (model) so the daemon
+// routes a path tap to the awaiting-path step. Shape: `tgp:<threadId>:<index>:<nonce>` — the
+// index is into the binding's persisted `pathChoices` (callback_data is 64 bytes, too small for a
+// path), and the NONCE pins the tap to the SPECIFIC prompt that offered those choices. Without it,
+// an OLD prompt's button (after a setup restart replaced pathChoices) would resolve its index
+// against the NEW list and silently pick the wrong directory (codex r3 P1). The entrypoint rejects
+// a tap whose nonce != the binding's current pathChoicesNonce.
+export const TOPIC_PATH_CALLBACK_PREFIX = 'tgp';
+
+export interface ParsedTopicPathCallback {
+  threadId: number;
+  index: number;
+  nonce: number;
+}
+
+// Parse `tgp:<threadId>:<index>:<nonce>`. Returns null on any mismatch. The index + nonce are
+// validated against the binding by the entrypoint (a stale/forged index or nonce re-asks); here we
+// only recover the integer fields. threadId mirrors the model-callback strictness (positive int).
+export function parseTopicPathCallback(data: string | undefined): ParsedTopicPathCallback | null {
+  if (!data) return null;
+  const parts = data.split(':');
+  if (parts.length !== 4 || parts[0] !== TOPIC_PATH_CALLBACK_PREFIX || !parts[1] || !parts[2] || !parts[3]) return null;
+  if (!/^[1-9]\d*$/.test(parts[1])) return null;
+  // Index is a NON-negative integer (0-based into pathChoices). `0` is valid here, so the
+  // threadId's `[1-9]\d*` shape does not apply — use the (0|[1-9]\d*) shape to reject leading-zero.
+  if (!/^(0|[1-9]\d*)$/.test(parts[2])) return null;
+  // Nonce is a positive integer (a binding ts, always >= 1) — leading-zero / zero rejected.
+  if (!/^[1-9]\d*$/.test(parts[3])) return null;
+  return { threadId: Number(parts[1]), index: Number(parts[2]), nonce: Number(parts[3]) };
+}
+
+// Pick the recent project paths to offer as awaiting-path buttons, most-recent first, deduped,
+// capped to MAX_PATH_CHOICES. PURE: the entrypoint passes the candidate cwds (from the routes
+// store + the per-pane registrations, newest first) and this filters to absolute, currently-
+// existing directories via the injected `isDir` probe so a button never points at a vanished or
+// relative path (the spawn requires an absolute existing dir — offering anything else is a trap).
+export function recentPathChoices(
+  candidates: ReadonlyArray<string | undefined>,
+  isAbsoluteDir: (p: string) => boolean,
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const c of candidates) {
+    if (typeof c !== 'string' || c.length === 0) continue;
+    if (seen.has(c)) continue;
+    seen.add(c);
+    if (!isAbsoluteDir(c)) continue;
+    out.push(c);
+    if (out.length >= MAX_PATH_CHOICES) break;
+  }
+  return out;
+}
+
+// The inline keyboard for the awaiting-path prompt: one button per recent path (callback
+// `tgp:<threadId>:<index>:<nonce>`), one path per row so a long path stays readable. The `nonce`
+// (the offering binding's ts) pins each button to THIS prompt's choice list, so a stale button
+// from a superseded prompt is rejected rather than mis-resolved (codex r3 P1). PURE — empty when
+// there are no choices (the entrypoint then posts the prompt without a keyboard, free-text only).
+export function buildPathKeyboard(
+  threadId: number,
+  choices: ReadonlyArray<string>,
+  nonce: number,
+): Array<Array<{ text: string; callback_data: string }>> {
+  return choices.map((p, i) => [
+    { text: p, callback_data: `${TOPIC_PATH_CALLBACK_PREFIX}:${threadId}:${i}:${nonce}` },
+  ]);
+}
+
+// --- re-spawn button (a message to a dead/closed topic, increment 4) ---
+
+// Callback-data prefix for a re-spawn button offered when a topic's bound pane is dead. The
+// retained path + model are re-used, so no payload beyond the threadId is needed. Shape:
+// `tgr:<threadId>`.
+export const TOPIC_RESPAWN_CALLBACK_PREFIX = 'tgr';
+
+// Parse `tgr:<threadId>` → the threadId, or null on mismatch (same positive-int strictness).
+export function parseTopicRespawnCallback(data: string | undefined): number | null {
+  if (!data) return null;
+  const parts = data.split(':');
+  if (parts.length !== 2 || parts[0] !== TOPIC_RESPAWN_CALLBACK_PREFIX || !parts[1]) return null;
+  if (!/^[1-9]\d*$/.test(parts[1])) return null;
+  return Number(parts[1]);
+}
+
+// The one-button "Re-spawn" keyboard for a dead topic. Offered only when the binding retains a
+// path + model (a full re-spawn is possible); otherwise the entrypoint re-enters the /new flow.
+export function buildRespawnKeyboard(
+  threadId: number,
+): Array<Array<{ text: string; callback_data: string }>> {
+  return [[{ text: 'Re-spawn the agent', callback_data: `${TOPIC_RESPAWN_CALLBACK_PREFIX}:${threadId}` }]];
 }
