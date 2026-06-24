@@ -230,6 +230,28 @@ export function externalLaunchdSupervisorLabel(jobs: LaunchdJob[], binPath: stri
   return undefined;
 }
 
+// A loaded launchd job after the caller probed BOTH its argv and its persistence (the `properties`
+// line). Carries the dump-derived facts so the SELECTION policy stays pure and unit-testable, while
+// the caller owns the impure `launchctl print` spawn + parsing.
+export interface ProbedLaunchdJob {
+  label: string;
+  argv: string[];
+  persistent: boolean;
+}
+
+// Select the external launchd job that counts as autostart for this tg-ctl binary: the first one
+// (other than tg-ctl's OWN unit) that BOTH supervises the binary (runs it with `run`) AND is
+// persistent (runatload/keepalive — it actually comes back at login). A loaded-but-temporary job is
+// rejected here so `status` doesn't claim "enabled" for something that won't survive reboot (PR #88
+// codex P2). Pure — the caller (detectExternalLaunchdSupervisor) probes launchctl and fills the jobs.
+export function selectExternalLaunchdSupervisor(jobs: ProbedLaunchdJob[], binPath: string): string | undefined {
+  for (const job of jobs) {
+    if (job.label === LAUNCHD_LABEL) continue;
+    if (job.persistent && launchdJobSupervisesBin(job, binPath)) return job.label;
+  }
+  return undefined;
+}
+
 // Parse the labels out of `launchctl list` output. Each data line is `PID\tStatus\tLabel`
 // (PID is `-` when not running) after a header line; we take the 3rd tab-separated field and skip
 // the `PID Status Label` header + blank lines. Pure so the caller's only impure step is the spawn.
@@ -243,6 +265,25 @@ export function parseLaunchctlListLabels(stdout: string): string[] {
     labels.push(label);
   }
   return labels;
+}
+
+// Does a `launchctl print` dump show the job as PERSISTENT — i.e. launchd will bring it back at
+// login? The dump carries a `properties = a | b | c` line listing flags like `keepalive` /
+// `runatload`. A job that was only temporarily bootstrapped (e.g. `launchctl bootstrap` of a plist
+// WITHOUT RunAtLoad/KeepAlive) is loaded now but won't survive reboot — and reporting it as
+// "autostart: enabled" would lie (PR #88 review, codex P2). We require `runatload` (relaunched at
+// login) OR `keepalive` (launchd keeps it alive) on the properties line. When the dump has no
+// properties line at all we conservatively treat it as persistent — older macOS `launchctl print`
+// may omit it, and falling back to argv-only match preserves the original behavior rather than
+// regressing detection to "NOT enabled".
+export function launchdJobIsPersistent(stdout: string): boolean {
+  const line = stdout.split('\n').find((l) => /^\s*properties\s*=/.test(l));
+  if (line === undefined) return true;
+  const flags = line
+    .slice(line.indexOf('=') + 1)
+    .split('|')
+    .map((f) => f.trim().toLowerCase());
+  return flags.includes('runatload') || flags.includes('keepalive');
 }
 
 // Parse the ProgramArguments (argv) out of one `launchctl print gui/<uid>/<label>` dump. The block

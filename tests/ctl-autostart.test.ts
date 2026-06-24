@@ -16,7 +16,10 @@ import {
   buildEnablePlan,
   defaultConfigDir,
   externalLaunchdSupervisorLabel,
+  launchdJobIsPersistent,
   launchdJobSupervisesBin,
+  selectExternalLaunchdSupervisor,
+  type ProbedLaunchdJob,
   launchdPlist,
   launchdPlistPath,
   parseLaunchctlListLabels,
@@ -301,12 +304,84 @@ test('parseLaunchctlPrintArgv: real `launchctl print` fixture (bare argv, ignore
     '\t\tXPC_SERVICE_NAME => ai.hyperide.tg-ctl',
     '\t}',
     '\tpid = 26098',
+    '\tproperties = keepalive | runatload | inferred program | managed LWCR',
     '}',
   ].join('\n');
   const argv = parseLaunchctlPrintArgv(fixture);
   expect(argv).toEqual(['/Users/u/.bun/bin/bun', '/Users/u/.files/bin/tg-ctl', 'run']);
   // And the captured shape feeds the matcher end-to-end.
   expect(launchdJobSupervisesBin({ label: 'ai.hyperide.tg-ctl', argv }, '/Users/u/.files/bin/tg-ctl')).toBe(true);
+  // The captured dump is persistent (runatload/keepalive present).
+  expect(launchdJobIsPersistent(fixture)).toBe(true);
+});
+
+// --- persistence gating: a loaded-but-non-persistent job must NOT count as autostart (codex P2) ---
+// A job bootstrapped temporarily (no RunAtLoad/KeepAlive) is loaded now but won't survive reboot, so
+// reporting "autostart: enabled" for it would lie. We gate on the `properties = …` line.
+
+test('launchdJobIsPersistent: true when properties lists runatload', () => {
+  expect(launchdJobIsPersistent('x = {\n\tproperties = runatload | inferred program\n}')).toBe(true);
+});
+
+test('launchdJobIsPersistent: true when properties lists keepalive', () => {
+  expect(launchdJobIsPersistent('x = {\n\tproperties = keepalive\n}')).toBe(true);
+});
+
+test('launchdJobIsPersistent: FALSE for a temporarily-bootstrapped job (no runatload/keepalive)', () => {
+  // Loaded now, but launchd won't bring it back at login.
+  expect(launchdJobIsPersistent('x = {\n\tstate = running\n\tproperties = inferred program | managed LWCR\n}')).toBe(false);
+});
+
+test('launchdJobIsPersistent: matching is case-insensitive (RunAtLoad / KeepAlive)', () => {
+  expect(launchdJobIsPersistent('x = {\n\tproperties = RunAtLoad | InferredProgram\n}')).toBe(true);
+});
+
+test('launchdJobIsPersistent: no properties line at all → conservatively persistent (old macOS)', () => {
+  // Preserve original behavior on a dump that omits the properties line rather than regress to "NOT
+  // enabled".
+  expect(launchdJobIsPersistent('x = {\n\tstate = running\n\tpid = 1\n}')).toBe(true);
+});
+
+// --- selectExternalLaunchdSupervisor: the detection flow (argv-match AND persistence AND not-own) --
+// This is the pure core of detectExternalLaunchdSupervisor (the entrypoint only adds the launchctl
+// spawns + parsing on top). Covers the combined gate gemini flagged: a job that supervises the
+// binary but is NOT persistent must be rejected.
+
+const probed = (over: Partial<ProbedLaunchdJob> = {}): ProbedLaunchdJob => ({
+  label: 'ai.hyperide.tg-ctl',
+  argv: ['/home/u/.bun/bin/bun', BIN, 'run'],
+  persistent: true,
+  ...over,
+});
+
+test('selectExternalLaunchdSupervisor: persistent job that supervises the binary → its label', () => {
+  expect(selectExternalLaunchdSupervisor([probed()], BIN)).toBe('ai.hyperide.tg-ctl');
+});
+
+test('selectExternalLaunchdSupervisor: a NON-persistent supervising job is rejected (codex P2)', () => {
+  // Loaded now and runs `tg-ctl run`, but no runatload/keepalive → won't survive reboot → not autostart.
+  expect(selectExternalLaunchdSupervisor([probed({ persistent: false })], BIN)).toBeUndefined();
+});
+
+test('selectExternalLaunchdSupervisor: a persistent job that does NOT run this binary is ignored', () => {
+  const other = probed({ label: 'ai.hyperide.other', argv: ['/bun', '/some/other', 'run'] });
+  expect(selectExternalLaunchdSupervisor([other], BIN)).toBeUndefined();
+});
+
+test('selectExternalLaunchdSupervisor: tg-ctl OWN label is excluded even if persistent + supervising', () => {
+  expect(selectExternalLaunchdSupervisor([probed({ label: LAUNCHD_LABEL })], BIN)).toBeUndefined();
+});
+
+test('selectExternalLaunchdSupervisor: picks the first persistent supervisor, skipping a non-persistent one', () => {
+  const jobs: ProbedLaunchdJob[] = [
+    probed({ label: 'ai.hyperide.tg-ctl.temp', persistent: false }),
+    probed({ label: 'ai.hyperide.tg-ctl.boot', persistent: true }),
+  ];
+  expect(selectExternalLaunchdSupervisor(jobs, BIN)).toBe('ai.hyperide.tg-ctl.boot');
+});
+
+test('selectExternalLaunchdSupervisor: empty job list → undefined', () => {
+  expect(selectExternalLaunchdSupervisor([], BIN)).toBeUndefined();
 });
 
 test('end-to-end (parse → match): a real-shaped launchctl probe detects the external supervisor', () => {

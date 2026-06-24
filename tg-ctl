@@ -32,12 +32,14 @@ import {
   autostartUnitPath,
   buildDisablePlan,
   buildEnablePlan,
-  launchdJobSupervisesBin,
+  launchdJobIsPersistent,
   parseLaunchctlListLabels,
   parseLaunchctlPrintArgv,
+  selectExternalLaunchdSupervisor,
   type AutostartCommand,
   type AutostartEnv,
   type AutostartKind,
+  type ProbedLaunchdJob,
 } from "./features/tg-ctl/autostart"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
@@ -1019,40 +1021,62 @@ function autostartUnitInstalled(env: AutostartEnv): boolean {
   return path !== undefined && existsSync(path)
 }
 
+// The impure launchd probe behind detectExternalLaunchdSupervisor, factored out so the detection
+// flow can be unit-tested with a fake probe (no real launchctl). `listLabels` runs `launchctl list`;
+// `printDump(label)` runs `launchctl print <domain>/<label>`. Each returns undefined on failure so
+// the caller skips that job instead of crashing.
+interface LaunchctlProbe {
+  listLabels(): string[] | undefined
+  printDump(label: string): string | undefined
+}
+
+// The real probe: `launchctl list` for labels, `launchctl print <domain>/<label>` per label. A
+// LaunchAgent lives in the per-user `gui/<uid>` domain; under root (uid 0) daemons live in `system`
+// instead (`gui/0/<label>` just errors), so pick the domain by uid.
+function realLaunchctlProbe(): LaunchctlProbe {
+  const uid = process.getuid?.() ?? 0
+  const domain = uid === 0 ? "system" : `gui/${uid}`
+  return {
+    listLabels() {
+      const r = Bun.spawnSync(["launchctl", "list"], { stdout: "pipe", stderr: "ignore" })
+      if (r.exitCode !== 0 || !r.stdout) return undefined
+      return parseLaunchctlListLabels(new TextDecoder().decode(r.stdout))
+    },
+    printDump(label) {
+      const r = Bun.spawnSync(["launchctl", "print", `${domain}/${label}`], { stdout: "pipe", stderr: "ignore" })
+      if (r.exitCode !== 0 || !r.stdout) return undefined
+      return new TextDecoder().decode(r.stdout)
+    },
+  }
+}
+
 // Probe launchd (macOS only) for an EXTERNAL job that supervises this tg-ctl binary — autostart wired
 // outside `tg-ctl enable` (e.g. rig's `ai.hyperide.tg-ctl` LaunchAgent). Returns the supervising
 // label, or undefined when none / not macOS / launchctl unavailable. Used by `status` to stop lying
 // "NOT enabled" while launchd keeps the daemon alive across reboots (tg-cli#88). Read-only.
 //
-// Steps: `launchctl list` → loaded labels; then `launchctl print gui/<uid>/<label>` per label to read
-// its ProgramArguments, fed to the pure matcher (which excludes tg-ctl's OWN label). The argv-match
-// requires the job to run THIS binPath with a `run` subcommand, so we don't misclaim an unrelated
-// job. Bounded by short-circuiting on the first match. Fully wrapped so a launchctl hiccup, a
-// non-macOS host, or a missing binary never crashes `status` — it just reports no external supervisor.
-function detectExternalLaunchdSupervisor(env: AutostartEnv): string | undefined {
+// Builds a ProbedLaunchdJob per loaded label (its argv + whether it's persistent per the `properties`
+// line) from the probe, then hands selection to the PURE selectExternalLaunchdSupervisor (which
+// excludes tg-ctl's OWN label, requires the `run` subcommand against THIS binary, and rejects a
+// loaded-but-temporary job). `probe` is injectable for tests; defaults to the real launchctl probe.
+// Fully wrapped so a launchctl hiccup, a non-macOS host, or a missing binary never crashes `status`.
+function detectExternalLaunchdSupervisor(env: AutostartEnv, probe: LaunchctlProbe = realLaunchctlProbe()): string | undefined {
   if (env.platform !== "darwin") return undefined
   if (!env.binPath) return undefined
   try {
-    const list = Bun.spawnSync(["launchctl", "list"], { stdout: "pipe", stderr: "ignore" })
-    if (list.exitCode !== 0 || !list.stdout) return undefined
-    const labels = parseLaunchctlListLabels(new TextDecoder().decode(list.stdout))
-    // A LaunchAgent lives in the per-user `gui/<uid>` domain; under root (uid 0) daemons live in the
-    // `system` domain instead (`gui/0/<label>` would just error). Pick the domain accordingly.
-    const uid = process.getuid?.() ?? 0
-    const domain = uid === 0 ? "system" : `gui/${uid}`
+    const labels = probe.listLabels()
+    if (!labels) return undefined
+    const jobs: ProbedLaunchdJob[] = []
     for (const label of labels) {
-      // Skip tg-ctl's OWN unit — that's the `enable` path, reported separately (the own-unit file
-      // check), not an "external" supervisor.
       if (label === LAUNCHD_LABEL) continue
-      const printed = Bun.spawnSync(["launchctl", "print", `${domain}/${label}`], { stdout: "pipe", stderr: "ignore" })
-      if (printed.exitCode !== 0 || !printed.stdout) continue
-      const argv = parseLaunchctlPrintArgv(new TextDecoder().decode(printed.stdout))
-      if (launchdJobSupervisesBin({ label, argv }, env.binPath)) return label
+      const dump = probe.printDump(label)
+      if (dump === undefined) continue
+      jobs.push({ label, argv: parseLaunchctlPrintArgv(dump), persistent: launchdJobIsPersistent(dump) })
     }
+    return selectExternalLaunchdSupervisor(jobs, env.binPath)
   } catch {
     return undefined
   }
-  return undefined
 }
 
 // The `autostart:` status line. Gathers the impure facts — own-unit file existence and (only when
