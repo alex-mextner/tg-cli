@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.18.1
+
+`tg-ctl status` no longer lies about autostart when the daemon is supervised by an
+EXTERNAL launchd job (tg-cli#88). It previously recognized only tg-ctl's own `enable`
+unit (`com.agenttools.tg-ctl.tg-ctl`), so when launchd kept the daemon alive across
+reboots via a separately-wired job (e.g. an `ai.hyperide.tg-ctl` LaunchAgent), status
+printed `autostart: NOT enabled` while it actually autostarts on boot.
+
+- **status probes launchd** (`launchctl list` + `launchctl print`) for any loaded job —
+  other than tg-ctl's own unit — whose `ProgramArguments` runs THIS tg-ctl binary with the
+  `run` subcommand, discovered by what the job RUNS (not a hardcoded label), and reports
+  `autostart: enabled (via launchd: <label>)`. The own-`enable` mechanism is unchanged and
+  takes precedence.
+- Robust: non-macOS / launchctl-unavailable falls back to the existing logic and never
+  crashes; root (uid 0) uses the `system` domain, not `gui/0`; binPath matching is
+  basename-aware so a symlink-vs-realpath mismatch still resolves.
+
 ## 1.18.0
 
 Forum-topics increment 4 — lifecycle polish (spec §9.4; tg-cli#86, refs #31/#85). Builds
