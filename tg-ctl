@@ -26,13 +26,18 @@ import {
 } from "./features/tg-ctl/agent-match"
 import {
   LAUNCHD_LABEL,
-  SYSTEMD_UNIT,
   autostartKind,
+  autostartKindLabel,
+  autostartStatusLine,
   autostartUnitPath,
   buildDisablePlan,
   buildEnablePlan,
+  launchdJobSupervisesBin,
+  parseLaunchctlListLabels,
+  parseLaunchctlPrintArgv,
   type AutostartCommand,
   type AutostartEnv,
+  type AutostartKind,
 } from "./features/tg-ctl/autostart"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
@@ -818,15 +823,15 @@ function composeStatus(ctx: Ctx): string {
   // Autostart (the shared service-management lifecycle): an installed unit means the daemon
   // comes back at login. Mirrors the q→buttons line — installed reports the kind/label, absent
   // gets a hint. On the no-op fallback (no launchd/systemd) there's no unit to find.
+  //
+  // Two mechanisms can autostart the daemon: tg-ctl's OWN `enable` unit (the file existence check),
+  // OR an EXTERNAL launchd job that supervises this tg-ctl binary, wired outside tg-ctl (e.g. rig's
+  // `ai.hyperide.tg-ctl` LaunchAgent). We check the own unit first (it carries the precise kind/label
+  // and is cheap), then probe launchd for an external supervisor before declaring "NOT enabled" —
+  // otherwise status lies while launchd keeps the daemon alive across reboots (tg-cli#88).
   const env = autostartEnv(ctx)
   const kind = autostartKind(env)
-  lines.push(
-    kind === "none"
-      ? "autostart: not supported on this OS — `tg-ctl start` runs now but won't survive reboot"
-      : autostartUnitInstalled(env)
-        ? `autostart: enabled (${kind}, ${autostartUnitLabel(kind)})`
-        : "autostart: NOT enabled — run `tg-ctl enable` to start at login",
-  )
+  lines.push(composeAutostartLine(env, kind))
   return lines.join("\n")
 }
 
@@ -999,12 +1004,12 @@ function autostartEnv(ctx: Ctx): AutostartEnv {
   }
 }
 
-// The OS unit label/name for a status/enable message (the lib's launchd Label / systemd unit
-// name). Defined only for the kinds that HAVE a unit; "none" (the no-op fallback) installs no
-// unit, so it has no label and callers must not ask — guarded explicitly so the signature can't
-// silently mislabel a fallback as launchd.
+// The OS unit label/name for an enable-path message. Narrows the type to the kinds that HAVE a unit
+// (the "none" fallback installs none) so a fallback can't be mislabeled, and delegates the actual
+// mapping to autostartKindLabel — single source of truth shared with the status line, so the two
+// can't drift.
 function autostartUnitLabel(kind: "launchd" | "systemd"): string {
-  return kind === "systemd" ? `${SYSTEMD_UNIT}.service` : LAUNCHD_LABEL
+  return autostartKindLabel(kind)
 }
 
 // Is the launchd/systemd unit file already on disk for tg-ctl? Cheap existence check (no plist/
@@ -1012,6 +1017,54 @@ function autostartUnitLabel(kind: "launchd" | "systemd"): string {
 function autostartUnitInstalled(env: AutostartEnv): boolean {
   const path = autostartUnitPath(env)
   return path !== undefined && existsSync(path)
+}
+
+// Probe launchd (macOS only) for an EXTERNAL job that supervises this tg-ctl binary — autostart wired
+// outside `tg-ctl enable` (e.g. rig's `ai.hyperide.tg-ctl` LaunchAgent). Returns the supervising
+// label, or undefined when none / not macOS / launchctl unavailable. Used by `status` to stop lying
+// "NOT enabled" while launchd keeps the daemon alive across reboots (tg-cli#88). Read-only.
+//
+// Steps: `launchctl list` → loaded labels; then `launchctl print gui/<uid>/<label>` per label to read
+// its ProgramArguments, fed to the pure matcher (which excludes tg-ctl's OWN label). The argv-match
+// requires the job to run THIS binPath with a `run` subcommand, so we don't misclaim an unrelated
+// job. Bounded by short-circuiting on the first match. Fully wrapped so a launchctl hiccup, a
+// non-macOS host, or a missing binary never crashes `status` — it just reports no external supervisor.
+function detectExternalLaunchdSupervisor(env: AutostartEnv): string | undefined {
+  if (env.platform !== "darwin") return undefined
+  if (!env.binPath) return undefined
+  try {
+    const list = Bun.spawnSync(["launchctl", "list"], { stdout: "pipe", stderr: "ignore" })
+    if (list.exitCode !== 0 || !list.stdout) return undefined
+    const labels = parseLaunchctlListLabels(new TextDecoder().decode(list.stdout))
+    // A LaunchAgent lives in the per-user `gui/<uid>` domain; under root (uid 0) daemons live in the
+    // `system` domain instead (`gui/0/<label>` would just error). Pick the domain accordingly.
+    const uid = process.getuid?.() ?? 0
+    const domain = uid === 0 ? "system" : `gui/${uid}`
+    for (const label of labels) {
+      // Skip tg-ctl's OWN unit — that's the `enable` path, reported separately (the own-unit file
+      // check), not an "external" supervisor.
+      if (label === LAUNCHD_LABEL) continue
+      const printed = Bun.spawnSync(["launchctl", "print", `${domain}/${label}`], { stdout: "pipe", stderr: "ignore" })
+      if (printed.exitCode !== 0 || !printed.stdout) continue
+      const argv = parseLaunchctlPrintArgv(new TextDecoder().decode(printed.stdout))
+      if (launchdJobSupervisesBin({ label, argv }, env.binPath)) return label
+    }
+  } catch {
+    return undefined
+  }
+  return undefined
+}
+
+// The `autostart:` status line. Gathers the impure facts — own-unit file existence and (only when
+// that's absent, to skip the launchctl probe otherwise) the external-launchd-supervisor probe — then
+// hands them to the PURE autostartStatusLine for precedence + formatting (own-unit before external).
+// Keeps composeStatus slim and isolates the one impure probe behind status logic.
+function composeAutostartLine(env: AutostartEnv, kind: AutostartKind): string {
+  const ownInstalled = kind !== "none" && autostartUnitInstalled(env)
+  // Only probe launchd when the own unit is absent — autostartStatusLine prefers the own unit, so the
+  // probe would be wasted work otherwise. The probe itself no-ops off launchd / on non-macOS.
+  const external = !ownInstalled && kind === "launchd" ? detectExternalLaunchdSupervisor(env) : undefined
+  return autostartStatusLine(kind, ownInstalled, external)
 }
 
 // Run one plan command. Returns true on success. An `optional` command that fails is treated as

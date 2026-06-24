@@ -9,15 +9,22 @@ import {
   LAUNCHD_LABEL,
   SYSTEMD_UNIT,
   autostartKind,
+  autostartKindLabel,
+  autostartStatusLine,
   autostartUnitEnv,
   buildDisablePlan,
   buildEnablePlan,
   defaultConfigDir,
+  externalLaunchdSupervisorLabel,
+  launchdJobSupervisesBin,
   launchdPlist,
   launchdPlistPath,
+  parseLaunchctlListLabels,
+  parseLaunchctlPrintArgv,
   systemdUnit,
   systemdUnitPath,
   type AutostartEnv,
+  type LaunchdJob,
 } from '../features/tg-ctl/autostart';
 
 function env(overrides: Partial<AutostartEnv> = {}): AutostartEnv {
@@ -187,4 +194,177 @@ test('systemd unit: a non-default config dir pins TG_CTL_CONFIG_DIR via Environm
 test('systemd unit: a config dir with spaces / % is quoted as one Environment= token', () => {
   const unit = systemdUnit(env({ platform: 'linux', hasSystemd: true, configDir: '/c/my 100% dir' }));
   expect(unit).toContain('Environment="TG_CTL_CONFIG_DIR=/c/my 100%% dir"');
+});
+
+// --- external launchd supervision detection (tg-cli#88) -----------------------------------------
+// `status` must ALSO recognize an external launchd job (e.g. rig's `ai.hyperide.tg-ctl`) that
+// supervises this tg-ctl binary, not only tg-ctl's OWN enable unit — otherwise it lies "NOT enabled"
+// while launchd keeps the daemon alive across reboots. These cover the PURE detection policy + the
+// parsers for the `launchctl list` / `launchctl print` probe output (the spawn itself lives in the
+// entrypoint and isn't unit-tested here).
+
+const BIN = '/home/u/.files/bin/tg-ctl';
+
+test('launchdJobSupervisesBin: matches a job that runs THIS binPath with a `run` subcommand', () => {
+  const job: LaunchdJob = { label: 'ai.hyperide.tg-ctl', argv: ['/home/u/.bun/bin/bun', BIN, 'run'] };
+  expect(launchdJobSupervisesBin(job, BIN)).toBe(true);
+});
+
+test('launchdJobSupervisesBin: false when the job runs a DIFFERENT binary', () => {
+  const job: LaunchdJob = { label: 'ai.hyperide.other', argv: ['/home/u/.bun/bin/bun', '/some/other/tool', 'run'] };
+  expect(launchdJobSupervisesBin(job, BIN)).toBe(false);
+});
+
+test('launchdJobSupervisesBin: false when the job runs this bin but NOT the `run` subcommand', () => {
+  // A one-shot `tg-ctl status` job is not autostart supervision of the daemon.
+  const job: LaunchdJob = { label: 'ai.hyperide.tg-ctl-once', argv: ['/home/u/.bun/bin/bun', BIN, 'status'] };
+  expect(launchdJobSupervisesBin(job, BIN)).toBe(false);
+});
+
+test('launchdJobSupervisesBin: false for an empty argv (program unreadable) or empty binPath', () => {
+  expect(launchdJobSupervisesBin({ label: 'x', argv: [] }, BIN)).toBe(false);
+  expect(launchdJobSupervisesBin({ label: 'x', argv: ['/bun', BIN, 'run'] }, '')).toBe(false);
+});
+
+test('externalLaunchdSupervisorLabel: returns the supervising job label when one is present', () => {
+  const jobs: LaunchdJob[] = [
+    { label: 'com.apple.something', argv: [] },
+    { label: 'ai.hyperide.tg-ctl', argv: ['/home/u/.bun/bin/bun', BIN, 'run'] },
+  ];
+  expect(externalLaunchdSupervisorLabel(jobs, BIN)).toBe('ai.hyperide.tg-ctl');
+});
+
+test('externalLaunchdSupervisorLabel: EXCLUDES tg-ctl OWN label (own-mechanism is reported separately)', () => {
+  // A job under tg-ctl's own LAUNCHD_LABEL is the `enable` path, handled by the unit-file check —
+  // not an "external" supervisor — so it must not be returned here.
+  const jobs: LaunchdJob[] = [{ label: LAUNCHD_LABEL, argv: ['/home/u/.bun/bin/bun', BIN, 'run'] }];
+  expect(externalLaunchdSupervisorLabel(jobs, BIN)).toBeUndefined();
+});
+
+test('externalLaunchdSupervisorLabel: undefined when no loaded job supervises this binary', () => {
+  const jobs: LaunchdJob[] = [
+    { label: 'com.apple.a', argv: ['/usr/bin/foo'] },
+    { label: 'ai.hyperide.model-freshness', argv: ['/home/u/.bun/bin/bun', '/home/u/.files/bin/model-freshness', 'run'] },
+  ];
+  expect(externalLaunchdSupervisorLabel(jobs, BIN)).toBeUndefined();
+});
+
+test('parseLaunchctlListLabels: takes the 3rd tab-field, skips header + short lines', () => {
+  const out = ['PID\tStatus\tLabel', '26098\t0\tai.hyperide.tg-ctl', '-\t0\tai.hyperide.tmux-boot', '', 'garbage'].join('\n');
+  expect(parseLaunchctlListLabels(out)).toEqual(['ai.hyperide.tg-ctl', 'ai.hyperide.tmux-boot']);
+});
+
+test('parseLaunchctlPrintArgv: extracts the ProgramArguments block, trimming each token', () => {
+  const out = [
+    'gui/501/ai.hyperide.tg-ctl = {',
+    '\tstate = running',
+    '\targuments = {',
+    '\t\t/Users/u/.bun/bin/bun',
+    '\t\t/Users/u/.files/bin/tg-ctl',
+    '\t\trun',
+    '\t}',
+    '\tpid = 26098',
+    '}',
+  ].join('\n');
+  expect(parseLaunchctlPrintArgv(out)).toEqual(['/Users/u/.bun/bin/bun', '/Users/u/.files/bin/tg-ctl', 'run']);
+});
+
+test('parseLaunchctlPrintArgv: [] when the dump has no arguments block', () => {
+  expect(parseLaunchctlPrintArgv('gui/501/x = {\n\tstate = running\n}')).toEqual([]);
+});
+
+// Regression guard against the real `launchctl print` shape (captured from a live macOS host): the
+// `arguments = { ... }` block holds BARE indented argv tokens, while the surrounding `environment` /
+// `default environment` blocks use the `KEY => value` form. The parser must read the bare argv block
+// and NOT confuse it with the `=> ` env blocks. If a future macOS changes the arguments-block shape
+// this fixture breaks loudly instead of the detection silently regressing to "NOT enabled".
+test('parseLaunchctlPrintArgv: real `launchctl print` fixture (bare argv, ignores `=>` env blocks)', () => {
+  const fixture = [
+    'gui/501/ai.hyperide.tg-ctl = {',
+    '\tactive count = 1',
+    '\tpath = /Users/u/Library/LaunchAgents/ai.hyperide.tg-ctl.plist',
+    '\tstate = running',
+    '',
+    '\tprogram = /Users/u/.bun/bin/bun',
+    '\targuments = {',
+    '\t\t/Users/u/.bun/bin/bun',
+    '\t\t/Users/u/.files/bin/tg-ctl',
+    '\t\trun',
+    '\t}',
+    '',
+    '\tdefault environment = {',
+    '\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin',
+    '\t}',
+    '',
+    '\tenvironment = {',
+    '\t\tHOME => /Users/u',
+    '\t\tXPC_SERVICE_NAME => ai.hyperide.tg-ctl',
+    '\t}',
+    '\tpid = 26098',
+    '}',
+  ].join('\n');
+  const argv = parseLaunchctlPrintArgv(fixture);
+  expect(argv).toEqual(['/Users/u/.bun/bin/bun', '/Users/u/.files/bin/tg-ctl', 'run']);
+  // And the captured shape feeds the matcher end-to-end.
+  expect(launchdJobSupervisesBin({ label: 'ai.hyperide.tg-ctl', argv }, '/Users/u/.files/bin/tg-ctl')).toBe(true);
+});
+
+test('end-to-end (parse → match): a real-shaped launchctl probe detects the external supervisor', () => {
+  const realBin = '/Users/u/.files/bin/tg-ctl';
+  const listOut = ['PID\tStatus\tLabel', '26098\t0\tai.hyperide.tg-ctl', '-\t0\tai.hyperide.tmux-boot'].join('\n');
+  const labels = parseLaunchctlListLabels(listOut);
+  const printByLabel: Record<string, string> = {
+    'ai.hyperide.tg-ctl': 'x = {\n\targuments = {\n\t\t/Users/u/.bun/bin/bun\n\t\t/Users/u/.files/bin/tg-ctl\n\t\trun\n\t}\n}',
+    'ai.hyperide.tmux-boot': 'x = {\n\targuments = {\n\t\t/bin/sh\n\t\t-c\n\t\ttmux start-server\n\t}\n}',
+  };
+  const jobs: LaunchdJob[] = labels.map((label) => ({ label, argv: parseLaunchctlPrintArgv(printByLabel[label] ?? '') }));
+  expect(externalLaunchdSupervisorLabel(jobs, realBin)).toBe('ai.hyperide.tg-ctl');
+});
+
+// binPath matching must survive a symlink-vs-target / normalization mismatch — rig may write the
+// realpath'd target into ProgramArguments while we resolve the `~/.files/bin/tg-ctl` symlink (or vice
+// versa). An exact-string compare would miss the very case this detection exists for, so we ALSO
+// match by basename (paired with the `run` requirement so it stays specific).
+test('launchdJobSupervisesBin: matches by basename when the job runs a DIFFERENT path to tg-ctl (symlink vs target)', () => {
+  // We resolve the symlink path; the job's argv carries the realpath'd target — different strings,
+  // same `/tg-ctl` basename.
+  const job: LaunchdJob = { label: 'ai.hyperide.tg-ctl', argv: ['/home/u/.bun/bin/bun', '/home/u/dotfiles/bin/tg-ctl', 'run'] };
+  expect(launchdJobSupervisesBin(job, '/home/u/.files/bin/tg-ctl')).toBe(true);
+});
+
+test('launchdJobSupervisesBin: basename match still requires the `run` subcommand', () => {
+  const job: LaunchdJob = { label: 'x', argv: ['/bun', '/home/u/dotfiles/bin/tg-ctl', 'status'] };
+  expect(launchdJobSupervisesBin(job, '/home/u/.files/bin/tg-ctl')).toBe(false);
+});
+
+// --- autostartStatusLine: pure precedence + formatting (own-unit > external > NOT enabled) -------
+
+test('autostartKindLabel: launchd → own label, systemd → unit name, none → empty', () => {
+  expect(autostartKindLabel('launchd')).toBe(LAUNCHD_LABEL);
+  expect(autostartKindLabel('systemd')).toBe(`${SYSTEMD_UNIT}.service`);
+  expect(autostartKindLabel('none')).toBe('');
+});
+
+test('autostartStatusLine (none): not supported on this OS', () => {
+  expect(autostartStatusLine('none', false, undefined)).toContain("not supported on this OS");
+});
+
+test('autostartStatusLine (own unit installed): reports the precise kind + own label', () => {
+  expect(autostartStatusLine('launchd', true, undefined)).toBe(`autostart: enabled (launchd, ${LAUNCHD_LABEL})`);
+  expect(autostartStatusLine('systemd', true, undefined)).toBe(`autostart: enabled (systemd, ${SYSTEMD_UNIT}.service)`);
+});
+
+test('autostartStatusLine: own unit WINS over an external launchd job (precedence)', () => {
+  // Even if an external supervisor is also present, the own-mechanism label is reported.
+  expect(autostartStatusLine('launchd', true, 'ai.hyperide.tg-ctl')).toBe(`autostart: enabled (launchd, ${LAUNCHD_LABEL})`);
+});
+
+test('autostartStatusLine: external launchd supervisor (own unit absent) → "via launchd: <label>"', () => {
+  expect(autostartStatusLine('launchd', false, 'ai.hyperide.tg-ctl')).toBe('autostart: enabled (via launchd: ai.hyperide.tg-ctl)');
+});
+
+test('autostartStatusLine: neither mechanism → NOT enabled hint', () => {
+  expect(autostartStatusLine('launchd', false, undefined)).toContain('NOT enabled');
+  // systemd with no unit and no external supervisor is also NOT enabled (external is launchd-only).
+  expect(autostartStatusLine('systemd', false, undefined)).toContain('NOT enabled');
 });

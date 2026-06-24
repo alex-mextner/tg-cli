@@ -171,6 +171,134 @@ export function autostartUnitPath(env: AutostartEnv): string | undefined {
   return undefined;
 }
 
+// --- external launchd supervision (status-only detection) ---------------------------------------
+//
+// `tg-ctl enable` installs the OWN launchd unit (LAUNCHD_LABEL) and `status` finds it by file
+// existence (autostartUnitPath). But the daemon can ALSO be kept alive across reboots by a DIFFERENT
+// launchd job set up outside tg-ctl — e.g. rig wiring an `ai.hyperide.tg-ctl` LaunchAgent whose
+// ProgramArguments is `bun <binPath> run`. That external job is real autostart, but its label is not
+// LAUNCHD_LABEL, so the own-unit check misses it and `status` wrongly prints "NOT enabled" while
+// launchd supervises the daemon (tg-cli#88).
+//
+// These helpers are the PURE half of detecting that case: given the loaded launchd jobs already
+// probed by the caller (label + the job's ProgramArguments), decide which — if any — supervises THIS
+// tg-ctl binary. The caller (tg-ctl) runs `launchctl list` / `launchctl print` to gather the jobs;
+// the matching policy lives here so it is unit-testable with no real launchctl. Discovery is by what
+// the job RUNS (the tg-ctl binary), never by hardcoding a specific label.
+
+// A loaded launchd job as the caller probed it: its reverse-DNS Label and its ProgramArguments
+// (argv). `argv` may be empty when the caller could not read a job's program (it then can't match).
+export interface LaunchdJob {
+  label: string;
+  argv: string[];
+}
+
+// The trailing path component of a POSIX-ish path (the part after the last '/'), or the whole string
+// when there is no '/'. Used to compare a launchd job's argv token against the tg-ctl binary by
+// basename — robust to symlink-vs-target / normalization differences (see launchdJobSupervisesBin).
+function pathBasename(p: string): string {
+  const i = p.lastIndexOf('/');
+  return i < 0 ? p : p.slice(i + 1);
+}
+
+// Does this loaded launchd job supervise the given tg-ctl binary? True when the job's argv runs the
+// tg-ctl `run` subcommand against this binary — i.e. some argv token IS the tg-ctl binary AND a later
+// token is `run`. Requiring `run` avoids matching a one-shot `tg-ctl status` job. A token counts as
+// "the tg-ctl binary" when it equals binPath exactly OR shares its basename (e.g. both end in
+// `/tg-ctl`): rig may write the realpath'd target while we resolve the `~/.files/bin/tg-ctl` symlink
+// (or vice versa), so an exact-string compare alone would miss the very case this detection exists
+// for. The basename is specific enough — paired with the `run` requirement — not to claim an
+// unrelated job. binPath with no recognizable basename, or empty, never matches.
+export function launchdJobSupervisesBin(job: LaunchdJob, binPath: string): boolean {
+  if (!binPath) return false;
+  const wantBase = pathBasename(binPath);
+  if (!wantBase) return false;
+  const binIdx = job.argv.findIndex((tok) => tok === binPath || pathBasename(tok) === wantBase);
+  if (binIdx < 0) return false;
+  return job.argv.slice(binIdx + 1).includes('run');
+}
+
+// The label of the first loaded launchd job (other than tg-ctl's OWN unit) that supervises this
+// tg-ctl binary, or undefined when none does. tg-ctl's own LAUNCHD_LABEL is excluded so the caller
+// can keep reporting the own-mechanism path distinctly ("enabled (launchd, <own label>)") and only
+// falls back to this when the own unit is absent. Pure: the caller supplies the probed jobs.
+export function externalLaunchdSupervisorLabel(jobs: LaunchdJob[], binPath: string): string | undefined {
+  for (const job of jobs) {
+    if (job.label === LAUNCHD_LABEL) continue;
+    if (launchdJobSupervisesBin(job, binPath)) return job.label;
+  }
+  return undefined;
+}
+
+// Parse the labels out of `launchctl list` output. Each data line is `PID\tStatus\tLabel`
+// (PID is `-` when not running) after a header line; we take the 3rd tab-separated field and skip
+// the `PID Status Label` header + blank lines. Pure so the caller's only impure step is the spawn.
+export function parseLaunchctlListLabels(stdout: string): string[] {
+  const labels: string[] = [];
+  for (const line of stdout.split('\n')) {
+    const fields = line.split('\t');
+    if (fields.length < 3) continue;
+    const label = fields[2].trim();
+    if (!label || label === 'Label') continue;
+    labels.push(label);
+  }
+  return labels;
+}
+
+// Parse the ProgramArguments (argv) out of one `launchctl print gui/<uid>/<label>` dump. The block
+// looks like:
+//     arguments = {
+//         /path/to/bun
+//         /path/to/tg-ctl
+//         run
+//     }
+// We read the lines between `arguments = {` and the closing `}`, trimming each. Returns [] when the
+// dump has no arguments block (a job without ProgramArguments). Pure — no spawn here.
+export function parseLaunchctlPrintArgv(stdout: string): string[] {
+  const lines = stdout.split('\n');
+  const start = lines.findIndex((l) => /^\s*arguments\s*=\s*\{/.test(l));
+  if (start < 0) return [];
+  const argv: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed === '}') break;
+    if (trimmed) argv.push(trimmed);
+  }
+  return argv;
+}
+
+// The launchd/systemd unit label/name for a status line. Defined for the kinds that HAVE a unit;
+// 'none' (the no-op fallback) installs no unit so callers must not ask — return '' there rather than
+// mislabel a fallback. Mirrors the entrypoint's autostartUnitLabel; here so autostartStatusLine is
+// self-contained and unit-testable.
+export function autostartKindLabel(kind: AutostartKind): string {
+  if (kind === 'systemd') return `${SYSTEMD_UNIT}.service`;
+  if (kind === 'launchd') return LAUNCHD_LABEL;
+  return '';
+}
+
+// Render the `autostart:` status line from already-resolved facts (the I/O — file existence + the
+// launchctl probe — happens in the caller; this is the pure precedence + formatting). Precedence:
+//   1. kind 'none'        → no OS autostart support (won't survive reboot)
+//   2. ownUnitInstalled   → tg-ctl's OWN `enable` unit on disk (the precise kind/label)
+//   3. externalLabel set  → an EXTERNAL launchd job supervises this binary ("via launchd: <label>")
+//   4. otherwise          → NOT enabled
+// Own-unit BEFORE external so a daemon enabled via `tg-ctl enable` keeps its precise label even if an
+// external job also happens to run it. externalLabel is only meaningful on launchd (the caller passes
+// undefined elsewhere).
+export function autostartStatusLine(kind: AutostartKind, ownUnitInstalled: boolean, externalLabel: string | undefined): string {
+  if (kind === 'none') {
+    return 'autostart: not supported on this OS — `tg-ctl start` runs now but won\'t survive reboot';
+  }
+  if (ownUnitInstalled) {
+    return `autostart: enabled (${kind}, ${autostartKindLabel(kind)})`;
+  }
+  if (externalLabel) {
+    return `autostart: enabled (via launchd: ${externalLabel})`;
+  }
+  return 'autostart: NOT enabled — run `tg-ctl enable` to start at login';
+}
+
 // XML-escape a string for safe inlining in plist <string> values (text + attribute safe).
 // Order matters: `&` first so we don't double-escape the entities we just produced (mirrors the
 // lib's _xml_escape).
