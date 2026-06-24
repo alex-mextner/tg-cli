@@ -178,24 +178,26 @@ inbound topic message routes to its bound pane.
 
 Caveats while this is experimental:
 
-- **An agent's own `tg` replies now thread into a topic — when told which one.** Pass
-  `tg --topic <id>` (or set `TG_TOPIC=<id>` in the agent's env) and every outbound message
-  carries `message_thread_id`, landing in topic *T* instead of General. Without the flag/env the
-  reply still goes to General (byte-identical to before). `TG_TOPIC` is *advisory*: a stale or
-  closed topic id makes a **text / rich** send (`tg "…"`) log and fall back to General rather than
-  hard-failing, whereas an explicit `--topic` stays strict. (A `--photo`/`--file`/album send with a
-  stale env topic is NOT covered by the fallback and still fails — the multipart rebuild is out of
-  scope here; pass a known-good `--topic` or no topic for media.) What is NOT wired yet: the daemon
-  auto-stamping a bound pane's `TG_TOPIC` so the agent threads *automatically* — that lands with the
-  spawn executor. Until then the agent (or its launcher) must supply the topic id.
-- **Creating a topic does not spawn an agent yet** (the per-topic `/new` path+model flow +
-  `tmux new-window` spawn is not wired), so a topic only routes once it already has a binding.
-- **Closing then reopening a topic does NOT re-attach its agent yet.** Reopen drops the old
-  pane binding and waits for the spawn flow — which isn't wired — so the topic lands in a
-  dead-end "awaiting model" state while the original agent keeps running, untracked, in its
-  old pane. Don't close/reopen a live topic until the spawn executor lands.
+- **Creating a topic spawns an agent.** A `forum_topic_created` starts the per-topic `/new` flow:
+  the daemon asks for the working directory (offering recent project cwds as one-tap buttons, with a
+  free-text fallback), then the model (catalog buttons), then `tmux new-window`s a fresh agent bound
+  to that topic. Messages to the topic route to its pane; the agent's replies thread back.
+- **An agent's own `tg` replies thread into their topic automatically.** A topic-spawned agent's
+  window carries `TG_TOPIC=<id>` (stamped by the daemon at spawn), so a plain `tg "reply"` lands in
+  the topic, not General — no `--topic` needed. (You can still pass `tg --topic <id>` / `TG_TOPIC`
+  explicitly for a non-spawned shell; `TG_TOPIC` is *advisory* for **text / rich** sends — a stale or
+  closed topic id falls back to General rather than hard-failing — whereas an explicit `--topic` is
+  strict. A `--photo`/`--file`/album send with a stale env topic is NOT covered by that fallback.)
+- **A dead topic offers a one-tap re-spawn.** If a topic's agent exits, the next message offers a
+  *Re-spawn* button that re-launches with the retained project + model (or restarts setup if the dir
+  vanished). A daemon restart re-binds a crash-orphaned agent to its topic instead of double-spawning.
+- **Closing then reopening a LIVE topic does NOT re-attach its agent.** `forum_topic_reopened`
+  drops the old pane binding and restarts the `/new` flow (re-pick model → re-spawn) rather than
+  re-attaching the still-running original agent — so that agent keeps running untracked in its old
+  pane until it idle-exits. Don't close/reopen a topic whose agent is mid-task; let it finish or
+  send `/stop` first.
 
-See `docs/specs/tg-forum-topics.md` (§9 increment plan) for the full design and remaining work.
+See `docs/specs/tg-forum-topics.md` (§9 increment plan) for the full design; increments 1–4 have landed.
 
 ### Recalling messages (`tg replies`, v1.11.0)
 

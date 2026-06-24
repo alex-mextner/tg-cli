@@ -13,7 +13,7 @@
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
 import { parseButtonCallback } from './questions';
 import { parseAgentCallback, parseAgentCommand } from './agent-match';
-import { parseTopicModelCallback } from './topics';
+import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
 const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -79,6 +79,32 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   let skippedStale = 0;
   let maxId = -1;
 
+  // PRE-SCAN for threads this batch undergoes a LIFECYCLE TRANSITION (close OR reopen): callbacks
+  // are buffered and executed BEFORE message/service actions, so a same-batch
+  // `[forum_topic_closed/reopened, tgr/tgm/tgp:<thread>]` would otherwise run the spawn tap FIRST and
+  // the lifecycle transition AFTER. For a CLOSE that orphans the just-spawned agent into a closed
+  // topic (codex r21); for a REOPEN, markReopened drops the freshly-bound paneId → orphans it too
+  // (codex r27). So suppress any topic spawn-flow callback (model/path/re-spawn) for a thread the
+  // SAME batch closes OR reopens, letting the lifecycle transition win. Apply the SAME filters the
+  // message loop uses (codex r22): a STALE or UNAUTHORIZED service message is ignored there, so it
+  // must NOT suppress a valid same-batch tap here either. Only an allowed, fresh, TRACKED-topic one.
+  // Map each such thread to the EARLIEST lifecycle update_id (codex r30): suppression is ORDER-AWARE
+  // for text/media messages — only a message that came AFTER the transition (higher update_id) is
+  // suppressed; one that came BEFORE it is processed normally (it happened before the close/reopen).
+  const lifecycleInBatch = new Map<number, number>();
+  if (opts.topicsEnabled) {
+    for (const u of updates) {
+      const m = u.message;
+      const t = m?.message_thread_id;
+      if (!(m?.forum_topic_closed || m?.forum_topic_reopened) || t === undefined) continue;
+      if (!senderAllowed(m.from?.id, opts)) continue;
+      if (opts.nowSec - m.date > opts.cfg.stalenessSec) continue;
+      if ((opts.topicStatusOf?.(t) ?? null) === null) continue;
+      const prior = lifecycleInBatch.get(t);
+      if (prior === undefined || u.update_id < prior) lifecycleInBatch.set(t, u.update_id);
+    }
+  }
+
   for (const u of updates) {
     if (u.update_id > maxId) maxId = u.update_id;
     const cb = u.callback_query;
@@ -87,19 +113,55 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         callbackActions.push({ kind: 'answer-callback', callbackQueryId: cb.id, text: 'not allowed' });
         continue;
       }
-      // A model-pick tap (tgm:…) inside a forum topic routes the spawn flow — checked first
-      // and only when topics mode is on (with the flag off a stray tgm: tap falls through to
-      // the question/agent parsers, which reject it as expired — never spawns).
+      // Forum-topic /new-flow taps (tgm: model, tgp: recent-path, tgr: re-spawn) route the spawn
+      // flow — checked first and only when topics mode is on (with the flag off a stray topic tap
+      // falls through to the question/agent parsers, which reject it as expired — never spawns). A
+      // tap whose thread is CLOSED in this SAME batch is answered as expired, NOT routed to the spawn
+      // flow (codex r21: the close wins over a same-batch spawn tap, so no spawn-into-a-closed-topic).
       if (opts.topicsEnabled) {
         const modelCb = parseTopicModelCallback(cb.data);
         if (modelCb) {
-          callbackActions.push({
-            kind: 'topic-model',
-            callbackQueryId: cb.id,
-            threadId: modelCb.threadId,
-            modelId: modelCb.modelId,
-            messageId: cb.message?.message_id ?? null,
-          });
+          callbackActions.push(
+            lifecycleInBatch.has(modelCb.threadId)
+              ? { kind: 'answer-callback', callbackQueryId: cb.id, text: 'topic changed — try again' }
+              : {
+                  kind: 'topic-model',
+                  callbackQueryId: cb.id,
+                  threadId: modelCb.threadId,
+                  modelId: modelCb.modelId,
+                  messageId: cb.message?.message_id ?? null,
+                },
+          );
+          continue;
+        }
+        const pathCb = parseTopicPathCallback(cb.data);
+        if (pathCb) {
+          callbackActions.push(
+            lifecycleInBatch.has(pathCb.threadId)
+              ? { kind: 'answer-callback', callbackQueryId: cb.id, text: 'topic changed — try again' }
+              : {
+                  kind: 'topic-path',
+                  callbackQueryId: cb.id,
+                  threadId: pathCb.threadId,
+                  index: pathCb.index,
+                  nonce: pathCb.nonce,
+                  messageId: cb.message?.message_id ?? null,
+                },
+          );
+          continue;
+        }
+        const respawnThreadId = parseTopicRespawnCallback(cb.data);
+        if (respawnThreadId !== null) {
+          callbackActions.push(
+            lifecycleInBatch.has(respawnThreadId)
+              ? { kind: 'answer-callback', callbackQueryId: cb.id, text: 'topic changed — try again' }
+              : {
+                  kind: 'topic-respawn',
+                  callbackQueryId: cb.id,
+                  threadId: respawnThreadId,
+                  messageId: cb.message?.message_id ?? null,
+                },
+          );
           continue;
         }
       }
@@ -153,6 +215,23 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     // returns a (possibly empty) action list so its messages can NEVER leak to a flat agent
     // (the media/closed mis-routing the review caught).
     if (opts.topicsEnabled) {
+      // A text/media message in a thread the SAME batch CLOSES or REOPENS, and that arrived AFTER the
+      // transition (higher update_id), must NOT emit a topic-route or a dead-topic recovery (codex r24
+      // P1b / r27): it would route into / offer a re-spawn for a topic the lifecycle transition is
+      // about to change. Ack only — the transition wins. ORDER-AWARE (codex r30): a message BEFORE the
+      // transition (lower update_id) is processed normally. Service messages flow through below.
+      const tid = m.message_thread_id;
+      const lifeId = tid !== undefined ? lifecycleInBatch.get(tid) : undefined;
+      if (
+        lifeId !== undefined &&
+        u.update_id > lifeId &&
+        !m.forum_topic_closed &&
+        !m.forum_topic_reopened &&
+        !m.forum_topic_created
+      ) {
+        actions.push({ kind: 'ack', messageId: m.message_id });
+        continue;
+      }
       const topicActions = topicActionFor(m, name, opts);
       if (topicActions) {
         actions.push(...topicActions);
@@ -283,8 +362,13 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     return [{ kind: 'topic-route', threadId, injectText, from: name, messageId: m.message_id }];
   }
   if (status === 'closed') {
-    // Re-attach/re-spawn is the entrypoint's job (increment 2). For now: ack, never leak to flat.
-    return [];
+    // The topic's agent died (pane gone). A message here is not lost: emit topic-dead so the
+    // entrypoint offers a one-tap re-spawn (increment 4) instead of the old silent dead-end.
+    // Carry the wrapped text so a SAME-BATCH re-spawn (which re-binds before this runs) can route
+    // it to the now-live pane rather than dropping it (codex r9 #1). Never leaks to a flat agent.
+    const deadText = m.text ?? '';
+    const deadInject = deadText ? (isLikelySlashCommand(deadText) ? deadText : opts.wrap(name, deadText, m.message_id)) : '';
+    return [{ kind: 'topic-dead', threadId, injectText: deadInject, messageId: m.message_id }];
   }
   // awaiting-path / awaiting-model: a text answer to the /new flow. A path message advances the
   // flow (the model is picked by the `tgm:` button callback handled in the callback branch above,

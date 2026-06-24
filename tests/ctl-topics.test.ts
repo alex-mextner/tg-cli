@@ -13,15 +13,24 @@ import {
   applyModelAnswer,
   applyPathAnswer,
   buildModelKeyboard,
+  buildPathKeyboard,
+  buildRespawnKeyboard,
   createTopic,
   findTopic,
   isAwaitingAnswer,
+  clearSpawnPending,
   markBound,
   markClosed,
   markReopened,
+  markRespawnOffered,
+  markSpawnPending,
+  MAX_PATH_CHOICES,
   MAX_TOPICS,
   parseTopics,
   parseTopicModelCallback,
+  parseTopicPathCallback,
+  parseTopicRespawnCallback,
+  recentPathChoices,
   serializeTopics,
   slugifyTopicName,
 } from '../features/tg-ctl/topics';
@@ -210,12 +219,28 @@ test('topics ON: media (no text) in a BOUND topic is ACKED only — never leaks 
   expect(r.actions).toEqual([{ kind: 'ack', messageId: 12 }]);
 });
 
-test('topics ON: a message in a CLOSED topic is ACKED only — never leaks to a flat agent', () => {
+test('topics ON: a message in a CLOSED topic → topic-dead (offer re-spawn) — never leaks to a flat agent', () => {
+  // increment 4: a message to a topic whose agent died emits topic-dead so the entrypoint offers
+  // a one-tap re-spawn (the old behaviour was a silent ack-only dead-end). Still never leaks flat.
   const r = stepUpdates(
     [upd(13, { text: 'still here?', message_thread_id: 50, is_topic_message: true })],
     makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }),
   );
-  expect(r.actions).toEqual([{ kind: 'ack', messageId: 13 }]);
+  expect(r.actions).toEqual([
+    { kind: 'topic-dead', threadId: 50, injectText: wrap('Alex', 'still here?', 13), messageId: 13 },
+    { kind: 'ack', messageId: 13 },
+  ]);
+});
+
+test('topics ON: a media-only message in a CLOSED topic → topic-dead with empty injectText', () => {
+  const r = stepUpdates(
+    [upd(14, { photo: [{ file_id: 'f' }], message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }),
+  );
+  expect(r.actions).toEqual([
+    { kind: 'topic-dead', threadId: 50, injectText: '', messageId: 14 },
+    { kind: 'ack', messageId: 14 },
+  ]);
 });
 
 test('topics ON: a message in an AWAITING topic → topic-answer (raw text)', () => {
@@ -407,4 +432,231 @@ test('topics OFF: a tgm: tap does NOT emit topic-model — falls through to the 
   // With topics off the model tap is not recognized as a spawn action; it falls to the
   // button-callback parser which rejects the non-tgq data as an expired callback.
   expect(r.actions).toEqual([{ kind: 'answer-callback', callbackQueryId: 'cb8', text: 'expired' }]);
+});
+
+// --- increment 4: recent-path buttons, path/respawn callbacks, pathChoices persistence ---
+
+test('recentPathChoices: dedupes, keeps absolute existing dirs, preserves newest-first order', () => {
+  const existing = new Set(['/a', '/b', '/c']);
+  const isAbsDir = (p: string) => p.startsWith('/') && existing.has(p);
+  // '/a' repeated, 'rel' relative, '/gone' not a dir → only /a,/b,/c survive, in first-seen order.
+  const out = recentPathChoices(['/a', '/a', 'rel', '/gone', '/b', undefined, '', '/c'], isAbsDir);
+  expect(out).toEqual(['/a', '/b', '/c']);
+});
+
+test('recentPathChoices: caps at MAX_PATH_CHOICES', () => {
+  const candidates = Array.from({ length: MAX_PATH_CHOICES + 5 }, (_, i) => `/p${i}`);
+  const out = recentPathChoices(candidates, () => true);
+  expect(out).toHaveLength(MAX_PATH_CHOICES);
+  expect(out[0]).toBe('/p0');
+});
+
+test('buildPathKeyboard: one button per choice, callback tgp:<threadId>:<index>:<nonce>', () => {
+  expect(buildPathKeyboard(42, ['/x', '/y'], 7)).toEqual([
+    [{ text: '/x', callback_data: 'tgp:42:0:7' }],
+    [{ text: '/y', callback_data: 'tgp:42:1:7' }],
+  ]);
+});
+
+test('buildPathKeyboard: empty choices → empty keyboard (free-text only)', () => {
+  expect(buildPathKeyboard(42, [], 7)).toEqual([]);
+});
+
+test('parseTopicPathCallback: valid tgp:<thread>:<index>:<nonce> (index may be 0)', () => {
+  expect(parseTopicPathCallback('tgp:42:0:99')).toEqual({ threadId: 42, index: 0, nonce: 99 });
+  expect(parseTopicPathCallback('tgp:7:3:5')).toEqual({ threadId: 7, index: 3, nonce: 5 });
+});
+
+test('parseTopicPathCallback: rejects malformed / wrong-prefix / leading-zero index / negative / missing nonce', () => {
+  expect(parseTopicPathCallback(undefined)).toBeNull();
+  expect(parseTopicPathCallback('tgp:42')).toBeNull();
+  expect(parseTopicPathCallback('tgp:42:0')).toBeNull(); // missing nonce (old 3-part shape)
+  expect(parseTopicPathCallback('tgm:42:0:1')).toBeNull(); // model prefix
+  expect(parseTopicPathCallback('tgp:0:1:1')).toBeNull(); // threadId must be >=1
+  expect(parseTopicPathCallback('tgp:42:00:1')).toBeNull(); // leading-zero index
+  expect(parseTopicPathCallback('tgp:42:-1:1')).toBeNull();
+  expect(parseTopicPathCallback('tgp:42:x:1')).toBeNull();
+  expect(parseTopicPathCallback('tgp:42:0:0')).toBeNull(); // nonce must be >=1
+});
+
+test('parseTopicRespawnCallback: valid tgr:<thread>, rejects malformed', () => {
+  expect(parseTopicRespawnCallback('tgr:42')).toBe(42);
+  expect(parseTopicRespawnCallback(undefined)).toBeNull();
+  expect(parseTopicRespawnCallback('tgr:0')).toBeNull();
+  expect(parseTopicRespawnCallback('tgr:42:extra')).toBeNull();
+  expect(parseTopicRespawnCallback('tgm:42')).toBeNull();
+});
+
+test('buildRespawnKeyboard: one Re-spawn button carrying tgr:<threadId>', () => {
+  expect(buildRespawnKeyboard(42)).toEqual([[{ text: 'Re-spawn the agent', callback_data: 'tgr:42' }]]);
+});
+
+test('parseTopics: preserves a clean pathChoices array; drops a malformed one', () => {
+  const good = serializeTopics([
+    { threadId: 1, name: 'a', status: 'awaiting-path', ts: 1, pathChoices: ['/p', '/q'] },
+  ]);
+  expect(parseTopics(good)[0].pathChoices).toEqual(['/p', '/q']);
+  const bad = JSON.stringify([
+    { threadId: 2, name: 'b', status: 'awaiting-path', ts: 1, pathChoices: ['/p', 5] },
+  ]);
+  expect(parseTopics(bad)[0].pathChoices).toBeUndefined();
+});
+
+test('applyPathAnswer: drops the now-stale pathChoices when advancing to awaiting-model', () => {
+  const b: TopicBinding = { threadId: 1, name: 'a', status: 'awaiting-path', ts: 1, pathChoices: ['/p'] };
+  const next = applyPathAnswer(b, '/chosen', 2);
+  expect(next.status).toBe('awaiting-model');
+  expect(next.path).toBe('/chosen');
+  expect(next.pathChoices).toBeUndefined();
+});
+
+test('topics ON: a tgp: tap → topic-path action (recent-path button, carries the nonce)', () => {
+  expect(stepUpdates([cbUpd(9, 'tgp:50:1:77')], makeOpts({ topicsEnabled: true })).actions).toEqual([
+    { kind: 'topic-path', callbackQueryId: 'cb9', threadId: 50, index: 1, nonce: 77, messageId: 9 },
+  ]);
+});
+
+test('topics ON: a tgr: tap → topic-respawn action', () => {
+  expect(stepUpdates([cbUpd(10, 'tgr:50')], makeOpts({ topicsEnabled: true })).actions).toEqual([
+    { kind: 'topic-respawn', callbackQueryId: 'cb10', threadId: 50, messageId: 10 },
+  ]);
+});
+
+test('topics OFF: a tgp:/tgr: tap does NOT emit a topic action — falls through (expired)', () => {
+  expect(stepUpdates([cbUpd(9, 'tgp:50:0:1')], makeOpts({ topicsEnabled: false })).actions).toEqual([
+    { kind: 'answer-callback', callbackQueryId: 'cb9', text: 'expired' },
+  ]);
+  expect(stepUpdates([cbUpd(10, 'tgr:50')], makeOpts({ topicsEnabled: false })).actions).toEqual([
+    { kind: 'answer-callback', callbackQueryId: 'cb10', text: 'expired' },
+  ]);
+});
+
+test('topics ON: a SAME-BATCH forum_topic_closed wins over a tgr/tgm/tgp tap — no spawn into a closed topic (codex r21)', () => {
+  // The close + a stale spawn tap arrive in one batch. Callbacks run before service messages, so
+  // without the pre-scan the tap would spawn into the just-closed topic. The pre-scan suppresses the
+  // tap (answered "topic closed") so the close wins. topicStatusOf must see the topic as TRACKED.
+  const closedMsg = upd(20, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false });
+  const opts = makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' });
+
+  const r1 = stepUpdates([closedMsg, cbUpd(21, 'tgr:50')], opts);
+  expect(r1.actions).toContainEqual({ kind: 'answer-callback', callbackQueryId: 'cb21', text: 'topic changed — try again' });
+  expect(r1.actions.some((a) => a.kind === 'topic-respawn')).toBe(false);
+  expect(r1.actions.some((a) => a.kind === 'topic-close')).toBe(true);
+
+  const r2 = stepUpdates([closedMsg, cbUpd(22, 'tgm:50:claude-opus')], opts);
+  expect(r2.actions).toContainEqual({ kind: 'answer-callback', callbackQueryId: 'cb22', text: 'topic changed — try again' });
+  expect(r2.actions.some((a) => a.kind === 'topic-model')).toBe(false);
+
+  const r3 = stepUpdates([closedMsg, cbUpd(23, 'tgp:50:0:7')], opts);
+  expect(r3.actions).toContainEqual({ kind: 'answer-callback', callbackQueryId: 'cb23', text: 'topic changed — try again' });
+  expect(r3.actions.some((a) => a.kind === 'topic-path')).toBe(false);
+});
+
+test('topics ON: a SAME-BATCH forum_topic_reopened also suppresses a stale spawn tap (codex r27)', () => {
+  // The reopen + a stale tgr tap in one batch: the tap would re-bind a pane that the reopen
+  // (markReopened) then drops → orphan. The pre-scan suppresses the tap so the reopen wins.
+  const reopenMsg = upd(26, { forum_topic_reopened: {}, message_thread_id: 50, is_topic_message: false });
+  const opts = makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' });
+
+  const r = stepUpdates([reopenMsg, cbUpd(27, 'tgr:50')], opts);
+  expect(r.actions).toContainEqual({ kind: 'answer-callback', callbackQueryId: 'cb27', text: 'topic changed — try again' });
+  expect(r.actions.some((a) => a.kind === 'topic-respawn')).toBe(false);
+  expect(r.actions.some((a) => a.kind === 'topic-reopen')).toBe(true);
+
+  // A same-batch reopen (id 26) + a LATER TEXT (id 28 > 26) → suppressed (ack only).
+  const textAfter = upd(28, { text: 'hi', message_thread_id: 50, is_topic_message: true });
+  const r2 = stepUpdates([reopenMsg, textAfter], opts);
+  expect(r2.actions.some((a) => a.kind === 'topic-route' || a.kind === 'topic-dead')).toBe(false);
+  expect(r2.actions).toContainEqual({ kind: 'ack', messageId: 28 });
+});
+
+test('topics ON: a text BEFORE a same-batch close (lower update_id) is PROCESSED, not dropped (codex r30 order-aware)', () => {
+  // The text (id 20) arrived BEFORE the close (id 21), so it happened before the topic was closed →
+  // it must route to the (still-bound) agent, NOT be silently acked/dropped.
+  const textBefore = upd(20, { text: 'last thing', message_thread_id: 50, is_topic_message: true });
+  const closeAfter = upd(21, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false });
+  const r = stepUpdates([textBefore, closeAfter], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
+  expect(r.actions.some((a) => a.kind === 'topic-route' && (a as { threadId: number }).threadId === 50)).toBe(true);
+  expect(r.actions.some((a) => a.kind === 'topic-close')).toBe(true);
+
+  // The SYMMETRIC reopen order: a text (id 30) BEFORE a reopen (id 31) on a closed topic still routes
+  // its dead-topic recovery (topic-dead) — it happened before the reopen.
+  const textBefore2 = upd(30, { text: 'hi', message_thread_id: 50, is_topic_message: true });
+  const reopenAfter = upd(31, { forum_topic_reopened: {}, message_thread_id: 50, is_topic_message: false });
+  const r2 = stepUpdates([textBefore2, reopenAfter], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }));
+  expect(r2.actions.some((a) => a.kind === 'topic-dead')).toBe(true);
+});
+
+test('topics ON: a tgr tap is NOT suppressed when the same-batch close is for a DIFFERENT thread', () => {
+  // The pre-scan is per-thread: a close of thread 99 must not block a tap on thread 50.
+  const closedOther = upd(24, { forum_topic_closed: {}, message_thread_id: 99, is_topic_message: false });
+  const r = stepUpdates([closedOther, cbUpd(25, 'tgr:50')], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' }));
+  expect(r.actions.some((a) => a.kind === 'topic-respawn' && (a as { threadId: number }).threadId === 50)).toBe(true);
+});
+
+test('topics ON: a same-batch close + a TEXT message to that thread → ack only, NO topic-route/recovery (codex r24 P1b)', () => {
+  // A [forum_topic_closed, <text>] batch on a bound topic: the text must NOT emit a topic-route (which
+  // would route into / offer a re-spawn for the just-closed topic). Ack only; the close action wins.
+  const closeMsg = upd(40, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false });
+  const textMsg = upd(41, { text: 'still there?', message_thread_id: 50, is_topic_message: true });
+  const r = stepUpdates([closeMsg, textMsg], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
+  expect(r.actions.some((a) => a.kind === 'topic-route')).toBe(false);
+  expect(r.actions.some((a) => a.kind === 'topic-dead')).toBe(false);
+  expect(r.actions.some((a) => a.kind === 'topic-close')).toBe(true);
+  expect(r.actions).toContainEqual({ kind: 'ack', messageId: 41 }); // the text is acked, not routed
+});
+
+test('topics ON: a STALE or UNAUTHORIZED same-batch close does NOT suppress a valid tap (codex r22)', () => {
+  const opts = makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' });
+  // STALE close (date far in the past, beyond stalenessSec): it's ignored by the loop, so it must
+  // NOT suppress the fresh tgr tap on the same thread.
+  const staleClose = upd(30, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, date: NOW - 10 * 3600 });
+  const rStale = stepUpdates([staleClose, cbUpd(31, 'tgr:50')], opts);
+  expect(rStale.actions.some((a) => a.kind === 'topic-respawn')).toBe(true);
+
+  // UNAUTHORIZED close (from a non-allowlisted user id): same — must not suppress the valid tap.
+  const unauthClose = upd(32, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, from: { id: 999_999, first_name: 'Mallory' } });
+  const rUnauth = stepUpdates([unauthClose, cbUpd(33, 'tgr:50')], opts);
+  expect(rUnauth.actions.some((a) => a.kind === 'topic-respawn')).toBe(true);
+});
+
+test('markRespawnOffered sets the flag; markClosed/markBound/markReopened clear it', () => {
+  const closed: TopicBinding = { threadId: 1, name: 'a', status: 'closed', path: '/p', model: 'claude-opus', ts: 1 };
+  const offered = markRespawnOffered(closed, 2);
+  expect(offered.respawnOffered).toBe(true);
+  // A fresh close drops a stale flag (so the first message after re-close re-offers).
+  expect(markClosed(offered, 3).respawnOffered).toBeUndefined();
+  // Re-binding (re-spawn succeeded) clears it — the topic is no longer dead.
+  expect(markBound(offered, '%5', 4).respawnOffered).toBeUndefined();
+  // Reopen restarts the flow → clears it too.
+  expect(markReopened(offered, 5).respawnOffered).toBeUndefined();
+});
+
+test('parseTopics preserves respawnOffered:true, ignores a non-true value', () => {
+  const on = serializeTopics([{ threadId: 1, name: 'a', status: 'closed', ts: 1, respawnOffered: true }]);
+  expect(parseTopics(on)[0].respawnOffered).toBe(true);
+  const off = JSON.stringify([{ threadId: 2, name: 'b', status: 'closed', ts: 1, respawnOffered: 'yes' }]);
+  expect(parseTopics(off)[0].respawnOffered).toBeUndefined();
+});
+
+test('markSpawnPending sets the flag + token; clearSpawnPending / markBound / markClosed / markReopened clear both', () => {
+  const am: TopicBinding = { threadId: 1, name: 'a', status: 'awaiting-model', path: '/p', model: 'claude-opus', ts: 1 };
+  const pending = markSpawnPending(am, 'TOK1', 2);
+  expect(pending.spawnPending).toBe(true);
+  expect(pending.spawnToken).toBe('TOK1');
+  for (const next of [clearSpawnPending(pending, 3), markBound(pending, '%5', 4), markClosed(pending, 5), markReopened(pending, 6)]) {
+    expect(next.spawnPending).toBeUndefined();
+    expect(next.spawnToken).toBeUndefined();
+  }
+});
+
+test('parseTopics preserves spawnPending:true + spawnToken, ignores non-true / non-string values', () => {
+  const on = serializeTopics([
+    { threadId: 1, name: 'a', status: 'awaiting-model', path: '/p', model: 'm', ts: 1, spawnPending: true, spawnToken: 'TOK' },
+  ]);
+  expect(parseTopics(on)[0].spawnPending).toBe(true);
+  expect(parseTopics(on)[0].spawnToken).toBe('TOK');
+  const off = JSON.stringify([{ threadId: 2, name: 'b', status: 'awaiting-model', ts: 1, spawnPending: 1, spawnToken: 42 }]);
+  expect(parseTopics(off)[0].spawnPending).toBeUndefined();
+  expect(parseTopics(off)[0].spawnToken).toBeUndefined();
 });

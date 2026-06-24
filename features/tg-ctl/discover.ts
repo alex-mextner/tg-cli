@@ -28,16 +28,26 @@ export function parsePaneList(out: string): PaneInfo[] {
     const windowIndex = Number(parts[1]);
     const panePid = Number(parts[3]);
     if (!Number.isInteger(windowIndex) || !Number.isInteger(panePid)) continue;
+    // Field layout: session, window_index, pane_id, pane_pid, command, window_name, [spawn_token,]
+    // path(greedy). The `@tg_spawn_token` field (index 6) is the forum-topics increment-4 addition.
+    // Accept BOTH the 8-field shape (token at index 6) and the legacy 7-field shape (no token field).
+    // DISAMBIGUATION (codex r12 P2): a 7-field line whose PATH contains a literal tab ALSO yields 8+
+    // parts — but its parts[6] is a path fragment, NOT a token. Our tokens have a fixed shape
+    // (`<threadId>-<unixSec>-<nonce>`, all digits + dashes) and an unset option is ''. So treat
+    // parts[6] as a token ONLY when it is '' or matches that shape; otherwise it's a tab-split path
+    // (legacy) and the path is the greedy tail from index 6.
+    const tokenField = parts.length >= 8 ? parts[6] : undefined;
+    const looksLikeToken = tokenField !== undefined && (tokenField === '' || /^\d+-\d+-\d+$/.test(tokenField));
     panes.push({
       sessionName: parts[0],
       windowIndex,
       paneId: parts[2],
       panePid,
       paneCommand: parts[4],
-      // window_name is a fixed field (tmux names never contain tabs); the path is
-      // the greedy tail (it CAN contain a tab) so it stays LAST and rejoins parts[6..].
       windowName: parts[5],
-      panePath: parts.slice(6).join('\t'),
+      spawnToken: looksLikeToken ? (tokenField as string) : '',
+      // The path is the greedy tail (it CAN contain a tab) so it stays LAST and rejoins the rest.
+      panePath: (looksLikeToken ? parts.slice(7) : parts.slice(6)).join('\t'),
     });
   }
   return panes;

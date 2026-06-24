@@ -145,10 +145,10 @@ mirroring how `routes.cwd` already flows).
    server-REJECTED value (closed/deleted topic, non-forum chat → `message thread not found` /
    `TOPIC_CLOSED`) makes the send retry ONCE without the thread id rather than hard-fail — so a
    daily-critical send never dies because of a stale ambient default. An EXPLICIT `--topic` stays
-   strict: the agent asked for that topic, so a rejection surfaces as a real error. Still DEFERRED
-   (increment 4): the DAEMON auto-stamping `TG_TOPIC` into the bound pane's env so the agent need
-   not pass `--topic` — that touches the spawn/inject path and lands with the spawn executor (the
-   advisory fallback above is what keeps that future auto-stamp safe against a since-closed topic).
+   strict: the agent asked for that topic, so a rejection surfaces as a real error. The DAEMON
+   auto-stamping `TG_TOPIC` into the spawned window's env (so the agent need not pass `--topic`)
+   LANDED in increment 4 (`new-window -e TG_TOPIC=<id>`); the advisory fallback above keeps that
+   ambient default safe against a since-closed topic.
 2. **Spawn + bind executor (the remaining seam)** — LANDED: the entrypoint handles
    `topic-new`/`topic-answer` plus a new `topic-model` model-button callback. `forum_topic_created`
    → an `awaiting-path` binding + a "which directory?" prompt; a path message → validated (must
@@ -161,21 +161,39 @@ mirroring how `routes.cwd` already flows).
    in `stepUpdates`, so a restart/dup can't double-spawn); the whole path only runs when `control.topics`
    is on (default OFF → 1:1 byte-identical). Tests: `tests/ctl-topic-spawn-integration.test.ts` (valid
    spawn, malformed path, spawn failure survives, no double-spawn, flag-off no-op) + the pure
-   parser/keyboard/callback-emission units in `tests/ctl-topics.test.ts`. Still deferred to increment 4:
-   the recent-repo path BUTTONS (today the path is free-text only), and re-spawn on a dead/closed pane.
-4. **Lifecycle polish** — re-spawn on a dead/closed pane (today it marks closed + asks the human to
-   recreate the topic), daemon-restart re-bind, General-vs-topic edge cases, admin-permission
-   onboarding error, and the DAEMON auto-stamping a bound pane's `TG_TOPIC` env (so the agent's `tg`
-   threads automatically without `--topic`; the explicit flag/env already landed in increment 2).
-   Two narrow gaps the increment-2 spawn executor leaves for here (review-flagged, low-risk):
-   (a) **crash-window orphan** — `handleTopicModel` persists `awaiting-model` → `tmux new-window`
-   → persists `bound`; a daemon crash BETWEEN a successful `new-window` and the `bound` write
-   leaves a live orphan pane + an `awaiting-model` binding, and a re-tap then spawns a second
-   agent (the "restart can't double-spawn" guarantee covers `bound` topics, not this sliver).
-   Close it by detecting the topic-slug window before re-spawning. (b) **dangling model buttons**
-   — the `topic-model` callback carries the prompt `messageId` but doesn't `editMessageReplyMarkup`
-   it away after binding, so the model buttons stay tappable (harmless — the `bound`-guard refuses
-   them with "already running"). Edit/remove the keyboard on bind.
+   parser/keyboard/callback-emission units in `tests/ctl-topics.test.ts`. (The recent-repo path
+   buttons and re-spawn-on-dead-pane were deferred to increment 4 — now LANDED, see below.)
+4. **Lifecycle polish — LANDED.** All increment-4 items shipped together:
+   - **Recent-repo path buttons** on the awaiting-path step (`tgp:<threadId>:<index>:<nonce>`): the
+     prompt offers recent project cwds (from the routes store + per-pane registrations, newest-first,
+     deduped to absolute existing dirs) as one-tap buttons; the chosen list + a per-prompt NONCE are
+     persisted on the binding so a STALE button from a superseded prompt is rejected (never resolves
+     its index against a newer choice list). Free-text remains a fallback.
+   - **Model keyboard cleared on bind** via `editMessageReplyMarkup` (and on a restart-to-path) so the
+     stale buttons can't be re-tapped.
+   - **Re-spawn on a dead/closed pane**: a message to a topic whose bound pane died marks it `closed`
+     and offers a one-tap **Re-spawn** button (`tgr:<threadId>`) that re-launches with the retained
+     path + model (else restarts the /new flow when the path/model is missing or the dir vanished).
+     The offer is THROTTLED (one per dead topic, `respawnOffered`), only stamped when the button send
+     succeeds, and a re-spawn failure restores `closed` so the next message re-offers.
+   - **DAEMON auto-stamps `TG_TOPIC`** into the spawned window's env (`new-window -e TG_TOPIC=<id>`)
+     so the agent's plain `tg "reply"` threads back into the topic without `--topic`.
+   - **Crash-window orphan reconcile** on startup: a binding stuck `awaiting-model` after a crash
+     between `new-window` and the `bound` write is RE-BOUND to its live orphan pane (no second spawn)
+     — proven by a per-spawn token stamped as a `@tg_spawn_token` WINDOW USER OPTION (queryable via
+     `#{@tg_spawn_token}` in the pane format; `new-window -e` process env is NOT queryable later),
+     with the recorded paneId as a fallback proof. Adoption requires same slug + same cwd + (token OR
+     recorded paneId), so a same-slug/cwd STRANGER is never adopted; only `awaiting-model + path +
+     model + spawnPending` bindings are candidates (a normal pre-model or failed-spawn state is not).
+     A flaky/empty startup snapshot is skipped (never mass-closes live bindings); a model tap on a
+     still-`spawnPending` binding re-probes (the just-in-time adoption) so a missed startup reconcile
+     can't double-spawn. A `bound` binding whose pane is gone is marked `closed`.
+   - **Same-batch races**: a re-spawn tap + a text message in one getUpdates batch routes the text to
+     the re-bound pane (not dropped); a second same-batch message to a just-closed topic goes through
+     the throttled recovery, never the old "recreate the topic" dead-end.
+   Residual (accepted): a daemon crash in the sub-ms gap between `new-window` returning and the token
+   stamp leaves an orphan with neither a token nor a recorded paneId — bounded by the JIT re-probe and
+   astronomically unlikely; a stranded orphan is recoverable by hand.
 
 ## 10. Edge cases / decisions
 

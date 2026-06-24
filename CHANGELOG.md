@@ -3,6 +3,37 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.18.0
+
+Forum-topics increment 4 — lifecycle polish (spec §9.4; tg-cli#86, refs #31/#85). Builds
+on the increment-2 spawn executor with the deferred recovery + UX items:
+
+- **Recent-repo path buttons** on the awaiting-path step (`tgp:<threadId>:<index>:<nonce>`):
+  the prompt offers recent project cwds (routes store + per-pane registrations, newest-first,
+  deduped to absolute existing dirs) as one-tap buttons, with a free-text fallback. A per-prompt
+  nonce pins each button to its prompt, so a stale button from a superseded prompt is rejected
+  rather than resolving its index against a newer choice list.
+- **Model keyboard cleared on bind** (and on a restart-to-path) via `editMessageReplyMarkup`.
+- **Re-spawn on a dead/closed pane:** a message to a topic whose pane died marks it `closed` and
+  offers a one-tap *Re-spawn* button (`tgr:<threadId>`) that re-launches with the retained path +
+  model — or restarts the `/new` flow when the path/model is missing or the dir vanished. The offer
+  is throttled (one per dead topic), only stamped on a successful send, and a re-spawn failure
+  restores `closed` so the next message re-offers.
+- **Daemon auto-stamps `TG_TOPIC`** into the spawned window's env (`new-window -e TG_TOPIC=<id>`),
+  so a topic agent's plain `tg "reply"` threads back into the topic without `--topic`.
+- **Crash-window orphan reconcile** on startup re-binds a crash-orphaned agent to its topic instead
+  of double-spawning, proven by a per-spawn token stored as a `@tg_spawn_token` window option
+  (queryable via the pane format; `new-window -e` process env is not) plus a recorded-paneId
+  fallback. Adoption requires same slug + same cwd + (token OR paneId), so a same-slug/cwd stranger
+  is never adopted; a flaky startup snapshot is skipped (no mass-close); a model tap on a still-
+  pending binding re-probes (just-in-time adoption) so a missed reconcile can't double-spawn.
+- **Same-batch races handled:** a re-spawn tap + a text message in one batch routes the text to the
+  re-bound pane (not dropped); a second same-batch message to a just-closed topic uses the throttled
+  recovery, never the old "recreate the topic" dead-end.
+
+All gated behind `control.topics` (default OFF → 1:1 byte-identical). Extensive tests in
+`tests/ctl-topic-spawn-integration.test.ts`, `tests/ctl-topics.test.ts`, `tests/ctl-discover.test.ts`.
+
 ## 1.17.0
 
 Forum-topics: spawn an agent on topic creation (the `/new` flow trigger, spec

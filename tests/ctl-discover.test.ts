@@ -21,8 +21,9 @@ function pane(
   paneCommand: string,
   panePath: string,
   windowName = '',
+  spawnToken = '',
 ): PaneInfo {
-  return { sessionName, windowIndex, paneId, panePid, paneCommand, windowName, panePath };
+  return { sessionName, windowIndex, paneId, panePid, paneCommand, windowName, spawnToken, panePath };
 }
 
 function proc(pid: number, ppid: number, command: string): ProcInfo {
@@ -48,6 +49,37 @@ test('parsePaneList keeps paths with spaces intact (tabs protect them)', () => {
   expect(panes[0].panePath).toBe('/Users/ultra/my project/sub dir');
   expect(panes[0].paneCommand).toBe('2.1.150'); // cc reports its VERSION here
   expect(panes[0].windowName).toBe('api-bot'); // a fixed field BEFORE the greedy path
+});
+
+test('parsePaneList reads the 8-field @tg_spawn_token field (forum-topics increment 4)', () => {
+  // 8 fields: …window_name \t @tg_spawn_token \t path. The token is '' when the option is unset.
+  const out =
+    'main\t0\t%0\t100\t-zsh\trig\t113-9-7\t/Users/ultra/work\n' + 'side\t2\t%5\t200\topencode\t3d\t\t/tmp/x\n';
+  const panes = parsePaneList(out);
+  expect(panes).toHaveLength(2);
+  expect(panes[0].spawnToken).toBe('113-9-7');
+  expect(panes[0].panePath).toBe('/Users/ultra/work');
+  expect(panes[1].spawnToken).toBe(''); // unset → empty
+  expect(panes[1].panePath).toBe('/tmp/x');
+});
+
+test('parsePaneList keeps a token + a path-with-tab intact (token fixed, path greedy)', () => {
+  // Token shape is `<threadId>-<unixSec>-<nonce>` (digits + dashes); path is the greedy tail.
+  const out = 'main\t1\t%3\t4242\t2.1.150\tapi-bot\t113-1700000000-5\t/Users/ultra/my\tproject\n';
+  const panes = parsePaneList(out);
+  expect(panes).toHaveLength(1);
+  expect(panes[0].spawnToken).toBe('113-1700000000-5');
+  expect(panes[0].panePath).toBe('/Users/ultra/my\tproject'); // greedy tail rejoins the tab
+});
+
+test('parsePaneList does NOT misread a legacy 7-field path-with-tab as a token (codex r12 P2)', () => {
+  // Legacy 7-field shape (no token field) whose PATH contains a tab → 8 parts. parts[6] is a path
+  // fragment ("/Users/a"), NOT a digit-dash token, so it must be treated as the path, not a token.
+  const out = 'win\t0\t%1\t100\t-zsh\trig\t/Users/a\tb\n';
+  const panes = parsePaneList(out);
+  expect(panes).toHaveLength(1);
+  expect(panes[0].spawnToken).toBe(''); // NOT "/Users/a"
+  expect(panes[0].panePath).toBe('/Users/a\tb'); // greedy tail keeps the whole path
 });
 
 test('parsePaneList skips malformed lines', () => {
