@@ -65,6 +65,18 @@ describe('DeferQueues', () => {
     expect(q.has('%1')).toBe(false);
     expect(q.drop('%1')).toEqual([]); // idempotent on an empty pane
   });
+
+  test('panesWithBacklog lists only panes that still hold items (tg-cli#58)', () => {
+    const q = new DeferQueues();
+    expect(q.panesWithBacklog()).toEqual([]);
+    q.enqueue('%1', 'a');
+    q.enqueue('%2', 'b');
+    q.enqueue('%2', 'c');
+    expect(q.panesWithBacklog().sort()).toEqual(['%1', '%2']);
+    // A drained pane drops out of the list (so an unscoped sweep won't touch it).
+    q.drop('%1');
+    expect(q.panesWithBacklog()).toEqual(['%2']);
+  });
 });
 
 describe('driveFlush', () => {

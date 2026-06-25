@@ -33,6 +33,17 @@ export class DeferQueues {
     return (this.byPane.get(paneId)?.length ?? 0) > 0;
   }
 
+  // Every pane that currently holds a non-empty backlog. Used to dead-letter the
+  // strays behind an UNSCOPED question on its abandon: an unscoped question (no
+  // paneId) defers inbound for ANY pane, so its backlog can sit on several panes
+  // at once and there is no single pane key to dead-letter (tg-cli#58). The caller
+  // sweeps each returned pane through the same per-pane abandon guard.
+  panesWithBacklog(): string[] {
+    const panes: string[] = [];
+    for (const [pane, q] of this.byPane) if (q.length > 0) panes.push(pane);
+    return panes;
+  }
+
   // Read-only view of a pane's queue (tests; never mutate the result).
   peek(paneId: string): readonly string[] {
     return this.byPane.get(paneId) ?? [];
