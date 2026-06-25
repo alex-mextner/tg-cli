@@ -3,6 +3,25 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.18.2
+
+An **unscoped** forwarded question (the hook ran without `TMUX_PANE`) that expires
+unanswered no longer silently strands the inbound messages deferred behind it
+(tg-cli#58). An unscoped question defers inbound for **any** pane, so its backlog
+can sit on several panes at once and there was no single pane key to dead-letter —
+the expiry timer dropped the queue without telling anyone. Now, on the unscoped
+abandon (timeout / hook socket close / send failure), the daemon **sweeps every
+pane that still holds a backlog** and dead-letters the idle ones, emitting the same
+`⚠️ … were NOT delivered. Resend them.` notice the scoped socket-close path already
+gave.
+
+- The sweep reuses the existing per-pane abandon guard, so a pane that still has
+  **another** live question (its answer flushes the queue legitimately) or an
+  in-flight flush (it owns the queue) is left untouched — no other handler's
+  messages are dropped.
+- The no-wedge guarantee is unchanged: the stale text is never pasted into the
+  freed pane (the agent has moved on), and routing un-wedges immediately.
+
 ## 1.18.1
 
 `tg-ctl status` no longer lies about autostart when the daemon is supervised by an

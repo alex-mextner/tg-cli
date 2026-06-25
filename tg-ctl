@@ -1338,6 +1338,7 @@ function startHookServer(
   pending: Map<string, PendingButton>,
   activeKeys: Set<string>,
   onAbandon: (paneId: string) => void,
+  onUnscopedAbandon: () => void,
 ): Server | null {
   try {
     try {
@@ -1357,7 +1358,7 @@ function startHookServer(
         }
         const line = raw.slice(0, newline).trim()
         raw = raw.slice(newline + 1)
-        void handleHookSocketLine(ctx, pending, activeKeys, onAbandon, socket, line)
+        void handleHookSocketLine(ctx, pending, activeKeys, onAbandon, onUnscopedAbandon, socket, line)
       })
     })
     server.on("error", (err) => {
@@ -1386,6 +1387,11 @@ async function handleHookSocketLine(
   // deferred backlog so it can't resurface, stale + out of order, on a LATER
   // unrelated question's answer (review finding).
   onAbandon: (paneId: string) => void,
+  // Same, for an UNSCOPED question (no paneId): sweeps every pane that still
+  // holds a backlog and dead-letters the idle ones (tg-cli#58). Must run AFTER
+  // the unscoped entry is deleted from `pending` — see onUnscopedAbandon's
+  // caller contract — so the per-pane guard sees the real post-removal state.
+  onUnscopedAbandon: () => void,
   socket: Socket,
   line: string,
 ): Promise<void> {
@@ -1470,8 +1476,11 @@ async function handleHookSocketLine(
       if (pending.get(pendingKey) !== entry) return
       pending.delete(pendingKey)
       activeKeys.delete(pendingKey)
-      // Unscoped → no onAbandon(paneId) (there is no pane to dead-letter); the
-      // editMessageText/finalText path mirrors the socket-close branch.
+      // Unscoped → no single pane to dead-letter, but the question deferred inbound
+      // across ANY pane, so its backlog may be stranded on several. Sweep them
+      // (tg-cli#58) — AFTER the delete above, so the per-pane guard no longer sees
+      // this just-expired unscoped question and dead-letters the truly-idle panes.
+      onUnscopedAbandon()
       if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, "expired — answer in terminal")
       else entry.finalText = "expired — answer in terminal"
       socket.end("null\n")
@@ -1487,7 +1496,11 @@ async function handleHookSocketLine(
     clearTimeout(entry.timer)
     pending.delete(pendingKey)
     activeKeys.delete(pendingKey)
+    // Scoped → dead-letter its own pane; unscoped → sweep every pane holding a
+    // backlog (tg-cli#58). Both run AFTER the delete above so the per-pane guard
+    // sees the real post-removal state.
     if (entry.req.paneId) onAbandon(entry.req.paneId)
+    else onUnscopedAbandon()
     if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, "expired — answer in terminal")
     else entry.finalText = "expired — answer in terminal"
   })
@@ -1502,7 +1515,10 @@ async function handleHookSocketLine(
       pending.delete(pendingKey)
       activeKeys.delete(pendingKey)
       clearTimeout(entry.timer)
+      // Scoped → dead-letter its own pane; unscoped → sweep all panes (tg-cli#58),
+      // after the delete above so the guard sees the real post-removal state.
       if (entry.req.paneId) onAbandon(entry.req.paneId)
+      else onUnscopedAbandon()
       if (!socketClosed) socket.end("null\n")
     }
     return
@@ -1862,6 +1878,25 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     log(`question abandoned on ${paneId} (idle) — dead-lettered ${droppedCount} queued message(s)`)
     notifyDeadLettered(paneId, droppedCount)
   }
+  // An UNSCOPED question (no paneId — hook ran without TMUX_PANE) was removed
+  // WITHOUT a Telegram answer (timeout / socket close / send failure). It defers
+  // inbound for ANY pane (paneHasPendingQuestion's `if (!pb.req.paneId) return
+  // true`), so its stranded backlog can sit on SEVERAL panes at once and there is
+  // no single pane to dead-letter — the gap #58 closes (the scoped paths
+  // dead-letter via onAbandon(paneId); the unscoped expiry used to drop the
+  // backlog silently). Sweep every pane that still holds a backlog through the
+  // SAME per-pane abandon guard: onQuestionAbandoned skips a pane that has ANOTHER
+  // pending question (its answer flushes legitimately) or an in-flight flush (it
+  // owns the queue), so this never dead-letters a different live question's items.
+  //
+  // CALLER CONTRACT: invoke this only AFTER the unscoped entry is removed from
+  // `pendingButtons`. While it is still present, paneHasPendingQuestion returns
+  // true for EVERY pane (its own `!paneId` arm), so every sweep call would skip —
+  // dead-lettering nothing. Removing it first lets the guard see the real
+  // post-removal state (dead-letter an idle pane, leave one with a live question).
+  const onUnscopedAbandon = (): void => {
+    for (const paneId of deferred.panesWithBacklog()) onQuestionAbandoned(paneId)
+  }
   let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
     try {
@@ -1878,7 +1913,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   process.on("SIGTERM", () => cleanExit(0))
   process.on("SIGINT", () => cleanExit(0))
 
-  hookServer = startHookServer(ctx, pendingButtons, activeButtonKeys, onQuestionAbandoned)
+  hookServer = startHookServer(ctx, pendingButtons, activeButtonKeys, onQuestionAbandoned, onUnscopedAbandon)
 
   if (ctx.cfg.transport === "channel") {
     log("transport 'channel' is reserved for v1.2+ — falling back to tmux")

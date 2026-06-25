@@ -903,7 +903,14 @@ const SHORT_UNSCOPED_MS = '1500';
 // A Telegram server that records editMessageText bodies (so a test can assert the
 // prompt was — or was NOT — rewritten to "expired"), tracks the question's
 // callback data, and feeds getUpdates from a caller-owned queue.
-function recordingServer(updateQueue: unknown[][], reactions: Array<Record<string, unknown>>, edits: string[]): {
+function recordingServer(
+  updateQueue: unknown[][],
+  reactions: Array<Record<string, unknown>>,
+  edits: string[],
+  // Optional collector for plain (button-less) sendMessage bodies — e.g. the
+  // dead-letter notice (tg-cli#58). Omitted by callers that don't assert on it.
+  plainMessages?: string[],
+): {
   port: number;
   cb: () => string;
   stop: (closeActiveConnections?: boolean) => Promise<void> | void;
@@ -929,6 +936,7 @@ function recordingServer(updateQueue: unknown[][], reactions: Array<Record<strin
           questionCallbackData = kb[0][0].callback_data;
           return Response.json({ ok: true, result: { message_id: buttonMessageId } });
         }
+        plainMessages?.push(String(body.text ?? ''));
         return Response.json({ ok: true, result: { message_id: 900 } });
       }
       if (url.pathname.endsWith('/setMessageReaction')) {
@@ -1086,7 +1094,8 @@ test('NO-WEDGE guard: an UNSCOPED question never answered still self-clears at t
   const updateQueue: unknown[][] = [];
   const reactions: Array<Record<string, unknown>> = [];
   const edits: string[] = [];
-  const server = recordingServer(updateQueue, reactions, edits);
+  const plainMessages: string[] = []; // plain sendMessage bodies (the dead-letter notice)
+  const server = recordingServer(updateQueue, reactions, edits, plainMessages);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
 
@@ -1136,17 +1145,202 @@ test('NO-WEDGE guard: an UNSCOPED question never answered still self-clears at t
   expect(injected(cfgDir).some((l) => l.includes('routing alive'))).toBe(true);
 
   // Fate of the message deferred behind the EXPIRED unscoped question ('unwedge
-  // me'): it is silently LOST. flushDeferred only fires on a real ANSWER, and an
-  // unscoped expiry has no paneId to dead-letter, so the entry is dropped without
-  // flushing OR dead-lettering its backlog; the later direct inject does not drain
-  // it either. This is a deliberate, asserted DATA-LOSS gap (the user gets no
-  // dead-letter notice), NOT mere "asymmetry" — distinct from the scoped
-  // socket-close path which DOES dead-letter via onAbandon + notify. It is
-  // PRE-EXISTING (the old 110s timer never dead-lettered an unscoped backlog —
-  // onAbandon was gated on req.paneId) and tracked for a real fix in #58. Pinned
-  // here so a future change can't silently regress it; the no-wedge guarantee —
-  // the point of this test — holds regardless: 'routing alive' got through.
+  // me'): the agent has moved on (its prompt was rewritten to "expired"), so the
+  // stale text is NEVER pasted into the now-free pane — that would be the very
+  // hanging-question resurface this module exists to kill. But the user is no
+  // longer silently robbed of it: on the unscoped expiry the daemon sweeps every
+  // pane that still holds a backlog and dead-letters the idle ones (tg-cli#58),
+  // emitting the same '⚠️ … were NOT delivered' notice the scoped socket-close
+  // path already gives. Before #58 this was a silent DATA-LOSS gap (the unscoped
+  // expiry had no paneId to dead-letter). The no-wedge guarantee still holds
+  // ('routing alive' got through) and the stale text still never lands on a pane.
   expect(injected(cfgDir).some((l) => l.includes('unwedge me'))).toBe(false);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !plainMessages.some((m) => m.includes('were NOT delivered')))
+      await Bun.sleep(50);
+  }
+  expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(true);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 40_000);
+
+// The dangerous failure mode of the #58 sweep: an unscoped question's expiry must
+// NOT dead-letter a backlog that belongs to a DIFFERENT, still-live question on
+// the same pane. The deferred queue is keyed by PANE, not question, so a naive
+// "drop every pane's backlog on the unscoped expiry" would destroy the scoped
+// question's legitimately-queued messages. The per-pane guard
+// (onQuestionAbandoned skips a pane that still has a pending question) is what
+// prevents this; this test pins that guard so a regression in it is caught.
+test('an UNSCOPED expiry does NOT dead-letter a backlog held behind a still-live SCOPED question on the same pane (tg-cli#58 guard)', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const plainMessages: string[] = [];
+  let scopedCb = '';
+  let scopedMsg = 0;
+  let buttonMessageId = 0;
+
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        const batch = updateQueue.shift();
+        if (batch) return Response.json({ ok: true, result: batch });
+        await Bun.sleep(80);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as Record<string, unknown>;
+        const kb = (body.reply_markup as { inline_keyboard?: Array<Array<{ callback_data: string }>> } | undefined)
+          ?.inline_keyboard;
+        if (kb?.length) {
+          buttonMessageId += 1;
+          // The FIRST question posted is the scoped one; capture its callback +
+          // message id so the test can answer it later. The unscoped question
+          // posts second and is never answered (it expires).
+          if (scopedCb === '') {
+            scopedCb = kb[0][0].callback_data;
+            scopedMsg = buttonMessageId;
+          }
+          return Response.json({ ok: true, result: { message_id: buttonMessageId } });
+        }
+        plainMessages.push(String(body.text ?? ''));
+        return Response.json({ ok: true, result: { message_id: 900 } });
+      }
+      if (url.pathname.endsWith('/setMessageReaction')) {
+        reactions.push((await req.json()) as Record<string, unknown>);
+        return Response.json({ ok: true, result: true });
+      }
+      return Response.json({ ok: true, result: true });
+    },
+  });
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // 1. A SCOPED question on PANE_ID — it has no timer (waits forever) and defers
+  //    only its own pane.
+  const askScoped = startAsk(cfgDir, server.port, {
+    requestId: 'q_scoped_safe',
+    agent: 'claude',
+    kind: 'question',
+    question: 'Scoped?',
+    options: [{ label: 'Y' }],
+  });
+  trackProc(reg, askScoped);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && scopedCb === '') await Bun.sleep(50);
+    expect(scopedCb).not.toBe('');
+  }
+
+  // 2. A message deferred behind the scoped question (this is the backlog the
+  //    sweep must NOT touch).
+  updateQueue.push([
+    { update_id: 60, message: { message_id: 61, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'keep me safe' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+  expect(injected(cfgDir)).toEqual([]); // deferred, not pasted
+
+  // 3. An UNSCOPED question opens too (defers ALL panes) and is NEVER answered, so
+  //    it expires on the short bound — triggering the #58 sweep.
+  const askUnscoped = startAsk(
+    cfgDir,
+    server.port,
+    { requestId: 'q_unscoped_expires', agent: 'claude', kind: 'question', question: 'Unscoped?', options: [{ label: 'Y' }] },
+    { unscoped: true },
+  );
+  trackProc(reg, askUnscoped);
+  await askUnscoped.exited; // the unscoped hook is released (null) when it expires
+
+  // 4. The sweep ran, but PANE_ID still has a pending (scoped) question, so the
+  //    guard SKIPPED it — no dead-letter of the scoped backlog. The negative window
+  //    below is sound because the sweep (onUnscopedAbandon) runs SYNCHRONOUSLY in
+  //    the expiry timer BEFORE the hook's `socket.end("null\n")` that unblocks the
+  //    ask subprocess — so by the time `askUnscoped.exited` above resolves, the
+  //    sweep has already happened; a (wrongly) sent notice would already be in
+  //    plainMessages. The extra 3s only absorbs the daemon→fake-server round trip.
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 3000 && !plainMessages.some((m) => m.includes('were NOT delivered'))) await Bun.sleep(50);
+  }
+  expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(false);
+  expect(daemonLogText(cfgDir)).not.toMatch(/dead-lettered \d+ queued message/);
+  expect(injected(cfgDir)).toEqual([]); // 'keep me safe' is still queued, not lost, not pasted
+
+  // 5. Answer the SCOPED question → its backlog flushes intact (the proof the
+  //    sweep left it alone).
+  updateQueue.push([
+    { update_id: 61, callback_query: { id: 'cbsafe', from: { id: 1, first_name: 'Alex' }, message: { message_id: scopedMsg, chat: { id: 1 }, date: nowSec }, data: scopedCb } },
+  ]);
+  await askScoped.exited;
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && injected(cfgDir).length < 1) await Bun.sleep(100);
+  }
+  expect(injected(cfgDir).some((l) => l.includes('keep me safe'))).toBe(true);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 40_000);
+
+// The unscoped sweep is wired into THREE removal paths (timeout / socket close /
+// send failure); the tests above exercise the timeout path. This one covers the
+// SOCKET-CLOSE path: an unscoped question whose hook process dies (fd closed)
+// BEFORE its bound elapses must still dead-letter its idle-pane backlog. Without
+// the `else onUnscopedAbandon()` in the close handler this regresses to the
+// silent loss #58 fixes — and no timeout-based test would catch it.
+test('an UNSCOPED question abandoned by SOCKET CLOSE (process dies) dead-letters its idle backlog (tg-cli#58, close path)', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const plainMessages: string[] = [];
+  // A long bound so the SOCKET CLOSE — not the timer — is unambiguously the path
+  // that fires the sweep (the kill below happens well before 60s elapses).
+  const server = recordingServer(updateQueue, reactions, edits, plainMessages);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: '60000' });
+
+  const ask = startAsk(
+    cfgDir,
+    server.port,
+    { requestId: 'q_unscoped_close', agent: 'claude', kind: 'question', question: 'Proceed?', options: [{ label: 'Yes' }] },
+    { unscoped: true },
+  );
+  trackProc(reg, ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  // Inbound defers behind the open unscoped question.
+  updateQueue.push([
+    { update_id: 70, message: { message_id: 71, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'die with me' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+  expect(injected(cfgDir)).toEqual([]); // deferred
+
+  // The agent process dies (socket close) with NO answer, WELL before the 60s
+  // bound. The close handler must run the unscoped sweep and dead-letter the pane.
+  ask.kill(9);
+  await ask.exited;
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !plainMessages.some((m) => m.includes('were NOT delivered'))) await Bun.sleep(50);
+  }
+  expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(true);
+  expect(injected(cfgDir)).toEqual([]); // 'die with me' never pasted into the dead prompt
 
   daemon.kill('SIGTERM');
   await daemon.exited;
