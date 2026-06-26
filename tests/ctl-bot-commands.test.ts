@@ -51,6 +51,7 @@ test('the menu carries the user-facing routing commands', () => {
   const names = botCommandNames();
   // /agent is the headline of the ask ("/agent и другие команды добавь в меню").
   expect(names).toContain('agent');
+  expect(names).toContain('new');
   expect(names).toContain('stop');
   expect(names).toContain('kill');
   expect(names).toContain('status');

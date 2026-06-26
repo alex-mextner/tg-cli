@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.19.0
+
+A new **`/new` slash command** (tg-cli#27) spawns a fresh agent session straight from
+the flat chat: `/new [<model>] [<dir>] <name> [<task>]`. Omitted parts are chosen
+interactively via inline buttons — a recent-project picker for `<dir>` (the in-use
+project dirs **and their `..` parents**, normalized, deduped, LRU/MRU-ranked) and a
+model picker for `<model>`. A `<name>` that collides with a live tmux window is a
+non-blocking warning. With name + dir + model all supplied the agent spawns
+immediately, passing the optional `<task>` as its initial prompt; otherwise the
+daemon walks the interactive flow. This is the NON-topic sibling of the forum-topics
+`/new` flow: it carries its own in-memory pending-state machine and its own button
+callbacks (`tnm:`/`tnp:`), so it never collides with the topic flow, and it works
+regardless of `control.topics`. The whole feature is fail-soft (no path is allowed
+to throw into the poll loop) and 1:1 routing stays byte-identical when no `/new` is
+in flight.
+
 ## 1.18.2
 
 An **unscoped** forwarded question (the hook ran without `TMUX_PANE`) that expires

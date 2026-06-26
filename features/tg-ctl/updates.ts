@@ -14,6 +14,8 @@ import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatu
 import { parseButtonCallback } from './questions';
 import { parseAgentCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
+import { parseNewCommand, parseNewDirCallback, parseNewModelCallback } from './new-command';
+import { botCommandNames } from './bot-commands';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
 const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
@@ -38,6 +40,13 @@ export interface StepOpts {
   // /new answer — without owning the binding store (the entrypoint owns it, like routes).
   topicsEnabled?: boolean;
   topicStatusOf?: (threadId: number) => TopicStatus | null;
+  // Flat-chat `/new` command (issue #27). The `/new` slash is ALWAYS recognized (it's a real bot
+  // command, not gated by topics mode). `newSessionAwaitingDir` is injected by the entrypoint and
+  // returns true while a flat `/new` is in its awaiting-dir step — so a plain text message is a
+  // path ANSWER to it rather than an inject. The entrypoint owns the pending-session store (in
+  // memory), like it owns routes/topics. Unset → no /new in flight → plain text injects as normal,
+  // keeping 1:1 byte-identical when the feature isn't triggered.
+  newSessionAwaitingDir?: () => boolean;
 }
 
 // Default quote-anchor time format: deterministic UTC `YYYY-MM-DD HH:MM`.
@@ -165,6 +174,31 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
           continue;
         }
       }
+      // Flat-chat /new taps (tnm: model, tnp: recent-dir) route the new-session flow. NOT gated by
+      // topics mode — /new is a flat-chat command. A stale tap whose session expired is rejected by
+      // the entrypoint (no pending session → "expired"), never spawns.
+      const newModelCb = parseNewModelCallback(cb.data);
+      if (newModelCb) {
+        callbackActions.push({
+          kind: 'new-model',
+          callbackQueryId: cb.id,
+          token: newModelCb.token,
+          modelId: newModelCb.modelId,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
+      }
+      const newDirCb = parseNewDirCallback(cb.data);
+      if (newDirCb) {
+        callbackActions.push({
+          kind: 'new-dir',
+          callbackQueryId: cb.id,
+          token: newDirCb.token,
+          index: newDirCb.index,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
+      }
       // /agent selection taps (tga:…) route first; q→buttons taps (tgq:…) next.
       const agentCb = parseAgentCallback(cb.data);
       if (agentCb) {
@@ -242,18 +276,32 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
 
     let action: Action | null = null;
     if (m.text) {
-      // A reply carrying prose forwards the quote anchor (items 2,3) via
-      // reply-route — the daemon picks the recognized origin pane or a LRU/MRU
-      // picker. A reply whose text is a /command still runs the command verbatim.
-      action =
-        m.reply_to_message && !m.text.startsWith('/')
-          ? {
-              kind: 'reply-route',
-              replyToMessageId: m.reply_to_message.message_id,
-              injectText: buildReplyInject(m, name, opts),
-              from: name,
-            }
-          : textAction(m.text, name, opts, m.message_id);
+      // POSITIVE gate (review #1): a flat-`/new` dir answer is an ABSOLUTE PATH — `startsWith('/')` —
+      // that is NOT one of the daemon's own slash-commands, and is not a reply. Gating on the path
+      // FORM (not `!isLikelySlashCommand`) fixes two inversions: (a) ordinary prose to the agent
+      // (`fix the bug`) is NOT swallowed while a /new is pending — it falls through to the normal
+      // inject, so a forgotten /new can't mute 1:1 routing; (b) a single-component path (`/tmp`,
+      // `/srv`) IS accepted (it starts with `/` and isn't a command), where the old
+      // isLikelySlashCommand test wrongly rejected it. A real /command (`/status`, a second `/new`)
+      // or a reply is never consumed as the answer. Topic messages (control.topics on) are already
+      // routed + `continue`d by the topics block above, so they never reach this gate. (issue #27)
+      const isDirAnswerCandidate = !m.reply_to_message && m.text.startsWith('/') && !isDaemonSlashCommand(m.text);
+      if (isDirAnswerCandidate && (opts.newSessionAwaitingDir?.() ?? false)) {
+        action = { kind: 'new-answer', text: m.text, from: name, messageId: m.message_id };
+      } else {
+        // A reply carrying prose forwards the quote anchor (items 2,3) via
+        // reply-route — the daemon picks the recognized origin pane or a LRU/MRU
+        // picker. A reply whose text is a /command still runs the command verbatim.
+        action =
+          m.reply_to_message && !m.text.startsWith('/')
+            ? {
+                kind: 'reply-route',
+                replyToMessageId: m.reply_to_message.message_id,
+                injectText: buildReplyInject(m, name, opts),
+                from: name,
+              }
+            : textAction(m.text, name, opts, m.message_id);
+      }
     } else if (m.voice ?? m.audio) action = voiceAction(u.update_id, m, name, opts);
     else if (m.photo?.length) action = photoAction(u.update_id, m, name);
     else if (m.document) action = documentAction(u.update_id, m, name);
@@ -278,6 +326,22 @@ function senderAllowed(sender: number | undefined, opts: StepOpts): boolean {
   return sender !== undefined && (sender === opts.chatId || opts.cfg.allowedSenders.includes(sender));
 }
 
+// The daemon's OWN slash-commands (the verbs textAction handles). Used to tell a `/new` dir answer
+// (an absolute path) apart from a control command typed mid-flow: a `/status` while a /new awaits its
+// dir is still the command, not a path. Matched on the first whitespace token (tolerating
+// /cmd@botname). A path like `/tmp` or `/Users/...` is NOT in this set, so it reads as a dir answer.
+//
+// DERIVED from botCommandNames() — the SINGLE SOURCE OF TRUTH the ctl-bot-commands test pins to the
+// set of verbs textAction actually dispatches (review #1: a hand-kept parallel list would silently
+// drift, mis-routing a newly-handled command into the agent as a passthrough mid-/new). A new daemon
+// command added to BOT_COMMANDS therefore lands here automatically.
+const DAEMON_SLASH_COMMANDS = new Set(botCommandNames().map((c) => `/${c}`));
+function isDaemonSlashCommand(text: string): boolean {
+  if (!text.startsWith('/')) return false;
+  const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
+  return DAEMON_SLASH_COMMANDS.has(verb);
+}
+
 // Command-vs-prompt split (spec §13). Verbs match on the first whitespace
 // token; unknown slash commands pass through VERBATIM so the harness
 // interprets its own (/compact, /clear, …) — no wrap on those.
@@ -291,6 +355,10 @@ function textAction(text: string, name: string, opts: StepOpts, messageId: numbe
     if (cmd === '/agent') {
       const p = parseAgentCommand(text);
       return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name };
+    }
+    if (cmd === '/new') {
+      const p = parseNewCommand(text);
+      return { kind: 'new-command', model: p.model, dir: p.dir, name: p.name, task: p.task, from: name };
     }
     return { kind: 'inject-text', text };
   }

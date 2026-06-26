@@ -222,7 +222,24 @@ export type Action =
   | { kind: 'topic-dead'; threadId: number; injectText: string; messageId: number }
   // Topic closed / reopened service messages → mark the binding (entrypoint persists).
   | { kind: 'topic-close'; threadId: number }
-  | { kind: 'topic-reopen'; threadId: number };
+  | { kind: 'topic-reopen'; threadId: number }
+  // --- flat-chat /new command (issue #27; NON-topic) ---
+  // A `/new [<model>] [<dir>] name [<task>]` slash command in the flat chat → start the
+  // interactive new-session flow (ask dir, then model, then spawn). All parts but `name` are
+  // optional; omitted model/dir are picked via inline buttons. Distinct from topic-new (which is
+  // keyed to a forum threadId) — a flat /new carries no thread, so the entrypoint mints a token.
+  | { kind: 'new-command'; model: string | null; dir: string | null; name: string; task: string; from: string }
+  // A tap on a flat-/new model button (tnm:<token>:<modelId>) → spawn the agent with that model.
+  // callbackQueryId answers the tap; messageId is the prompt (its keyboard is cleared on spawn).
+  | { kind: 'new-model'; callbackQueryId: string; token: string; modelId: string; messageId: number | null }
+  // A tap on a flat-/new recent-dir button (tnp:<token>:<index>) → resolve the index against the
+  // pending session's dirChoices and advance like a typed path. callbackQueryId answers the tap.
+  | { kind: 'new-dir'; callbackQueryId: string; token: string; index: number; messageId: number | null }
+  // A free-text message answering an in-flight flat-/new prompt (the awaiting-dir step — an
+  // absolute path typed instead of tapping a button). `text` is the raw user text. The entrypoint
+  // matches it to the SINGLE pending session in awaiting-dir (a flat chat has at most one /new in
+  // flight at a time); a stray one with no pending session falls through to normal handling.
+  | { kind: 'new-answer'; text: string; from: string; messageId: number };
 
 export interface StepResult {
   actions: Action[];
