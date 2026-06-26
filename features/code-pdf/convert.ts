@@ -577,9 +577,20 @@ a { color: #0a66c2; }
 // The formatting tags the report needs (<b>/<i>/<code>/<h1>/<table>/<ul>/
 // <blockquote>/…) are untouched. Defense-in-depth alongside the DNS blackhole:
 // the blackhole stops a remote fetch; these two layers stop code from running.
+//
+// FIXED-POINT loop: a SINGLE replace pass is bypassable by overlap — removing an
+// inner match can re-form an outer one (`<scr<script>ipt>` → `<script>`,
+// `<<script>script>` → `<script>`). Repeating the strip until the string stops
+// changing closes that nesting bypass (and clears CodeQL's
+// js/incomplete-multi-character-sanitization, which flags single-pass regex
+// HTML sanitizers for exactly this reason). Each pass strictly shrinks the
+// string until stable; the iteration cap only guards a pathological input.
 export function sanitizeReportHtml(html: string): string {
-  return (
-    html
+  let prev = '';
+  let cur = html;
+  for (let i = 0; cur !== prev && i < 100; i++) {
+    prev = cur;
+    cur = cur
       // Element blocks whose CONTENT must go too (open-tag…close-tag, any case,
       // across newlines). [^] matches any char incl. newline (s-flag-free). The
       // block scan reaches the matching </tag>, so a `>` inside an attribute
@@ -592,8 +603,9 @@ export function sanitizeReportHtml(html: string): string {
       .replace(
         /<\/?(script|style|iframe|object|embed|link|meta|base|svg|math|use|image|animate|animateTransform|animateMotion|animateColor|set|foreignObject)\b[^>]*>/gi,
         '',
-      )
-  );
+      );
+  }
+  return cur;
 }
 
 // Remove `on*=` event-handler ATTRIBUTES from start-tags. Designed to run on

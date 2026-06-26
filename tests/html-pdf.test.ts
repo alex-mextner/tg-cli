@@ -334,6 +334,20 @@ test('sanitizeReportHtml: a <foreignObject> (arbitrary-HTML embed) tag is stripp
   expect(out).toContain('<p>z</p>');
 });
 
+test('sanitizeReportHtml: NESTING bypass — a single pass that re-forms a tag is fully stripped (fixed point)', () => {
+  // The classic single-pass-sanitizer bypass: removing the inner match re-forms
+  // an outer <script> (`<scr<script>ipt>` -> `<script>`). The fixed-point loop
+  // repeats until stable, so NO <script>/<iframe> survives. (CodeQL
+  // js/incomplete-multi-character-sanitization regression.)
+  expect(sanitizeReportHtml('<scr<script>ipt>alert(1)')).not.toMatch(/<script/i);
+  expect(sanitizeReportHtml('<<script>script>')).not.toMatch(/<script/i);
+  expect(sanitizeReportHtml('<ifr<iframe>ame src="x">')).not.toMatch(/<iframe/i);
+  // A real report with a stray nested form still keeps its legitimate formatting.
+  const out = sanitizeReportHtml('<b>ok</b><scr<script>ipt>steal()</scr</script>ipt>');
+  expect(out).not.toMatch(/<script/i);
+  expect(out).toContain('<b>ok</b>');
+});
+
 // --- Sanitizer LAYER 2 (stripEventHandlerAttrs): strip on*= on pandoc output --
 // Runs on pandoc's NORMALIZED html5 (every attribute double-quoted; any `>` in a
 // value escaped to `&gt;`), where the tag boundary is sound. This closes the
