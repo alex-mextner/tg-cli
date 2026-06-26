@@ -84,7 +84,7 @@ import {
 } from "./features/tg-ctl/routes"
 import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
 import { inboundHistoryRecords } from "./features/replies/inbound"
-import { stepUpdates } from "./features/tg-ctl/updates"
+import { isLikelySlashCommand, stepUpdates } from "./features/tg-ctl/updates"
 import {
   appendTopic,
   applyModelAnswer,
@@ -106,6 +106,14 @@ import {
   slugifyTopicName,
 } from "./features/tg-ctl/topics"
 import { findModel, MODEL_CATALOG, spawnArgv } from "./features/tg-ctl/models"
+import {
+  buildNewDirKeyboard,
+  buildNewModelKeyboard,
+  nameCollides,
+  parseNewCommand,
+  rankNewDirChoices,
+  type NewSession,
+} from "./features/tg-ctl/new-command"
 import {
   buildFasterWhisperArgv,
   buildFfmpegArgv,
@@ -1659,6 +1667,32 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   >()
   let agentTokenSeq = 0
+  // Flat-chat `/new` sessions in flight (issue #27), keyed by an opaque token. IN-MEMORY only:
+  // a `/new` interrupted by a daemon restart is simply abandoned (the user re-runs it) — far
+  // simpler than the crash-recovery the PERSISTENT forum-topic bindings need, because a flat /new
+  // creates a plain pane (addressed by /agent afterwards), not a tracked binding. Sessions older
+  // than NEW_SESSION_TTL_MS are reaped lazily so an abandoned awaiting-dir can't capture a much
+  // later plain message as its "path answer".
+  const pendingNew = new Map<string, NewSession>()
+  let newTokenSeq = 0
+  const NEW_SESSION_TTL_MS = 10 * 60_000
+  // Reap expired /new sessions (lazy GC, called before each read of the store). Keeps an
+  // abandoned awaiting-dir from later swallowing an unrelated plain message as a path answer.
+  const reapNewSessions = (): void => {
+    const cutoff = Math.floor(Date.now() / 1000) - NEW_SESSION_TTL_MS / 1000
+    for (const [tok, s] of pendingNew) {
+      if (s.ts < cutoff) pendingNew.delete(tok)
+    }
+  }
+  // True while at least one /new session is awaiting its working directory — so stepUpdates
+  // treats the next plain prose message as the typed path answer (injected via newSessionAwaitingDir).
+  const newSessionAwaitingDir = (): boolean => {
+    reapNewSessions()
+    for (const s of pendingNew.values()) {
+      if (s.status === "awaiting-dir") return true
+    }
+    return false
+  }
   // Inbound queued behind an agent's outstanding question (defer-while-waiting):
   // pane → already-wrapped texts, flushed when the question is answered. The
   // flag tells the trailing `ack` to mark the source message with DEFER_REACTION
@@ -3142,6 +3176,287 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return markBound(binding, orphan.paneId, ts)
   }
 
+  // --- flat-chat `/new` command (issue #27, NON-topic) ---
+  // The flat sibling of the forum-topics /new flow: a `/new [<model>] [<dir>] name [<task>]`
+  // slash command in the flat chat spawns a fresh agent in a named tmux window. SAFETY (this is
+  // the CTO's daily lifeline): every step is exception-guarded — a bad path, missing tmux, unknown
+  // model, or spawn error NEVER throws into the poll loop; it logs and replies, leaving the pending
+  // session so the user can retry/answer again. Unlike the topic flow there is NO persistent
+  // binding: once the agent spawns the pending session is deleted (the new pane is a plain pane,
+  // addressed by /agent afterwards). The pending store is in-memory (pendingNew).
+
+  // The recent project dirs to offer as `/new` dir buttons, parents-aware + LRU/MRU (issue #27).
+  // Source = the same routes + per-pane registrations gatherRecentPaths uses (already newest-first),
+  // but rankNewDirChoices ALSO adds each cwd's `..` parents. Best-effort: any read error → [].
+  const gatherNewDirChoices = (): string[] => {
+    try {
+      const stamped: Array<{ cwd: string | undefined; ts: number }> = [
+        ...parseRoutes(readFileOrNull(ctx.paths.routes)).map((r) => ({ cwd: r.cwd, ts: r.ts })),
+        ...parseRegistrations(readFileOrNull(ctx.paths.registration)).map((r) => ({ cwd: r.cwd, ts: r.registeredAt ?? 0 })),
+      ]
+      stamped.sort((a, b) => b.ts - a.ts) // newest first
+      return rankNewDirChoices(stamped.map((s) => s.cwd), (p) => isAbsolute(p) && isExistingDirectory(p))
+    } catch (err) {
+      log(`gatherNewDirChoices failed: ${err}`)
+      return []
+    }
+  }
+
+  // The live tmux window names (for the name-uniqueness warning). Best-effort → [] on any flake.
+  const liveWindowNames = (): string[] => {
+    try {
+      return snapshot().panes.map((p) => p.windowName).filter((n) => n.length > 0)
+    } catch {
+      return []
+    }
+  }
+
+  // Spawn a flat `/new` agent into a named tmux window and return the pane id, or a typed error.
+  // Mirrors spawnTopicWindow but WITHOUT TG_TOPIC (a flat /new agent is not bound to a topic — it
+  // registers itself normally via `tg` and is addressed by /agent). When a task is given it is the
+  // agent's initial prompt argv (claude accepts a positional prompt), so the agent starts working
+  // immediately. Fully guarded: a throw or non-zero exit becomes a typed error, never an exception.
+  const spawnNewWindow = (
+    windowSlug: string,
+    path: string,
+    model: string,
+    task: string,
+    spawnToken: string,
+  ): { ok: true; paneId: string } | { ok: false; error: string } => {
+    const baseArgv = spawnArgv(model, path)
+    if (!baseArgv) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
+    // Append the initial task as a positional prompt, after a `--` end-of-options separator (review
+    // #1): without `--`, a task beginning with a dash (`--continue`, `-p`, …) would be parsed by the
+    // agent as a FLAG, not a prompt — the agent would mis-launch or run an unintended action. `--`
+    // makes everything after it positional. A discrete argv element (never shell-split), so a task
+    // with spaces/quotes is also safe.
+    const argv = task.trim().length > 0 ? [...baseArgv, "--", task.trim()] : baseArgv
+    try {
+      const session = sessionForSpawn()
+      const tmuxArgv = [
+        "tmux",
+        "new-window",
+        ...(session ? ["-t", session] : []),
+        // Stamp the per-spawn token into the window env too, mirroring the topic spawn — harmless
+        // for a flat /new (no reconcile depends on it) but keeps spawn provenance greppable.
+        "-e",
+        `TG_SPAWN_TOKEN=${spawnToken}`,
+        "-n",
+        windowSlug,
+        "-c",
+        path,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "--",
+        ...argv,
+      ]
+      const proc = Bun.spawnSync(tmuxArgv, { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+      if (proc.exitCode !== 0) {
+        return { ok: false, error: `couldn't start the agent (tmux: ${proc.stderr.toString().trim() || `exit ${proc.exitCode}`})` }
+      }
+      const paneId = proc.stdout.toString().trim()
+      if (!paneId) return { ok: false, error: "tmux did not return a pane id — agent not started" }
+      return { ok: true, paneId }
+    } catch (err) {
+      return { ok: false, error: `couldn't start the agent (${err})` }
+    }
+  }
+
+  // Post the dir-pick prompt for a pending /new session (recent dirs as buttons + free-text). The
+  // session is already stored (awaiting-dir); this offers the choices and records the prompt id.
+  const askNewDir = async (session: NewSession): Promise<void> => {
+    const choices = gatherNewDirChoices()
+    session.dirChoices = choices
+    const extra: Record<string, unknown> =
+      choices.length > 0 ? { reply_markup: { inline_keyboard: buildNewDirKeyboard(session.token, choices) } } : {}
+    const prompt =
+      choices.length > 0
+        ? `New agent \`${session.name}\`. Pick a recent project below, or send an absolute path (e.g. /Users/you/project).`
+        : `New agent \`${session.name}\`. Which directory should it work in? Send an absolute path (e.g. /Users/you/project).`
+    session.promptMessageId = await sendMessage(ctx, prompt, extra)
+  }
+
+  // Post the model-pick prompt for a pending /new session (one button per catalog model).
+  const askNewModel = async (session: NewSession): Promise<void> => {
+    session.status = "awaiting-model"
+    session.ts = Math.floor(Date.now() / 1000)
+    session.promptMessageId = await sendMessage(ctx, `Which model should \`${session.name}\` run?`, {
+      reply_markup: { inline_keyboard: buildNewModelKeyboard(session.token) },
+    })
+  }
+
+  // Do the actual spawn for a session that has name + dir + model, then DELETE the session (the
+  // agent is now a plain pane). On a spawn failure the session stays awaiting-model so a re-tap can
+  // retry without losing dir/name. Clears the prompt keyboard on success so it can't be re-tapped.
+  const spawnNewSession = async (session: NewSession, modelId: string, promptMessageId: number | null): Promise<boolean> => {
+    if (!session.dir || !isAbsolute(session.dir) || !isExistingDirectory(session.dir)) {
+      // The dir vanished between the prompt and now → back to awaiting-dir so the user re-picks.
+      // Clear the stale MODEL keyboard first (review #6) so the user isn't left with two live sets.
+      if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+      session.status = "awaiting-dir"
+      session.ts = Math.floor(Date.now() / 1000)
+      await sendMessage(ctx, `\`${session.dir ?? "(none)"}\` is not an absolute existing directory — send a full path like /Users/you/project.`)
+      await askNewDir(session)
+      return false
+    }
+    const slug = slugifyTopicName(session.name, 0)
+    const spawnToken = `new-${session.token}-${Math.floor(Date.now() / 1000)}`
+    const spawned = spawnNewWindow(slug, session.dir, modelId, session.task, spawnToken)
+    if (!spawned.ok) {
+      // Spawn FAILED → leave the session retryable AND re-post the model keyboard (review #3): the
+      // "immediate spawn" path (model+dir supplied on the /new line) never sent a keyboard, so
+      // without re-asking there'd be nothing to re-tap and the session would just rot to TTL. Clear
+      // the OLD model keyboard first (review #5) so the user isn't left with two live button sets.
+      if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+      await sendMessage(ctx, spawned.error)
+      await askNewModel(session) // sets status=awaiting-model, posts the (fresh) model buttons
+      return false
+    }
+    stampSpawnToken(spawned.paneId, spawnToken)
+    pendingNew.delete(session.token)
+    if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+    const taskNote = session.task.trim().length > 0 ? ` with task: ${session.task.trim()}` : ""
+    await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`)${taskNote} — use \`/agent ${slug}\` to talk to it`)
+    return true
+  }
+
+  // A `/new [<model>] [<dir>] name [<task>]` command → start (or short-circuit) the flow. With a
+  // name+dir+model all supplied the agent spawns immediately; otherwise the missing piece is asked
+  // via buttons. A name collision with a live window is a non-fatal WARNING (tmux allows dup names).
+  const handleNewCommand = async (action: Extract<Action, { kind: "new-command" }>): Promise<boolean> => {
+    if (!action.name) {
+      await sendMessage(ctx, "usage: /new [<model>] [<dir>] <name> [<task>] — e.g. `/new opus /Users/you/app api fix the build`")
+      return false
+    }
+    // Name-uniqueness WARNING (issue #27): warn if the resulting window slug collides, don't block.
+    const slug = slugifyTopicName(action.name, 0)
+    if (nameCollides(slug, liveWindowNames())) {
+      await sendMessage(ctx, `⚠️ a window named \`${slug}\` already exists — the new agent will share the name. Continuing.`)
+    }
+    // A flat chat has at most ONE /new in flight (review #2): a second /new REPLACES any prior
+    // pending session, so a typed path can never be mis-applied to a stale earlier session that the
+    // user has visibly abandoned by starting over. Button taps are token-addressed and unaffected.
+    pendingNew.clear()
+    // Validate a supplied dir up front; an invalid one is dropped (→ asked) rather than failing.
+    let dir = action.dir
+    if (dir && (!isAbsolute(dir) || !isExistingDirectory(dir))) {
+      await sendMessage(ctx, `\`${dir}\` is not an absolute existing directory — pick one below or send a full path.`)
+      dir = null
+    }
+    const token = `n${++newTokenSeq}`
+    const session: NewSession = {
+      token,
+      name: action.name,
+      status: dir ? "awaiting-model" : "awaiting-dir",
+      task: action.task,
+      ts: Math.floor(Date.now() / 1000),
+      ...(dir ? { dir } : {}),
+    }
+    pendingNew.set(token, session)
+    // Model already supplied AND dir resolved → spawn straight away (no buttons).
+    if (dir && action.model && findModel(action.model)) {
+      session.model = action.model
+      return spawnNewSession(session, action.model, null)
+    }
+    // Model supplied but dir missing → ask dir; we'll spawn with the supplied model once dir lands.
+    if (action.model && findModel(action.model)) session.model = action.model
+    if (dir) await askNewModel(session)
+    else await askNewDir(session)
+    return true
+  }
+
+  // A typed path answer to an awaiting-dir /new session. Matches the SINGLE awaiting-dir session
+  // (a flat chat has at most one /new in flight). Validates the abs path, then advances: if a model
+  // was already supplied on the command line, spawn now; else ask the model.
+  const handleNewAnswer = async (action: Extract<Action, { kind: "new-answer" }>): Promise<boolean> => {
+    reapNewSessions()
+    // The NEWEST awaiting-dir session owns the typed path (review #2): even though handleNewCommand
+    // clears prior sessions on a fresh /new, take the newest as a belt-and-suspenders so the path
+    // always lands on the prompt the user is actually answering.
+    const session = [...pendingNew.values()]
+      .filter((s) => s.status === "awaiting-dir")
+      .sort((a, b) => b.ts - a.ts)[0]
+    if (!session) return false // no /new awaiting a dir — defensive (stepUpdates only emits when one is)
+    const path = action.text.trim()
+    // Reject the filesystem ROOT as a typed cwd (review #4): the dir BUTTONS already exclude `/`
+    // (parentDirs stops above root — spawning an agent at `/` is never the intent), so mirror that
+    // guard for a typed `/` instead of letting it slip past `isExistingDirectory('/')`.
+    if (path === "/") {
+      await sendMessage(ctx, "the filesystem root `/` isn't a project directory — send a real project path like /Users/you/project.")
+      return false
+    }
+    if (!path || !isAbsolute(path) || !isExistingDirectory(path)) {
+      // The text isn't a usable directory. A BARE `/word` (isLikelySlashCommand) is most likely a
+      // HARNESS passthrough command — `/compact`, `/clear` — meant for the live 1:1 agent, NOT a
+      // path attempt (review #1, second pass): so inject it through instead of erroring, preserving
+      // 1:1 passthrough even mid-/new. The session stays awaiting-dir (the user can still answer the
+      // dir prompt). A `/path/with/slashes` that doesn't exist IS a genuine bad-path attempt → the
+      // dir error. An empty / non-slash answer (the stepUpdates gate only emits slash text, but be
+      // defensive) also re-asks.
+      if (path.startsWith("/") && isLikelySlashCommand(path)) {
+        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, path), path, true)
+      }
+      await sendMessage(ctx, `\`${path || "(empty)"}\` is not an absolute path to an existing directory — send a full path like /Users/you/project.`)
+      return false
+    }
+    session.dir = path
+    session.ts = Math.floor(Date.now() / 1000)
+    if (session.promptMessageId != null) await clearMessageKeyboard(ctx, session.promptMessageId)
+    // If a model was supplied on the /new line, spawn immediately; else ask the model.
+    if (session.model && findModel(session.model)) return spawnNewSession(session, session.model, null)
+    await askNewModel(session)
+    return true
+  }
+
+  // A recent-dir button tap (tnp:<token>:<index>) → resolve the index against the session's
+  // dirChoices and advance like a typed path. A stale/forged tap (no session, wrong state, bad
+  // index, vanished dir) re-asks rather than spawning into a guessed dir.
+  const handleNewDir = async (action: Extract<Action, { kind: "new-dir" }>): Promise<boolean> => {
+    reapNewSessions()
+    const session = pendingNew.get(action.token)
+    if (!session || session.status !== "awaiting-dir") {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "that menu expired — send a directory")
+      return false
+    }
+    const path = session.dirChoices?.[action.index]
+    if (!path || !isAbsolute(path) || !isExistingDirectory(path)) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "that path is gone — send one")
+      await sendMessage(ctx, `\`${path ?? "(unknown)"}\` is no longer an existing directory — send an absolute path.`)
+      return false
+    }
+    await answerCallbackQuery(ctx, action.callbackQueryId, "ok")
+    session.dir = path
+    session.ts = Math.floor(Date.now() / 1000)
+    if (action.messageId !== null) await clearMessageKeyboard(ctx, action.messageId)
+    if (session.model && findModel(session.model)) return spawnNewSession(session, session.model, null)
+    await askNewModel(session)
+    return true
+  }
+
+  // A model button tap (tnm:<token>:<modelId>) → spawn the agent with that model. Refuses an
+  // unknown model id (stale/forged callback) and an out-of-state session (already spawned / gone).
+  const handleNewModel = async (action: Extract<Action, { kind: "new-model" }>): Promise<boolean> => {
+    reapNewSessions()
+    const session = pendingNew.get(action.token)
+    if (!session) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired — run /new again")
+      return false
+    }
+    if (session.status !== "awaiting-model" || !session.dir) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "send a directory first")
+      return false
+    }
+    if (!findModel(action.modelId)) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "unknown model")
+      await sendMessage(ctx, `unknown model \`${action.modelId}\` — pick a model again`)
+      return false
+    }
+    await answerCallbackQuery(ctx, action.callbackQueryId, "starting…")
+    session.model = action.modelId
+    return spawnNewSession(session, action.modelId, action.messageId)
+  }
+
   // --- crash-window orphan reconcile (docs/specs/tg-forum-topics.md §9 increment 4) ---
   // CRASH GAP (spec §9.4a): handleTopicModel persists awaiting-model → `tmux new-window` →
   // persists `bound`. A daemon crash BETWEEN a successful new-window and the `bound` write leaves
@@ -3484,6 +3799,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return handleTopicPath(action)
       case "topic-respawn":
         return handleTopicRespawn(action)
+      case "new-command":
+        return handleNewCommand(action)
+      case "new-answer":
+        return handleNewAnswer(action)
+      case "new-dir":
+        return handleNewDir(action)
+      case "new-model":
+        return handleNewModel(action)
       case "ack":
         if (lastWasDeferred) {
           lastWasDeferred = false
@@ -3568,6 +3891,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // topicStatusOf reads the binding store so topic messages route per-topic.
         topicsEnabled: ctx.cfg.topics,
         topicStatusOf: ctx.cfg.topics ? topicStatusOf : undefined,
+        // Flat /new (issue #27): always wired (not gated by topics) — a plain message while a
+        // /new awaits its dir is the typed path. When no /new is in flight this is false and the
+        // plain-text path is byte-identical to before.
+        newSessionAwaitingDir,
       })
 
       // At-most-once (spec §10): persist the offset BEFORE acting. A crash

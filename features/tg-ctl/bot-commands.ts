@@ -31,6 +31,7 @@ const COMMAND_RE = new RegExp(`^[a-z0-9_]{1,${MAX_COMMAND_LEN}}$`);
 // The published menu. Order = the order shown in the Telegram client.
 export const BOT_COMMANDS: readonly BotCommand[] = [
   { command: 'agent', description: 'Route a message to a specific agent (or pick from buttons)' },
+  { command: 'new', description: 'Spawn a new agent session: /new [model] [dir] name [task]' },
   { command: 'stop', description: 'Interrupt the current agent turn — session survives' },
   { command: 'kill', description: 'End the agent session (SIGINT)' },
   { command: 'status', description: 'Report daemon state' },
