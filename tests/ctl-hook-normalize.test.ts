@@ -52,6 +52,37 @@ test('AskUserQuestion with no concrete options → null', () => {
   expect(req).toBeNull();
 });
 
+test('AskUserQuestion delivered via the PermissionRequest matcher → null (no double-cover, tg-cli#97)', () => {
+  // Claude installs BOTH a PreToolUse:AskUserQuestion matcher AND a
+  // PermissionRequest:* catch-all, so an AskUserQuestion fires the hook twice and
+  // both copies normalize to the SAME stable requestId. Only the PreToolUse copy
+  // forwards; the PermissionRequest-delivered copy must drop so a re-fire after the
+  // answer can't post a second, "expired"-reading card.
+  const payload = {
+    session_id: 'abcdef123456',
+    cwd: '/proj',
+    hook_event_name: 'PermissionRequest',
+    tool_name: 'AskUserQuestion',
+    tool_input: {
+      questions: [{ header: 'Deploy', question: 'Where to deploy?', options: [{ label: 'Staging' }, { label: 'Prod' }] }],
+    },
+  };
+  expect(normalizeHookPayload(payload, env)).toBeNull();
+
+  // The dedicated PreToolUse copy of the very same question still forwards.
+  expect(normalizeHookPayload({ ...payload, hook_event_name: 'PreToolUse' }, env)).toMatchObject({
+    kind: 'question',
+    question: 'Where to deploy?',
+  });
+
+  // Back-compat: a payload with NO hook_event_name (manual callers / very old
+  // installs that never wrote the event) is NOT the PermissionRequest catch-all,
+  // so it must still forward — the drop is strictly the PermissionRequest copy.
+  const { hook_event_name, ...noEvent } = payload;
+  void hook_event_name;
+  expect(normalizeHookPayload(noEvent, env)).toMatchObject({ kind: 'question', question: 'Where to deploy?' });
+});
+
 test('PermissionRequest → permission with a tool + command summary', () => {
   const req = normalizeHookPayload(
     { session_id: 'sid', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'rm -rf /tmp/x' } },

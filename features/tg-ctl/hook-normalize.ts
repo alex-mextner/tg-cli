@@ -116,6 +116,15 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
 
   // Claude Code AskUserQuestion → a single concrete question with options.
   if (toolName === 'AskUserQuestion' && input) {
+    // AskUserQuestion is forwarded ONLY via its dedicated PreToolUse matcher. The
+    // `PermissionRequest *` catch-all (hook-install.ts) ALSO fires for it and
+    // re-normalizes to the SAME stable requestId. Once the PreToolUse card is
+    // answered the in-flight dedup key is freed, so this PermissionRequest copy
+    // would post a SECOND, superseded card whose tap reads as "expired" (tg-cli#97).
+    // Drop the PermissionRequest-delivered copy so exactly one hook forwards each
+    // AskUserQuestion. (Manual / back-compat callers leave hook_event_name unset
+    // and still pass through.)
+    if (p.hook_event_name === 'PermissionRequest') return null;
     const questions = input.questions;
     if (!Array.isArray(questions) || questions.length !== 1) return null; // multi-question → local UI
     const q = asRecord(questions[0]);
