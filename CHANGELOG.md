@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.19.3
+
+**Fix (tg-cli#95): `tg --file report.html` now renders a FORMATTED PDF instead
+of printing raw HTML tags.** An attached `.html`/`.htm` file is a Telegram-subset
+HTML *report* meant to be rendered, but it matched `CODE_EXT_LANG` and took the
+code-as-pdf path, which fenced the whole file into a syntax-highlighted code
+block — so the PDF showed literal `<b>`/`<code>`/`<table>`/`<h1>` tags as
+monospace text. `.html`/`.htm` now take a new HTML→PDF render path
+(`convertHtmlToPdf`): pandoc `-f html` parses the document and Chrome prints it,
+so the tags become real bold/italic/headings/tables/lists/code/blockquotes. The
+code/config→syntax-PDF path (`.ts`/`.json`/`.yaml`/…) is unchanged. The Chrome
+print is network-blackholed (`--host-resolver-rules=MAP * ~NOTFOUND`) so a
+report's remote `<img>`/font can't beacon out during the print. The report HTML
+is sanitized in two layers: executable/embed elements (`<script>`/`<iframe>`/…)
+are stripped from the raw report before pandoc, and `on*=` event handlers
+(`onerror`/`onclick`/…) are stripped from pandoc's *normalized* output before the
+print — the only place a `>`-inside-a-quoted-attribute can't shield a handler
+from the strip and then be re-preserved by pandoc on a `<img>`/`<div>` it models.
+`<svg>`/`<math>` subtrees are stripped whole before pandoc (they are not in the
+Telegram report subset, and are the one place the `on*=` regex can't be trusted —
+pandoc may pass an `<svg onload=…>` / nested `<script>` / external `<use href>`
+through as raw markup). Local relative `<img>` are deliberately NOT inlined (no
+pandoc `--embed-resources`): a report is text-formatting, not an image document,
+and inlining would read arbitrary referenced local files into the uploaded PDF.
+
 ## 1.19.2
 
 **Fix (tg-cli#97): an `AskUserQuestion` no longer forwards a duplicate Telegram

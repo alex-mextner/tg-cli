@@ -112,10 +112,15 @@ export const CODE_EXT_LANG: Record<string, string> = {
   scss: 'scss',
   sass: 'scss',
   less: 'css',
-  html: 'html',
-  htm: 'html',
+  // NOTE: .html/.htm are deliberately NOT here. An attached .html is a
+  // Telegram-subset HTML *report* meant to be RENDERED (its <b>/<table>/<h1>
+  // become real formatting), not source code to syntax-highlight. Fencing it as
+  // code printed the literal tags verbatim in the PDF (issue #95). HTML takes
+  // the convertHtmlToPdf render path; see HTML_RENDER_EXTENSIONS below.
   xml: 'xml',
   svg: 'xml',
+  // .vue stays code: it is a component SOURCE file (template + script), read as
+  // code on a phone — not a rendered report.
   vue: 'html',
   // Build / infra
   dockerfile: 'dockerfile',
@@ -168,9 +173,27 @@ export function detectCodeLang(path: string): string | null {
   return null;
 }
 
-/** Disk-sourced code/config documents are eligible for code→PDF conversion. */
+// Extensions that are RENDERED to a formatted PDF (HTML→DOM→PDF) rather than
+// fenced as syntax-highlighted source. An attached .html/.htm is a
+// Telegram-subset HTML report whose tags must become real formatting (issue
+// #95), not literal text.
+export const HTML_RENDER_EXTENSIONS = new Set(['html', 'htm']);
+
+/** True for a disk-sourced .html/.htm document — rendered, not fenced as code. */
+export function isRenderableHtml(item: SendItem): boolean {
+  return (
+    item.type === 'document' && item.source.kind === 'disk' && HTML_RENDER_EXTENSIONS.has(extOf(item.source.path))
+  );
+}
+
+/**
+ * Disk-sourced documents eligible for the code-pdf plan pass: either a
+ * code/config file (fenced + syntax-highlighted) OR an HTML report (rendered to
+ * formatted PDF). convertCodeToPdf dispatches between the two by extension.
+ */
 export function isConvertibleCode(item: SendItem): boolean {
-  return item.type === 'document' && item.source.kind === 'disk' && detectCodeLang(item.source.path) !== null;
+  if (item.type !== 'document' || item.source.kind !== 'disk') return false;
+  return detectCodeLang(item.source.path) !== null || HTML_RENDER_EXTENSIONS.has(extOf(item.source.path));
 }
 
 /** config.ts → config.ts.pdf (keep the full original name so .ts vs .json is
@@ -329,6 +352,15 @@ export function convertCodeToPdf(
   preset: DevicePreset,
   options: CodeConvertOptions = {},
 ): ConvertOutcome {
+  // .html/.htm are RENDERED (tags → formatting), not fenced as source (issue
+  // #95). Dispatch here so the entrypoint + applyCodePdfToPlan stay one pass.
+  // `options` (highlightStyle / lineNumbers) is intentionally NOT forwarded: it
+  // is code-fence-only (syntax theme + a line-number gutter), meaningless for a
+  // rendered HTML report. If a render-relevant option is ever added, thread it.
+  if (HTML_RENDER_EXTENSIONS.has(extOf(codePath))) {
+    return convertHtmlToPdf(codePath, deps, preset);
+  }
+
   const lang = detectCodeLang(codePath);
   if (!lang) return { pdfPath: null, error: 'not a recognized code/config type', tmpDir: null };
 
@@ -387,6 +419,43 @@ export function convertCodeToPdf(
     return fail(`pandoc failed: ${pandoc.stderr.trim().slice(0, 200)}`);
   }
 
+  const printErr = printToPdf(deps, chrome, htmlPath, pdfPath);
+  if (printErr) return fail(printErr);
+  return { pdfPath, error: null, tmpDir: tmp };
+}
+
+// Run headless Chrome --print-to-pdf on a local HTML file. Returns null on
+// success, or an error string (the caller wraps it in a ConvertOutcome and
+// keeps the original attachment). Shared by the code-fence and HTML-render
+// paths so they never drift on the Chrome flags or the empty-PDF check.
+//
+// SANDBOXING — the HTML-render path (issue #95) feeds LIVE report HTML to
+// Chrome, not inert fenced source. A report could carry `<img src="http://…">`
+// (or other remote refs pandoc's raw_html preserves), which on print would make
+// Chrome fetch it — tracking pixels, SSRF to internal hosts. The network
+// blackhole neutralizes that primary surface; a print job needs no network at
+// all (the document is a local file:// URL):
+//   --host-resolver-rules=MAP * ~NOTFOUND : fails EVERY DNS lookup, so no
+//       remote subresource (`<img>`/font/iframe over http(s)) can fetch.
+// SCOPE — this blocks resolution of remote HOST NAMES, which covers the realistic
+// beacon (`<img src="http://host/p.png">`). It is NOT a complete SSRF wall: an
+// IP-literal host may skip the resolver (version-dependent) and a `file://`
+// subresource needs no DNS at all — but there is no return channel either way,
+// so the residual is low-impact. The executable surface — `<script>`, inline
+// `on*=` handlers, `<iframe>`/`<object>`/`<embed>` — is removed UPSTREAM by
+// sanitizeReportHtml before the HTML reaches Chrome (the documented JS-off flag
+// `--blink-settings=scriptEnabled=false` was tried and SILENTLY breaks the print
+// — Chrome emits an empty PDF — so the strip is the JS mitigation, not a flag).
+// RESIDUAL: the render still runs under `--no-sandbox` (inherited from the fence
+// path), so a Chrome parser/font bug on attacker-shaped HTML/CSS is not fully
+// contained — accepted trade-off, same as the pre-existing fence path.
+// The fence path inherits the same flag at zero cost (it had no remote refs).
+function printToPdf(
+  deps: Pick<ConvertDeps, 'run' | 'fileSize'>,
+  chrome: string,
+  htmlPath: string,
+  pdfPath: string,
+): string | null {
   const chromeRun = deps.run(
     [
       chrome,
@@ -394,6 +463,7 @@ export function convertCodeToPdf(
       '--disable-gpu',
       '--no-sandbox',
       '--no-pdf-header-footer',
+      '--host-resolver-rules=MAP * ~NOTFOUND',
       '--virtual-time-budget=2000',
       `--print-to-pdf=${pdfPath}`,
       fileUrl(htmlPath),
@@ -402,11 +472,257 @@ export function convertCodeToPdf(
   );
   if (chromeRun === null || chromeRun.exitCode !== 0) {
     const detail = chromeRun ? chromeRun.stderr.trim().slice(0, 200) : 'spawn failed';
-    return fail(`chrome print-to-pdf failed: ${detail}`);
+    return `chrome print-to-pdf failed: ${detail}`;
   }
   if (deps.fileSize(pdfPath) <= 0) {
-    return fail('chrome reported success but produced no/empty PDF');
+    return 'chrome reported success but produced no/empty PDF';
   }
+  return null;
+}
+
+// --- HTML report → rendered PDF (issue #95) -------------------------------
+//
+// An attached .html/.htm is a Telegram-subset HTML report. Its tags
+// (<b>/<i>/<code>/<pre>/<h1>-<h6>/<ul>/<ol>/<li>/<table>/<blockquote>/…) must be
+// RENDERED as formatting, not printed verbatim. pandoc `-f html -t html5`
+// parses the HTML into a document AST and re-emits clean standalone HTML
+// (<b>→<strong>, tables/headings/lists preserved); Chrome then prints it
+// formatted. This is the opposite of the code-fence path, which wraps the file
+// in a <pre><code> block and shows the source.
+//
+// The Telegram custom tags (<tg-emoji>/<tg-spoiler>/<tg-math>/…) are not known
+// to a browser; they render as their text content, which is acceptable (and far
+// better than the raw `<b>` the bug printed). The standard formatting tags —
+// which is what the CTO's reports use — render correctly.
+
+// Mobile, readable CSS for a rendered HTML report. Same phone @page geometry as
+// the code path, but a proportional body font (it's prose, not source) with
+// styled tables / blockquotes / code spans. Soft-wrap rules keep long code
+// spans and URLs from forcing horizontal scroll on a phone.
+export function htmlReportCss(preset: DevicePreset): string {
+  return `
+@page { size: ${preset.widthPt}pt ${preset.heightPt}pt; margin: ${preset.marginPt}pt; }
+html, body { margin: 0; padding: 0; background: #ffffff; }
+body {
+  color: #1a1a1a; max-width: none;
+  font-family: -apple-system, "Helvetica Neue", "Segoe UI", sans-serif;
+  font-size: ${preset.fontPt}pt; line-height: 1.5;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+header#title-block-header { display: none; }
+h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 0.8em 0 0.4em; }
+h1 { font-size: ${(preset.fontPt + 5).toFixed(1)}pt; }
+h2 { font-size: ${(preset.fontPt + 3).toFixed(1)}pt; }
+h3 { font-size: ${(preset.fontPt + 1.5).toFixed(1)}pt; }
+p { margin: 0.5em 0; }
+code, pre {
+  font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: ${(preset.fontPt - 0.5).toFixed(1)}pt;
+}
+code { background: #f2f2f4; border-radius: 3pt; padding: 0 2pt; }
+pre {
+  background: #f7f7f8; border: 1px solid #ececef; border-radius: 5pt;
+  padding: 8pt; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+}
+pre code { background: none; padding: 0; }
+blockquote {
+  border-left: 3pt solid #d0d0d4; margin: 0.6em 0; padding: 0.1em 0 0.1em 0.8em; color: #555;
+}
+ul, ol { margin: 0.5em 0; padding-left: 1.4em; }
+li { margin: 0.2em 0; }
+table { border-collapse: collapse; margin: 0.6em 0; width: 100%; }
+th, td { border: 1px solid #d0d0d4; padding: 3pt 6pt; text-align: left; vertical-align: top; }
+th { background: #f2f2f4; }
+hr { border: 0; border-top: 1px solid #ddd; margin: 0.8em 0; }
+a { color: #0a66c2; }
+`;
+}
+
+// Sanitization is TWO layers, applied at the two points where each is safe to
+// reason about. `tg --file x.html` accepts ANY disk .html, and pandoc's default
+// raw_html extension preserves `<script>`, inline `on*=` handlers, and embed
+// elements verbatim — which then RUN in the (--no-sandbox) Chrome print. This is
+// a render of a STATIC report; none of that is ever legitimate, so it is removed:
+//
+//   LAYER 1 — sanitizeReportHtml, on the RAW report BEFORE pandoc: strip whole
+//     executable/embed ELEMENT blocks (<script>/<style>/<iframe>/<object>/
+//     <embed>/<link>/<meta>/<base>) including their content. An open-tag…close-tag
+//     block scan handles a `>` inside an attribute value correctly (it scans to
+//     the matching close tag, not the first `>`). <svg>/<math> are handled here
+//     too: they are NOT in the Telegram report subset (so nothing legitimate is
+//     lost), and they are the one place LAYER 2's html5-shaped regex can't be
+//     trusted — pandoc may pass an <svg> subtree through as raw_html, where an
+//     <svg onload=…>, a nested <svg><script>, or an external <use href="http://…">
+//     would not be modeled by the start-tag tokenizer.
+//     A WELL-FORMED <svg>…</svg>/<math>…</math> is removed whole (block pass). A
+//     MALFORMED/UNCLOSED one (no clean </svg>) doesn't match the block pass, so the
+//     open/close tags AND the svg/math child elements that can carry a handler or
+//     an external ref (<use>/<image>/<animate*>/<set>/<foreignObject>) are also
+//     stripped individually — so an orphaned <animate onbegin=…> / <use href=…>
+//     can't survive LAYER 1 into pandoc's raw passthrough. Residual: a benign
+//     leftover like a stray <circle> text node is harmless; any handler pandoc DOES
+//     normalize is still caught by LAYER 2, and remote refs by the DNS blackhole.
+//
+//   LAYER 2 — stripEventHandlerAttrs, on pandoc's OUTPUT (see convertHtmlToPdf):
+//     remove `on*=` event handlers (onerror/onload/onclick/…). This MUST run on
+//     pandoc's output, not the raw input: a raw-HTML tag matcher that stops at the
+//     first `>` is defeated by `<img alt=">" src="x" onerror="beacon()">` — the
+//     `>` inside the quoted `alt` ends the match early and the trailing `onerror`
+//     survives, and pandoc then re-parses the full tag and KEEPS the handler. On
+//     pandoc's NORMALIZED html5 every attribute is double-quoted and any `>` in a
+//     value is escaped to `&gt;`, so `[^>]*` is a sound tag boundary and the
+//     handler strip is robust. Without this the `onerror` fires during the print
+//     (the blackholed `src` is guaranteed to fail to load → onerror runs).
+//
+// The formatting tags the report needs (<b>/<i>/<code>/<h1>/<table>/<ul>/
+// <blockquote>/…) are untouched. Defense-in-depth alongside the DNS blackhole:
+// the blackhole stops a remote fetch; these two layers stop code from running.
+//
+// FIXED-POINT loop: a SINGLE replace pass is bypassable by overlap — removing an
+// inner match can re-form an outer one (`<scr<script>ipt>` → `<script>`,
+// `<<script>script>` → `<script>`). Repeating the strip until the string stops
+// changing closes that nesting bypass. Each pass strictly shrinks the string
+// until stable; the iteration cap only guards a pathological input.
+export function sanitizeReportHtml(html: string): string {
+  let prev = '';
+  let cur = html;
+  for (let i = 0; cur !== prev && i < 100; i++) {
+    prev = cur;
+    // This is a DEFENSE-IN-DEPTH pre-filter, NOT the security boundary, so the
+    // residual CodeQL flags below is accepted: a `<script` with no closing `>`
+    // can survive this regex pass, but it cannot reach an executable context —
+    // pandoc RE-PARSES the HTML (a broken/partial tag is normalized or dropped),
+    // LAYER 2 strips every `on*=` handler on that normalized output, and the DNS
+    // blackhole blocks any remote fetch; the input is the user's OWN attached
+    // report, not adversarial web input. A DOM-parser sanitizer (jsdom/DOMPurify)
+    // is disproportionate for a CLI that already shells out to pandoc + Chrome.
+    // codeql[js/incomplete-multi-character-sanitization]
+    cur = cur
+      // Element blocks whose CONTENT must go too (open-tag…close-tag, any case,
+      // across newlines). [^] matches any char incl. newline (s-flag-free). The
+      // block scan reaches the matching </tag>, so a `>` inside an attribute
+      // value can't end it early.
+      .replace(/<(script|style|iframe|object|embed|svg|math)\b[^]*?<\/\1\s*>/gi, '')
+      // Void/standalone head-injection, leftover unmatched open tags, and the
+      // svg/math child elements that can carry a handler or an external ref —
+      // stripped individually so a MALFORMED/unclosed <svg>/<math> (which the
+      // block pass above can't match) still can't leave an active child behind.
+      .replace(
+        /<\/?(script|style|iframe|object|embed|link|meta|base|svg|math|use|image|animate|animateTransform|animateMotion|animateColor|set|foreignObject)\b[^>]*>/gi,
+        '',
+      );
+  }
+  return cur;
+}
+
+// Remove `on*=` event-handler ATTRIBUTES from start-tags. Designed to run on
+// pandoc's NORMALIZED html5 output (every attribute is `name="value"`, double-
+// quoted, with any `>` inside a value escaped to `&gt;`), where `[^>]*` is a
+// sound tag boundary — so it tokenizes attributes correctly instead of guessing,
+// with no false positive on body text like `online=true` (text nodes are never
+// matched) and no malformed-input bypass. Pure. See LAYER 2 above for why the
+// raw report can't be the input here.
+export function stripEventHandlerAttrs(html: string): string {
+  // A start-tag: letter-led name, an attribute run up to the closing `>`, an
+  // optional self-closing `/`. pandoc never emits a literal `>` inside a value.
+  return html.replace(/<([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[^>]*?)?)(\s*\/?)>/g, (whole, name, attrs, tail) => {
+    if (!attrs) return whole;
+    // Drop any attribute whose NAME is `on…` (the value is the double-quoted
+    // string pandoc emits; `[^"]*` can't escape it because inner `"` is escaped).
+    // `[\s/]` as the name boundary also catches the `<b/onmouseover=…>` form.
+    const cleaned = attrs.replace(/([\s/])on[a-zA-Z]+\s*=\s*"[^"]*"/g, '$1');
+    return `<${name}${cleaned}${tail}>`;
+  });
+}
+
+/**
+ * Render one on-disk .html/.htm report to a mobile, FORMATTED PDF in a private
+ * temp dir. Unlike convertCodeToPdf's fence path, the HTML is parsed by pandoc
+ * (-f html) and rendered as DOM, so the tags become real bold/headings/tables/
+ * lists/blockquotes (issue #95) — never printed verbatim. Sanitized in two
+ * layers: sanitizeReportHtml strips executable/embed ELEMENTS from the raw
+ * report before pandoc, and stripEventHandlerAttrs removes `on*=` handlers from
+ * pandoc's normalized output before the print (see the layer note above).
+ * Returns the PDF path on success; otherwise an error string (the caller keeps
+ * the original .html).
+ */
+export function convertHtmlToPdf(htmlSrcPath: string, deps: ConvertDeps, preset: DevicePreset): ConvertOutcome {
+  const chrome = findChrome(deps);
+  if (!chrome) return { pdfPath: null, error: 'Chrome not found (set TG_CHROME_PATH)', tmpDir: null };
+
+  let content: string;
+  try {
+    content = deps.readFile(htmlSrcPath);
+  } catch {
+    return { pdfPath: null, error: 'could not read file', tmpDir: null };
+  }
+
+  const tmp = deps.makeTempDir();
+  const fail = (error: string): ConvertOutcome => ({ pdfPath: null, error, tmpDir: tmp });
+  const cssPath = `${tmp}/style.css`;
+  const srcPath = `${tmp}/source.html`; // ASCII name; the file content is the report HTML
+  const htmlPath = `${tmp}/doc.html`; // pandoc's rendered, standalone output
+  const pdfPath = `${tmp}/${pdfNameForCode(htmlSrcPath)}`;
+
+  deps.writeFile(cssPath, htmlReportCss(preset));
+  // Sanitize BEFORE pandoc: strip scripts/embeds/event handlers so nothing
+  // executable survives into the (--no-sandbox) Chrome print. Formatting tags
+  // are kept. See sanitizeReportHtml.
+  deps.writeFile(srcPath, sanitizeReportHtml(content));
+
+  const base = basenameOf(htmlSrcPath);
+  // `-f html -t html5`: pandoc PARSES the HTML into its document model and
+  // re-emits standalone html5. This is what turns the report's tags into a
+  // rendered DOM instead of escaped source text. --standalone wraps it with our
+  // mobile CSS; the title metadata avoids pandoc's empty-title warning (the CSS
+  // hides the title block on the page).
+  //
+  // DELIBERATELY NO `--embed-resources` / `--resource-path` (md-pdf uses them to
+  // inline relative images). A `.html` REPORT is text-formatting, not an image
+  // document — and embed-resources base64-inlines ANY local file the HTML
+  // references (`<img src="../secret">` reads it into the PDF that is then
+  // uploaded to Telegram), a local-file-disclosure surface this render path's
+  // own threat model (the DNS blackhole for remote refs) exists to avoid. The
+  // cost is that a relative LOCAL `<img>` shows broken; remote images are
+  // blackholed anyway. Accepted: reports don't carry images. (Follow-up: reconcile
+  // md-pdf's broader embed surface — tracked separately.)
+  const pandocArgs = [
+    'pandoc',
+    '-f',
+    'html',
+    '-t',
+    'html5',
+    '--standalone',
+    '--metadata',
+    `title=${base}`,
+    '--css',
+    cssPath,
+    '-o',
+    htmlPath,
+    srcPath,
+  ];
+
+  const pandoc = deps.run(pandocArgs, 10_000);
+  if (pandoc === null) return fail('pandoc not found (brew install pandoc)');
+  if (pandoc.exitCode !== 0) {
+    return fail(`pandoc failed: ${pandoc.stderr.trim().slice(0, 200)}`);
+  }
+
+  // LAYER 2: strip `on*=` handlers from pandoc's NORMALIZED output before the
+  // print. pandoc preserves event-handler attributes on the elements it models
+  // (<img>/<div>/<span>/<td>/…), and the raw-input strip in sanitizeReportHtml
+  // can be bypassed by a `>` inside a quoted attribute value — so the authoritative
+  // handler removal happens here, on the quoted/escaped html5 where the tag
+  // boundary is sound. A failure to re-read/-write the rendered doc must not abort
+  // the send; on any I/O error keep pandoc's output (the blackhole still applies).
+  try {
+    deps.writeFile(htmlPath, stripEventHandlerAttrs(deps.readFile(htmlPath)));
+  } catch {
+    // best-effort: fall back to pandoc's output unchanged.
+  }
+
+  const printErr = printToPdf(deps, chrome, htmlPath, pdfPath);
+  if (printErr) return fail(printErr);
   return { pdfPath, error: null, tmpDir: tmp };
 }
 
