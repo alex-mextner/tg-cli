@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Subprocess } from 'bun';
@@ -111,3 +111,76 @@ test('flock singleton: one daemon survives, the loser exits 0, SIGTERM cleans th
   expect(survivor!.exitCode).toBe(0);
   expect(existsSync(pidFile)).toBe(false);
 }, 10_000);
+
+// tg#93 — the launchd-relaunch ownership race. A daemon that is shutting down
+// must remove the pidfile ONLY when it still names its OWN pid. If a newer
+// instance has already taken ownership and rewritten the pidfile with ITS pid
+// (the window a launchd KeepAlive relaunch / a re-run `enable` opens), the
+// departing daemon's cleanExit must NOT delete it — otherwise `tg-ctl status`
+// reads no pid and falsely reports "not running" while the real daemon is alive.
+//
+// We can't deterministically schedule two real daemons into that overlap, so we
+// drive the exact cleanExit decision: bring a daemon up, then OVERWRITE its
+// pidfile with a FOREIGN live pid (a successor's), SIGTERM the daemon, and assert
+// the foreign pidfile SURVIVES. RED before the fix (cleanExit unlinked it blindly).
+test('cleanExit leaves a FOREIGN pidfile intact — a successor pidfile survives the old daemon shutdown (tg#93)', async () => {
+  const ownCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-ownership-'));
+  writeFileSync(join(ownCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
+  writeFileSync(join(ownCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
+  const ownPidFile = join(ownCfgDir, 'tg-ctl.123.pid');
+
+  const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
+    env: {
+      PATH: `${shimDir}:${process.env.PATH ?? ''}`,
+      HOME: ownCfgDir,
+      TG_CTL_CONFIG_DIR: ownCfgDir,
+      TG_API_BASE: `http://127.0.0.1:${server.port}`,
+    },
+    stdout: 'ignore',
+    stderr: 'ignore',
+  });
+  trackProc(reg, daemon);
+  // NOTE: deliberately do NOT trackCfgDir here. The teardown backstop reaps
+  // whatever pid this cfgDir's pidfile names — and this test parks a FOREIGN
+  // live pid in it on purpose. We clean the pidfile ourselves at the end so the
+  // sweep can never read (and SIGKILL) the foreign successor.
+
+  // Wait until the daemon has written its own pidfile.
+  const t0 = Date.now();
+  while (Date.now() - t0 < 5000 && !existsSync(ownPidFile)) await Bun.sleep(50);
+  expect(readFileSync(ownPidFile, 'utf8').trim()).toBe(String(daemon.pid));
+
+  // A throwaway, demonstrably-LIVE "successor" process whose pid we park in the
+  // pidfile — simulating a newer daemon that took ownership during the relaunch
+  // overlap. A long sleep so it stays alive across the SIGTERM + assertion.
+  const successor = Bun.spawn(['sleep', '30'], { stdout: 'ignore', stderr: 'ignore' });
+  trackProc(reg, successor);
+  const foreignPid = successor.pid;
+  expect(foreignPid).not.toBe(daemon.pid);
+  // Assumption: the daemon writes its pidfile ONCE at startup and never rewrites
+  // it in the run loop. If a future heartbeat re-writes it, the daemon would put
+  // its own pid back over `foreignPid` before SIGTERM and this would go falsely
+  // RED even with the fix — revisit the parking strategy then.
+  writeFileSync(ownPidFile, `${foreignPid}\n`);
+
+  try {
+    daemon.kill('SIGTERM');
+    const exited = await Promise.race([
+      daemon.exited,
+      Bun.sleep(4000).then(() => 'timeout' as const),
+    ]);
+    expect(exited).not.toBe('timeout');
+
+    // The foreign (successor) pidfile MUST survive — cleanExit only removes a
+    // pidfile it owns. Pre-fix this asserts false (the blind unlink deleted it).
+    expect(existsSync(ownPidFile)).toBe(true);
+    expect(readFileSync(ownPidFile, 'utf8').trim()).toBe(String(foreignPid));
+  } finally {
+    // Deterministic cleanup even if an assertion threw (e.g. the RED run): remove
+    // the parked-pid pidfile and kill the successor so nothing reads the foreign pid.
+    try {
+      unlinkSync(ownPidFile);
+    } catch {}
+    successor.kill('SIGKILL');
+  }
+}, 12_000);

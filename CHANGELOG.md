@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.19.1
+
+**Fix (tg-cli#93): `tg-ctl status` no longer falsely reports "not running" on a
+launchd relaunch.** The daemon's `cleanExit` unlinked its pidfile unconditionally,
+so a departing daemon — or one whose ownership a newer instance had already taken
+over by rewriting `tg-ctl.<bot>.pid` with its own pid — would delete the **live**
+successor's pidfile. `status` (which reads the pidfile) then reported "not running"
+while the real daemon was alive and long-polling. `cleanExit` now removes the
+pidfile only when its content is still its own pid (new `ownsPidFile` guard); the
+flock loser is unaffected (it exits before writing any pidfile) and a graceful
+exit still removes the owner's pidfile.
+
 ## 1.19.0
 
 A new **`/new` slash command** (tg-cli#27) spawns a fresh agent session straight from
