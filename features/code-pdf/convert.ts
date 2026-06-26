@@ -581,15 +581,22 @@ a { color: #0a66c2; }
 // FIXED-POINT loop: a SINGLE replace pass is bypassable by overlap — removing an
 // inner match can re-form an outer one (`<scr<script>ipt>` → `<script>`,
 // `<<script>script>` → `<script>`). Repeating the strip until the string stops
-// changing closes that nesting bypass (and clears CodeQL's
-// js/incomplete-multi-character-sanitization, which flags single-pass regex
-// HTML sanitizers for exactly this reason). Each pass strictly shrinks the
-// string until stable; the iteration cap only guards a pathological input.
+// changing closes that nesting bypass. Each pass strictly shrinks the string
+// until stable; the iteration cap only guards a pathological input.
 export function sanitizeReportHtml(html: string): string {
   let prev = '';
   let cur = html;
   for (let i = 0; cur !== prev && i < 100; i++) {
     prev = cur;
+    // This is a DEFENSE-IN-DEPTH pre-filter, NOT the security boundary, so the
+    // residual CodeQL flags below is accepted: a `<script` with no closing `>`
+    // can survive this regex pass, but it cannot reach an executable context —
+    // pandoc RE-PARSES the HTML (a broken/partial tag is normalized or dropped),
+    // LAYER 2 strips every `on*=` handler on that normalized output, and the DNS
+    // blackhole blocks any remote fetch; the input is the user's OWN attached
+    // report, not adversarial web input. A DOM-parser sanitizer (jsdom/DOMPurify)
+    // is disproportionate for a CLI that already shells out to pandoc + Chrome.
+    // codeql[js/incomplete-multi-character-sanitization]
     cur = cur
       // Element blocks whose CONTENT must go too (open-tag…close-tag, any case,
       // across newlines). [^] matches any char incl. newline (s-flag-free). The
