@@ -48,7 +48,10 @@ test('detectCodeLang: code/config extensions map to highlight languages', () => 
   expect(detectCodeLang('/x/styles.css')).toBe('css');
   expect(detectCodeLang('/x/styles.scss')).toBe('scss');
   expect(detectCodeLang('/x/styles.less')).toBe('css');
-  expect(detectCodeLang('/x/page.html')).toBe('html');
+  // .html/.htm are NOT code-fence types — they take the HTML render path
+  // (issue #95). Asserted in tests/html-pdf.test.ts.
+  expect(detectCodeLang('/x/page.html')).toBeNull();
+  expect(detectCodeLang('/x/component.vue')).toBe('html'); // .vue stays source
   expect(detectCodeLang('/x/data.xml')).toBe('xml');
   expect(detectCodeLang('/x/icon.svg')).toBe('xml');
   expect(detectCodeLang('/x/schema.graphql')).toBe('graphql');
