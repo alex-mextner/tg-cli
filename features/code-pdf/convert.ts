@@ -548,7 +548,20 @@ a { color: #0a66c2; }
 //     executable/embed ELEMENT blocks (<script>/<style>/<iframe>/<object>/
 //     <embed>/<link>/<meta>/<base>) including their content. An open-tag…close-tag
 //     block scan handles a `>` inside an attribute value correctly (it scans to
-//     the matching close tag, not the first `>`).
+//     the matching close tag, not the first `>`). <svg>/<math> are handled here
+//     too: they are NOT in the Telegram report subset (so nothing legitimate is
+//     lost), and they are the one place LAYER 2's html5-shaped regex can't be
+//     trusted — pandoc may pass an <svg> subtree through as raw_html, where an
+//     <svg onload=…>, a nested <svg><script>, or an external <use href="http://…">
+//     would not be modeled by the start-tag tokenizer.
+//     A WELL-FORMED <svg>…</svg>/<math>…</math> is removed whole (block pass). A
+//     MALFORMED/UNCLOSED one (no clean </svg>) doesn't match the block pass, so the
+//     open/close tags AND the svg/math child elements that can carry a handler or
+//     an external ref (<use>/<image>/<animate*>/<set>/<foreignObject>) are also
+//     stripped individually — so an orphaned <animate onbegin=…> / <use href=…>
+//     can't survive LAYER 1 into pandoc's raw passthrough. Residual: a benign
+//     leftover like a stray <circle> text node is harmless; any handler pandoc DOES
+//     normalize is still caught by LAYER 2, and remote refs by the DNS blackhole.
 //
 //   LAYER 2 — stripEventHandlerAttrs, on pandoc's OUTPUT (see convertHtmlToPdf):
 //     remove `on*=` event handlers (onerror/onload/onclick/…). This MUST run on
@@ -571,9 +584,15 @@ export function sanitizeReportHtml(html: string): string {
       // across newlines). [^] matches any char incl. newline (s-flag-free). The
       // block scan reaches the matching </tag>, so a `>` inside an attribute
       // value can't end it early.
-      .replace(/<(script|style|iframe|object|embed)\b[^]*?<\/\1\s*>/gi, '')
-      // Void/standalone head-injection + leftover unmatched open tags.
-      .replace(/<\/?(script|style|iframe|object|embed|link|meta|base)\b[^>]*>/gi, '')
+      .replace(/<(script|style|iframe|object|embed|svg|math)\b[^]*?<\/\1\s*>/gi, '')
+      // Void/standalone head-injection, leftover unmatched open tags, and the
+      // svg/math child elements that can carry a handler or an external ref —
+      // stripped individually so a MALFORMED/unclosed <svg>/<math> (which the
+      // block pass above can't match) still can't leave an active child behind.
+      .replace(
+        /<\/?(script|style|iframe|object|embed|link|meta|base|svg|math|use|image|animate|animateTransform|animateMotion|animateColor|set|foreignObject)\b[^>]*>/gi,
+        '',
+      )
   );
 }
 
@@ -638,6 +657,16 @@ export function convertHtmlToPdf(htmlSrcPath: string, deps: ConvertDeps, preset:
   // rendered DOM instead of escaped source text. --standalone wraps it with our
   // mobile CSS; the title metadata avoids pandoc's empty-title warning (the CSS
   // hides the title block on the page).
+  //
+  // DELIBERATELY NO `--embed-resources` / `--resource-path` (md-pdf uses them to
+  // inline relative images). A `.html` REPORT is text-formatting, not an image
+  // document — and embed-resources base64-inlines ANY local file the HTML
+  // references (`<img src="../secret">` reads it into the PDF that is then
+  // uploaded to Telegram), a local-file-disclosure surface this render path's
+  // own threat model (the DNS blackhole for remote refs) exists to avoid. The
+  // cost is that a relative LOCAL `<img>` shows broken; remote images are
+  // blackholed anyway. Accepted: reports don't carry images. (Follow-up: reconcile
+  // md-pdf's broader embed surface — tracked separately.)
   const pandocArgs = [
     'pandoc',
     '-f',

@@ -276,6 +276,64 @@ test('sanitizeReportHtml: a remote <img> is KEPT (the DNS blackhole, not the str
   expect(out).toContain('src="http://host/p.png"');
 });
 
+test('sanitizeReportHtml: <svg> subtree is stripped whole (onload / nested <script> / <use href>)', () => {
+  // <svg> is not in the Telegram report subset and is the one place LAYER 2 can't
+  // be trusted (pandoc may pass it through as raw_html). The whole subtree goes —
+  // the onload handler, a nested <script>, and an external <use href> all vanish,
+  // while the surrounding report formatting is untouched. (#95 review hardening.)
+  const html = '<b>ok</b><svg onload="beacon()"><script>steal()</script><use href="http://h/x#i"/></svg><i>done</i>';
+  const out = sanitizeReportHtml(html);
+  expect(out).not.toMatch(/<svg/i);
+  expect(out).not.toMatch(/onload/i);
+  expect(out).not.toContain('beacon()');
+  expect(out).not.toContain('steal()');
+  expect(out).not.toContain('http://h/x');
+  expect(out).toContain('<b>ok</b>');
+  expect(out).toContain('<i>done</i>');
+});
+
+test('sanitizeReportHtml: <math> (MathML) subtree is stripped whole', () => {
+  const out = sanitizeReportHtml('<p>x</p><math><mi onclick="go()">a</mi></math><p>y</p>');
+  expect(out).not.toMatch(/<math/i);
+  expect(out).not.toMatch(/onclick/i);
+  expect(out).not.toContain('go()');
+  expect(out).toContain('<p>x</p>');
+  expect(out).toContain('<p>y</p>');
+});
+
+test('sanitizeReportHtml: a MALFORMED/unclosed <svg> still cannot leave an active child', () => {
+  // No clean </svg>, so the block pass can't match — the open tag AND the
+  // handler/ref-bearing svg children (<animate>/<use>/<image>/<set>/<foreignObject>)
+  // are stripped individually so nothing executable rides into pandoc's raw
+  // passthrough. (#95 review: the block-pass-only guarantee was too strong.)
+  const unclosed = '<b>ok</b><svg><animate onbegin="beacon()"/><use href="http://h/x#i"/><image href="http://h/p.png"/>';
+  const out = sanitizeReportHtml(unclosed);
+  expect(out).not.toMatch(/<svg/i);
+  expect(out).not.toMatch(/<animate/i);
+  expect(out).not.toMatch(/<use\b/i);
+  expect(out).not.toMatch(/<image\b/i);
+  expect(out).not.toMatch(/onbegin/i);
+  expect(out).not.toContain('beacon()');
+  expect(out).not.toContain('http://h/');
+  expect(out).toContain('<b>ok</b>');
+});
+
+test('sanitizeReportHtml: an unclosed <svg onload=…> has its handler removed (open-tag strip)', () => {
+  const out = sanitizeReportHtml('<b>ok</b><svg onload="beacon()"><circle r="9"/>');
+  expect(out).not.toMatch(/<svg/i);
+  expect(out).not.toMatch(/onload/i);
+  expect(out).not.toContain('beacon()');
+  expect(out).toContain('<b>ok</b>');
+});
+
+test('sanitizeReportHtml: a <foreignObject> (arbitrary-HTML embed) tag is stripped', () => {
+  const out = sanitizeReportHtml('<p>x</p><svg><foreignObject><div onclick="go()">y</div></foreignObject></svg><p>z</p>');
+  expect(out).not.toMatch(/<svg/i);
+  expect(out).not.toMatch(/<foreignObject/i);
+  expect(out).toContain('<p>x</p>');
+  expect(out).toContain('<p>z</p>');
+});
+
 // --- Sanitizer LAYER 2 (stripEventHandlerAttrs): strip on*= on pandoc output --
 // Runs on pandoc's NORMALIZED html5 (every attribute double-quoted; any `>` in a
 // value escaped to `&gt;`), where the tag boundary is sound. This closes the
@@ -341,6 +399,45 @@ test('convertHtmlToPdf: hands pandoc the element-SANITIZED source (no <script> s
   expect(writtenSource).toContain('<b>report</b>');
   expect(writtenSource).not.toMatch(/<script/i);
   expect(writtenSource).not.toContain('steal()');
+});
+
+test('convertHtmlToPdf: LAYER 2 is actually INVOKED on pandoc output (pandoc-independent)', () => {
+  // The two real-pandoc integration tests below are `skipIf(!pandocAvailable)`, so
+  // on a pandoc-less runner they prove nothing. This mocked test pins LAYER 2's
+  // invocation with NO pandoc: an in-memory FS where the stubbed pandoc step writes
+  // a doc.html carrying an `onerror`, then the Chrome step captures doc.html AFTER
+  // LAYER 2 rewrote it — the handler must be gone. A refactor that deletes the
+  // LAYER 2 block would now fail here regardless of pandoc availability (#95 review).
+  const store: Record<string, string> = {};
+  let printed = '';
+  const deps: ConvertDeps = {
+    readFile: (p) => store[p] ?? '<b>raw report</b>',
+    writeFile: (p, c) => {
+      store[p] = c;
+    },
+    run: (cmd) => {
+      if (cmd[0] === 'pandoc') {
+        // pandoc's NORMALIZED output: an element pandoc models, carrying a handler.
+        store['/t/doc.html'] = '<html><body><img src="x" onerror="beacon()"/><strong>ok</strong></body></html>';
+        return { exitCode: 0, stderr: '' };
+      }
+      printed = store['/t/doc.html']; // Chrome's input = post-LAYER-2 doc.html
+      return { exitCode: 0, stderr: '' };
+    },
+    makeTempDir: () => '/t',
+    fileExists: () => true,
+    fileSize: () => 4096,
+    whichCmd: () => '/usr/bin/google-chrome',
+    env: {},
+  };
+
+  const out = convertHtmlToPdf('/x/report.html', deps, DEVICE_PRESETS.iphone15pro);
+  expect(out.error).toBeNull();
+  // The <img> element survives; the handler was stripped by LAYER 2 before Chrome.
+  expect(printed).toMatch(/<img[\s/>]/i);
+  expect(printed).not.toMatch(/onerror/i);
+  expect(printed).not.toContain('beacon()');
+  expect(printed).toContain('<strong>ok</strong>'); // formatting untouched
 });
 
 // --- Error branches: a failed render keeps the original attachment ----------
@@ -535,6 +632,81 @@ test.skipIf(!pandocAvailable)(
     // Sanity: prove pandoc ran and we inspected its real output (not a vacuous
     // green) — the bold text is rendered as <strong>.
     expect(printedHtml).toMatch(/<strong>\s*ok\s*<\/strong>/i);
+  },
+  60_000,
+);
+
+// Render `report` with REAL pandoc but a stubbed Chrome, returning the exact
+// doc.html (post-LAYER-2) that would be printed. Shared by the payload-shape and
+// content-survival integration tests so they can't drift on the deps wiring.
+function renderPrintedDoc(report: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'tg-htmlpdf-shape-'));
+  let printed = '';
+  const deps: ConvertDeps = {
+    ...realDeps,
+    makeTempDir: () => dir,
+    readFile: (p: string) => (p.endsWith('doc.html') ? readFileSync(p, 'utf8') : report),
+    run: (cmd, timeoutMs) => {
+      if (cmd[0] === 'pandoc') return realDeps.run(cmd, timeoutMs);
+      printed = readFileSync(join(dir, 'doc.html'), 'utf8');
+      return { exitCode: 0, stderr: '' };
+    },
+    fileSize: () => 4096,
+    fileExists: () => true,
+    whichCmd: () => '/usr/bin/google-chrome',
+  };
+  const out = convertHtmlToPdf('/proj/report.html', deps, DEVICE_PRESETS.iphone15pro);
+  expect(out.error).toBeNull();
+  return printed;
+}
+
+// The #95 review questioned whether stripEventHandlerAttrs's "pandoc always
+// double-quotes / escapes `>`" assumption holds for OTHER handler shapes. Prove it
+// against the actual pandoc on PATH: every shape is neutralized end-to-end.
+test.skipIf(!pandocAvailable)(
+  'integration(real pandoc): on*= handlers are stripped for unquoted / single-quoted / `>`-in-value shapes',
+  () => {
+    const shapes = [
+      '<b>ok</b><img src="x" onerror=beacon()>', // unquoted value
+      "<b>ok</b><img src='x' onerror='beacon()'>", // single-quoted value
+      '<b>ok</b><img alt=">" src="x" onerror="beacon()">', // `>` shields a raw matcher
+      '<b>ok</b><div ONCLICK="beacon()">y</div>', // uppercase handler name
+    ];
+    for (const report of shapes) {
+      const printed = renderPrintedDoc(report);
+      expect(printed).not.toMatch(/on(error|click)\s*=/i);
+      expect(printed).not.toContain('beacon()');
+      // Sanity: pandoc actually ran and we read its real output.
+      expect(printed).toMatch(/<strong>\s*ok\s*<\/strong>/i);
+    }
+  },
+  60_000,
+);
+
+// A `<svg onload>` carried in a report must be neutralized end-to-end (LAYER 1
+// strips the whole subtree before pandoc). Real pandoc + stubbed Chrome.
+test.skipIf(!pandocAvailable)(
+  'integration(real pandoc): a <svg onload> in a report is stripped before the print',
+  () => {
+    const printed = renderPrintedDoc('<b>ok</b><svg onload="beacon()"><circle r="9"/></svg><i>done</i>');
+    expect(printed).not.toMatch(/onload/i);
+    expect(printed).not.toContain('beacon()');
+    expect(printed).not.toMatch(/<svg/i);
+    expect(printed).toMatch(/<strong>\s*ok\s*<\/strong>/i);
+  },
+  60_000,
+);
+
+// Content-loss guard: pandoc's handling of UNKNOWN Telegram custom tags
+// (<tg-spoiler>/<tg-emoji>) is version-dependent — it must not drop the element's
+// TEXT. The literal-tag bug at least showed the text; the fix must not regress to
+// losing it. Assert the inner text survives in the printed doc.
+test.skipIf(!pandocAvailable)(
+  'integration(real pandoc): text inside Telegram custom tags survives in the rendered doc',
+  () => {
+    const printed = renderPrintedDoc('<b>ok</b> <tg-spoiler>hidden text</tg-spoiler> <tg-emoji emoji-id="5">x</tg-emoji>');
+    expect(printed).toContain('hidden text');
+    expect(printed).toMatch(/<strong>\s*ok\s*<\/strong>/i);
   },
   60_000,
 );

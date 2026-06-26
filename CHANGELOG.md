@@ -21,6 +21,12 @@ are stripped from the raw report before pandoc, and `on*=` event handlers
 (`onerror`/`onclick`/…) are stripped from pandoc's *normalized* output before the
 print — the only place a `>`-inside-a-quoted-attribute can't shield a handler
 from the strip and then be re-preserved by pandoc on a `<img>`/`<div>` it models.
+`<svg>`/`<math>` subtrees are stripped whole before pandoc (they are not in the
+Telegram report subset, and are the one place the `on*=` regex can't be trusted —
+pandoc may pass an `<svg onload=…>` / nested `<script>` / external `<use href>`
+through as raw markup). Local relative `<img>` are deliberately NOT inlined (no
+pandoc `--embed-resources`): a report is text-formatting, not an image document,
+and inlining would read arbitrary referenced local files into the uploaded PDF.
 
 ## 1.19.2
 
