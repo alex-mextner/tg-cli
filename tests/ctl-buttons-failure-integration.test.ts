@@ -426,7 +426,7 @@ test('daemon rejects a stale tap from a different Telegram message and accepts t
   });
   expect(answered).toEqual([
     { callback_query_id: 'cb_stale', text: 'expired' },
-    { callback_query_id: 'cb_fresh', text: 'answered' },
+    { callback_query_id: 'cb_fresh', text: '✓ sent to the agent' },
   ]);
 }, 10_000);
 

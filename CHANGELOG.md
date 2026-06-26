@@ -3,6 +3,28 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.19.2
+
+**Fix (tg-cli#97): an `AskUserQuestion` no longer forwards a duplicate Telegram
+card whose tap reads as "expired".** The `requestId` is a stable hash of (session,
+question text), and the in-flight dedup (`activeButtonKeys`) is released the instant
+the question is answered — so the same `AskUserQuestion` re-firing afterwards posted
+a SECOND, superseded card; tapping it showed an "expired" toast though the first tap
+had already landed. Two complementary fixes: (a) the daemon now keeps an
+answered-request replay cache, so a re-forward of an already-answered `requestId`
+replays the stored answer down the hook socket and posts NO new card (scoped to
+questions; a permission's stable `requestId` is never silently re-replayed), bounded
+by a 5-minute window after which the entry is pruned and a genuinely new question
+reusing the hash gets a fresh card; and (b) `hook-normalize` drops the
+`AskUserQuestion` copy delivered by the `PermissionRequest *` catch-all matcher, so
+only the dedicated `PreToolUse:AskUserQuestion` matcher forwards it (the
+double-coverage that re-fired the same `requestId`). Observability: the answer path
+now logs `ask-answered:` (previously silent), the tap toast reads "✓ sent to the
+agent", and a tap on an already-answered card reads "already answered" instead of
+"expired". Known trade-off: within the replay window a genuine human re-ask of the
+exact same question (same session + text) is indistinguishable from a re-fire and is
+auto-answered with the prior answer; the window bounds how long that lasts.
+
 ## 1.19.1
 
 **Fix (tg-cli#93): `tg-ctl status` no longer falsely reports "not running" on a

@@ -61,7 +61,9 @@ import {
   questionCapability,
   registrationSetAllowsHook,
   resolveButtonCallback,
+  type ButtonAnswer,
   type ButtonRequest,
+  type PermissionDecision,
 } from "./features/tg-ctl/questions"
 import {
   parseRegistrations,
@@ -1262,6 +1264,43 @@ interface PendingButton {
   finalText?: string
 }
 
+// A question that has already been ANSWERED, kept briefly so a re-forward of the
+// SAME requestId (a stable hash of session + question text) replays the stored
+// answer instead of posting a fresh card. The in-flight dedup (`activeButtonKeys`)
+// is released the instant a question is answered, so without this an
+// AskUserQuestion that re-fires AFTER its answer would post a second, superseded
+// card whose tap reads as "expired" (tg-cli#97). Keyed by `callbackRequestId`.
+interface AnsweredButton {
+  value: string
+  label: string
+  decision?: PermissionDecision
+  at: number
+}
+
+// How long an answered request stays replayable. The re-fire that motivated this
+// arrived ~37s after the answer; 5 min is a generous bound that still lets a
+// genuinely NEW question reusing the same hash (the human re-asks much later) post
+// a fresh card rather than silently replaying a stale answer. Overridable via env
+// only so the integration tests can exercise the past-window expiry without a real
+// 5-minute wait; production never sets it. Unlike UNSCOPED_ABANDON_MS this is only
+// ever compared against (now - answeredAt), never used as a setTimeout delay, so no
+// overflow clamp is needed. A non-positive / non-numeric / absent value falls back
+// to the 5-minute default.
+const ANSWERED_REPLAY_MS = (() => {
+  const raw = Number(process.env.TG_CTL_ANSWERED_REPLAY_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 5 * 60_000
+})()
+
+// Drop answered entries past the replay window. Called whenever a NEW answer is
+// recorded, so the cache stays bounded to ~the questions answered in the last
+// window instead of growing for the daemon's whole lifetime (most requestIds are
+// unique and never re-forwarded, so access-time pruning alone would leak).
+function pruneAnsweredButtons(answered: Map<string, AnsweredButton>, now: number): void {
+  for (const [key, entry] of answered) {
+    if (now - entry.at > ANSWERED_REPLAY_MS) answered.delete(key)
+  }
+}
+
 function normalizeButtonRequest(value: unknown): ButtonRequest | null {
   if (!value || typeof value !== "object") return null
   const rec = value as Record<string, unknown>
@@ -1345,6 +1384,7 @@ function startHookServer(
   ctx: Ctx,
   pending: Map<string, PendingButton>,
   activeKeys: Set<string>,
+  answered: Map<string, AnsweredButton>,
   onAbandon: (paneId: string) => void,
   onUnscopedAbandon: () => void,
 ): Server | null {
@@ -1366,7 +1406,7 @@ function startHookServer(
         }
         const line = raw.slice(0, newline).trim()
         raw = raw.slice(newline + 1)
-        void handleHookSocketLine(ctx, pending, activeKeys, onAbandon, onUnscopedAbandon, socket, line)
+        void handleHookSocketLine(ctx, pending, activeKeys, answered, onAbandon, onUnscopedAbandon, socket, line)
       })
     })
     server.on("error", (err) => {
@@ -1390,6 +1430,9 @@ async function handleHookSocketLine(
   ctx: Ctx,
   pending: Map<string, PendingButton>,
   activeKeys: Set<string>,
+  // Answered-request replay cache (tg-cli#97): a re-forward of an already-answered
+  // requestId replays the stored answer down the socket and posts NO second card.
+  answered: Map<string, AnsweredButton>,
   // Called when a forwarded question is removed WITHOUT a Telegram answer
   // (timeout, hook socket close, send failure). The daemon drops that pane's
   // deferred backlog so it can't resurface, stale + out of order, on a LATER
@@ -1450,6 +1493,33 @@ async function handleHookSocketLine(
     log(`ask-forward dropped: reason=duplicate-in-flight ${describeAskRequest(req)} key=${pendingKey}`)
     socket.end("null\n")
     return
+  }
+  // Idempotency across the answer boundary (tg-cli#97): the in-flight dedup above
+  // is RELEASED the instant a question is answered, so the SAME requestId
+  // re-firing afterwards would post a second, superseded card. If we have a FRESH
+  // answer for this key, replay it down the socket — rebuilt against the NEW req so
+  // the reply shape matches this re-fire's own kind/event — and post no card. The
+  // entry stays replayable for the whole window (a question can re-fire more than
+  // once); a STALE entry (a genuinely new question reusing the hash past the TTL)
+  // is pruned here so it falls through to a fresh forward. Only QUESTIONS are ever
+  // cached (the write is kind-guarded), so consult it only for questions — symmetric
+  // with the write and immune to a (practically impossible) cross-kind key clash.
+  const prior = req.kind === "question" ? answered.get(pendingKey) : undefined
+  if (prior) {
+    if (Date.now() - prior.at <= ANSWERED_REPLAY_MS) {
+      const replayAnswer: ButtonAnswer = {
+        status: "answered",
+        requestId: req.requestId,
+        label: prior.label,
+        value: prior.value,
+        decision: prior.decision,
+      }
+      const output = formatAgentHookOutput(req, replayAnswer)
+      log(`ask-forward replayed-answer: ${describeAskRequest(req)} key=${pendingKey} label=${prior.label}`)
+      socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
+      return
+    }
+    answered.delete(pendingKey)
   }
   activeKeys.add(pendingKey)
   const entry: PendingButton = {
@@ -1649,6 +1719,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   writeFileSync(ctx.paths.pid, `${process.pid}\n`)
   const pendingButtons = new Map<string, PendingButton>()
   const activeButtonKeys = new Set<string>()
+  // Answered-request replay cache (tg-cli#97): requestId → the answer just given,
+  // so a re-forward of the same question within ANSWERED_REPLAY_MS replays it
+  // instead of posting a duplicate card. Swept on every record (pruneAnsweredButtons)
+  // so it stays bounded to the last window's answers, never unbounded.
+  const answeredButtons = new Map<string, AnsweredButton>()
   // /agent (and unrecognized-reply) selection awaiting a button tap: token →
   // message + candidate list. `prewrapped` = inject the message verbatim (a reply
   // already carries its wrap/anchor) instead of wrapping it again.
@@ -1952,7 +2027,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   process.on("SIGTERM", () => cleanExit(0))
   process.on("SIGINT", () => cleanExit(0))
 
-  hookServer = startHookServer(ctx, pendingButtons, activeButtonKeys, onQuestionAbandoned, onUnscopedAbandon)
+  hookServer = startHookServer(ctx, pendingButtons, activeButtonKeys, answeredButtons, onQuestionAbandoned, onUnscopedAbandon)
 
   if (ctx.cfg.transport === "channel") {
     log("transport 'channel' is reserved for v1.2+ — falling back to tmux")
@@ -3698,7 +3773,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "answer-question": {
         const pending = pendingButtons.get(action.requestId)
         if (!pending) {
-          await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+          // No live prompt for this key. If we ANSWERED it WITHIN the replay window
+          // the tap is on an already-resolved card, not a truly-expired prompt — say
+          // so plainly instead of the misleading "expired" (tg-cli#97). Gated on the
+          // same window as the hook-path replay so the two never disagree on whether
+          // an entry is still "answered" vs aged-out.
+          const priorAnswer = answeredButtons.get(action.requestId)
+          const stillAnswered = priorAnswer !== undefined && Date.now() - priorAnswer.at <= ANSWERED_REPLAY_MS
+          await answerCallbackQuery(ctx, action.callbackQueryId, stillAnswered ? "already answered" : "expired")
           return true
         }
         // A tap must come from THIS prompt's Telegram message: a stale tap on
@@ -3720,12 +3802,35 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         }
         pendingButtons.delete(action.requestId)
         activeButtonKeys.delete(action.requestId)
+        // Remember a QUESTION's answer briefly so a re-forward of the SAME requestId
+        // (the AskUserQuestion double-cover / re-fire race) replays it instead of
+        // posting a second card (tg-cli#97). Scoped to questions on purpose: a
+        // permission's requestId is also stable, but silently replaying a prior
+        // allow/deny without re-prompting would be a behavioral/security change the
+        // bug never asked for — and permissions have no double-card problem (they
+        // forward via a single catch-all matcher, not a dedicated + catch-all pair).
+        // Recorded AFTER the in-flight key is released, so the replay cache takes
+        // over exactly where the in-flight dedup leaves off. Sweep stale entries on
+        // each record so the cache can't grow unbounded.
+        if (pending.req.kind === "question") {
+          const answeredAt = Date.now()
+          pruneAnsweredButtons(answeredButtons, answeredAt)
+          answeredButtons.set(action.requestId, {
+            value: answer.value,
+            label: answer.label,
+            decision: answer.decision,
+            at: answeredAt,
+          })
+        }
         clearTimeout(pending.timer)
         const finalText = `answered: ${answer.label}`
         if (pending.messageId === null) pending.finalText = finalText
         const output = formatAgentHookOutput(pending.req, answer)
         pending.socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
-        void answerCallbackQuery(ctx, action.callbackQueryId, "answered")
+        // Previously silent — a question reaching the agent left no daemon trace,
+        // making the duplicate-card report impossible to confirm from logs.
+        log(`ask-answered: ${describeAskRequest(pending.req)} key=${action.requestId} label=${answer.label} messageId=${pending.messageId ?? "-"}`)
+        void answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
         if (pending.messageId !== null) void editMessageText(ctx, pending.messageId, finalText)
         // The agent is unblocked → deliver anything queued behind this question.
         // Fire-and-forget, but guard the promise: an error here must never become

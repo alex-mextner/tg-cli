@@ -146,7 +146,7 @@ test('tg-ctl ask forwards a Claude question to inline buttons and returns hook o
       ],
     },
   });
-  expect(answeredCallbacks).toEqual([{ callback_query_id: 'cb1', text: 'answered' }]);
+  expect(answeredCallbacks).toEqual([{ callback_query_id: 'cb1', text: '✓ sent to the agent' }]);
   expect(allowedUpdates.some((v) => decodeURIComponent(v).includes('callback_query'))).toBe(true);
 
   daemon.kill('SIGTERM');
