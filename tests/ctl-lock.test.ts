@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { ctlPaths, botIdFromToken, readPidFile, pidStatus, shouldAutoStart } from '../features/tg-ctl/lock';
+import { ctlPaths, botIdFromToken, readPidFile, pidStatus, ownsPidFile, shouldAutoStart } from '../features/tg-ctl/lock';
 import { DEFAULT_CONTROL, type ControlConfig } from '../features/tg-ctl/types';
 
 const cfg = (over: Partial<ControlConfig> = {}): ControlConfig => ({
@@ -76,6 +76,26 @@ test('pidStatus is running when kill0 confirms the pid', () => {
 
 test('pidStatus is stale when the pidfile exists but the process is gone', () => {
   expect(pidStatus(4242, () => false)).toBe('stale');
+});
+
+// --- ownsPidFile: cleanExit may unlink the pidfile ONLY when it is ours (tg#93) ---
+test('ownsPidFile is true only when the pidfile content equals our pid', () => {
+  expect(ownsPidFile('4242\n', 4242)).toBe(true);
+  expect(ownsPidFile('  4242  ', 4242)).toBe(true);
+});
+
+test('ownsPidFile is false for a FOREIGN pid — a departing daemon must NOT delete the live winner pidfile', () => {
+  // The launchd-relaunch race: a newer winner already rewrote the pidfile with
+  // its own pid (9999); the departing/loser daemon (pid 4242) running cleanExit
+  // must see it is NOT the owner and leave the file alone.
+  expect(ownsPidFile('9999\n', 4242)).toBe(false);
+});
+
+test('ownsPidFile is false for an absent or garbage pidfile', () => {
+  expect(ownsPidFile(null, 4242)).toBe(false);
+  expect(ownsPidFile('', 4242)).toBe(false);
+  expect(ownsPidFile('   \n', 4242)).toBe(false);
+  expect(ownsPidFile('not-a-pid', 4242)).toBe(false);
 });
 
 // --- shouldAutoStart: gate is TMUX + enabled, NOTHING else (spec §7) ---

@@ -51,6 +51,27 @@ export function pidStatus(pid: number | null, kill0: (pid: number) => boolean): 
   return kill0(pid) ? 'running' : 'stale';
 }
 
+// Does the pidfile on disk belong to US? `cleanExit` (and any other shutdown
+// path) MUST gate its `unlink(pidfile)` on this. The bug it guards (tg#93): on a
+// launchd relaunch a daemon that is shutting down — or whose ownership a newer
+// instance already took over by rewriting the pidfile with ITS pid — would
+// otherwise unconditionally delete whatever pid is on disk, including the live
+// successor's. That makes `tg-ctl status` (which reads the pidfile) falsely
+// report "not running" while the real daemon is alive and long-polling. Only the
+// instance whose own pid is written there may remove it.
+//
+// NOTE: read-then-unlink is NOT atomic — a successor that rewrites the pidfile in
+// the sliver between this check and the caller's `unlink` is still vulnerable.
+// This NARROWS the race to that sliver; it does not eliminate it. Full closure
+// needs atomic semantics (O_EXCL token / rename), but the flock — not the pidfile
+// — is the real singleton (spec §6), so the pidfile is informational and this
+// guard is enough to keep `status` honest in practice. Same ownership idea as
+// `unlinkIfOwner` in routes.ts, but that one guards the ROUTES lock (a different
+// file + LockOwner model), so the two are kept separate deliberately.
+export function ownsPidFile(content: string | null, ownPid: number): boolean {
+  return readPidFile(content) === ownPid;
+}
+
 // Lazy auto-start gate (spec §7): inside tmux AND control.enabled. Deliberately
 // NO TTY check — agents call tg through a piped Bash tool, so isatty is false
 // in exactly the scenario that must fire; the TMUX check alone excludes

@@ -53,7 +53,7 @@ import {
 } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
-import { botIdFromToken, ctlPaths, pidStatus, readPidFile } from "./features/tg-ctl/lock"
+import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, readPidFile } from "./features/tg-ctl/lock"
 import {
   buildButtonMessage,
   callbackRequestId,
@@ -1933,8 +1933,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
   let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
+    // Remove the pidfile ONLY when it still names OUR pid (tg#93). On a launchd
+    // relaunch a newer instance can take ownership and rewrite the pidfile with
+    // ITS pid before this departing daemon's cleanExit runs; a blind unlink would
+    // then delete the LIVE successor's pidfile, and `tg-ctl status` would read no
+    // pid and falsely report "not running" while the real daemon is long-polling.
     try {
-      unlinkSync(ctx.paths.pid)
+      if (ownsPidFile(readFileOrNull(ctx.paths.pid), process.pid)) unlinkSync(ctx.paths.pid)
     } catch {}
     try {
       hookServer?.close()
