@@ -314,6 +314,7 @@ export interface CtlPaths {
   routes: string; // message_id→pane map for reply recognition + LRU/MRU picker
   history: string; // append-only JSONL message log for `tg replies` recall
   topics: string; // threadId→agent binding map for forum-topics mode (always allocated)
+  questions: string; // durable forwarded-question state (pending/abandoned + answered-replay)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---

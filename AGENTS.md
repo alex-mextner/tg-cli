@@ -112,7 +112,10 @@ tests can pass fakes.
   PreToolUse→`permissionDecision`, PermissionRequest→`decision.behavior`), `hook-install.ts`
   (idempotent q→buttons hook merge for `tg-ctl install-hooks` — PreToolUse matches `AskUserQuestion`,
   plus a `PermissionRequest *` catch-all that also carries plan-approval; ExitPlanMode gets NO
-  dedicated matcher to avoid double-forwarding, since both events fire for it), `defer.ts` (defer-while-waiting queue model: inbound text is
+  dedicated matcher to avoid double-forwarding, since both events fire for it), `question-store.ts`
+  (PURE (de)serialization for the durable forwarded-question state — the on-disk envelope +
+  age/count pruning; the entrypoint owns the atomic file I/O and the authoritative req
+  normalization), `defer.ts` (defer-while-waiting queue model: inbound text is
   QUEUED per-pane while that pane has an open question and flushed on answer, so it is never pasted
   into the prompt — `driveFlush` re-checks the pane before EACH paste so a follow-up question
   re-defers the untouched tail), and `voice.ts` (inbound VOICE→text: `voice:` config block
@@ -149,6 +152,25 @@ tests can pass fakes.
     `O_APPEND`, so a daemon-inbound write racing a concurrent agent-outbound write could lose a
     record. The daemon is the single inbound writer and outbound writes are short; a file lock is
     out of scope for a best-effort, bounded log (same posture as the `routes` map).
+
+- **Durable forwarded-question state (`tg-ctl.<botid>.questions.json`, v1.20.0):** the daemon held
+  all question state ONLY in memory (`pendingButtons`/`activeButtonKeys`/`answeredButtons`), so a
+  hook socket close or a daemon restart lost it. The daemon now persists scoped questions + the
+  answered-replay cache to this file (path on `CtlPaths`, atomic temp+rename write) on every
+  mutation, and restores them on bootstrap. Three guarantees, one mechanism: (a) **late-delivery** —
+  a tap that lands after a question's hook socket closed (the agent's 120s budget elapsed, or it
+  died) injects the chosen option into the asking pane (the text-reply inject path) instead of
+  hitting the `!pending` drop; the retained card keeps its keyboard. A socket-closed scoped question
+  moves out of `pendingButtons` into `abandonedButtons` (so it never defers its pane's inbound) and
+  is retained for `TG_CTL_ABANDONED_RETAIN_MS` (default 30 min) — a window enforced at delivery time
+  (not only on restore), so a tap past the window expires rather than injecting a long-stale answer,
+  even on a quiet daemon with no intervening mutation. (b) **lossless reconnect** — the
+  `tg-ctl ask` client for a SCOPED question reconnect-and-resends the same requestId across a
+  mid-block socket drop; the restored daemon re-attaches the pending entry (no duplicate card) or
+  replays the stored answer (#98, now persisted). (c) **dead-card UX** — a genuinely-dead card (an
+  unscoped question, or a send-failed forward) has its inline keyboard cleared on expiry.
+  Permissions + unscoped questions keep the single-attempt client path (resending would duplicate
+  the card). `question-store.ts` owns the on-disk format (PURE); the entrypoint owns the I/O.
 
 - **Inbound voice (STT):** a Telegram voice/audio note → `transcribe-voice` action (updates.ts).
   The daemon downloads the OGG, transcodes to WAV 16 kHz mono via `ffmpeg`, runs the configured
