@@ -3,6 +3,44 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.20.0
+
+**Feature (tg-cli#99): forwarded-question state survives a socket close and a
+daemon restart — a late tap is late-delivered, a restart loses nothing within the
+retention window (default 30 min).** The
+`tg-ctl` daemon held all forwarded-question state ONLY in memory, so two failures
+hurt the question channel: a Telegram tap that arrived AFTER a question's hook
+socket closed (the agent's 120s hook budget elapsed, or the agent process died)
+hit the `!pending` branch and was DROPPED — you pressed a button and nothing
+reached the harness; and a daemon restart (crash-relaunch / stop+start) wiped
+every pending and recently-answered question. One mechanism fixes both:
+
+- **Persist** scoped questions + the answered-replay cache to a new durable file
+  (`tg-ctl.<bot>.questions.json`, atomic temp+rename write) on every mutation,
+  and restore them on daemon bootstrap.
+- **Late-deliver**: a tap with no live pending socket now injects the chosen
+  option into the asking tmux pane (the same text-reply injection path as a voice
+  or typed reply) instead of dropping. The retained card keeps its keyboard so a
+  late tap still works.
+- **Reconnect**: the `tg-ctl ask` client for a SCOPED question reconnects and
+  resends the same requestId across a mid-block socket drop; the restored daemon
+  re-attaches the pending entry (no duplicate card) or replays the stored answer.
+- **UX**: a genuinely-dead card (an unscoped question with no pane to deliver to,
+  or a send-failed forward) now has its inline keyboard cleared on expiry so it
+  isn't tappable.
+
+Permissions and unscoped questions keep the single-attempt path unchanged (they
+aren't retained across a restart, so resending would post a duplicate). The #98
+answered-replay behavior is extended, not changed — it is now persisted too.
+
+The retention window (`TG_CTL_ABANDONED_RETAIN_MS`, default 30 min) is enforced at
+delivery time, not only on restore: a retained question whose window has elapsed
+expires even on a quiet daemon. This bounds late-delivery — a question the human
+left untapped for longer than the window (with a daemon restart in between) expires
+rather than injecting a long-stale answer into a pane whose agent has moved on. A
+question whose hook reconnects (the agent is still blocked) re-attaches as live and
+is not subject to the window.
+
 ## 1.19.3
 
 **Fix (tg-cli#95): `tg --file report.html` now renders a FORMATTED PDF instead

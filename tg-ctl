@@ -12,7 +12,7 @@
 // (`run`) takes the flock as its FIRST action and exits 0 when another
 // instance already owns the bot.
 
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { dirname, isAbsolute, join, resolve } from "path"
 import {
@@ -65,6 +65,11 @@ import {
   type ButtonRequest,
   type PermissionDecision,
 } from "./features/tg-ctl/questions"
+import {
+  parseQuestionStore,
+  serializeQuestionStore,
+  type QuestionStoreData,
+} from "./features/tg-ctl/question-store"
 import {
   parseRegistrations,
   pruneRegistrations,
@@ -278,6 +283,17 @@ function readFileOrNull(path: string): string | null {
   } catch {
     return null
   }
+}
+
+// Crash-safe write: stage into a sibling temp file then rename(2) over the target.
+// rename is atomic on the same filesystem, so a reader (or a daemon that died
+// mid-write) sees either the old file or the new one whole — never a torn JSON the
+// next startup would fail to parse. Used for the durable question state, which is
+// rewritten on every mutation of a hot path.
+function atomicWrite(path: string, content: string): void {
+  const tmp = `${path}.tmp`
+  writeFileSync(tmp, content, { mode: 0o600 })
+  renameSync(tmp, path)
 }
 
 // Append history records to the JSONL log, trimmed to the bound. BEST-EFFORT:
@@ -1256,12 +1272,31 @@ interface PendingButton {
   req: ButtonRequest
   socket: Socket
   messageId: number | null
+  // ms epoch when this entry was created (or revived). Persisted so a restored
+  // entry carries its true age into the retention window, and so the durable file
+  // can be ordered/pruned by recency.
+  at: number
   // Only a SCOPED-less (unscoped) question arms an abandon timer; a scoped
   // question waits forever, so its timer is undefined. clearTimeout(undefined)
   // is a safe no-op, so every clearTimeout(entry.timer) call site is correct
   // whether or not the timer was armed.
   timer?: ReturnType<typeof setTimeout>
   finalText?: string
+}
+
+// A SCOPED question whose hook socket has CLOSED — the agent's 120s hook budget
+// elapsed (it fell back to the terminal AskUserQuestion prompt) OR the daemon
+// restarted and restored it from disk. Its answer can STILL reach the pane it asked
+// from, so we retain {paneId, options, card id} keyed by callbackRequestId. A LATER
+// Telegram tap injects the chosen option into that pane (late-delivery), and a
+// reconnecting hook with the SAME requestId re-attaches to this card instead of
+// posting a duplicate (lossless restart). Unlike a PendingButton it holds NO live
+// socket and — crucially — is NOT in `pendingButtons`, so it never defers the pane's
+// inbound (the agent moved on / is blocked on its own reconnect).
+interface AbandonedButton {
+  req: ButtonRequest
+  messageId: number | null
+  at: number
 }
 
 // A question that has already been ANSWERED, kept briefly so a re-forward of the
@@ -1275,6 +1310,10 @@ interface AnsweredButton {
   label: string
   decision?: PermissionDecision
   at: number
+  // How the answer reached the agent: `socket` (down the hook socket → a re-fire
+  // REPLAYS it, #98) or `pane` (late-delivered by pane injection → a reconnecting
+  // hook must NOT also replay it, or the agent gets it twice). Defaults to socket.
+  delivery: "socket" | "pane"
 }
 
 // How long an answered request stays replayable. The re-fire that motivated this
@@ -1298,6 +1337,25 @@ const ANSWERED_REPLAY_MS = (() => {
 function pruneAnsweredButtons(answered: Map<string, AnsweredButton>, now: number): void {
   for (const [key, entry] of answered) {
     if (now - entry.at > ANSWERED_REPLAY_MS) answered.delete(key)
+  }
+}
+
+// How long a socket-closed (abandoned) scoped question stays retained for
+// late-delivery + reconnect. Longer than the 5-min answered window: the human may
+// tap the card minutes after the hook budget elapsed and the agent fell back to the
+// terminal, and that answer is still worth delivering to the still-running agent.
+// Env-overridable so the integration tests exercise the past-window prune without a
+// real 30-min wait; production never sets it.
+const ABANDONED_RETAIN_MS = (() => {
+  const raw = Number(process.env.TG_CTL_ABANDONED_RETAIN_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60_000
+})()
+
+// Drop abandoned entries past the retention window. Called before every persist so
+// the durable file (and the in-memory map) stay bounded to the recent window.
+function pruneAbandonedButtons(abandoned: Map<string, AbandonedButton>, now: number): void {
+  for (const [key, entry] of abandoned) {
+    if (now - entry.at > ABANDONED_RETAIN_MS) abandoned.delete(key)
   }
 }
 
@@ -1380,14 +1438,177 @@ function describeHookLine(line: string): string {
   return one.length > 120 ? `${one.slice(0, 120)}…` : one
 }
 
-function startHookServer(
+// The in-memory + durable state for forwarded questions, threaded through the hook
+// socket handlers. Bundled into one struct so the handlers (and their helpers) take
+// a single param instead of a long positional list, and so the durable `persist`
+// callback travels with the maps it serializes.
+interface QuestionRuntime {
+  pending: Map<string, PendingButton>
+  activeKeys: Set<string>
+  // Socket-closed SCOPED questions retained for late-delivery + reconnect. NEVER in
+  // `pending`, so an abandoned question never defers its pane's inbound.
+  abandoned: Map<string, AbandonedButton>
+  // Answered-request replay cache (tg-cli#97): a re-forward of an already-answered
+  // requestId replays the stored answer down the socket and posts NO second card.
+  answered: Map<string, AnsweredButton>
+  // Persist the durable question state after any mutation (atomic write). A restored
+  // daemon late-delivers a late tap and re-attaches a reconnecting hook.
+  persist: () => void
+  // Drop a pane's deferred backlog when its question is abandoned without an answer
+  // (timeout / socket close / send failure) so the stale queue can't resurface, out
+  // of order, on a LATER unrelated question's answer (review finding).
+  onAbandon: (paneId: string) => void
+  // Same, for an UNSCOPED question (no paneId): sweep every pane that still holds a
+  // backlog and dead-letter the idle ones (tg-cli#58). Must run AFTER the entry is
+  // deleted from `pending` so the per-pane guard sees the real post-removal state.
+  onUnscopedAbandon: () => void
+}
+
+// A genuinely dead card: an UNSCOPED question (no pane to late-deliver to) that
+// timed out, or a send-failed forward. Its keyboard is cleared so it can't be tapped.
+const EXPIRED_TERMINAL_TEXT = "expired — answer in terminal"
+// A SCOPED question whose hook socket closed: the agent fell back to the terminal,
+// but a LATE tap still injects the chosen option into its pane (late-delivery), so
+// the keyboard STAYS tappable and the card says so.
+const ABANDONED_TAP_TEXT = "window closed — tap still delivers your answer to the terminal"
+
+// A SCOPED question carrying options can still be answered into its pane after the
+// socket closes — retain it (paneId + options + card id) for late-delivery +
+// reconnect. Returns true when it was retained (caller keeps the keyboard live).
+function retainAbandonedQuestion(rt: QuestionRuntime, entry: PendingButton, pendingKey: string): boolean {
+  if (entry.req.kind !== "question" || !entry.req.paneId || !entry.req.options?.length) return false
+  rt.abandoned.set(pendingKey, { req: entry.req, messageId: entry.messageId, at: Date.now() })
+  return true
+}
+
+// A dead card (unscoped / no options) can never be late-delivered: clear its keyboard
+// so it isn't tappable and mark it expired. messageId may still be null mid-send —
+// stash the text so the post-send reconciliation applies it.
+function expireDeadCard(ctx: Ctx, entry: PendingButton): void {
+  if (entry.messageId !== null) {
+    void clearMessageKeyboard(ctx, entry.messageId)
+    void editMessageText(ctx, entry.messageId, EXPIRED_TERMINAL_TEXT)
+  } else {
+    entry.finalText = EXPIRED_TERMINAL_TEXT
+  }
+}
+
+// Arm the hook socket's 'close' handler for a freshly-forwarded or revived pending
+// question. On close (the agent's hook process exits, or its 120s budget elapses)
+// the entry leaves `pending` so it stops deferring the pane, then a SCOPED question
+// is RETAINED for late-delivery/reconnect (keyboard stays live) while a dead card is
+// expired. The pane's deferred backlog is dead-lettered either way. Returns a getter
+// the caller uses to avoid double-ending a socket it still owns.
+function armPendingSocketClose(
   ctx: Ctx,
-  pending: Map<string, PendingButton>,
-  activeKeys: Set<string>,
-  answered: Map<string, AnsweredButton>,
-  onAbandon: (paneId: string) => void,
-  onUnscopedAbandon: () => void,
-): Server | null {
+  rt: QuestionRuntime,
+  entry: PendingButton,
+  pendingKey: string,
+): { closed: () => boolean } {
+  let socketClosed = false
+  entry.socket.on("close", () => {
+    socketClosed = true
+    if (rt.pending.get(pendingKey) !== entry) return
+    clearTimeout(entry.timer)
+    rt.pending.delete(pendingKey)
+    rt.activeKeys.delete(pendingKey)
+    if (retainAbandonedQuestion(rt, entry, pendingKey)) {
+      rt.onAbandon(entry.req.paneId as string)
+      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, ABANDONED_TAP_TEXT)
+      else entry.finalText = ABANDONED_TAP_TEXT
+    } else {
+      if (entry.req.paneId) rt.onAbandon(entry.req.paneId)
+      else rt.onUnscopedAbandon()
+      expireDeadCard(ctx, entry)
+    }
+    rt.persist()
+  })
+  return { closed: () => socketClosed }
+}
+
+// Fresh forward: register the pending entry, arm its socket-close handler, post the
+// inline-keyboard card, and reconcile against a socket that closed mid-send. Split
+// out of handleHookSocketLine so the dispatcher stays a readable parse→guard→route.
+async function forwardAndPostQuestion(
+  ctx: Ctx,
+  rt: QuestionRuntime,
+  req: ButtonRequest,
+  socket: Socket,
+  pendingKey: string,
+): Promise<void> {
+  rt.activeKeys.add(pendingKey)
+  const entry: PendingButton = { req, socket, messageId: null, at: Date.now() }
+  // An UNSCOPED question defers EVERY pane (fail-closed), so it MUST self-clear on a
+  // timer or it wedges all routing. A SCOPED question waits forever (no timer): only
+  // its socket close releases it (see armPendingSocketClose).
+  if (!req.paneId) {
+    entry.timer = setTimeout(() => {
+      if (rt.pending.get(pendingKey) !== entry) return
+      rt.pending.delete(pendingKey)
+      rt.activeKeys.delete(pendingKey)
+      rt.onUnscopedAbandon()
+      expireDeadCard(ctx, entry)
+      rt.persist()
+      socket.end("null\n")
+    }, UNSCOPED_ABANDON_MS)
+  }
+  rt.pending.set(pendingKey, entry)
+  const conn = armPendingSocketClose(ctx, rt, entry, pendingKey)
+
+  const payload = buildButtonMessage(ctx.chatId, req)
+  const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+  if (messageId === null) {
+    // botPost already logged the low-level send failure; tie it to THIS abandoned
+    // forward so the drop is greppable. No card posted → nothing to late-deliver.
+    log(`ask-forward dropped: reason=send-failed ${describeAskRequest(req)}`)
+    if (rt.pending.get(pendingKey) === entry) {
+      rt.pending.delete(pendingKey)
+      rt.activeKeys.delete(pendingKey)
+      clearTimeout(entry.timer)
+      if (entry.req.paneId) rt.onAbandon(entry.req.paneId)
+      else rt.onUnscopedAbandon()
+    } else {
+      // The socket closed DURING the failed send, so the close handler already
+      // removed the pending entry — and, for a scoped question, RETAINED an abandoned
+      // entry with a null card id. But the card never posted, so drop that phantom:
+      // left in place it would persist, survive a restart, and let a reconnect
+      // re-attach to a card the human never saw (the agent blocked blind).
+      const phantom = rt.abandoned.get(pendingKey)
+      if (phantom && phantom.req.requestId === req.requestId && phantom.messageId === null) {
+        rt.abandoned.delete(pendingKey)
+      }
+    }
+    rt.persist()
+    if (!conn.closed()) socket.end("null\n")
+    return
+  }
+  log(`ask-forward posted: ${describeAskRequest(req)} messageId=${messageId}`)
+  entry.messageId = messageId
+  // If the socket closed DURING the send, the close handler may have retained an
+  // abandoned entry with a null card id — backfill it now so late-delivery can edit
+  // the right message.
+  const ab = rt.abandoned.get(pendingKey)
+  if (ab && ab.req.requestId === req.requestId && ab.messageId === null) ab.messageId = messageId
+  // Accepted bound: a SIGKILL in the sub-ms window between the card posting above and
+  // this persist (the atomicWrite included) leaves a card in Telegram with no on-disk
+  // record — a reconnect-resend after restart then finds no retained entry and posts a
+  // SECOND card. Same nature as the sub-inject window in lateDeliverAbandonedQuestion;
+  // full closure would need a write-ahead marker BEFORE the send, not worth it for a
+  // sub-ms window on a crash-relaunch.
+  rt.persist() // the card id is now known — persist so a restart can late-deliver/reattach
+  // The socket (or unscoped timer) closed DURING the send: the close handler set
+  // finalText but, with messageId still null, couldn't touch the card. Apply it now —
+  // and for a genuinely-dead card (EXPIRED_TERMINAL_TEXT) clear the keyboard too, so
+  // the "dead card → not tappable" guarantee holds even on this race (a scoped
+  // ABANDONED_TAP_TEXT card deliberately keeps its keyboard for late-delivery).
+  if (rt.pending.get(pendingKey) !== entry || entry.finalText) {
+    const finalText = entry.finalText ?? EXPIRED_TERMINAL_TEXT
+    if (finalText === EXPIRED_TERMINAL_TEXT) void clearMessageKeyboard(ctx, messageId)
+    void editMessageText(ctx, messageId, finalText)
+  }
+}
+
+function startHookServer(ctx: Ctx, rt: QuestionRuntime): Server | null {
   try {
     try {
       unlinkSync(ctx.paths.socket)
@@ -1406,7 +1627,7 @@ function startHookServer(
         }
         const line = raw.slice(0, newline).trim()
         raw = raw.slice(newline + 1)
-        void handleHookSocketLine(ctx, pending, activeKeys, answered, onAbandon, onUnscopedAbandon, socket, line)
+        void handleHookSocketLine(ctx, rt, socket, line)
       })
     })
     server.on("error", (err) => {
@@ -1426,26 +1647,7 @@ function startHookServer(
   }
 }
 
-async function handleHookSocketLine(
-  ctx: Ctx,
-  pending: Map<string, PendingButton>,
-  activeKeys: Set<string>,
-  // Answered-request replay cache (tg-cli#97): a re-forward of an already-answered
-  // requestId replays the stored answer down the socket and posts NO second card.
-  answered: Map<string, AnsweredButton>,
-  // Called when a forwarded question is removed WITHOUT a Telegram answer
-  // (timeout, hook socket close, send failure). The daemon drops that pane's
-  // deferred backlog so it can't resurface, stale + out of order, on a LATER
-  // unrelated question's answer (review finding).
-  onAbandon: (paneId: string) => void,
-  // Same, for an UNSCOPED question (no paneId): sweeps every pane that still
-  // holds a backlog and dead-letters the idle ones (tg-cli#58). Must run AFTER
-  // the unscoped entry is deleted from `pending` — see onUnscopedAbandon's
-  // caller contract — so the per-pane guard sees the real post-removal state.
-  onUnscopedAbandon: () => void,
-  socket: Socket,
-  line: string,
-): Promise<void> {
+async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socket, line: string): Promise<void> {
   let req: ButtonRequest | null = null
   try {
     req = normalizeButtonRequest(JSON.parse(line))
@@ -1489,7 +1691,7 @@ async function handleHookSocketLine(
   }
 
   const pendingKey = callbackRequestId(req)
-  if (activeKeys.has(pendingKey)) {
+  if (rt.activeKeys.has(pendingKey)) {
     log(`ask-forward dropped: reason=duplicate-in-flight ${describeAskRequest(req)} key=${pendingKey}`)
     socket.end("null\n")
     return
@@ -1504,9 +1706,19 @@ async function handleHookSocketLine(
   // is pruned here so it falls through to a fresh forward. Only QUESTIONS are ever
   // cached (the write is kind-guarded), so consult it only for questions — symmetric
   // with the write and immune to a (practically impossible) cross-kind key clash.
-  const prior = req.kind === "question" ? answered.get(pendingKey) : undefined
+  const prior = req.kind === "question" ? rt.answered.get(pendingKey) : undefined
   if (prior) {
     if (Date.now() - prior.at <= ANSWERED_REPLAY_MS) {
+      if (prior.delivery === "pane") {
+        // The answer was already LATE-DELIVERED into the pane (this PR). A hook that
+        // reconnects (the restart race) or re-fires must NOT also have it replayed
+        // down the socket — that delivers the answer twice. Return null with NO card:
+        // a still-blocked hook falls back to the terminal, where the pane injection
+        // lands, so the agent gets the chosen option exactly once.
+        log(`ask-forward already-pane-delivered: ${describeAskRequest(req)} key=${pendingKey} label=${prior.label}`)
+        socket.end("null\n")
+        return
+      }
       const replayAnswer: ButtonAnswer = {
         status: "answered",
         requestId: req.requestId,
@@ -1519,93 +1731,33 @@ async function handleHookSocketLine(
       socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
       return
     }
-    answered.delete(pendingKey)
+    rt.answered.delete(pendingKey)
   }
-  activeKeys.add(pendingKey)
-  const entry: PendingButton = {
-    req,
-    socket,
-    messageId: null,
-  }
-  // A SCOPED question (paneId known) waits INDEFINITELY for its Telegram answer
-  // or a socket close — no abandon timer. This is the CTO's daily lifeline: a
-  // forwarded question must not silently expire to "answer in terminal" while the
-  // human is still deciding. It is safe to wait forever because a scoped question
-  // defers inbound for ONLY its own pane (paneHasPendingQuestion's
-  // `pb.req.paneId === paneId` arm), and THAT pane's agent is itself blocked
-  // waiting on this very question — so the deferral never starves inbound the
-  // agent would otherwise process, and the queue flushes when the answer arrives.
-  //
-  // With the timer gone, the ONLY non-answer release for a scoped entry is the
-  // socket 'close' below (registered before any await, so a close at any point —
-  // even before messageId is set — is caught and dead-letters the pane). The hook
-  // client (`tg-ctl ask`) holds this socket open for the agent's whole block, so
-  // the agent's death closes the fd and frees the pane; a half-open socket would
-  // be the only way to strand it, the same fd the kernel reaps on process exit.
-  //
-  // An UNSCOPED question (paneId undefined) still gets the bound: it defers ALL
-  // panes (the fail-closed `if (!pb.req.paneId) return true`), so leaving it open
-  // forever WOULD wedge every pane's routing. The timer is the only thing that
-  // keeps that fail-closed defer from becoming a permanent all-pane wedge. The
-  // #55 reply-route picker resolves where a REPLY goes, not a question's own
-  // paneId — an unscoped question is never re-scoped, so this bound must stay.
-  if (!req.paneId) {
-    entry.timer = setTimeout(() => {
-      if (pending.get(pendingKey) !== entry) return
-      pending.delete(pendingKey)
-      activeKeys.delete(pendingKey)
-      // Unscoped → no single pane to dead-letter, but the question deferred inbound
-      // across ANY pane, so its backlog may be stranded on several. Sweep them
-      // (tg-cli#58) — AFTER the delete above, so the per-pane guard no longer sees
-      // this just-expired unscoped question and dead-letters the truly-idle panes.
-      onUnscopedAbandon()
-      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, "expired — answer in terminal")
-      else entry.finalText = "expired — answer in terminal"
-      socket.end("null\n")
-    }, UNSCOPED_ABANDON_MS)
-  }
-  pending.set(pendingKey, entry)
-
-  let socketClosed = false
-  socket.on("close", () => {
-    socketClosed = true
-    const current = pending.get(pendingKey)
-    if (current !== entry) return
-    clearTimeout(entry.timer)
-    pending.delete(pendingKey)
-    activeKeys.delete(pendingKey)
-    // Scoped → dead-letter its own pane; unscoped → sweep every pane holding a
-    // backlog (tg-cli#58). Both run AFTER the delete above so the per-pane guard
-    // sees the real post-removal state.
-    if (entry.req.paneId) onAbandon(entry.req.paneId)
-    else onUnscopedAbandon()
-    if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, "expired — answer in terminal")
-    else entry.finalText = "expired — answer in terminal"
-  })
-
-  const payload = buildButtonMessage(ctx.chatId, req)
-  const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
-  if (messageId === null) {
-    // The low-level `sendMessage failed: …` is already logged in botPost; tie it
-    // to THIS forwarded question being abandoned so the drop is greppable too.
-    log(`ask-forward dropped: reason=send-failed ${describeAskRequest(req)}`)
-    if (pending.get(pendingKey) === entry) {
-      pending.delete(pendingKey)
-      activeKeys.delete(pendingKey)
-      clearTimeout(entry.timer)
-      // Scoped → dead-letter its own pane; unscoped → sweep all panes (tg-cli#58),
-      // after the delete above so the guard sees the real post-removal state.
-      if (entry.req.paneId) onAbandon(entry.req.paneId)
-      else onUnscopedAbandon()
-      if (!socketClosed) socket.end("null\n")
+  // RECONNECT re-attach (lossless restart): the SAME question re-arriving while we
+  // still RETAIN it — its socket died because the 120s window closed OR a daemon
+  // restart restored it from disk — re-attaches THIS new socket to the existing
+  // card instead of posting a duplicate. The agent's `tg-ctl ask` reconnect-and-
+  // resend (byte-identical requestId, still inside its hook budget) lands here. We
+  // require an EXACT requestId match (not just the callbackRequestId hash) so a
+  // genuinely different question that merely hash-collides falls through to a fresh
+  // card. A late TAP that already late-delivered moved the entry to `answered`
+  // (replayed above), so a tap and a reconnect never fight over the same key. Only
+  // SCOPED questions are ever retained, so the revived entry needs no unscoped timer.
+  const retained = req.kind === "question" ? rt.abandoned.get(pendingKey) : undefined
+  if (retained) {
+    if (retained.req.requestId === req.requestId) {
+      rt.abandoned.delete(pendingKey)
+      rt.activeKeys.add(pendingKey)
+      const entry: PendingButton = { req, socket, messageId: retained.messageId, at: Date.now() }
+      rt.pending.set(pendingKey, entry)
+      armPendingSocketClose(ctx, rt, entry, pendingKey)
+      rt.persist()
+      log(`ask-forward reattached: ${describeAskRequest(req)} key=${pendingKey} messageId=${retained.messageId ?? "-"}`)
+      return
     }
-    return
+    rt.abandoned.delete(pendingKey) // stale hash-collision → fall through to a fresh forward
   }
-  log(`ask-forward posted: ${describeAskRequest(req)} messageId=${messageId}`)
-  entry.messageId = messageId
-  if (pending.get(pendingKey) !== entry || entry.finalText) {
-    void editMessageText(ctx, messageId, entry.finalText ?? "expired — answer in terminal")
-  }
+  await forwardAndPostQuestion(ctx, rt, req, socket, pendingKey)
 }
 
 // The agent kind the hook was installed for (`tg-ctl ask --agent codex`);
@@ -1624,6 +1776,73 @@ function tmuxSessionName(): string | undefined {
     if (r.exitCode === 0) return r.stdout.toString().trim() || undefined
   } catch {}
   return undefined
+}
+
+// One result of a single hook-socket attempt. `response` is a COMPLETE reply (a
+// newline-terminated line the daemon wrote before closing — including a legitimate
+// "null" decline); `dropped` is a connection that closed/errored WITHOUT a complete
+// reply (daemon down, restarting, or died mid-block); `timeout` is the overall
+// budget elapsing. The distinction is what makes reconnect safe: only `dropped` is
+// retried — a real "null" decline is honored, not looped.
+type AskAttempt = { kind: "response"; raw: string | null } | { kind: "dropped" } | { kind: "timeout" }
+
+// Overall hook budget. Kept UNDER the 120s the harness gives the hook process so the
+// reconnect loop returns a real answer (or null) before the harness kills it.
+const ASK_TOTAL_TIMEOUT_MS = 115_000
+// Backoff between reconnect attempts. Also lets a LIVE daemon's socket-close handler
+// run (moving the entry to `abandoned`) BEFORE the resend lands, so the resend
+// re-attaches instead of racing the in-flight dedup.
+const ASK_RECONNECT_BACKOFF_MS = 250
+
+function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number): Promise<AskAttempt> {
+  return new Promise<AskAttempt>((resolve) => {
+    let done = false
+    const finish = (r: AskAttempt): void => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve(r)
+    }
+    const socket = createConnection(ctx.paths.socket)
+    let raw = ""
+    const timer = setTimeout(() => {
+      socket.destroy()
+      finish({ kind: "timeout" })
+    }, timeoutMs)
+    socket.setEncoding("utf8")
+    socket.on("connect", () => socket.write(requestLine + "\n"))
+    socket.on("data", (chunk) => {
+      raw += chunk
+    })
+    socket.on("error", () => finish({ kind: "dropped" }))
+    // A complete reply always ends in a newline (the daemon's socket.end(`${out}\n`));
+    // EOF with no newline means the daemon closed without answering → a drop to retry.
+    socket.on("end", () => finish(raw.includes("\n") ? { kind: "response", raw: raw.trim() || null } : { kind: "dropped" }))
+    socket.on("close", () => finish({ kind: "dropped" }))
+  })
+}
+
+// Reconnect-and-resend the SAME requestId across a mid-block socket drop (lossless
+// restart): a SCOPED question whose daemon restarted (crash-relaunch in ~1s, or a
+// deliberate stop+start) keeps trying until the restored daemon answers — it either
+// re-attaches the still-pending entry (no duplicate card) or replays the stored
+// answer. Bounded by ASK_TOTAL_TIMEOUT_MS; a real "null" decline returns immediately.
+async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string): Promise<string | null> {
+  const deadline = Date.now() + ASK_TOTAL_TIMEOUT_MS
+  let announcedDrop = false
+  for (;;) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return null
+    const res = await oneAskAttempt(ctx, requestLine, remaining)
+    if (res.kind === "response") return res.raw
+    if (res.kind === "timeout") return null
+    if (!announcedDrop) {
+      log("ask reconnect: daemon socket dropped — resending requestId until it comes back")
+      announcedDrop = true
+    }
+    const backoff = Math.min(ASK_RECONNECT_BACKOFF_MS, Math.max(0, deadline - Date.now()))
+    if (backoff > 0) await new Promise((r) => setTimeout(r, backoff))
+  }
 }
 
 async function askDaemon(ctx: Ctx): Promise<void> {
@@ -1654,27 +1873,18 @@ async function askDaemon(ctx: Ctx): Promise<void> {
   }
   const requestLine = JSON.stringify(req)
 
-  const output = await new Promise<string | null>((resolve) => {
-    const socket = createConnection(ctx.paths.socket)
-    let raw = ""
-    const timer = setTimeout(() => {
-      socket.destroy()
-      resolve(null)
-    }, 120_000)
-    socket.setEncoding("utf8")
-    socket.on("connect", () => socket.write(requestLine + "\n"))
-    socket.on("data", (chunk) => {
-      raw += chunk
-    })
-    socket.on("error", () => {
-      clearTimeout(timer)
-      resolve(null)
-    })
-    socket.on("end", () => {
-      clearTimeout(timer)
-      resolve(raw.trim() || null)
-    })
-  })
+  // A SCOPED question (paneId known) reconnect-and-resends across a daemon restart so
+  // a lossless stop+start / crash-relaunch never strands the human's pending card.
+  // Everything else (permissions, UNSCOPED questions) keeps the single-attempt path:
+  // those aren't retained across a restart, so resending would post a duplicate card.
+  const reconnectable = req.kind === "question" && Boolean(req.paneId)
+  let output: string | null
+  if (reconnectable) {
+    output = await requestHookAnswerWithReconnect(ctx, requestLine)
+  } else {
+    const attempt = await oneAskAttempt(ctx, requestLine, 120_000)
+    output = attempt.kind === "response" ? attempt.raw : null
+  }
   if (output && output !== "null") console.log(output)
   else {
     // The daemon declined (replied "null") or the connection failed / timed out,
@@ -1724,6 +1934,76 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // instead of posting a duplicate card. Swept on every record (pruneAnsweredButtons)
   // so it stays bounded to the last window's answers, never unbounded.
   const answeredButtons = new Map<string, AnsweredButton>()
+  // Socket-closed SCOPED questions retained for late-delivery + reconnect (this PR):
+  // a question whose hook socket died (the 120s window OR a daemon restart) but whose
+  // chosen answer can still reach the pane it asked from. NOT in `pendingButtons`, so
+  // it never defers its pane's inbound. Keyed by callbackRequestId, like the others.
+  const abandonedButtons = new Map<string, AbandonedButton>()
+  // Durable question state (this PR): persist pending + abandoned + answered to disk
+  // on every mutation (atomic) so a daemon restart loses nothing — a late tap still
+  // late-delivers and a reconnecting hook re-attaches instead of duplicating its card.
+  const persistQuestions = (): void => {
+    try {
+      const now = Date.now()
+      // Prune BOTH maps by age before writing: parse re-filters answered on restore,
+      // but pruning here too keeps the on-disk file tight and symmetric with abandoned.
+      pruneAbandonedButtons(abandonedButtons, now)
+      pruneAnsweredButtons(answeredButtons, now)
+      const data: QuestionStoreData = {
+        questions: [
+          // A LIVE pending scoped question and an abandoned one are equivalent on
+          // disk — both restore as "abandoned" (no live socket), recoverable by a
+          // late tap or a reconnect. Unscoped (paneId-less) pending is skipped: it
+          // can't be late-delivered (no pane) and must not resurrect to re-wedge.
+          ...[...pendingButtons.values()]
+            .filter((e) => e.req.kind === "question" && e.req.paneId && e.req.options?.length)
+            .map((e) => ({ req: e.req as unknown as Record<string, unknown>, messageId: e.messageId, at: e.at })),
+          ...[...abandonedButtons.values()].map((e) => ({
+            req: e.req as unknown as Record<string, unknown>,
+            messageId: e.messageId,
+            at: e.at,
+          })),
+        ],
+        answered: [...answeredButtons].map(([key, e]) => ({
+          key,
+          value: e.value,
+          label: e.label,
+          decision: e.decision,
+          at: e.at,
+          delivery: e.delivery,
+        })),
+      }
+      atomicWrite(ctx.paths.questions, serializeQuestionStore(data))
+    } catch (err) {
+      // Best-effort, like routes/topics: a persist failure must never break the hot
+      // forward/answer path. The state simply isn't durable until the next mutation.
+      log(`question persist failed: ${err}`)
+    }
+  }
+  // Restore durable state on bootstrap. A restored scoped question lands in
+  // `abandonedButtons` (no live socket) — a late tap injects to its pane, a reconnect
+  // re-attaches. Re-normalize each `req` through the AUTHORITATIVE validator and drop
+  // anything that isn't a scoped, option-bearing question. Answered entries restore
+  // the replay cache. Bounded to the retention/replay windows by parseQuestionStore.
+  {
+    const restored = parseQuestionStore(
+      readFileOrNull(ctx.paths.questions),
+      Date.now(),
+      ABANDONED_RETAIN_MS,
+      ANSWERED_REPLAY_MS,
+    )
+    for (const rec of restored.questions) {
+      const req = normalizeButtonRequest(rec.req)
+      if (!req || req.kind !== "question" || !req.paneId || !req.options?.length) continue
+      abandonedButtons.set(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at })
+    }
+    for (const a of restored.answered) {
+      answeredButtons.set(a.key, { value: a.value, label: a.label, decision: a.decision, at: a.at, delivery: a.delivery })
+    }
+    if (abandonedButtons.size || answeredButtons.size) {
+      log(`questions restored: ${abandonedButtons.size} retained, ${answeredButtons.size} answered`)
+    }
+  }
   // /agent (and unrecognized-reply) selection awaiting a button tap: token →
   // message + candidate list. `prewrapped` = inject the message verbatim (a reply
   // already carries its wrap/anchor) instead of wrapping it again.
@@ -2006,6 +2286,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const onUnscopedAbandon = (): void => {
     for (const paneId of deferred.panesWithBacklog()) onQuestionAbandoned(paneId)
   }
+  const questionRuntime: QuestionRuntime = {
+    pending: pendingButtons,
+    activeKeys: activeButtonKeys,
+    abandoned: abandonedButtons,
+    answered: answeredButtons,
+    persist: persistQuestions,
+    onAbandon: onQuestionAbandoned,
+    onUnscopedAbandon,
+  }
   let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
     // Remove the pidfile ONLY when it still names OUR pid (tg#93). On a launchd
@@ -2027,7 +2316,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   process.on("SIGTERM", () => cleanExit(0))
   process.on("SIGINT", () => cleanExit(0))
 
-  hookServer = startHookServer(ctx, pendingButtons, activeButtonKeys, answeredButtons, onQuestionAbandoned, onUnscopedAbandon)
+  hookServer = startHookServer(ctx, questionRuntime)
 
   if (ctx.cfg.transport === "channel") {
     log("transport 'channel' is reserved for v1.2+ — falling back to tmux")
@@ -3758,6 +4047,112 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // closest allowed emoji for "deferred behind the agent's open question".
   const DEFER_REACTION = "✍️"
 
+  // Late-delivery (this PR — the CTO's "I pressed a button but it didn't reach the
+  // harness" bug): a Telegram tap arrived for a SCOPED question whose hook socket
+  // already CLOSED (its 120s window elapsed → terminal fallback, OR a daemon restart
+  // restored it from disk). The agent is no longer blocked on the socket, but the
+  // chosen option can still reach the pane it asked from — inject it like any inbound
+  // reply (the established voice/text-reply path). Record the answer so a hook that
+  // reconnects with the SAME requestId replays it instead of re-forwarding, then drop
+  // the retained entry. Returns false when there is nothing to late-deliver (no
+  // retained entry, or the tap doesn't resolve to an option), so the caller falls
+  // back to the expired/already-answered toast.
+  const lateDeliverAbandonedQuestion = async (
+    action: Extract<Action, { kind: "answer-question" }>,
+  ): Promise<boolean> => {
+    const retained = abandonedButtons.get(action.requestId)
+    if (!retained || !retained.req.paneId) return false
+    // Enforce the retention window at DELIVERY time, not only on persist/restore. On a
+    // QUIET daemon (no mutation since the abandon) pruneAbandonedButtons never runs, so
+    // without this check an arbitrarily-stale answer would still be injected into a pane
+    // whose agent has long since moved on. Past the window → drop the entry, retire the
+    // now-dead card, and fall through to the "expired" toast.
+    if (Date.now() - retained.at > ABANDONED_RETAIN_MS) {
+      abandonedButtons.delete(action.requestId)
+      persistQuestions()
+      const staleCardId = retained.messageId ?? action.messageId
+      if (staleCardId !== null) {
+        void clearMessageKeyboard(ctx, staleCardId)
+        void editMessageText(ctx, staleCardId, EXPIRED_TERMINAL_TEXT)
+      }
+      log(`ask-late-deliver-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
+      return false
+    }
+    const answer = resolveButtonCallback(retained.req, { requestId: action.requestId, value: action.value })
+    if (answer.status !== "answered") return false
+    // Inject the chosen option into the asking pane, wrapped like any inbound reply.
+    // We do NOT enqueue it on the pane's defer queue: if the pane is BUSY we decline
+    // and keep the entry retained for a re-tap (the busy guard below) — a queued
+    // late-answer could be dead-lettered when that busy question is abandoned, a
+    // silent loss after we'd already have claimed "sent". NOTE (known bound): the pane
+    // is verified to still host an agent, but not that it is the SAME session as when
+    // the question was asked (a repurposed pane within the retention window receives a
+    // clearly-attributed "[TG from …] <label>" message, not a silent wrong action) —
+    // see issue tracker.
+    const paneId = retained.req.paneId
+    // The pane is BUSY (another live question, or a flush in progress) → do NOT
+    // deliver now. Injecting would hit the open prompt; ENQUEUING would risk the
+    // answer being dead-lettered when that other question is abandoned — a SILENT
+    // LOSS while we'd already have claimed "sent". Keep the entry RETAINED and ask
+    // the user to re-tap once the agent is free; never falsely confirm delivery.
+    if (shouldDeferInbound(paneId)) {
+      log(`ask-late-deliver-busy: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "agent is busy — tap again shortly")
+      return true
+    }
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, "tg", answer.label)
+    // CLAIM the entry BEFORE the inject await (consume it from `abandoned`, record the
+    // answer as PANE-delivered) instead of after. A daemon restart can deliver a
+    // queued tap and the reconnecting hook's resend at nearly the same instant; if we
+    // claimed only AFTER the await, a reconnect landing mid-inject would still find the
+    // entry in `abandoned` and either re-attach a LIVE socket (hanging the agent until
+    // ASK_TOTAL_TIMEOUT_MS) or fresh-forward a DUPLICATE card — and a later re-tap would
+    // inject the answer a SECOND time. Claiming first makes that concurrent reconnect
+    // hit the `already-pane-delivered` branch (it returns null → the agent falls back to
+    // the terminal where THIS injection lands), so the answer reaches the agent exactly
+    // once. Rolled back below if the inject fails, so a re-tap can still retry.
+    //
+    // Accepted bound: a daemon CRASH in the sub-inject window between this persist and
+    // the inject completing leaves the answer marked pane-delivered on disk though the
+    // injection may not have landed — a re-fire/re-tap then sees already-pane-delivered
+    // with no recovery. The window is shorter than one tmux send-keys (fast), and this
+    // is strictly better than the pre-PR behavior (a tap after the socket closed was
+    // dropped outright). A persisted "delivering" tri-state would close it but isn't
+    // worth the complexity for a sub-50ms window.
+    const answeredAt = Date.now()
+    abandonedButtons.delete(action.requestId)
+    pruneAnsweredButtons(answeredButtons, answeredAt)
+    answeredButtons.set(action.requestId, { value: answer.value, label: answer.label, decision: answer.decision, at: answeredAt, delivery: "pane" })
+    persistQuestions()
+    const res = await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
+    if (!res.ok) {
+      // The pane is unreachable (gone / no longer an agent). ROLL BACK the claim:
+      // restore the retained entry (with its ORIGINAL `at`, so a failed attempt doesn't
+      // extend its retention window) and drop the provisional answer — so a RE-TAP can
+      // retry and the answer isn't lost.
+      answeredButtons.delete(action.requestId)
+      abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
+      persistQuestions()
+      log(`ask-late-deliver-failed: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId} err=${res.error}`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "could not reach the terminal — tap again")
+      return true
+    }
+    log(`ask-late-delivered: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label} pane=${paneId}`)
+    await answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
+    const cardId = retained.messageId ?? action.messageId
+    if (cardId !== null) {
+      // Clear the keyboard now the answer landed: this card explicitly invited a tap
+      // ("window closed — tap still delivers …"), so once delivered it must stop being
+      // tappable. Otherwise a re-tap in the gap between the answered-replay window
+      // (ANSWERED_REPLAY_MS, 5 min) and the abandoned-retention window
+      // (ABANDONED_RETAIN_MS, 30 min) finds neither entry and shows a misleading
+      // "expired" on a card that WAS answered.
+      void clearMessageKeyboard(ctx, cardId)
+      void editMessageText(ctx, cardId, `answered: ${answer.label}`)
+    }
+    return true
+  }
+
   // Returns true when the action was handled successfully — the 'ack' case
   // reads the PREVIOUS action's verdict to decide whether the source message
   // earns its 👀 receipt (actions for one message are contiguous, ack last).
@@ -3773,11 +4168,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "answer-question": {
         const pending = pendingButtons.get(action.requestId)
         if (!pending) {
-          // No live prompt for this key. If we ANSWERED it WITHIN the replay window
-          // the tap is on an already-resolved card, not a truly-expired prompt — say
-          // so plainly instead of the misleading "expired" (tg-cli#97). Gated on the
-          // same window as the hook-path replay so the two never disagree on whether
-          // an entry is still "answered" vs aged-out.
+          // No LIVE prompt for this key. FIRST try late-delivery: a tap on a still-
+          // retained (abandoned) question injects the chosen option into its pane
+          // instead of being dropped (this PR). Only if there is nothing to deliver
+          // do we fall back to the toasts below.
+          if (await lateDeliverAbandonedQuestion(action)) return true
+          // If we ANSWERED it WITHIN the replay window the tap is on an already-
+          // resolved card, not a truly-expired prompt — say so plainly instead of the
+          // misleading "expired" (tg-cli#97). Gated on the same window as the hook-
+          // path replay so the two never disagree on whether an entry is still
+          // "answered" vs aged-out.
           const priorAnswer = answeredButtons.get(action.requestId)
           const stillAnswered = priorAnswer !== undefined && Date.now() - priorAnswer.at <= ANSWERED_REPLAY_MS
           await answerCallbackQuery(ctx, action.callbackQueryId, stillAnswered ? "already answered" : "expired")
@@ -3802,6 +4202,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         }
         pendingButtons.delete(action.requestId)
         activeButtonKeys.delete(action.requestId)
+        // A stale abandoned twin (a reconnect re-attach raced a tap) must not linger
+        // and resurrect on the next restart — the live answer below supersedes it.
+        abandonedButtons.delete(action.requestId)
         // Remember a QUESTION's answer briefly so a re-forward of the SAME requestId
         // (the AskUserQuestion double-cover / re-fire race) replays it instead of
         // posting a second card (tg-cli#97). Scoped to questions on purpose: a
@@ -3820,8 +4223,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             label: answer.label,
             decision: answer.decision,
             at: answeredAt,
+            delivery: "socket", // answered down the live hook socket → re-fire replays (#98)
           })
         }
+        // Persist the answer so a hook that reconnects after a restart replays it
+        // (no duplicate card) instead of re-forwarding the now-answered question.
+        persistQuestions()
         clearTimeout(pending.timer)
         const finalText = `answered: ${answer.label}`
         if (pending.messageId === null) pending.finalText = finalText
