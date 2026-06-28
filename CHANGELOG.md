@@ -3,6 +3,44 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.21.0
+
+**Fix (tg-cli#102): `tg --file report.md` → PDF closes two egress/exfil surfaces
+the sibling `.html` report path (tg-cli#96) had already closed.** The markdown→PDF
+render had two gaps:
+
+- **No network blackhole.** The Chrome `--print-to-pdf` invocation lacked
+  `--host-resolver-rules=MAP * ~NOTFOUND`, so a markdown document with a remote
+  resource (`![x](http://host/p.png)`, a remote font/iframe) made Chrome FETCH it
+  at print time — a tracking-pixel / SSRF / network-egress surface. The print now
+  runs with the DNS blackhole, so no remote subresource can resolve a host.
+- **pandoc-stage local-file inlining.** pandoc was invoked with `--embed-resources`
+  `--resource-path`, which base64-inlines ANY local file the markdown references
+  (`![x](/etc/passwd)`, `![x](../secret)`) into the produced HTML — with zero
+  attacker effort, for every referenced path — and fetches remote `src=`s at the
+  pandoc stage. Both flags are dropped (matching the #96 decision). Cost: a relative
+  LOCAL image in the markdown now shows broken in the PDF; remote images were
+  blackholed regardless. A report is text-formatting, not an image document.
+
+This is NOT yet full parity with the `.html` path, and the change does not claim
+to be. Two residuals remain on the md path, both tracked:
+- **tg-cli#103** (shared with the `.html` path): Chrome still loads an
+  ABSOLUTE-path / `file:`-scheme `<img>` from the `file://` document into the PDF
+  (the blackhole doesn't apply to `file://`). Relative refs are safe.
+- **tg-cli#104** (md path only): unlike the `.html` path, `convertMdToPdf` does
+  NOT run the element/handler sanitization (`sanitizeReportHtml` /
+  `stripEventHandlerAttrs`), so a hostile `.md` with raw `<iframe src="file://…">`
+  or `<script>` still reaches Chrome. pandoc keeps `raw_html` on for gfm.
+
+This change removes the primary, zero-effort exfil/egress surfaces (#102's scope);
+the sanitization and `file:`-subresource scrub are the #103/#104 follow-ups.
+
+The Chrome print step (with the blackhole + empty-PDF check) is now a single shared
+`printToPdf` helper used by BOTH the md-pdf path AND the code-pdf fence / html-report
+paths, so the print sandbox flags live in one place and the md path can never again
+silently diverge from the hardened code-pdf paths — which is the exact gap that
+caused this issue.
+
 ## 1.20.0
 
 **Feature (tg-cli#99): forwarded-question state survives a socket close and a

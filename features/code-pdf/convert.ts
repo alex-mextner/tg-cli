@@ -22,7 +22,7 @@
 // Conversion must never block or fail a send.
 
 import type { SendItem } from '../auto-attach/types';
-import { type ConvertDeps, type ConvertOutcome, fileUrl, findChrome } from '../md-pdf/convert';
+import { type ConvertDeps, type ConvertOutcome, findChrome, printToPdf } from '../md-pdf/convert';
 
 // --- Type detection -------------------------------------------------------
 //
@@ -343,7 +343,7 @@ export function fenceContent(content: string, lang: string, lineNumbers = false)
  * private temp dir. Returns the PDF path on success; otherwise an error string
  * (the caller warns and keeps the original attachment).
  *
- * Reuses findChrome + fileUrl from the md-pdf module; the only new pieces are
+ * Reuses findChrome + printToPdf from the md-pdf module; the only new pieces are
  * type detection, the fenced-markdown wrapping, and the mobile CSS.
  */
 export function convertCodeToPdf(
@@ -424,61 +424,16 @@ export function convertCodeToPdf(
   return { pdfPath, error: null, tmpDir: tmp };
 }
 
-// Run headless Chrome --print-to-pdf on a local HTML file. Returns null on
-// success, or an error string (the caller wraps it in a ConvertOutcome and
-// keeps the original attachment). Shared by the code-fence and HTML-render
-// paths so they never drift on the Chrome flags or the empty-PDF check.
-//
-// SANDBOXING — the HTML-render path (issue #95) feeds LIVE report HTML to
-// Chrome, not inert fenced source. A report could carry `<img src="http://…">`
-// (or other remote refs pandoc's raw_html preserves), which on print would make
-// Chrome fetch it — tracking pixels, SSRF to internal hosts. The network
-// blackhole neutralizes that primary surface; a print job needs no network at
-// all (the document is a local file:// URL):
-//   --host-resolver-rules=MAP * ~NOTFOUND : fails EVERY DNS lookup, so no
-//       remote subresource (`<img>`/font/iframe over http(s)) can fetch.
-// SCOPE — this blocks resolution of remote HOST NAMES, which covers the realistic
-// beacon (`<img src="http://host/p.png">`). It is NOT a complete SSRF wall: an
-// IP-literal host may skip the resolver (version-dependent) and a `file://`
-// subresource needs no DNS at all — but there is no return channel either way,
-// so the residual is low-impact. The executable surface — `<script>`, inline
-// `on*=` handlers, `<iframe>`/`<object>`/`<embed>` — is removed UPSTREAM by
-// sanitizeReportHtml before the HTML reaches Chrome (the documented JS-off flag
+// The headless-Chrome print step (with the DNS blackhole + empty-PDF check) is
+// the shared `printToPdf` helper in ../md-pdf/convert — ONE source of the print
+// sandbox flags for the md-pdf path AND both code-pdf paths, so they can't drift
+// (issue #102). What is code-pdf-SPECIFIC and stays here: the executable surface
+// the HTML-render path must remove BEFORE that print — `<script>`, inline `on*=`
+// handlers, `<iframe>`/`<object>`/`<embed>`/`<svg>` — handled UPSTREAM by
+// sanitizeReportHtml + stripEventHandlerAttrs (issue #95). The blackhole stops a
+// remote FETCH; those two layers stop code from RUNNING. (The JS-off flag
 // `--blink-settings=scriptEnabled=false` was tried and SILENTLY breaks the print
-// — Chrome emits an empty PDF — so the strip is the JS mitigation, not a flag).
-// RESIDUAL: the render still runs under `--no-sandbox` (inherited from the fence
-// path), so a Chrome parser/font bug on attacker-shaped HTML/CSS is not fully
-// contained — accepted trade-off, same as the pre-existing fence path.
-// The fence path inherits the same flag at zero cost (it had no remote refs).
-function printToPdf(
-  deps: Pick<ConvertDeps, 'run' | 'fileSize'>,
-  chrome: string,
-  htmlPath: string,
-  pdfPath: string,
-): string | null {
-  const chromeRun = deps.run(
-    [
-      chrome,
-      '--headless=new',
-      '--disable-gpu',
-      '--no-sandbox',
-      '--no-pdf-header-footer',
-      '--host-resolver-rules=MAP * ~NOTFOUND',
-      '--virtual-time-budget=2000',
-      `--print-to-pdf=${pdfPath}`,
-      fileUrl(htmlPath),
-    ],
-    30_000,
-  );
-  if (chromeRun === null || chromeRun.exitCode !== 0) {
-    const detail = chromeRun ? chromeRun.stderr.trim().slice(0, 200) : 'spawn failed';
-    return `chrome print-to-pdf failed: ${detail}`;
-  }
-  if (deps.fileSize(pdfPath) <= 0) {
-    return 'chrome reported success but produced no/empty PDF';
-  }
-  return null;
-}
+// — Chrome emits an empty PDF — so the strip is the JS mitigation, not a flag.)
 
 // --- HTML report → rendered PDF (issue #95) -------------------------------
 //
@@ -677,15 +632,14 @@ export function convertHtmlToPdf(htmlSrcPath: string, deps: ConvertDeps, preset:
   // mobile CSS; the title metadata avoids pandoc's empty-title warning (the CSS
   // hides the title block on the page).
   //
-  // DELIBERATELY NO `--embed-resources` / `--resource-path` (md-pdf uses them to
-  // inline relative images). A `.html` REPORT is text-formatting, not an image
-  // document — and embed-resources base64-inlines ANY local file the HTML
-  // references (`<img src="../secret">` reads it into the PDF that is then
-  // uploaded to Telegram), a local-file-disclosure surface this render path's
-  // own threat model (the DNS blackhole for remote refs) exists to avoid. The
-  // cost is that a relative LOCAL `<img>` shows broken; remote images are
-  // blackholed anyway. Accepted: reports don't carry images. (Follow-up: reconcile
-  // md-pdf's broader embed surface — tracked separately.)
+  // DELIBERATELY NO `--embed-resources` / `--resource-path`. A `.html` REPORT is
+  // text-formatting, not an image document — and embed-resources base64-inlines
+  // ANY local file the HTML references (`<img src="../secret">` reads it into the
+  // PDF that is then uploaded to Telegram), a local-file-disclosure surface this
+  // render path's own threat model (the DNS blackhole for remote refs) exists to
+  // avoid. The cost is that a relative LOCAL `<img>` shows broken; remote images
+  // are blackholed anyway. Accepted: reports don't carry images. (The md-pdf path
+  // was brought to the same no-embed-resources parity in issue #102.)
   const pandocArgs = [
     'pandoc',
     '-f',

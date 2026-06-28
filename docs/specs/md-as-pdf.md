@@ -6,9 +6,10 @@ Module: `features/md-pdf/convert.ts`. ON by default. Toggle: `--no-feature md-as
 ## North star
 
 `.md` / `.markdown` files attached from disk are converted to PDF before upload. Telegram's
-native Markdown preview is unreliable for rich documents (tables, fenced code, inline
-images); a PDF renders correctly on every client and is immediately readable without a viewer
-app. The conversion is silent on success and non-blocking on failure.
+native Markdown preview is unreliable for rich documents (tables, fenced code, formatting);
+a PDF renders correctly on every client and is immediately readable without a viewer app. The
+conversion is silent on success and non-blocking on failure. Local images referenced by the
+markdown are deliberately NOT embedded into the PDF — see [Security](#security).
 
 ## Pipeline
 
@@ -21,10 +22,15 @@ app. The conversion is silent on success and non-blocking on failure.
 3. **Chrome print pass** — render HTML to PDF:
    ```
    <chrome> --headless=new --no-pdf-header-footer \
+            --host-resolver-rules="MAP * ~NOTFOUND" \
             --virtual-time-budget=2000 \
             --print-to-pdf=<tmp.pdf> \
             "file://<percent-encoded-absolute-path-to-tmp.html>"
    ```
+   The print runs through the shared `printToPdf` helper, the single source of the
+   Chrome print flags for both this path and the code-as-pdf / html-report paths
+   (`features/code-pdf/convert.ts`), so they cannot drift on the print sandbox. See
+   [Security](#security).
 4. Upload the resulting PDF in place of the original `.md`. The filename shown in Telegram
    is `<original-basename>.pdf`.
 5. On any failure (see below) — upload the original `.md` unchanged and emit a one-line
@@ -76,6 +82,45 @@ The warning line format: `[md-as-pdf] <reason>: falling back to .md upload`.
 Temp files (`<tmp>.html`, `<tmp>.pdf`) are created in the OS temp directory and deleted in
 a `finally` block regardless of success or failure. On unclean exit (process kill), the OS
 cleans them up on the next reboot in the normal course.
+
+## Security
+
+The PDF is rendered from user-supplied markdown and then uploaded to Telegram, so the
+render must not be a network-egress or local-file-disclosure channel (issue tg-cli#102 —
+parity with the `.html` report path, tg-cli#95/#96):
+
+- **Network blackhole.** The Chrome print runs with
+  `--host-resolver-rules="MAP * ~NOTFOUND"`, which fails every DNS lookup. A markdown
+  document with a remote resource (`![x](http://host/p.png)`, a remote font/iframe) cannot
+  resolve a host at print time, so it cannot beacon out (tracking pixel / SSRF / egress).
+  Scope: this blocks remote HOST NAMES; an IP-literal host may skip the resolver and a
+  `file://` subresource needs no DNS — but there is no return channel either way.
+- **No pandoc-stage local-file inlining.** pandoc is invoked WITHOUT `--embed-resources` /
+  `--resource-path`. `--embed-resources` base64-inlines any local file the markdown
+  references (`![x](/etc/passwd)`, `![x](../secret)`) into the HTML it produces — with zero
+  attacker effort, for EVERY referenced path, relative or absolute — and fetches remote
+  `src=`s at the pandoc stage. Dropping it closes both. The cost: a relative LOCAL image in
+  the markdown shows broken in the PDF (remote images are blackholed regardless). A report
+  is text-formatting, not an image document.
+
+This closes the two surfaces above but is **not full parity** with the `.html` report path.
+Two residuals remain, both tracked:
+
+- **tg-cli#103 (shared with the `.html` path):** removing `--embed-resources` stops the
+  pandoc-stage inlining, but Chrome itself — printing the `file://` document — still loads
+  an ABSOLUTE-path or `file:`-scheme subresource (`<img src="file:///abs/secret.png">`) and
+  prints it into the PDF; the DNS blackhole does not apply to `file://`. A relative ref is
+  safe (it resolves into the temp dir, where the file isn't).
+- **tg-cli#104 (md path only):** unlike the `.html` path — which runs `sanitizeReportHtml`
+  + `stripEventHandlerAttrs` to strip `<script>`/`<iframe>`/`<object>`/`<embed>`/`<svg>` and
+  `on*=` handlers before the print — `convertMdToPdf` does NOT sanitize pandoc's output.
+  pandoc keeps gfm `raw_html` on, so a hostile `.md` with a raw `<iframe src="file://…">`
+  (arbitrary local TEXT disclosure, broader than the `<img>` residual) or `<script>` reaches
+  Chrome. Bringing the md path to the `.html` path's sanitization is tracked as tg-cli#104.
+
+Both the md-pdf path and the code-pdf/html-report paths share one print helper
+(`printToPdf` in `features/md-pdf/convert.ts`), so the print sandbox flags are defined in a
+single place and the paths cannot silently diverge.
 
 ## Dependencies
 
