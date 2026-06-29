@@ -3,6 +3,21 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.22.0
+
+**Feature (tg-cli#31): §11 forum-topic deferrals — reply anchor, slash intercept, rename persistence.**
+Three behavioral completions for forum-topics mode:
+
+- **Reply anchor in bound topics.** A reply to a message inside a bound forum topic now carries
+  the same `↩ «…»` quote-anchor as flat-chat replies (`buildReplyInject`), so the topic agent
+  knows which earlier message is being addressed.
+- **Daemon-global slash commands intercepted.** `/status`, `/agent`, and `/new` sent from inside
+  a bound topic are now routed to the daemon (not injected verbatim into the topic pane). `/stop`
+  and `/kill` are explicitly not intercepted — they still reach the topic's harness session.
+- **`forum_topic_edited` persists rename.** A topic rename service message now emits a
+  `topic-rename` action: the daemon persists the new name in `TopicBinding` and calls
+  `tmux rename-window` to keep the window slug in sync.
+
 ## 1.21.0
 
 **Fix (tg-cli#102): `tg --file report.md` → PDF closes two egress/exfil surfaces
