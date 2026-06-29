@@ -223,6 +223,8 @@ export type Action =
   // Topic closed / reopened service messages → mark the binding (entrypoint persists).
   | { kind: 'topic-close'; threadId: number }
   | { kind: 'topic-reopen'; threadId: number }
+  // Topic renamed service message → persist new name + update the tmux-window slug.
+  | { kind: 'topic-rename'; threadId: number; name: string }
   // --- flat-chat /new command (issue #27; NON-topic) ---
   // A `/new [<model>] [<dir>] name [<task>]` slash command in the flat chat → start the
   // interactive new-session flow (ask dir, then model, then spawn). All parts but `name` are

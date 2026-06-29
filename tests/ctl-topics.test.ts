@@ -21,6 +21,7 @@ import {
   clearSpawnPending,
   markBound,
   markClosed,
+  markRenamed,
   markReopened,
   markRespawnOffered,
   markSpawnPending,
@@ -357,9 +358,20 @@ test('topics ON: close/reopen on an UNTRACKED topic emits no topic action (just 
   expect(closed.actions).toEqual([{ kind: 'ack', messageId: 3 }]);
 });
 
-test('topics ON: forum_topic_edited (rename) is swallowed (ack only) — recognized service msg, never leaks to flat', () => {
+test('topics ON: forum_topic_edited (rename) with name → topic-rename + ack for a tracked topic — never leaks to flat', () => {
+  // §11 deferral 3: a rename of a tracked topic emits topic-rename so the entrypoint can
+  // persist the new name and update the tmux window slug.
   const r = stepUpdates(
     [upd(4, { message_thread_id: 50, forum_topic_edited: { name: 'renamed' } })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions).toEqual([{ kind: 'topic-rename', threadId: 50, name: 'renamed' }, { kind: 'ack', messageId: 4 }]);
+});
+
+test('topics ON: forum_topic_edited with no name (icon-only) is silently acked — never leaks to flat', () => {
+  // An icon-only edit carries no name; nothing to persist, just ack.
+  const r = stepUpdates(
+    [upd(4, { message_thread_id: 50, forum_topic_edited: {} })],
     makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
   );
   expect(r.actions).toEqual([{ kind: 'ack', messageId: 4 }]);
@@ -659,4 +671,114 @@ test('parseTopics preserves spawnPending:true + spawnToken, ignores non-true / n
   const off = JSON.stringify([{ threadId: 2, name: 'b', status: 'awaiting-model', ts: 1, spawnPending: 1, spawnToken: 42 }]);
   expect(parseTopics(off)[0].spawnPending).toBeUndefined();
   expect(parseTopics(off)[0].spawnToken).toBeUndefined();
+});
+
+// --- §11 deferrals: reply anchor, daemon-global slash intercept, topic-rename ---
+
+// Deferral 2 adversarial boundary: /stop and /kill must NOT be intercepted (they
+// belong to the topic's own harness session, not the daemon).
+test('§11 d2: /stop in a bound topic → topic-route with verbatim /stop (not daemon-intercepted)', () => {
+  const r = stepUpdates(
+    [upd(20, { text: '/stop', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '/stop', from: 'Alex', messageId: 20 });
+});
+
+test('§11 d2: /kill in a bound topic → topic-route with verbatim /kill (not daemon-intercepted)', () => {
+  const r = stepUpdates(
+    [upd(21, { text: '/kill', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '/kill', from: 'Alex', messageId: 21 });
+});
+
+test('§11 d2: /status in a bound topic → daemon-intercepted (kind: status)', () => {
+  const r = stepUpdates(
+    [upd(22, { text: '/status', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]).toMatchObject({ kind: 'status' });
+});
+
+test('§11 d2: /agent @bot in a bound topic → daemon-intercepted (kind: agent-route, NOT topic-route)', () => {
+  const r = stepUpdates(
+    [upd(23, { text: '/agent @mybot pane1', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]?.kind).not.toBe('topic-route');
+  expect(r.actions[0]?.kind).toBe('agent-route');
+});
+
+test('§11 d2: /new model dir Name in a bound topic → daemon-intercepted (NOT topic-route)', () => {
+  const r = stepUpdates(
+    [upd(24, { text: '/new claude-opus /tmp MyAgent', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]?.kind).not.toBe('topic-route');
+  expect(r.actions[0]?.kind).toBe('new-command');
+});
+
+// Deferral 1: prose reply in a bound topic gets the ↩ «…» quote-anchor.
+test('§11 d1: prose reply in a bound topic → topic-route with ↩ «…» quote-anchor', () => {
+  const replyTo = { message_id: 42, date: 1_749_000_000, text: 'quoted text', chat: { id: CHAT_ID, type: 'supergroup' as const } };
+  const r = stepUpdates(
+    [upd(25, { text: 'yes, do it', message_thread_id: 50, is_topic_message: true, reply_to_message: replyTo })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  const a = r.actions[0];
+  expect(a?.kind).toBe('topic-route');
+  if (a?.kind === 'topic-route') {
+    expect(a.injectText).toMatch(/^↩ «/);
+  }
+});
+
+test('§11 d1: /stop reply in a bound topic → verbatim /stop (no anchor, /stop is a command)', () => {
+  const replyTo = { message_id: 42, date: 1_749_000_000, text: 'whatever', chat: { id: CHAT_ID, type: 'supergroup' as const } };
+  const r = stepUpdates(
+    [upd(26, { text: '/stop', message_thread_id: 50, is_topic_message: true, reply_to_message: replyTo })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  // /stop must go verbatim to the topic agent, no anchor
+  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '/stop', from: 'Alex', messageId: 26 });
+});
+
+// Deferral 3: topic-rename action from forum_topic_edited.
+test('§11 d3: forum_topic_edited with name → topic-rename for a tracked topic', () => {
+  const r = stepUpdates(
+    [upd(30, { message_thread_id: 50, forum_topic_edited: { name: 'New Name' } })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: (t) => (t === 50 ? 'bound' : null) }),
+  );
+  expect(r.actions).toContainEqual({ kind: 'topic-rename', threadId: 50, name: 'New Name' });
+});
+
+test('§11 d3: forum_topic_edited with no name (icon-only edit) → [] for a tracked topic', () => {
+  const r = stepUpdates(
+    [upd(31, { message_thread_id: 50, forum_topic_edited: {} })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions.some((a) => a.kind === 'topic-rename')).toBe(false);
+  expect(r.actions).toContainEqual({ kind: 'ack', messageId: 31 });
+});
+
+test('§11 d3: forum_topic_edited with name for an UNTRACKED topic → [] (not topic-rename)', () => {
+  const r = stepUpdates(
+    [upd(32, { message_thread_id: 77, forum_topic_edited: { name: 'Whatever' } })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => null }),
+  );
+  expect(r.actions.some((a) => a.kind === 'topic-rename')).toBe(false);
+});
+
+// markRenamed lifecycle: keeps all fields except name + ts.
+test('markRenamed updates name + ts, preserves all other fields', () => {
+  const binding: TopicBinding = {
+    threadId: 50, name: 'old-name', status: 'bound', paneId: '%3', path: '/p', model: 'claude-opus', ts: 100,
+  };
+  const renamed = markRenamed(binding, 'new-name', 200);
+  expect(renamed.name).toBe('new-name');
+  expect(renamed.ts).toBe(200);
+  expect(renamed.status).toBe('bound');
+  expect(renamed.paneId).toBe('%3');
+  expect(renamed.path).toBe('/p');
+  expect(renamed.model).toBe('claude-opus');
 });

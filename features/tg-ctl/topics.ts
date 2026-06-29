@@ -156,6 +156,13 @@ export function markReopened(binding: TopicBinding, ts: number): TopicBinding {
   return { ...rest, status, paneId: undefined, ts };
 }
 
+// The topic was renamed in Telegram → update the stored name so the tmux-window slug stays
+// fresh. All other binding fields are preserved (status/paneId/path/model). Pure — the
+// entrypoint renames the live tmux window via tmux rename-window after persisting.
+export function markRenamed(binding: TopicBinding, name: string, ts: number): TopicBinding {
+  return { ...binding, name, ts };
+}
+
 // --- helpers ---
 
 // True when the topic is mid-/new-flow (the next user message/callback is an answer,

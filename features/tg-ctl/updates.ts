@@ -402,10 +402,17 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
   // entrypoint has no binding for (keeps the "untracked → not ours" symmetry; review catch).
   if (m.forum_topic_closed) return (opts.topicStatusOf?.(threadId) ?? null) !== null ? [{ kind: 'topic-close', threadId }] : [];
   if (m.forum_topic_reopened) return (opts.topicStatusOf?.(threadId) ?? null) !== null ? [{ kind: 'topic-reopen', threadId }] : [];
-  // A topic RENAME is a recognized service message — swallow it (ack, never leak to flat), keeping
-  // the "known topic never falls to flat" invariant. Persisting the new TopicBinding.name (for the
-  // tmux-window slug) is the increment-2 entrypoint's job; here we just don't mis-route it.
-  if (m.forum_topic_edited) return [];
+  // A topic RENAME (forum_topic_edited) is a recognized service message — never leak to flat.
+  // If the edit carries a new name and the topic is tracked, emit topic-rename so the entrypoint
+  // can persist the new name and rename the live tmux window slug. An icon-only edit (no name
+  // field) or an untracked topic → ack quietly (same "known topic stays ours" invariant).
+  if (m.forum_topic_edited) {
+    const newName = m.forum_topic_edited.name;
+    if (newName && opts.topicStatusOf?.(threadId) != null) {
+      return [{ kind: 'topic-rename', threadId, name: newName }];
+    }
+    return [];
+  }
   // A non-forum supergroup reply-thread also carries message_thread_id; only a real forum
   // topic message sets is_topic_message. Without it we'd false-capture a reply thread whose id
   // happened to match a tracked topic — so require the flag for non-service messages.
@@ -426,6 +433,19 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // is increment 2; the point is it must never leak to a flat agent.
     const text = m.text ?? '';
     if (!text) return [];
+    // §11 deferral 2: intercept the 3 daemon-global verbs (/status, /agent, /new) even inside
+    // a bound topic — they control the daemon, not the topic agent. /stop and /kill are NOT
+    // intercepted: they must still reach the topic's pane (kill/escape the harness session).
+    // Using an explicit set (not isDaemonSlashCommand) to avoid over-intercepting.
+    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new']);
+    const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
+    if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id)];
+    // §11 deferral 1: a prose reply carries the same ↩ «…» quote-anchor as flat-chat replies.
+    // A /command reply still goes verbatim (the startsWith('/') guard above already passed it
+    // through to the injectText path below).
+    if (m.reply_to_message && !text.startsWith('/')) {
+      return [{ kind: 'topic-route', threadId, injectText: buildReplyInject(m, name, opts), from: name, messageId: m.message_id }];
+    }
     const injectText = isLikelySlashCommand(text) ? text : opts.wrap(name, text, m.message_id);
     return [{ kind: 'topic-route', threadId, injectText, from: name, messageId: m.message_id }];
   }
