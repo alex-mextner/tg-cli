@@ -104,6 +104,7 @@ import {
   clearSpawnPending,
   markBound,
   markClosed,
+  markRenamed,
   markReopened,
   markRespawnOffered,
   markSpawnPending,
@@ -2907,6 +2908,32 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
+  // §11 deferral 3: forum_topic_edited (rename) → persist TopicBinding.name and rename the live
+  // tmux window slug so the window title stays in sync with the Telegram topic name.
+  const handleTopicRename = (action: Extract<Action, { kind: "topic-rename" }>): boolean => {
+    const topics = loadTopics()
+    const binding = findTopic(topics, action.threadId)
+    if (!binding) return true // untracked — stepUpdates already filtered, defensive only
+    const ts = Math.floor(Date.now() / 1000)
+    persistTopics(appendTopic(topics, markRenamed(binding, action.name, ts)))
+    if (binding.paneId && binding.status === "bound") {
+      const slug = slugifyTopicName(action.name, action.threadId)
+      try {
+        const proc = Bun.spawnSync(["tmux", "rename-window", "-t", binding.paneId, slug], {
+          stdout: "pipe",
+          stderr: "pipe",
+          env: SUBPROC_ENV,
+        })
+        if (proc.exitCode !== 0) {
+          log(`rename-window ${binding.paneId} → ${slug} exited ${proc.exitCode}: ${proc.stderr.toString().trim()}`)
+        }
+      } catch (err) {
+        log(`rename-window failed for pane ${binding.paneId}: ${err}`)
+      }
+    }
+    return true
+  }
+
   // --- forum-topics SPAWN executor (docs/specs/tg-forum-topics.md §5, increment 2) ---
   // The /new flow that creates a binding and launches a fresh agent into its own tmux window.
   // SAFETY (this is the CTO's daily lifeline daemon): every step is exception-guarded — a bad
@@ -4306,6 +4333,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "topic-close":
       case "topic-reopen":
         return handleTopicLifecycle(action)
+      case "topic-rename":
+        return handleTopicRename(action)
       case "topic-new":
         return handleTopicNew(action)
       case "topic-answer":
