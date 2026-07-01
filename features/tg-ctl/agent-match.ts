@@ -24,8 +24,8 @@ export interface AgentCandidate {
 
 export interface ParsedAgentCommand {
   // First whitespace token after `/agent` — a POSSIBLE window selector. The
-  // caller fuzzy-matches it; if it matches nothing, it is folded back into the
-  // message (see `rest` vs `all`).
+  // caller fuzzy-matches it; if it matches nothing, the caller replies with an
+  // error (no delivery). `rest` and `all` carry the message for each case.
   selector: string | null;
   rest: string; // message when `selector` IS a window (everything after it)
   all: string; // message when there is NO selector (everything after `/agent`)
