@@ -3,6 +3,15 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.23.1
+
+**Fix (tg-cli#57): permission card durability — retain on socket close, re-attach on reconnect.**
+
+- `retainAbandonedQuestion` extended to cover `kind === "permission"` cards alongside questions.
+- Socket-close text differentiation so permission cards are not discarded on disconnect.
+- Delivery guard and persist filter ensure the tap reaches the harness after reconnect.
+- 19/19 integration tests pass.
+
 ## 1.23.0
 
 **Fix: `review visual` argv rename + VS Code window crop enforcement in pre-send-photo hook.**
@@ -18,7 +27,6 @@ semantic versioning.
 - **Hook Caller Discipline** (AGENTS.md) — when a hook needs clearer callee semantics, fix
   the callee command surface and invoke that surface directly; do not change cwd or add
   caller-side env hacks.
-
 ## 1.22.0
 
 **Feature (tg-cli#31): §11 forum-topic deferrals — reply anchor, slash intercept, rename persistence.**
