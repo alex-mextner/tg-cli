@@ -2,6 +2,8 @@ import { expect, test } from 'bun:test';
 import {
   filterByDirection,
   filterByPane,
+  filterBySince,
+  filterByUntil,
   searchHistory,
   selectHistory,
   formatLine,
@@ -207,4 +209,63 @@ test('buildJsonOutput: machine shape (ts ms, id, direction, from, text, pane)', 
 test('buildJsonOutput: ts is epoch MS (history stores seconds)', () => {
   const json = buildJsonOutput([R({ ts: 1700000000, message_id: 1 })]);
   expect(json[0].ts).toBe(1700000000 * 1000);
+});
+
+// filterBySince / filterByUntil
+
+test('filterBySince: undefined is a pass-through', () => {
+  expect(filterBySince(sample, undefined).length).toBe(4);
+});
+
+test('filterBySince: keeps only records at or after the lower bound', () => {
+  // ts values: 1700000000, 1700000060, 1700000120, 1700000180
+  const out = filterBySince(sample, 1700000060);
+  expect(out.map((r) => r.message_id)).toEqual([11, 12, 13]);
+});
+
+test('filterBySince: exact match is inclusive', () => {
+  const out = filterBySince(sample, 1700000000);
+  expect(out.length).toBe(4);
+});
+
+test('filterBySince: value after last record returns empty', () => {
+  expect(filterBySince(sample, 1700000999)).toEqual([]);
+});
+
+test('filterByUntil: undefined is a pass-through', () => {
+  expect(filterByUntil(sample, undefined).length).toBe(4);
+});
+
+test('filterByUntil: keeps only records at or before the upper bound', () => {
+  const out = filterByUntil(sample, 1700000060);
+  expect(out.map((r) => r.message_id)).toEqual([10, 11]);
+});
+
+test('filterByUntil: exact match is inclusive', () => {
+  const out = filterByUntil(sample, 1700000180);
+  expect(out.length).toBe(4);
+});
+
+test('filterByUntil: value before first record returns empty', () => {
+  expect(filterByUntil(sample, 999999999)).toEqual([]);
+});
+
+test('selectHistory: --since and --until filter the window correctly', () => {
+  const out = selectHistory(
+    sample,
+    {
+      kind: 'query',
+      direction: 'all',
+      action: 'list',
+      allSessions: true,
+      limit: 20,
+      full: false,
+      json: false,
+      regex: false,
+      since: 1700000060,
+      until: 1700000120,
+    },
+    null,
+  );
+  expect(out.map((r) => r.message_id)).toEqual([11, 12]);
 });

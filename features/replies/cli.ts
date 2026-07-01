@@ -45,14 +45,24 @@ Flags:
   --regex              treat the find <query> as a regular expression
   --all-sessions       ignore the current pane; search across every session
   --session <paneId>   scope to a specific tmux pane (e.g. %7)
+  --since <date>       only messages at or after this date (inclusive)
+  --until <date>       only messages at or before this date (inclusive)
   -h, --help           show this help
+
+Date formats for --since / --until:
+  2026-06-28            ISO date (midnight UTC)
+  2026-06-28T10:00      ISO datetime (UTC)
+  3d / 24h / 7d         relative — N days or hours ago from now
 
 Line format:  [YYYY-MM-DD HH:MM] #<id> <text>
 Examples:
-  tg replies                      # what you sent in this session
-  tg replies all                  # full back-and-forth here
-  tg replies user find deploy     # your messages mentioning "deploy"
-  tg replies agent --all-sessions # everything the agent has sent, anywhere`;
+  tg replies                               # what you sent in this session
+  tg replies all                           # full back-and-forth here
+  tg replies user find deploy              # your messages mentioning "deploy"
+  tg replies agent --all-sessions          # everything the agent has sent, anywhere
+  tg replies user --since 2026-06-28       # your messages from June 28 onward
+  tg replies user --since 3d              # your messages in the last 3 days
+  tg replies all --since 2026-06-28 --until 2026-06-30  # a date range`;
 
 export function runReplies(argv: string[], deps: RepliesCliDeps): number | null {
   if (argv[0] !== 'replies') return null;

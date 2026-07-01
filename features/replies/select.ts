@@ -16,6 +16,18 @@ export function filterByDirection(records: HistoryRecord[], direction: Direction
   return records.filter((r) => r.direction === direction);
 }
 
+// Keep only records at or after a unix-seconds lower bound. Undefined = no filter.
+export function filterBySince(records: HistoryRecord[], since: number | undefined): HistoryRecord[] {
+  if (since === undefined) return records;
+  return records.filter((r) => r.ts >= since);
+}
+
+// Keep only records at or before a unix-seconds upper bound. Undefined = no filter.
+export function filterByUntil(records: HistoryRecord[], until: number | undefined): HistoryRecord[] {
+  if (until === undefined) return records;
+  return records.filter((r) => r.ts <= until);
+}
+
 // Scope to one tmux pane. A null pane means "no scope" (--all-sessions or no
 // detectable pane). A record whose own pane is null never matches a concrete
 // scope — it was logged outside tmux and belongs to no session.
@@ -40,9 +52,10 @@ export function searchHistory(records: HistoryRecord[], query: string, regex: bo
 
 // --- selection pipeline ---
 
-// direction → pane → (find ? search) → keep the LAST `limit`, oldest→newest.
-// The pane scope is resolved by the entrypoint (args.session / detected pane /
-// null for --all-sessions) and passed in; keeping it a param keeps this pure.
+// direction → pane → since/until → (find ? search) → keep the LAST `limit`,
+// oldest→newest. The pane scope is resolved by the entrypoint (args.session /
+// detected pane / null for --all-sessions) and passed in; keeping it a param
+// keeps this pure.
 export function selectHistory(
   records: HistoryRecord[],
   args: RepliesQuery,
@@ -50,6 +63,8 @@ export function selectHistory(
 ): HistoryRecord[] {
   let out = filterByDirection(records, args.direction);
   out = filterByPane(out, pane);
+  out = filterBySince(out, args.since);
+  out = filterByUntil(out, args.until);
   if (args.action === 'find' && args.query !== undefined) {
     out = searchHistory(out, args.query, args.regex);
   }

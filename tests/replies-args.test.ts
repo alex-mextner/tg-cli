@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { parseRepliesArgs } from '../features/replies/args';
+import { parseRepliesArgs, parseDateArg } from '../features/replies/args';
 
 test('parseRepliesArgs: bare `replies` → direction=user, action=list, scope=session, limit 20', () => {
   const a = parseRepliesArgs([]);
@@ -119,4 +119,86 @@ test('parseRepliesArgs: regex query keeps spaces and special chars verbatim', ()
 
 test('parseRepliesArgs: unknown flag is an error', () => {
   expect(parseRepliesArgs(['--nope']).kind).toBe('error');
+});
+
+// parseDateArg
+
+test('parseDateArg: ISO date resolves to midnight UTC of that day', () => {
+  const ts = parseDateArg('2026-06-28');
+  expect(ts).toBe(Date.parse('2026-06-28T00:00:00Z') / 1000);
+});
+
+test('parseDateArg: ISO datetime (YYYY-MM-DDTHH:MM) resolves to that UTC moment', () => {
+  const ts = parseDateArg('2026-06-28T10:30');
+  expect(ts).toBe(Date.parse('2026-06-28T10:30:00Z') / 1000);
+});
+
+test('parseDateArg: relative Nd resolves to now minus N days', () => {
+  const now = 1_000_000;
+  expect(parseDateArg('3d', now)).toBe(now - 3 * 86400);
+  expect(parseDateArg('7d', now)).toBe(now - 7 * 86400);
+});
+
+test('parseDateArg: relative Nh resolves to now minus N hours', () => {
+  const now = 1_000_000;
+  expect(parseDateArg('24h', now)).toBe(now - 24 * 3600);
+  expect(parseDateArg('1h', now)).toBe(now - 3600);
+});
+
+test('parseDateArg: invalid string returns null', () => {
+  expect(parseDateArg('bogus')).toBeNull();
+  expect(parseDateArg('2026-99-99')).toBeNull(); // invalid calendar date
+  expect(parseDateArg('yesterday')).toBeNull();
+});
+
+// parseRepliesArgs --since / --until
+
+test('parseRepliesArgs: --since ISO date sets since field', () => {
+  const a = parseRepliesArgs(['--since', '2026-06-28']);
+  if (a.kind !== 'query') throw new Error('unreachable');
+  expect(a.since).toBe(Date.parse('2026-06-28T00:00:00Z') / 1000);
+  expect(a.until).toBeUndefined();
+});
+
+test('parseRepliesArgs: --until ISO date sets until field', () => {
+  const a = parseRepliesArgs(['--until', '2026-06-30']);
+  if (a.kind !== 'query') throw new Error('unreachable');
+  expect(a.until).toBe(Date.parse('2026-06-30T00:00:00Z') / 1000);
+  expect(a.since).toBeUndefined();
+});
+
+test('parseRepliesArgs: --since and --until together', () => {
+  const a = parseRepliesArgs(['--since', '2026-06-28', '--until', '2026-06-30']);
+  if (a.kind !== 'query') throw new Error('unreachable');
+  expect(a.since).toBe(Date.parse('2026-06-28T00:00:00Z') / 1000);
+  expect(a.until).toBe(Date.parse('2026-06-30T00:00:00Z') / 1000);
+});
+
+test('parseRepliesArgs: --since with relative value (3d)', () => {
+  const a = parseRepliesArgs(['--since', '3d']);
+  if (a.kind !== 'query') throw new Error('unreachable');
+  // just verify it's a number and within a sane range (now - 3d ± 5s)
+  const expected = Math.floor(Date.now() / 1000) - 3 * 86400;
+  expect(a.since).toBeDefined();
+  expect(Math.abs((a.since as number) - expected)).toBeLessThan(5);
+});
+
+test('parseRepliesArgs: --since missing value is an error', () => {
+  expect(parseRepliesArgs(['--since']).kind).toBe('error');
+});
+
+test('parseRepliesArgs: --until missing value is an error', () => {
+  expect(parseRepliesArgs(['--until']).kind).toBe('error');
+});
+
+test('parseRepliesArgs: --since with invalid date is an error', () => {
+  const a = parseRepliesArgs(['--since', 'yesterday']);
+  expect(a.kind).toBe('error');
+  if (a.kind === 'error') expect(a.message).toContain('--since');
+});
+
+test('parseRepliesArgs: --until with invalid date is an error', () => {
+  const a = parseRepliesArgs(['--until', 'bogus']);
+  expect(a.kind).toBe('error');
+  if (a.kind === 'error') expect(a.message).toContain('--until');
 });

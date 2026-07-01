@@ -6,7 +6,8 @@
 //     ("вспомнить что писал ПОЛЬЗОВАТЕЛЬ" — inbound is the primary purpose).
 //   • action    (2nd positional): list (default) | find <query>
 //   • flags: -n/--limit N, --full, --json, --regex, --all-sessions,
-//            --session <paneId>, -h/--help.
+//            --session <paneId>, --since <date|relative>, --until <date|relative>,
+//            -h/--help.
 
 export type Direction = 'user' | 'agent' | 'all';
 export type Action = 'list' | 'find';
@@ -22,6 +23,8 @@ export interface RepliesQuery {
   regex: boolean;
   allSessions: boolean;
   session?: string; // explicit pane scope (--session %N)
+  since?: number; // unix seconds lower bound (inclusive), from --since
+  until?: number; // unix seconds upper bound (inclusive), from --until
 }
 
 export type RepliesArgs = RepliesQuery | { kind: 'help' } | { kind: 'error'; message: string };
@@ -33,6 +36,39 @@ function isDirection(tok: string): tok is Direction {
   return (DIRECTIONS as string[]).includes(tok);
 }
 
+// Parse a date/relative string into a unix-seconds timestamp, or return null
+// on parse failure. Supported formats:
+//   • ISO date:     "2026-06-28"       → midnight UTC of that day
+//   • ISO datetime: "2026-06-28T10:00" → that exact UTC moment
+//   • Relative:     "3d" / "24h" / "7d" → now minus that many days/hours
+export function parseDateArg(value: string, nowSec?: number): number | null {
+  const now = nowSec ?? Math.floor(Date.now() / 1000);
+
+  // Relative: <N>d or <N>h
+  const relMatch = /^(\d+)(d|h)$/.exec(value);
+  if (relMatch) {
+    const n = parseInt(relMatch[1], 10);
+    const unit = relMatch[2] === 'd' ? 86400 : 3600;
+    return now - n * unit;
+  }
+
+  // ISO datetime: YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS (UTC assumed)
+  const dtMatch = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.exec(value);
+  if (dtMatch) {
+    const ms = Date.parse(value + 'Z'); // append Z to treat as UTC
+    return isNaN(ms) ? null : Math.floor(ms / 1000);
+  }
+
+  // ISO date: YYYY-MM-DD (midnight UTC)
+  const dateMatch = /^\d{4}-\d{2}-\d{2}$/.exec(value);
+  if (dateMatch) {
+    const ms = Date.parse(value + 'T00:00:00Z');
+    return isNaN(ms) ? null : Math.floor(ms / 1000);
+  }
+
+  return null;
+}
+
 export function parseRepliesArgs(argv: string[]): RepliesArgs {
   let direction: Direction = 'user';
   let action: Action = 'list';
@@ -42,6 +78,8 @@ export function parseRepliesArgs(argv: string[]): RepliesArgs {
   let regex = false;
   let allSessions = false;
   let session: string | undefined;
+  let since: number | undefined;
+  let until: number | undefined;
 
   const positionals: string[] = [];
   let i = 0;
@@ -71,6 +109,20 @@ export function parseRepliesArgs(argv: string[]): RepliesArgs {
       const v = argv[i + 1];
       if (v === undefined) return { kind: 'error', message: '--session requires a pane id' };
       session = v;
+      i += 2;
+    } else if (tok === '--since') {
+      const v = argv[i + 1];
+      if (v === undefined) return { kind: 'error', message: '--since requires a date (e.g. 2026-06-28 or 3d)' };
+      const ts = parseDateArg(v);
+      if (ts === null) return { kind: 'error', message: `--since: cannot parse date: ${v}` };
+      since = ts;
+      i += 2;
+    } else if (tok === '--until') {
+      const v = argv[i + 1];
+      if (v === undefined) return { kind: 'error', message: '--until requires a date (e.g. 2026-06-30 or 1d)' };
+      const ts = parseDateArg(v);
+      if (ts === null) return { kind: 'error', message: `--until: cannot parse date: ${v}` };
+      until = ts;
       i += 2;
     } else if (tok.startsWith('-') && tok !== '-') {
       return { kind: 'error', message: `unknown flag: ${tok}` };
@@ -124,5 +176,7 @@ export function parseRepliesArgs(argv: string[]): RepliesArgs {
     regex,
     allSessions,
     session,
+    since,
+    until,
   };
 }
