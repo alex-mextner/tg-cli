@@ -2445,6 +2445,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     const paneId = found.target.pane.paneId
+    const textPreview = deferText?.slice(0, 60).replace(/\n/g, " ")
+    log(`inject: target=${paneId} autoBind=${autoBind} text="${textPreview ?? "(key)"}"`)
     // Defer a text message behind the pane's outstanding question OR an existing
     // backlog (⏳); control verbs (Escape, no deferText) always go through to
     // interrupt it.
@@ -2554,22 +2556,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
   // /agent routing (item 1): bare `/agent` → an inline-keyboard PICKER (tappable
   // buttons, one distinct-labelled button per agent); confident phonetic match →
-  // direct inject; ambiguous / no-match → the same session-grouped picker
-  // carrying the pending message.
+  // direct inject; ambiguous → the same session-grouped picker carrying the pending
+  // message; named selector with NO match → error reply, never silent fallback.
   const handleAgentRoute = async (action: Extract<Action, { kind: "agent-route" }>): Promise<boolean> => {
     const candidates = listAgentCandidates()
+    const msgPreview = action.all.slice(0, 60).replace(/\n/g, " ")
     if (candidates.length === 0) {
+      log(`agent-route: no candidates — selector=${action.selector || "(none)"} msg="${msgPreview}"`)
       await sendMessage(ctx, NO_AGENT_REPLY)
       return false
     }
     if (!action.all.trim()) {
       // Bare `/agent`: show the tappable picker so the CTO can SELECT an agent
       // (the buttons he asked for — "где кнопки?"), with distinct labels.
+      log(`agent-route: bare /agent → picker over ${candidates.length} candidates`)
       return postAgentPicker(candidates, "")
     }
 
-    let subset = candidates
-    let message = action.all
     if (action.selector) {
       const m = matchWindows(action.selector, candidates)
       if (m.matches.length > 0) {
@@ -2580,24 +2583,35 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         }
         if (m.confident) {
           const target = m.matches[0]
+          log(`agent-route: selector="${action.selector}" → ${target.paneId}/${target.windowName} confident=true msg="${msgPreview}"`)
           const res = await injectToPane(target.paneId, action.from, action.rest)
           if (!res.ok) {
+            log(`agent-route: inject failed → ${target.paneId}: ${res.error}`)
             await sendMessage(ctx, res.error ?? "inject failed")
             return false
           }
           if (res.deferred) lastWasDeferred = true
-          await sendMessage(ctx, routedReply(labelFor(target, candidates), res.deferred))
           return true
         }
-        subset = m.matches
-        message = action.rest
+        // Ambiguous: multiple matches — show picker over matched subset
+        const names = m.matches.map((c) => c.windowName).join(", ")
+        log(`agent-route: selector="${action.selector}" → ambiguous (${m.matches.length} matches: ${names}) → picker`)
+        return postAgentPicker(m.matches, action.rest)
       }
-      // selector matched nothing → the whole text is the message, ask over all
+      // Named selector matched NOTHING — never silently fall back to a random agent.
+      // Report the miss clearly so the user knows their intent was not routed.
+      const names = candidates.map((c) => c.windowName).join(", ")
+      log(`agent-route: selector="${action.selector}" → NO match among [${names}] — reporting error`)
+      await sendMessage(ctx, `no agent matching '${action.selector}' (running: ${names}) — try /agent to pick`)
+      return false
     }
 
-    if (subset.length === 1) {
-      const target = subset[0]
-      const res = await injectToPane(target.paneId, action.from, message)
+    // No selector (bare `/agent <message>` with no agent name): route to single
+    // candidate directly, or show picker when multiple are running.
+    if (candidates.length === 1) {
+      const target = candidates[0]
+      log(`agent-route: no selector, single candidate → ${target.paneId}/${target.windowName} msg="${msgPreview}"`)
+      const res = await injectToPane(target.paneId, action.from, action.all)
       if (!res.ok) {
         await sendMessage(ctx, res.error ?? "inject failed")
         return false
@@ -2607,7 +2621,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return true
     }
 
-    return postAgentPicker(subset, message)
+    log(`agent-route: no selector, ${candidates.length} candidates → picker msg="${msgPreview}"`)
+    return postAgentPicker(candidates, action.all)
   }
 
   const handleAgentCallback = async (action: Extract<Action, { kind: "agent-callback" }>): Promise<boolean> => {
@@ -2739,6 +2754,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     const goneNotice = (): string => `That agent (${goneOriginLabel()}) is no longer running — pick a live one:`
 
+    const msgPreview = action.injectText.slice(0, 60).replace(/\n/g, " ")
     if (recognized) {
       const { panes, procs } = snapshot()
       const pane = panes.find((p) => p.paneId === recognized.paneId)
@@ -2751,7 +2767,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // path; on mismatch (or no recorded cwd for an old route) fall through to
       // the picker rather than risk mis-routing.
       const sameProject = routeMatchesPane({ recognizedCwd: recognized.cwd, panePath: pane?.panePath })
-      if (pane && sameProject && findAgentInPane(pane, procs)) return injectVerbatim(recognized.paneId)
+      if (pane && sameProject && findAgentInPane(pane, procs)) {
+        log(`reply-route: replyTo=${action.replyToMessageId} → ${recognized.paneId} recognized=true sameProject=true msg="${msgPreview}"`)
+        return injectVerbatim(recognized.paneId)
+      }
 
       // We KNOW the origin pane but the snapshot can't CONFIRM it. snapshot()
       // already retried the transient empty/partial `tmux list-panes` read
@@ -2773,6 +2792,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (!pane) {
         const candidates = listAgentCandidates()
         if (candidates.length === 0) {
+          log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} invisible, no candidates`)
           await sendMessage(ctx, NO_AGENT_REPLY)
           return false
         }
@@ -2781,26 +2801,33 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // origin pane isn't visible — it may be a snapshot flake OR genuinely gone;
         // either way the human picks. Name the agent they meant so a real kill
         // reads as "that agent is gone" rather than a silent re-ask (CTO ask, #72).
+        log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} NOT visible in snapshot → picker (${candidates.length} candidates)`)
         return postReplyPicker(candidates, goneNotice())
       }
       // origin pane visible but not a same-project agent → genuinely reused/gone;
       // fall through to the normal picker path below (with the gone notice).
+      log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} visible but sameProject=${sameProject} hasAgent=${!!findAgentInPane(pane, procs)} → picker (gone/reused)`)
     }
 
     const candidates = listAgentCandidates()
     if (candidates.length === 0) {
+      log(`reply-route: replyTo=${action.replyToMessageId} → no candidates recognized=${!!recognized}`)
       await sendMessage(ctx, NO_AGENT_REPLY)
       return false
     }
     // An UNRECOGNIZED reply (no origin known) with a single agent is unambiguous —
     // inject there. The recognized-but-unconfirmed case above never reaches here.
-    if (!recognized && candidates.length === 1) return injectVerbatim(candidates[0].paneId)
+    if (!recognized && candidates.length === 1) {
+      log(`reply-route: replyTo=${action.replyToMessageId} → unrecognized, single candidate ${candidates[0].paneId}/${candidates[0].windowName} → inject msg="${msgPreview}"`)
+      return injectVerbatim(candidates[0].paneId)
+    }
 
     // Anything else — several agents, OR a recognized reply that fell through
     // (origin visible but reused/gone) — goes to the LRU/MRU-ordered picker. A
     // recognized reply that reached here KNEW an origin that's now gone (its pane
     // was reused by a different project), so it carries the gone notice; an
     // unrecognized reply never knew an origin, so no notice.
+    log(`reply-route: replyTo=${action.replyToMessageId} → ${candidates.length} candidates recognized=${!!recognized} → picker`)
     return postReplyPicker(candidates, recognized ? goneNotice() : undefined)
   }
 
