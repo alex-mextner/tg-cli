@@ -1474,13 +1474,21 @@ const EXPIRED_TERMINAL_TEXT = "expired — answer in terminal"
 // but a LATE tap still injects the chosen option into its pane (late-delivery), so
 // the keyboard STAYS tappable and the card says so.
 const ABANDONED_TAP_TEXT = "window closed — tap still delivers your answer to the terminal"
+// A SCOPED permission whose hook socket closed (daemon restart mid-block): the
+// keyboard stays live so the user can tap once the agent reconnects and the
+// reconnect re-attach delivers the answer down the new socket.
+const ABANDONED_PERMISSION_TEXT = "hook disconnected — tap after the agent reconnects"
 
-// A SCOPED question carrying options can still be answered into its pane after the
-// socket closes — retain it (paneId + options + card id) for late-delivery +
-// reconnect. Returns true when it was retained (caller keeps the keyboard live).
+// A SCOPED question (with options) or a SCOPED permission can survive socket close:
+// a question still injects into its pane (late-delivery); a permission re-attaches
+// when the hook reconnects. Retain both when paneId is set. Returns true when
+// retained (caller keeps the keyboard live); unscoped or option-less questions
+// fall through to expiry.
 function retainAbandonedQuestion(rt: QuestionRuntime, entry: PendingButton, pendingKey: string): boolean {
-  if (entry.req.kind !== "question" || !entry.req.paneId || !entry.req.options?.length) return false
-  rt.abandoned.set(pendingKey, { req: entry.req, messageId: entry.messageId, at: Date.now() })
+  const { req } = entry
+  if (!req.paneId) return false
+  if (req.kind === "question" && !req.options?.length) return false
+  rt.abandoned.set(pendingKey, { req, messageId: entry.messageId, at: Date.now() })
   return true
 }
 
@@ -1517,8 +1525,9 @@ function armPendingSocketClose(
     rt.activeKeys.delete(pendingKey)
     if (retainAbandonedQuestion(rt, entry, pendingKey)) {
       rt.onAbandon(entry.req.paneId as string)
-      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, ABANDONED_TAP_TEXT)
-      else entry.finalText = ABANDONED_TAP_TEXT
+      const abandonedText = entry.req.kind === "permission" ? ABANDONED_PERMISSION_TEXT : ABANDONED_TAP_TEXT
+      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText)
+      else entry.finalText = abandonedText
     } else {
       if (entry.req.paneId) rt.onAbandon(entry.req.paneId)
       else rt.onUnscopedAbandon()
@@ -1736,17 +1745,17 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
     }
     rt.answered.delete(pendingKey)
   }
-  // RECONNECT re-attach (lossless restart): the SAME question re-arriving while we
-  // still RETAIN it — its socket died because the 120s window closed OR a daemon
-  // restart restored it from disk — re-attaches THIS new socket to the existing
-  // card instead of posting a duplicate. The agent's `tg-ctl ask` reconnect-and-
-  // resend (byte-identical requestId, still inside its hook budget) lands here. We
-  // require an EXACT requestId match (not just the callbackRequestId hash) so a
-  // genuinely different question that merely hash-collides falls through to a fresh
-  // card. A late TAP that already late-delivered moved the entry to `answered`
-  // (replayed above), so a tap and a reconnect never fight over the same key. Only
-  // SCOPED questions are ever retained, so the revived entry needs no unscoped timer.
-  const retained = req.kind === "question" ? rt.abandoned.get(pendingKey) : undefined
+  // RECONNECT re-attach (lossless restart): the SAME question or permission re-arriving
+  // while we still RETAIN it — its socket died because the 120s window closed OR a
+  // daemon restart restored it from disk — re-attaches THIS new socket to the existing
+  // card instead of posting a duplicate. The agent's `tg-ctl ask` reconnect-and-resend
+  // (byte-identical requestId, still inside its hook budget) lands here. We require an
+  // EXACT requestId match (not just the callbackRequestId hash) so a genuinely different
+  // request that merely hash-collides falls through to a fresh card. A late TAP that
+  // already late-delivered moved the entry to `answered` (replayed above), so a tap and
+  // a reconnect never fight over the same key. Only SCOPED entries are ever retained,
+  // so the revived entry needs no unscoped timer.
+  const retained = rt.abandoned.get(pendingKey)
   if (retained) {
     if (retained.req.requestId === req.requestId) {
       rt.abandoned.delete(pendingKey)
@@ -1876,11 +1885,12 @@ async function askDaemon(ctx: Ctx): Promise<void> {
   }
   const requestLine = JSON.stringify(req)
 
-  // A SCOPED question (paneId known) reconnect-and-resends across a daemon restart so
-  // a lossless stop+start / crash-relaunch never strands the human's pending card.
-  // Everything else (permissions, UNSCOPED questions) keeps the single-attempt path:
-  // those aren't retained across a restart, so resending would post a duplicate card.
-  const reconnectable = req.kind === "question" && Boolean(req.paneId)
+  // SCOPED questions and SCOPED permissions reconnect-and-resend across a daemon restart:
+  // both are retained on socket close (abandoned map + persist), so a resend re-attaches
+  // to the existing card rather than posting a duplicate. UNSCOPED questions keep the
+  // single-attempt path — they aren't retained (no pane to late-deliver to), so a resend
+  // after a restart would post a duplicate card.
+  const reconnectable = Boolean(req.paneId) && (req.kind === "question" || req.kind === "permission")
   let output: string | null
   if (reconnectable) {
     output = await requestHookAnswerWithReconnect(ctx, requestLine)
@@ -1959,7 +1969,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // late tap or a reconnect. Unscoped (paneId-less) pending is skipped: it
           // can't be late-delivered (no pane) and must not resurrect to re-wedge.
           ...[...pendingButtons.values()]
-            .filter((e) => e.req.kind === "question" && e.req.paneId && e.req.options?.length)
+            .filter((e) => e.req.paneId && (e.req.kind === "permission" || e.req.options?.length))
             .map((e) => ({ req: e.req as unknown as Record<string, unknown>, messageId: e.messageId, at: e.at })),
           ...[...abandonedButtons.values()].map((e) => ({
             req: e.req as unknown as Record<string, unknown>,
@@ -1985,9 +1995,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
   // Restore durable state on bootstrap. A restored scoped question lands in
   // `abandonedButtons` (no live socket) — a late tap injects to its pane, a reconnect
-  // re-attaches. Re-normalize each `req` through the AUTHORITATIVE validator and drop
-  // anything that isn't a scoped, option-bearing question. Answered entries restore
-  // the replay cache. Bounded to the retention/replay windows by parseQuestionStore.
+  // re-attaches. Restored scoped permissions land there too so a reconnecting hook can
+  // re-attach to its existing card instead of posting a duplicate. Re-normalize each
+  // `req` through the AUTHORITATIVE validator and drop anything that isn't scoped (and
+  // for questions: carrying options). Answered entries restore the replay cache.
+  // Bounded to the retention/replay windows by parseQuestionStore.
   {
     const restored = parseQuestionStore(
       readFileOrNull(ctx.paths.questions),
@@ -1997,7 +2009,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     )
     for (const rec of restored.questions) {
       const req = normalizeButtonRequest(rec.req)
-      if (!req || req.kind !== "question" || !req.paneId || !req.options?.length) continue
+      if (!req || !req.paneId || (req.kind === "question" && !req.options?.length)) continue
       abandonedButtons.set(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at })
     }
     for (const a of restored.answered) {
@@ -4154,6 +4166,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ): Promise<boolean> => {
     const retained = abandonedButtons.get(action.requestId)
     if (!retained || !retained.req.paneId) return false
+    // Permissions are retained for RECONNECT re-attach (hook reconnects within budget),
+    // not for pane-text injection: hook JSON is required, not text. A tap on a retained
+    // permission with no live socket falls through to the "expired" toast below so the
+    // user knows to wait for the agent's reconnect window to pass.
+    if (retained.req.kind === "permission") return false
     // Enforce the retention window at DELIVERY time, not only on persist/restore. On a
     // QUIET daemon (no mutation since the abandon) pruneAbandonedButtons never runs, so
     // without this check an arbitrarily-stale answer would still be injected into a pane
