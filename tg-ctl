@@ -163,6 +163,7 @@ export const USAGE = `Usage:
   tg-ctl run             # foreground (blocking) daemon — the process itself
   tg-ctl status          # is it running? pid / bot / target pane / autostart
   tg-ctl stop            # stop the background daemon
+  tg-ctl restart         # stop the daemon (if running) then start it again
   tg-ctl enable [--dry-run]
                          # install OS autostart (launchd / systemd --user) AND start now
                          # (--dry-run prints the plan and touches nothing)
@@ -947,6 +948,7 @@ function startLauncher(ctx: Ctx, flags: StartFlags): void {
   const proc = Bun.spawn([process.execPath, import.meta.path, "run"], {
     detached: true,
     stdio: ["ignore", logFd, logFd],
+    env: { ...process.env, TG_CTL_CONFIG_DIR: ctx.configDir },
   })
   proc.unref()
   closeSync(logFd) // the child holds its own dup
@@ -4539,7 +4541,7 @@ if (import.meta.main) {
     console.log(USAGE)
     process.exit(0)
   }
-  if (!["start", "run", "stop", "status", "enable", "disable", "ask", "install-hooks", "voice-setup"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -4600,6 +4602,11 @@ if (import.meta.main) {
   }
   if (cmd === "stop") {
     stopDaemon(ctx)
+    process.exit(0)
+  }
+  if (cmd === "restart") {
+    stopDaemon(ctx)
+    startLauncher(ctx, parseStartFlags(process.argv.slice(3)))
     process.exit(0)
   }
   if (cmd === "enable") {

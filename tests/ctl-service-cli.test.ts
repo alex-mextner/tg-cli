@@ -6,7 +6,7 @@
 // loaded by the test run. (A real `launchctl load` would register a RunAtLoad agent into the
 // tester's session and actually start the daemon — exactly the side effect this avoids.)
 import { expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -207,3 +207,62 @@ test.if(process.platform === 'darwin')(
     expect(disabled.stderr.toString()).toContain('leaving the unit file in place');
   },
 );
+
+// --- restart (#56) ---
+
+// `restart` must be a known subcommand — not rejected by the unknown-command guard.
+// Without creds, it exits 1 for auth, NOT because of the "unknown subcommand" check.
+// Distinguisher: unknown exits with USAGE on stderr; missing-creds exits with "TG_BOT_TOKEN".
+test('restart: known subcommand — rejected for missing creds, not as unknown', () => {
+  const proc = run(['restart'], { HOME: '/tmp/tg-ctl-restart-nocreds' });
+  expect(proc.exitCode).toBe(1);
+  expect(proc.stderr.toString()).not.toContain('Usage:');
+  expect(proc.stderr.toString()).toContain('TG_BOT_TOKEN');
+});
+
+// `restart` with a running daemon: stops it, starts a new one, exits 0.
+// Uses a dead API base so the daemon loops without external calls. The pidfile
+// is our observable: it appears after the grandchild acquires the flock.
+test('restart: stops any running daemon and starts a fresh one, exits 0', () => {
+  const { env, cfg } = fakeEnv();
+  const fullEnv = { ...env, TG_API_BASE: 'http://127.0.0.1:1' };
+  // start a daemon first so stopDaemon has something to signal
+  const started = run(['start'], fullEnv);
+  expect(started.exitCode).toBe(0);
+  reapDaemon(cfg, '123456'); // wait for the grandchild to write its pidfile
+  const oldPid = Number(readFileSync(join(cfg, 'tg-ctl.123456.pid'), 'utf8').trim());
+  expect(oldPid).toBeGreaterThan(0);
+  // restart: stops the daemon above, then starts a new one
+  const restarted = run(['restart'], fullEnv);
+  expect(restarted.exitCode).toBe(0);
+  // a new daemon should appear (pidfile may be the same or a new pid — the
+  // flock serialises them, so at least one daemon must land a pidfile)
+  reapDaemon(cfg, '123456');
+}, 10_000);
+
+// --- env-pin (#61) ---
+
+// startLauncher passes TG_CTL_CONFIG_DIR: ctx.configDir to the grandchild even
+// when process.env does NOT have TG_CTL_CONFIG_DIR. Verified by running `start`
+// with only HOME in env (no TG_CTL_CONFIG_DIR); the grandchild must land its
+// pidfile in the HOME-derived configDir, proving it received the right configDir.
+test('env-pin: grandchild uses ctx.configDir when TG_CTL_CONFIG_DIR absent from env', () => {
+  const home = mkdtempSync(join(tmpdir(), 'tgctl-envpin-'));
+  const cfgDir = join(home, '.config', 'tg-cli');
+  mkdirSync(cfgDir, { recursive: true });
+  writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123456:FAKE\nTG_CHAT_ID=42\n');
+
+  // Deliberately omit TG_CTL_CONFIG_DIR — ctx resolves configDir from HOME.
+  const envNoConfigDir = {
+    HOME: home,
+    TG_API_BASE: 'http://127.0.0.1:1',
+  };
+
+  const proc = run(['start'], envNoConfigDir as Record<string, string>);
+  expect(proc.exitCode).toBe(0);
+
+  // The grandchild must write its pidfile inside cfgDir. If the env pin were
+  // absent and the grandchild computed a different configDir, the pidfile would
+  // not appear here (reapDaemon times out → test would hang but cleanup kills it).
+  reapDaemon(cfgDir, '123456');
+});
