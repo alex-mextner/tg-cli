@@ -17,8 +17,10 @@ several agents run side by side:
 
 - `<window>` is fuzzy-matched (phonetic) against tmux window names.
 - A confident unique match routes `<message>` straight to that agent's pane.
-- Ambiguous / no selector / no match → inline **selection buttons**, grouped by
+- Ambiguous / no selector → inline **selection buttons**, grouped by
   tmux session, each carrying the pending message; the tap injects it.
+- **No match** (selector given but nothing matched) → error reply naming the
+  selector and the running agents; the message is **not** delivered.
 - Bare `/agent` → an inline-keyboard **picker** (tappable buttons), one
   distinct-labelled button per addressable agent. A tap SELECTS that agent and
   replies with the exact selector to address it (`/agent <selector> <message>`);
@@ -59,7 +61,7 @@ selector usable; this is deliberately a *light* fold, not full Metaphone.
 
 ## Selection buttons
 
-When a choice is needed (a bare `/agent`, OR an ambiguous/no-match route),
+When a choice is needed (a bare `/agent`, OR an ambiguous route),
 `buildAgentSelectMessage(chatId, candidates, token, preview)` builds a message
 that is a SHORT prompt plus one inline button per candidate, each labelled with
 `<label>`. The message text is the prompt ONLY — there is **no** per-agent text
@@ -123,8 +125,9 @@ treated as non-distinguishing and the label leans on the cwd project dir instead
   silly).
 - **Confident match but empty message** (`/agent feat-bot`) → reply naming the
   match and asking for the message; nothing injected.
-- **Selector matches nothing** → the whole text is treated as the message and
-  buttons are shown over ALL agents.
+- **Selector matches nothing** → error reply ("No agent matching X found. Running:
+  …") is sent back to the user; the message is **not** delivered to any agent
+  and the request ends there (no picker fallthrough).
 - Injection always goes through `buildTextInjectPlan` (verify-pane → literal /
   bracketed-paste → paced Enter), so a pane that lost its agent is refused, not
   executed as a shell command.
