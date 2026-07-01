@@ -61,6 +61,7 @@ import { versionOutput } from "./features/cli/version"
 import { loadEnv } from "./features/config/env"
 import {
   convertEntitiesToHtml,
+  detectHtmlTags,
   escapeHtml,
   parseEmojiHelpers,
 } from "./features/render/html"
@@ -1086,7 +1087,13 @@ if (import.meta.main) {
     //   "Forced HTML" = a custom emoji / <b> window fallback, line-spec quotes,
     //     or autolink — escape the caption's plain text so literals can't break
     //     parsing.
-    const userHtml = fmt === "html"
+    // Auto-detect Telegram HTML tags in the body: if the text contains known
+    // Telegram markup (<b>, <i>, <code>, <pre>, <a>, etc.) treat it as HTML even
+    // without an explicit --format html. This lets agents write HTML-formatted
+    // reports naturally without the flag, while comparison operators like `2 < 3`
+    // or unknown tags like `<foo>` are never mis-treated (detectHtmlTags only
+    // matches the Telegram-supported tag set).
+    const userHtml = fmt === "html" || detectHtmlTags(parsedCaption.text)
     const renderToHtml =
       userHtml || prefix.forceHtml || parsedCaption.entities.length > 0 || hasQuotes || hasAutolink
     if (!renderToHtml) return { text: prefix.plain + parsedCaption.text, format: "plain" }
