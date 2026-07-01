@@ -128,7 +128,7 @@ test('/agent <no-match> sends error reply, never injects into another agent', as
   // Must be a plain text reply, not an inline keyboard.
   expect(reply.reply_markup).toBeUndefined();
   const text = String(reply.text);
-  expect(text).toContain('No agent matching "ext" found');
+  expect(text).toContain("no agent matching 'ext'");
   // Must name the running agent so the user knows what to type.
   expect(text).toContain('rig');
 
