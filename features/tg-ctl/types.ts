@@ -19,6 +19,12 @@ export interface ControlConfig {
   // handling (1:1 behaviour byte-identical). Opt in per machine with `control.topics: true`
   // once the chat is a forum supergroup with the bot as a topic-managing admin.
   topics: boolean;
+  // Private-chat forum topics (Bot API 9.4). Default OFF: when true the daemon calls
+  // `createForumTopic` after each flat /new spawn and binds the returned thread to the new
+  // agent (same TopicBinding store as supergroup topics). Requires BotFather "Threaded Mode"
+  // to be enabled for the bot — if `createForumTopic` fails the daemon falls back silently
+  // to the current flat-chat behaviour. Opt in with `control.private_topics: true`.
+  privateTopics: boolean;
 }
 
 // enabled defaults ON (user decision 2026-06-10, post-review): inbound is armed
@@ -39,6 +45,9 @@ export const DEFAULT_CONTROL: ControlConfig = {
   // OFF by default — topic mode activates only when the operator opts in (the routing half
   // ships before the spawn executor, so an accidental opt-in must not break the flat path).
   topics: false,
+  // OFF by default — private-chat topics auto-degrade when BotFather Threaded Mode is not
+  // enabled (createForumTopic fails → fall through to flat behaviour).
+  privateTopics: false,
 };
 
 // --- Telegram update shapes (only the fields we read) ---

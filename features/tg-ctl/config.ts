@@ -63,6 +63,13 @@ export function parseControlConfig(yaml: string): Partial<ControlConfig> {
         // unrecognized value → ignore (don't guess)
         break;
       }
+      case 'private_topics': {
+        const v = value.toLowerCase();
+        if (TRUE_TOKENS.has(v)) out.privateTopics = true;
+        else if (FALSE_TOKENS.has(v)) out.privateTopics = false;
+        // unrecognized value → ignore (don't guess)
+        break;
+      }
       case 'transport':
         // Raw string passthrough — resolveControlConfig normalizes garbage.
         out.transport = unquote(value) as ControlConfig['transport'];
@@ -112,6 +119,7 @@ export function resolveControlConfig(partial: Partial<ControlConfig>): ControlCo
     // Copy — the resolved config must never alias DEFAULT_CONTROL's array.
     allowedSenders: [...(partial.allowedSenders ?? DEFAULT_CONTROL.allowedSenders)],
     topics: partial.topics ?? DEFAULT_CONTROL.topics,
+    privateTopics: partial.privateTopics ?? DEFAULT_CONTROL.privateTopics,
   };
   if (partial.session !== undefined) cfg.session = partial.session;
   return cfg;
