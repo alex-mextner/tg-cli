@@ -3609,6 +3609,22 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   }
 
+  // Create a private-chat forum topic via Bot API 9.4 `createForumTopic` and return the new
+  // `message_thread_id`, or null on any failure (the daemon falls back to flat-chat behaviour).
+  // Graceful: a failure is logged once with a BotFather hint and NEVER thrown — the caller
+  // continues with the flat /new path. No retry: a flaky network gets a second chance on the
+  // NEXT /new; a misconfigured bot (Threaded Mode off) gets the log hint.
+  const createPrivateTopic = async (name: string): Promise<number | null> => {
+    const json = await botPost(ctx, "createForumTopic", { chat_id: ctx.chatId, name })
+    const result = json?.result
+    if (!result || typeof result !== "object") {
+      log("Private chat topics not enabled — enable Threaded Mode in BotFather.")
+      return null
+    }
+    const threadId = (result as { message_thread_id?: unknown }).message_thread_id
+    return typeof threadId === "number" ? threadId : null
+  }
+
   // Spawn a flat `/new` agent into a named tmux window and return the pane id, or a typed error.
   // Mirrors spawnTopicWindow but WITHOUT TG_TOPIC (a flat /new agent is not bound to a topic — it
   // registers itself normally via `tg` and is addressed by /agent). When a task is given it is the
@@ -3700,6 +3716,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     const slug = slugifyTopicName(session.name, 0)
     const spawnToken = `new-${session.token}-${Math.floor(Date.now() / 1000)}`
+    // Private-chat topic: try to create a per-session topic BEFORE spawning so the window is born
+    // with TG_TOPIC already set. Failure (Threaded Mode off, API error) → graceful flat fallback.
+    const threadId = ctx.cfg.privateTopics ? await createPrivateTopic(session.name) : null
+    if (threadId !== null) {
+      return spawnNewSessionWithTopic(session, modelId, threadId, slug, promptMessageId)
+    }
+    // Flat spawn path (no private topic, or createForumTopic failed gracefully).
     const spawned = spawnNewWindow(slug, session.dir, modelId, session.task, spawnToken)
     if (!spawned.ok) {
       // Spawn FAILED → leave the session retryable AND re-post the model keyboard (review #3): the
@@ -3716,6 +3739,46 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
     const taskNote = session.task.trim().length > 0 ? ` with task: ${session.task.trim()}` : ""
     await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`)${taskNote} — use \`/agent ${slug}\` to talk to it`)
+    return true
+  }
+
+  // Private-chat topic spawn path: topic was created (threadId known), now spawn and bind. Extracted
+  // from spawnNewSession to keep it under ~50 lines each. Handles the full lifecycle:
+  //   - Write a preliminary awaiting-model binding BEFORE spawn so the forum_topic_created echo
+  //     (already in flight from Telegram) is silently absorbed whether the spawn succeeds or fails.
+  //   - On spawn FAILURE: the preliminary binding stays → echo is absorbed, user retries via model tap.
+  //   - On spawn SUCCESS: upgrade to a `bound` binding; call stampSpawnToken for log greppability.
+  // NOTE: spawnTopicWindow has no `task` param (same as the supergroup topic flow). The confirmation
+  // message suppresses the task note so the user is not misled about whether the task was applied.
+  const spawnNewSessionWithTopic = async (
+    session: NewSession,
+    modelId: string,
+    threadId: number,
+    slug: string,
+    promptMessageId: number | null,
+  ): Promise<boolean> => {
+    const ts = Math.floor(Date.now() / 1000)
+    // Write a preliminary binding BEFORE spawn so the forum_topic_created echo is absorbed even if
+    // the spawn fails (no dangling untracked threadId that triggers the /new flow from a Telegram echo).
+    const preliminary = { threadId, name: session.name, status: "awaiting-model" as const, path: session.dir, model: modelId, ts }
+    persistTopics(appendTopic(loadTopics(), preliminary))
+    const spawnToken = `topic-${session.token}-${ts}`
+    const spawned = spawnTopicWindow(threadId, slug, session.dir, modelId)
+    if (!spawned.ok) {
+      if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+      await sendMessage(ctx, spawned.error)
+      await askNewModel(session)
+      return false
+    }
+    // Upgrade the preliminary binding to `bound` now that the pane exists.
+    const boundTs = Math.floor(Date.now() / 1000)
+    persistTopics(appendTopic(loadTopics(), markBound(preliminary, spawned.paneId, boundTs)))
+    stampSpawnToken(spawned.paneId, spawnToken)
+    pendingNew.delete(session.token)
+    if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
+    // NOTE: task is not applied via spawnTopicWindow (no task argv support) — suppress the task note
+    // so the user is not told a task was started that wasn't.
+    await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`) — use \`/agent ${slug}\` to talk to it`)
     return true
   }
 
@@ -4437,8 +4500,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // Forum-topics mode (spec §8). OFF by default: when ctx.cfg.topics is false stepUpdates
         // ignores message_thread_id and the flat 1:1 path is byte-identical to before. When on,
         // topicStatusOf reads the binding store so topic messages route per-topic.
-        topicsEnabled: ctx.cfg.topics,
-        topicStatusOf: ctx.cfg.topics ? topicStatusOf : undefined,
+        // privateTopics also uses the same TopicBinding store and the same routing — enabling
+        // either flag arms the topic router so private-chat topic messages reach their agent pane.
+        topicsEnabled: ctx.cfg.topics || ctx.cfg.privateTopics,
+        topicStatusOf: (ctx.cfg.topics || ctx.cfg.privateTopics) ? topicStatusOf : undefined,
         // Flat /new (issue #27): always wired (not gated by topics) — a plain message while a
         // /new awaits its dir is the typed path. When no /new is in flight this is false and the
         // plain-text path is byte-identical to before.
