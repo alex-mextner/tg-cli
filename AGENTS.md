@@ -22,6 +22,13 @@ Credentials: `~/.config/tg-cli/.env` — must contain `TG_BOT_TOKEN` and `TG_CHA
 - Never leave the checkout on a half-done feature branch.
 - Do all feature work in git worktrees on separate branches.
 
+## Hook Caller Discipline
+
+When a hook needs clearer callee semantics, fix the callee command surface and invoke that
+surface directly. Do not change cwd, hide repo context, or add caller-side environment hacks
+to coerce a tool into the desired mode; those workarounds make hook behavior depend on the
+launch environment and leave help/docs stale.
+
 ---
 
 ## Architecture

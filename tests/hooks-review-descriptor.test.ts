@@ -34,12 +34,12 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-// Install a fake `review` that emits a fixed --visual --json verdict + rc.
+// Install a fake `review` that emits a fixed visual --json verdict + rc.
 function mockReview(jsonVerdict: string, exitCode: number): void {
   const review = join(binDir, 'review');
   writeFileSync(
     review,
-    `#!/usr/bin/env bash\n# fake review --visual\ncat <<'JSON'\n${jsonVerdict}\nJSON\nexit ${exitCode}\n`,
+    `#!/usr/bin/env bash\n# fake review visual\ncat <<'JSON'\n${jsonVerdict}\nJSON\nexit ${exitCode}\n`,
   );
   chmodSync(review, 0o755);
 }
@@ -83,6 +83,24 @@ test('review verdict "keep" → send proceeds', () => {
   installDescriptorTrusted();
   const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'hi' }, process.env, home);
   expect(v.blocked).toBe(false);
+});
+
+test('review visual hook calls canonical review visual argv from the caller cwd', () => {
+  const argsFile = join(home, 'review-args.txt');
+  const cwdFile = join(home, 'review-cwd.txt');
+  const review = join(binDir, 'review');
+  writeFileSync(
+    review,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > '${argsFile}'\npwd > '${cwdFile}'\ncat <<'JSON'\n{"decision":"keep"}\nJSON\nexit 0\n`,
+  );
+  chmodSync(review, 0o755);
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'hi' }, process.env, home);
+  expect(v.blocked).toBe(false);
+  const args = readFileSync(argsFile, 'utf8').trim().split('\n');
+  expect(args).toEqual(['visual', pngPath, '--json', '--strict']);
+  const cwd = readFileSync(cwdFile, 'utf8').trim();
+  expect(cwd).toBe(REPO);
 });
 
 test('review verdict "rollback" (unstyled) → BLOCKED with reason', () => {

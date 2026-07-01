@@ -1120,7 +1120,7 @@ if (import.meta.main) {
   // Guarded by ONE `stat ~/.agents/hooks/tg/` (hooksActive). With no descriptors
   // dir the whole block is skipped and the send path is byte-for-byte today's
   // behaviour. Hooks fire ONLY here (the photo subcommand) — plain `tg "msg"`
-  // never reaches this. A `block` (a hook exits 10, e.g. review --visual judging
+  // never reaches this. A `block` (a hook exits 10, e.g. review visual judging
   // the screenshot unstyled/broken) HOLDS the send. Everything else (hook error,
   // timeout) fails open per the runner policy.
   // SECURITY: descriptors are trust-by-default — a drop-in names an executable
@@ -1143,7 +1143,7 @@ if (import.meta.main) {
       // NOTE on `caption`: this is the RAW parsed caption, BEFORE the autolink /
       // line-spec transforms below mutate plan.textMessages[0]. The gate sits
       // here (not after those mutations) to keep the non-breaking seam in one
-      // clean place and gate on the IMAGE — the shipped `review --visual` hook
+      // clean place and gate on the IMAGE — the shipped `review visual` hook
       // judges the screenshot and ignores caption. A future hook that needs the
       // FINAL rendered caption should read the image, not args.caption (which is
       // best-effort pre-transform text).

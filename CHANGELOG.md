@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.23.0
+
+**Fix: `review visual` argv rename + VS Code window crop enforcement in pre-send-photo hook.**
+
+- **`review visual` (no `--`) canonical argv** — the pre-send-photo hook and all references
+  throughout now call `review visual <png> --json --strict` (subcommand form) instead of
+  `review --visual`. The hook's argv test verifies the exact call surface.
+- **Full VS Code window screenshot blocked** — `looks_like_vscode_window()` heuristic detects
+  a full-editor screenshot by sampling the dark, uniform activity-bar strip on the left edge
+  (calibrated: channel mean < 60, spread < 40) and blocks the send with an explicit crop
+  instruction. A cropped preview-pane or narrow image passes through. Fail-open: any PIL
+  error or missing dep treats the image as NOT a window.
+- **Hook Caller Discipline** (AGENTS.md) — when a hook needs clearer callee semantics, fix
+  the callee command surface and invoke that surface directly; do not change cwd or add
+  caller-side env hacks.
+
 ## 1.22.0
 
 **Feature (tg-cli#31): §11 forum-topic deferrals — reply anchor, slash intercept, rename persistence.**
@@ -686,7 +702,7 @@ Reply-routing + message-header fixes.
 
 ## 1.7.0
 
-Pre-send-photo hook framework + `review --visual` unstyled guard.
+Pre-send-photo hook framework + `review visual` unstyled guard.
 
 - **Pre-send-photo hook point** — `tg` now runs an extensible hook chain
   (`agents-hooks/v1`) over every outgoing `--photo` before it leaves. Drop a
@@ -694,8 +710,8 @@ Pre-send-photo hook framework + `review --visual` unstyled guard.
   with a priority / timeout / on-error policy) and it runs against the PNG; a
   hook can `allow` the send or `block` it with the canonical exit code 10.
   (`features/hooks/`, `tg hooks list|trust`.)
-- **`review --visual` unstyled guard** — the bundled `review-visual` descriptor
-  pipes the outgoing photo through `review --visual <png> --json --strict` and
+- **`review visual` unstyled guard** — the bundled `review-visual` descriptor
+  pipes the outgoing photo through `review visual <png> --json --strict` and
   blocks an unstyled / broken / blank render before it ships. Vision is slow, so
   the hook runs with a 60s timeout and `on_error: open`: a slow or unavailable
   vision call NEVER blocks a send — only an explicit rollback verdict does.

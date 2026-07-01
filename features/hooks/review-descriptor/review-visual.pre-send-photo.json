@@ -5,5 +5,5 @@
   "priority": 50,
   "timeout_ms": 60000,
   "on_error": "open",
-  "description": "TEMPLATE — `review install-hook tg` substitutes the absolute cmd path (cmd MUST be absolute; the runner rejects relative/bare commands). Runs `review --visual <png> --json --strict` on the outgoing photo and blocks (exit 10) an unstyled/broken/blank render. Vision is slow, so timeout_ms is 60s and on_error is open: a slow or unavailable vision call NEVER blocks a send unless the verdict is an explicit rollback."
+  "description": "TEMPLATE — `review install-hook tg` substitutes the absolute cmd path (cmd MUST be absolute; the runner rejects relative/bare commands). Runs `review visual <png> --json --strict` on the outgoing photo and blocks (exit 10) an unstyled/broken/blank render. Vision is slow, so timeout_ms is 60s and on_error is open: a slow or unavailable vision call NEVER blocks a send unless the verdict is an explicit rollback."
 }

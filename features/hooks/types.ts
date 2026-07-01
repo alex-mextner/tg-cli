@@ -3,7 +3,7 @@
 // This is the universal hook framework described in
 // docs/specs (review-cli architecture-visual-verification.md §7) and
 // /tmp/detector-cli/design.md. The whole point: a host tool (tg) can run an
-// OUT-OF-PROCESS hook (e.g. a Python `review --visual` gate) before an action,
+// OUT-OF-PROCESS hook (e.g. a Python `review visual` gate) before an action,
 // with the hook deciding allow/block over a tiny JSON-on-stdin / exit-code
 // protocol. No shared runtime between host and hook.
 //
