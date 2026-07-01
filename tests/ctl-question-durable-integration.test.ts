@@ -234,6 +234,17 @@ const QUESTION = {
   options: [{ label: 'Staging' }, { label: 'Production' }],
 };
 
+// Permission fixture — uses PermissionRequest so no toolInput round-trip is needed.
+// callbackRequestId('p_durable') === 'p_durable' (short, clean string), so the
+// callback_data values are the literal strings constructed below.
+const PERMISSION = {
+  requestId: 'p_durable',
+  agent: 'claude',
+  kind: 'permission',
+  question: 'Allow bash command: rm -rf /tmp/test?',
+  permissionEvent: 'PermissionRequest',
+};
+
 async function until(cond: () => boolean, ms: number): Promise<boolean> {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
@@ -754,3 +765,92 @@ test('EXPIRY clears the keyboard for a genuinely-dead unscoped card', async () =
   expect(await until(() => tg.edits().includes('expired — answer in terminal'), 8000)).toBe(true);
   expect(tg.keyboardClears()).toBeGreaterThanOrEqual(1);
 }, 20_000);
+
+// ---------------------------------------------------------------------------
+// Permission durability (tg-cli#57) — three guarantees for permission-kind prompts:
+//   A. Socket close keeps the permission card live for reconnect (not expired).
+//   B. Daemon bounce re-attaches the card; eventual tap delivers via the new socket.
+//   C. A tap with NO live socket shows "expired" (no pane-inject path for permissions).
+// ---------------------------------------------------------------------------
+
+test('PERM RETAIN: scoped permission keeps card live after socket close (not expired)', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+
+  const ask = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+
+  // Kill the hook socket (hook's 120s budget elapsed or process died).
+  ask.kill(9);
+  await ask.exited;
+
+  // Card must show "hook disconnected"; keyboard must stay live (no expire, no clear).
+  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
+  expect(tg.edits().some((e) => e.includes('expired'))).toBe(false);
+  expect(tg.keyboardClears()).toBe(0);
+}, 20_000);
+
+test('PERM RECONNECT: daemon bounce mid-block re-attaches the permission card and answer flows', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  const daemon1 = await startDaemon(cfgDir, tg.port);
+  const ask = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+
+  // SIGKILL the daemon (socket drops; hook reconnect loop begins resending the same requestId).
+  daemon1.kill(9);
+  await daemon1.exited;
+
+  // Restart — daemon restores the permission from disk.
+  const daemon2 = await startDaemon(cfgDir, tg.port);
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), 6000)).toBe(true);
+  // The hook reconnects and re-attaches to the existing card — no second card posted.
+  expect(await until(() => daemonLog(cfgDir).includes('ask-forward reattached'), 8000)).toBe(true);
+  expect(tg.cards()).toHaveLength(1);
+
+  // Tap approve — answer must flow down the reconnected socket and unblock ask.
+  tg.push([tap('tgq:p_durable:allow', 801, 1)]);
+  const out = await new Response(ask.stdout).text();
+  await ask.exited;
+  expect(JSON.parse(out)).toMatchObject({
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
+  });
+  expect(tg.cards()).toHaveLength(1); // still one card across the whole bounce
+  daemon2.kill('SIGTERM');
+  await daemon2.exited;
+}, 35_000);
+
+test('PERM LATE-TAP: a tap on a retained-but-dead permission card shows "expired"', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  const daemon1 = await startDaemon(cfgDir, tg.port);
+  const ask = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+
+  // Kill BOTH daemon and hook (hook budget expired — won't reconnect).
+  daemon1.kill(9);
+  await daemon1.exited;
+  ask.kill(9);
+  await ask.exited;
+
+  // Restart — daemon restores the permission as abandoned.
+  const daemon2 = await startDaemon(cfgDir, tg.port);
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), 6000)).toBe(true);
+  expect(tg.cards()).toHaveLength(1); // nothing re-posted
+
+  // User taps Approve with no live socket. Permissions can't be delivered via
+  // terminal-text injection — the callback gets "expired" so the user knows to
+  // wait for the agent's own reconnect or retry.
+  tg.push([tap('tgq:p_durable:allow', 802, 1)]);
+  expect(await until(() => tg.answeredCbs().some((c) => c.text === 'expired'), 6000)).toBe(true);
+  // Nothing injected into the pane (no text-inject path for permissions).
+  expect(injected(cfgDir).length).toBe(0);
+  daemon2.kill('SIGTERM');
+  await daemon2.exited;
+}, 30_000);
