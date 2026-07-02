@@ -32,8 +32,12 @@ export const LIMIT_CONTINUE_PREFIX = 'lc';
 export type HarnessFailureKind = 'session-limit' | 'api-error';
 
 // A normalized harness failure. The entrypoint builds this from the StopFailure
-// payload + transcript tail; every field the notification needs is explicit so
-// this module stays pure and testable.
+// payload + transcript prose; every field the notification needs is explicit so
+// this module stays pure and testable. The entrypoint resolves `agent` from the
+// live pane and `paneId` from TMUX_PANE. `sourceMessageId` is supplied via the
+// --source-message-id flag when known (a caller that tracks the last inbound
+// message per pane); auto-resolving it from the daemon is a follow-up, so the
+// reaction lifecycle degrades gracefully to "no source flip" when it is null.
 export interface HarnessFailureEvent {
   kind: HarnessFailureKind;
   agent: string; // tmux window / session name the failed pane belongs to
@@ -41,7 +45,7 @@ export interface HarnessFailureEvent {
   reason: string; // the StopFailure matcher (rate_limit, overloaded, session_limit, …)
   detail: string; // human-readable tail (trimmed synthetic message)
   resetAt: number | null; // ms epoch when the limit resets; null = unknown/not a limit
-  sourceMessageId: number | null; // last inbound message routed to that pane (reaction flip)
+  sourceMessageId: number | null; // inbound message to flip 👀→😴→👀 (null = skip)
 }
 
 export interface LimitNotification {
@@ -64,15 +68,63 @@ export function classifyFailure(reason: string): HarnessFailureKind {
 // resolved to its NEXT occurrence in the daemon's local timezone (which is the
 // operator's — the reset text's "(Europe/Belgrade)" is that same zone).
 export function parseResetTime(text: string, now: number): number | null {
-  const isoMatch = text.match(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?/);
+  // Only look near a "reset" mention — scanning the whole text for a bare ISO
+  // would grab an unrelated transcript timestamp (a message stamp in the past).
+  const resetIdx = text.search(/reset/i);
+  const window = resetIdx >= 0 ? text.slice(resetIdx, resetIdx + 120) : '';
+  const isoMatch = window.match(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?/);
   if (isoMatch) {
     const t = Date.parse(isoMatch[0].replace(' ', 'T'));
     if (Number.isFinite(t)) return t;
   }
-  const clockMatch = text.match(/reset[s]?(?:\s+(?:at|by))?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?/i);
+  // Wall clock: "resets 4:10am", "reset at 3pm", "resets 16:10". Guard against a
+  // bare count ("resets 3 times per hour") — a lone integer with no am/pm, no
+  // ":MM", and no "at/by" is NOT a time.
+  const clockMatch = text.match(/reset[s]?\s+(at|by)?\s*(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?/i);
   if (!clockMatch) return null;
-  const clock = parseClock(clockMatch[1], clockMatch[2], clockMatch[3]);
+  const [, atBy, hStr, mStr, ampm] = clockMatch;
+  if (!atBy && !mStr && !ampm) return null; // a bare "resets 3" is not a time
+  const clock = parseClock(hStr, mStr, ampm);
   return clock ? nextWallClock(now, clock.hour, clock.minute) : null;
+}
+
+// Extract the last ASSISTANT message text from a Claude Code JSONL transcript.
+// StopFailure hands a transcript_path, not clean text; scanning the raw JSONL
+// would pick up per-line ISO timestamps and dump raw JSON into the alert. This
+// pulls the synthetic session-limit / error message (the last assistant turn) so
+// the reset time + detail come from real prose. Empty when nothing parses.
+export function extractAssistantText(transcript: string): string {
+  let last = '';
+  for (const line of transcript.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const text = assistantTextOf(obj);
+    if (text) last = text;
+  }
+  return last;
+}
+
+function assistantTextOf(obj: unknown): string {
+  if (!obj || typeof obj !== 'object') return '';
+  const rec = obj as Record<string, unknown>;
+  const msg = (rec.message && typeof rec.message === 'object' ? (rec.message as Record<string, unknown>) : rec) as Record<string, unknown>;
+  const role = rec.role ?? msg.role ?? rec.type;
+  if (role !== 'assistant') return '';
+  const content = msg.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c) => c && typeof c === 'object' && (c as Record<string, unknown>).type === 'text' && typeof (c as Record<string, unknown>).text === 'string')
+      .map((c) => (c as Record<string, unknown>).text as string)
+      .join('\n');
+  }
+  return '';
 }
 
 // A 12h ("4:10am"/"3pm") or 24h ("16:10") clock → {hour, minute}, or null on an

@@ -4,6 +4,7 @@ import {
   buildLimitNotification,
   classifyFailure,
   continueCallbackData,
+  extractAssistantText,
   extractFailure,
   formatClock,
   formatDelta,
@@ -69,6 +70,44 @@ test('parseResetTime: no reset info → null; nonsense clock → null', () => {
   expect(parseResetTime('overloaded_error: please try again', NOW)).toBeNull();
   expect(parseResetTime('resets 13pm', NOW)).toBeNull();
   expect(parseResetTime('resets 25:00', NOW)).toBeNull();
+});
+
+test('parseResetTime: a bare count near "resets" is NOT a time (no false positive)', () => {
+  expect(parseResetTime('the counter resets 3 times per hour', NOW)).toBeNull();
+  expect(parseResetTime('resets 5 requests remaining', NOW)).toBeNull();
+});
+
+test('parseResetTime: an unrelated ISO timestamp far from "reset" is ignored', () => {
+  // A transcript line stamp must not be mistaken for the reset time.
+  const text = '2020-01-01T00:00:00Z the agent said hi. later: your session limit resets 4:10am';
+  const r = parseResetTime(text, NOW);
+  expect(new Date(r!).getHours()).toBe(4); // the wall clock near "resets", not the 2020 stamp
+});
+
+test('extractAssistantText: pulls the LAST assistant message, both content shapes, ignoring stamps', () => {
+  const jsonl = [
+    JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' }, timestamp: '2026-07-02T09:00:00.000Z' }),
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'working on it' }] }, timestamp: '2026-07-02T09:01:00.000Z' }),
+    JSON.stringify({ role: 'assistant', content: 'You have hit your session limit · resets 4:10am (Europe/Belgrade)' }),
+    'not json — skipped',
+  ].join('\n');
+  const text = extractAssistantText(jsonl);
+  expect(text).toContain('session limit');
+  expect(text).not.toContain('2026-07-02T09'); // no timestamp bled in
+});
+
+test('extractAssistantText + extractFailure: a realistic JSONL transcript yields the reset + clean detail', () => {
+  const jsonl = [
+    JSON.stringify({ type: 'user', message: { role: 'user', content: 'go' }, timestamp: '2026-07-02T08:00:00.000Z' }),
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'You have hit your session limit · resets 4:10am (Europe/Belgrade)' }] }, timestamp: '2026-07-02T10:00:00.000Z' }),
+  ].join('\n');
+  const f = extractFailure('session_limit', extractAssistantText(jsonl), NOW);
+  expect(f.kind).toBe('session-limit');
+  expect(new Date(f.resetAt!).getHours()).toBe(4);
+  // detail is clean prose, NOT a raw JSONL line with a timestamp
+  expect(f.detail).toContain('session limit');
+  expect(f.detail).not.toContain('timestamp');
+  expect(f.detail).not.toContain('{');
 });
 
 test('staleness guard: a limit whose reset is already past is SUPPRESSED (null)', () => {

@@ -100,6 +100,37 @@ test('--dry-run sends nothing (isolation, bug a) and prints the rendered notific
   expect(reactions).toHaveLength(0);
 });
 
+test('production path: a JSONL transcript_path (not flags) yields the reset + clean detail', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  // A realistic Claude transcript: per-line JSON with timestamps; the limit is the
+  // last assistant message. This is the prod shape the bare hook feeds (no message
+  // flag). Proves the reset is parsed from prose (not a line stamp) and the detail
+  // is clean (not raw JSONL) — the two prod bugs the review caught.
+  const transcript = join(cfgDir, 'transcript.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'user', message: { role: 'user', content: 'go' }, timestamp: '2020-01-01T00:00:00.000Z' }),
+    JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'You have hit your session limit · resets 4:10am (Europe/Belgrade)' }] },
+      timestamp: '2026-07-02T10:00:00.000Z',
+    }),
+  ].join('\n');
+  writeFileSync(transcript, lines);
+  // stdin carries ONLY the hook envelope (reason + transcript_path), no message.
+  const payload = JSON.stringify({ reason: 'session_limit', transcript_path: transcript });
+  const { code } = await runHarnessEvent(['--agent', 'hyperide', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  const msg = sentMessages[0];
+  expect(msg.text).toContain('session limit');
+  // detail (blockquote) is clean prose — no raw JSON / timestamp leaked
+  expect(msg.text).not.toContain('timestamp');
+  expect(msg.text).not.toContain('"role"');
+  // the button's reset came from the 4:10am prose, not the 2020 line stamp
+  expect(msg.reply_markup.inline_keyboard[0][0].callback_data).toMatch(/^lc:%3:\d+$/);
+});
+
 test('an API error with no reset → alert, no button', async () => {
   sentMessages.length = 0;
   const { code } = await runHarnessEvent(['--agent', 'hyperide'], JSON.stringify({ reason: 'overloaded', message: 'overloaded_error (529)' }));

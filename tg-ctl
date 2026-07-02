@@ -56,6 +56,7 @@ import {
   autoContinueDelayMs,
   buildLimitNotification,
   continueCallbackData,
+  extractAssistantText,
   extractFailure,
   formatClock,
   parseContinueCallback,
@@ -2086,33 +2087,41 @@ function strField(obj: unknown, key: string): string {
   return typeof v === "string" ? v : ""
 }
 
-// Read the tail of a Claude transcript (JSONL). The synthetic session-limit
-// message is at the end, and parseResetTime scans free text, so the last 8KB is
-// enough context without loading a multi-MB transcript.
-function transcriptTail(path: string | null): string {
+// The failure prose from a Claude transcript (JSONL): the LAST assistant message
+// text — where the synthetic session-limit / error message lives. Scanning the
+// raw file would pick up per-line ISO timestamps and dump JSON into the alert;
+// extractAssistantText pulls clean prose. Bounded read (tail) for a big file.
+function transcriptFailureText(path: string | null): string {
   if (!path) return ""
   const raw = readFileOrNull(path)
-  return raw ? raw.slice(-8000) : ""
+  if (!raw) return ""
+  return extractAssistantText(raw.length > 200_000 ? raw.slice(-200_000) : raw)
 }
 
-// Normalize the StopFailure payload + flags into a HarnessFailureEvent.
-function buildHarnessEvent(payloadText: string, flags: HarnessEventFlags, now: number): HarnessFailureEvent {
+// Normalize the StopFailure payload + flags into a HarnessFailureEvent. The
+// installed hook runs a BARE `tg-ctl harness-event`, so everything but the
+// payload/transcript is resolved from the runtime: paneId from TMUX_PANE (flag
+// default), agent from the live pane. The failure text comes from the transcript
+// (prod) or an inline `message` field / plain-text stdin (tests / manual).
+function buildHarnessEvent(payloadText: string, flags: HarnessEventFlags, agent: string, now: number): HarnessFailureEvent {
   let payload: unknown = null
   try {
     payload = JSON.parse(payloadText)
   } catch {
-    /* non-JSON stdin (or empty) — rely on flags + inline text */
+    /* non-JSON stdin (or empty) — treat it as the inline failure text */
   }
   const reason = flags.reason ?? (strField(payload, "reason") || strField(payload, "matcher"))
   const tPath = flags.transcriptPath ?? (strField(payload, "transcript_path") || null)
-  const inline = strField(payload, "message") || strField(payload, "last_message") || payloadText
-  const failureText = [inline, transcriptTail(tPath)].filter(Boolean).join("\n")
+  // inline: an explicit message field, else plain-text (non-JSON) stdin. NEVER
+  // the raw JSON payload — parseResetTime would scan JSON noise (a real bug).
+  const inline = strField(payload, "message") || strField(payload, "last_message") || (payload === null ? payloadText : "")
+  const failureText = [inline, transcriptFailureText(tPath)].filter(Boolean).join("\n")
   const extracted = extractFailure(reason, failureText, now)
   const explicitReset = flags.resetAtIso ? Date.parse(flags.resetAtIso) : NaN
   const resetAt = Number.isFinite(explicitReset) ? explicitReset : extracted.resetAt
   return {
     kind: resetAt !== null ? "session-limit" : extracted.kind,
-    agent: flags.agent ?? "agent",
+    agent,
     paneId: flags.paneId,
     reason: extracted.reason,
     detail: extracted.detail,
@@ -2121,10 +2130,18 @@ function buildHarnessEvent(payloadText: string, flags: HarnessEventFlags, now: n
   }
 }
 
+// The agent (window) name for a pane, from the live tmux snapshot — so the bare
+// installed hook still labels the notification instead of a default "agent".
+function resolveAgentForPane(paneId: string | null): string {
+  if (!paneId) return "agent"
+  return listAgentCandidates().find((c) => c.paneId === paneId)?.windowName ?? "agent"
+}
+
 async function runHarnessEvent(ctx: Ctx, argv: string[], now: number): Promise<number> {
   const flags = parseHarnessEventFlags(argv)
   const payloadText = await readStdinText().catch(() => "")
-  const ev = buildHarnessEvent(payloadText, flags, now)
+  const agent = flags.agent ?? resolveAgentForPane(flags.paneId)
+  const ev = buildHarnessEvent(payloadText, flags, agent, now)
   const notif = buildLimitNotification(ev, now)
   if (!notif) {
     // Staleness guard (#113): a reset already in the past, or nothing to report.
@@ -4420,6 +4437,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   }
   const fireAutoContinue = async (s: AutoContinueSchedule): Promise<void> => {
+    // A reset > ~24.8 days out is clamped to MAX_TIMER_MS, so the timer can wake
+    // BEFORE the real reset — re-arm instead of injecting early.
+    if (Date.now() < s.resetAt) {
+      armAutoContinue(s)
+      return
+    }
     continueTimers.delete(s.paneId)
     scheduleStore = removeSchedule(scheduleStore, s.paneId)
     persistSchedules()
