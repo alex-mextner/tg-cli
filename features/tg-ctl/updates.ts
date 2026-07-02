@@ -222,6 +222,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
           callbackQueryId: cb.id,
           paneId: contCb.paneId,
           resetAt: contCb.resetAt,
+          sourceMessageId: contCb.sourceMessageId,
           messageId: cb.message?.message_id ?? null,
         });
         continue;

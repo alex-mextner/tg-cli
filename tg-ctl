@@ -196,7 +196,7 @@ export const USAGE = `Usage:
                          # (--dry-run prints the plan and touches nothing)
   tg-ctl disable         # remove OS autostart AND stop
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
-  tg-ctl install-hooks   # wire q→buttons + StopFailure/UserPromptSubmit hooks
+  tg-ctl install-hooks   # wire q→buttons + StopFailure (limit/error) hooks
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
   tg-ctl harness-event [--dry-run] [--pane %N] [--agent NAME] [--reason MATCHER]
                         [--reset-at ISO] [--source-message-id ID] [--transcript PATH]
@@ -4423,9 +4423,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     continueTimers.delete(s.paneId)
     scheduleStore = removeSchedule(scheduleStore, s.paneId)
     persistSchedules()
+    // Clear the card's button first so a stale card can't re-arm a second inject.
+    if (s.cardMessageId !== null) await clearMessageKeyboard(ctx, s.cardMessageId)
     const res = await executeInjectSteps(buildTextInjectPlan(s.paneId, "continue"))
     if (!res.ok) log(`auto-continue inject failed for ${s.paneId}: ${res.error}`)
     else log(`auto-continue fired for ${s.paneId} (agent=${s.agent})`)
+    // Resume: flip the ORIGINAL inbound message (😴 → 👀), not the bot's card.
     if (s.sourceMessageId !== null) await setMessageReaction(ctx, s.sourceMessageId, reactionForStage("working"))
   }
   const armAutoContinue = (s: AutoContinueSchedule): void => {
@@ -4435,11 +4438,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     continueTimers.set(s.paneId, timer)
   }
   const handleLimitContinue = async (action: Extract<Action, { kind: "limit-continue" }>): Promise<boolean> => {
+    // The agent name isn't in the callback_data — recover it from the live pane.
+    const agent = listAgentCandidates().find((c) => c.paneId === action.paneId)?.windowName ?? ""
     const schedule: AutoContinueSchedule = {
       paneId: action.paneId,
       resetAt: action.resetAt,
-      agent: "",
-      sourceMessageId: action.messageId,
+      agent,
+      // The ORIGINAL inbound message (from the callback_data) is the reaction
+      // target; action.messageId is the bot's card, whose button we clear on fire.
+      sourceMessageId: action.sourceMessageId,
+      cardMessageId: action.messageId,
       armedAt: Date.now(),
     }
     scheduleStore = upsertSchedule(scheduleStore, schedule)

@@ -80,13 +80,15 @@ test('staleness guard: a limit whose reset is already past is SUPPRESSED (null)'
 
 test('notification: future reset → text + auto-continue button; no unrendered placeholder', () => {
   const future = NOW + 3 * 60 * 60_000 + 5 * 60_000; // +3h05m
-  const n = buildLimitNotification(ev({ resetAt: future }), NOW)!;
+  const n = buildLimitNotification(ev({ resetAt: future, sourceMessageId: 55 }), NOW)!;
   expect(n).not.toBeNull();
   expect(n.text).toContain('hyperide');
   expect(n.text).toContain('Resets at');
   expect(n.text).toContain('in 3h 5m');
   expect(n.button).not.toBeNull();
-  expect(n.button!.data).toBe(continueCallbackData('%3', future));
+  // the source message id is threaded into the button so the resume flip can find it
+  expect(n.button!.data).toBe(continueCallbackData('%3', future, 55));
+  expect(n.button!.data).toContain(':55');
   // bug (c): the rendered text must never carry a printf-style or template token.
   expect(n.text).not.toMatch(/%\d/);
   expect(n.text).not.toMatch(/%s/);
@@ -124,9 +126,18 @@ test('autoContinueDelayMs: future = remaining, past = 0, far future clamped', ()
   expect(autoContinueDelayMs(NOW + MAX_TIMER_MS * 3, NOW)).toBe(MAX_TIMER_MS);
 });
 
-test('parseContinueCallback: round-trips a valid tap, rejects foreign data', () => {
-  const data = continueCallbackData('%12', 1720000000000);
-  expect(parseContinueCallback(data)).toEqual({ paneId: '%12', resetAt: 1720000000000 });
+test('parseContinueCallback: round-trips a tap with/without a source id, rejects foreign data', () => {
+  expect(parseContinueCallback(continueCallbackData('%12', 1720000000000))).toEqual({
+    paneId: '%12',
+    resetAt: 1720000000000,
+    sourceMessageId: null,
+  });
+  // the source message id survives the round-trip and is NOT swallowed into paneId
+  expect(parseContinueCallback(continueCallbackData('%3', 1720000000000, 55))).toEqual({
+    paneId: '%3',
+    resetAt: 1720000000000,
+    sourceMessageId: 55,
+  });
   expect(parseContinueCallback('agent:foo:1')).toBeNull();
   expect(parseContinueCallback('lc:%3:notanumber')).toBeNull();
 });

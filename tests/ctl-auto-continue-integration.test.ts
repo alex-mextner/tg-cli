@@ -108,21 +108,35 @@ test('tapping the auto-continue button arms + persists a schedule and answers th
   }
 });
 
-test('a persisted schedule survives a restart and re-arms — a past reset fires on startup and is dropped', async () => {
+test('a persisted schedule survives a restart, re-arms, fires, flips 👀 on the source, and clears the card', async () => {
   const cfgDir = makeCfg();
   // Pre-seed a schedule whose reset is already past → a restarted daemon re-arms
-  // it and fires immediately (delay 0), then removes it from the persisted file.
+  // it and fires immediately (delay 0): removes it from the file, flips the SOURCE
+  // message (55) back to 👀 (NOT the card), and clears the card's (88) button.
   const schedPath = join(cfgDir, SCHEDULES);
   writeFileSync(
     schedPath,
     JSON.stringify({
       version: 1,
-      schedules: [{ paneId: '%9', resetAt: Date.now() - 5000, agent: 'x', sourceMessageId: null, armedAt: Date.now() }],
+      schedules: [
+        { paneId: '%9', resetAt: Date.now() - 5000, agent: 'hyperide', sourceMessageId: 55, cardMessageId: 88, armedAt: Date.now() },
+      ],
     }),
   );
+  const reactions: any[] = [];
+  const clearedKeyboards: any[] = [];
   const server = Bun.serve({
     port: 0,
-    async fetch() {
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/setMessageReaction')) {
+        reactions.push(await req.json());
+        return Response.json({ ok: true, result: true });
+      }
+      if (url.pathname.endsWith('/editMessageReplyMarkup')) {
+        clearedKeyboards.push(await req.json());
+        return Response.json({ ok: true, result: true });
+      }
       await Bun.sleep(80);
       return Response.json({ ok: true, result: [] });
     },
@@ -130,17 +144,21 @@ test('a persisted schedule survives a restart and re-arms — a past reset fires
   try {
     spawnDaemon(cfgDir, server.port);
     const t0 = Date.now();
-    // Wait until the fired schedule is removed from the persisted file.
     while (Date.now() - t0 < 8000) {
       const data = JSON.parse(readFileSync(schedPath, 'utf8'));
       if (!data.schedules.some((s: any) => s.paneId === '%9')) break;
       await Bun.sleep(50);
     }
     // Only fireAutoContinue removes an entry, and it is triggered solely by the
-    // startup re-arm timer — so %9 disappearing proves the restart re-armed and
-    // fired the persisted schedule.
+    // startup re-arm timer — so %9 disappearing proves the restart re-armed + fired.
     const data = JSON.parse(readFileSync(schedPath, 'utf8'));
     expect(data.schedules.some((s: any) => s.paneId === '%9')).toBe(false);
+    // Resume reaction lands on the SOURCE message (55), not the card, with 👀.
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+    expect(reactions).toHaveLength(1);
+    expect(reactions[0]).toMatchObject({ message_id: 55, reaction: [{ type: 'emoji', emoji: '👀' }] });
+    // The card's (88) button is removed so it can't re-arm.
+    expect(clearedKeyboards.some((k) => k.message_id === 88)).toBe(true);
   } finally {
     server.stop(true);
   }

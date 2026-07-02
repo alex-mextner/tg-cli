@@ -146,7 +146,7 @@ export type Action =
   // A tap on a limit-stop's "auto-continue" button (lc:<pane>:<resetAt>): the
   // entrypoint arms a timer that injects "continue" into that pane at reset time
   // (immediately if already past), persisted so a restart re-arms it (#113).
-  | { kind: 'limit-continue'; callbackQueryId: string; paneId: string; resetAt: number; messageId: number | null }
+  | { kind: 'limit-continue'; callbackQueryId: string; paneId: string; resetAt: number; sourceMessageId: number | null; messageId: number | null }
   // /agent [<win>] <msg> — entrypoint discovers panes, fuzzy-matches the window
   // (phonetic), routes <msg> to that agent or asks via session-grouped buttons.
   | { kind: 'agent-route'; selector: string | null; rest: string; all: string; from: string }

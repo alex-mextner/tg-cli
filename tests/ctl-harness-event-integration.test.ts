@@ -66,9 +66,9 @@ test('a session-limit with a parseable reset → notification + auto-continue bu
   expect(msg.text).toContain('session limit');
   // bug (c): no unrendered placeholder leaked into the live message.
   expect(msg.text).not.toMatch(/%\d/);
-  // auto-continue button present, encoding pane + reset.
+  // auto-continue button present, encoding pane + reset + source message id (55).
   const button = msg.reply_markup.inline_keyboard[0][0];
-  expect(button.callback_data).toMatch(/^lc:%3:\d+$/);
+  expect(button.callback_data).toMatch(/^lc:%3:\d+:55$/);
   // stalled reaction (😴) on the source message.
   expect(reactions).toHaveLength(1);
   expect(reactions[0]).toMatchObject({ chat_id: 1, message_id: 55, reaction: [{ type: 'emoji', emoji: '😴' }] });

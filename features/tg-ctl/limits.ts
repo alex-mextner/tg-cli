@@ -139,7 +139,7 @@ export function buildLimitNotification(ev: HarnessFailureEvent, now: number): Li
   const detail = ev.detail ? `\n<blockquote>${escapeHtml(ev.detail)}</blockquote>` : '';
   const button =
     ev.resetAt !== null && ev.paneId
-      ? { label: `▶️ Auto-continue at ${formatClock(ev.resetAt)}`, data: continueCallbackData(ev.paneId, ev.resetAt) }
+      ? { label: `▶️ Auto-continue at ${formatClock(ev.resetAt)}`, data: continueCallbackData(ev.paneId, ev.resetAt, ev.sourceMessageId) }
       : null;
   return { text: `${head}${when}${detail}`, button, resetAt: ev.resetAt };
 }
@@ -155,16 +155,22 @@ export function autoContinueDelayMs(resetAt: number, now: number): number {
   return Math.max(0, Math.min(resetAt - now, MAX_TIMER_MS));
 }
 
-export function continueCallbackData(paneId: string, resetAt: number): string {
-  return `${LIMIT_CONTINUE_PREFIX}:${paneId}:${resetAt}`;
+// Encode the auto-continue tap: pane + reset + (optionally) the inbound message
+// to flip 👀 back onto when it fires. A tmux paneId is `%N` (no colon), the epoch
+// is ~13 digits, an id is small — well inside Telegram's 64-byte callback_data cap.
+export function continueCallbackData(paneId: string, resetAt: number, sourceMessageId?: number | null): string {
+  const base = `${LIMIT_CONTINUE_PREFIX}:${paneId}:${resetAt}`;
+  return sourceMessageId != null ? `${base}:${sourceMessageId}` : base;
 }
 
 // Inverse of continueCallbackData. Returns null for anything that is not a
-// well-formed auto-continue tap (a foreign or truncated callback).
-export function parseContinueCallback(data: string): { paneId: string; resetAt: number } | null {
-  const m = data.match(/^lc:(.+):(\d+)$/);
+// well-formed auto-continue tap (a foreign or truncated callback). paneId is
+// matched as a non-colon run so the optional trailing source id can't be
+// swallowed into it.
+export function parseContinueCallback(data: string): { paneId: string; resetAt: number; sourceMessageId: number | null } | null {
+  const m = data.match(/^lc:([^:]+):(\d+)(?::(\d+))?$/);
   if (!m) return null;
-  return { paneId: m[1], resetAt: Number(m[2]) };
+  return { paneId: m[1], resetAt: Number(m[2]), sourceMessageId: m[3] ? Number(m[3]) : null };
 }
 
 // Local HH:MM (24h) for a ms epoch — stable, locale-independent formatting.

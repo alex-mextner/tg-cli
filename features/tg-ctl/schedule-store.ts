@@ -15,6 +15,7 @@ export interface AutoContinueSchedule {
   resetAt: number; // ms epoch when the continue should fire
   agent: string; // window/session name (resume copy + logging)
   sourceMessageId: number | null; // inbound message to flip back to 👀 on resume
+  cardMessageId: number | null; // the notification card — its button is cleared on fire
   armedAt: number; // ms epoch the tap armed it (bookkeeping / ordering)
 }
 
@@ -41,6 +42,7 @@ function isValid(r: unknown): r is AutoContinueSchedule {
     Number.isFinite(s.resetAt) &&
     typeof s.agent === 'string' &&
     (s.sourceMessageId === null || typeof s.sourceMessageId === 'number') &&
+    (s.cardMessageId === null || typeof s.cardMessageId === 'number') &&
     typeof s.armedAt === 'number'
   );
 }

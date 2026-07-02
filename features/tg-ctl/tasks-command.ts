@@ -119,7 +119,10 @@ export function matchPrsToTasks(tasks: TaskItem[], prs: PrRef[]): Map<string, Pr
   for (const task of tasks) {
     const num = task.id.replace(/^#/, '');
     if (!num) continue;
-    const re = new RegExp(`#${num}\\b`);
+    // The id comes from `task list --json` output — escape regex metacharacters
+    // so a non-numeric / odd id (e.g. a `+`/`(`/`[`) can't corrupt the match or
+    // throw an uncaught RegExp error in the daemon.
+    const re = new RegExp(`#${escapeRegExp(num)}\\b`);
     const matches = prs.filter((pr) => re.test(pr.title) || (pr.body ? re.test(pr.body) : false));
     if (matches.length === 0) continue;
     out.set(task.id, matches.reduce((best, pr) => (pr.number > best.number ? pr : best)));
@@ -160,4 +163,8 @@ function taskRow(t: TaskItem, pr: PrRef | null): string {
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

@@ -14,6 +14,7 @@ const sched = (over: Partial<AutoContinueSchedule> = {}): AutoContinueSchedule =
   resetAt: NOW + 3_600_000,
   agent: 'hyperide',
   sourceMessageId: 42,
+  cardMessageId: 77,
   armedAt: NOW,
   ...over,
 });

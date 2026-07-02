@@ -72,13 +72,12 @@ test('a non-answer tag with --reply-to sets NO reaction', async () => {
   expect(reactions).toHaveLength(0);
 });
 
-test('--tag answer WITHOUT a reply target sets NO reaction', async () => {
+test('a plain message (no tag, no reply target) sets NO reaction', async () => {
   reactions = [];
-  const code = await runSend(['--tag', 'answer', '--reply-to', '4321', 'ok']);
-  // sanity: the answer WITH a target reacted (covered above); without a target it must not.
-  reactions = [];
-  const code2 = await runSend(['plain message']);
+  // The CLI rejects `--tag answer` without `--reply-to` (answer requires a
+  // target), so the replyToMessageId==null branch is unreachable here — it is
+  // covered by the doneReactionForSend unit test. This checks the everyday path.
+  const code = await runSend(['plain message']);
   expect(code).toBe(0);
-  expect(code2).toBe(0);
   expect(reactions).toHaveLength(0);
 });
