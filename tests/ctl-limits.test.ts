@@ -77,6 +77,13 @@ test('parseResetTime: a bare count near "resets" is NOT a time (no false positiv
   expect(parseResetTime('resets 5 requests remaining', NOW)).toBeNull();
 });
 
+test('parseResetTime: a bare count does NOT shadow the real reset later in the text', () => {
+  // The first "resets 3 times" must not swallow the parse — scan finds "resets 4:10am".
+  const r = parseResetTime('counter resets 3 times. your session resets 4:10am', NOW);
+  expect(new Date(r!).getHours()).toBe(4);
+  expect(new Date(r!).getMinutes()).toBe(10);
+});
+
 test('parseResetTime: an unrelated ISO timestamp far from "reset" is ignored', () => {
   // A transcript line stamp must not be mistaken for the reset time.
   const text = '2020-01-01T00:00:00Z the agent said hi. later: your session limit resets 4:10am';

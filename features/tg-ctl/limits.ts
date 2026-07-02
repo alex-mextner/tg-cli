@@ -68,19 +68,29 @@ export function classifyFailure(reason: string): HarnessFailureKind {
 // resolved to its NEXT occurrence in the daemon's local timezone (which is the
 // operator's — the reset text's "(Europe/Belgrade)" is that same zone).
 export function parseResetTime(text: string, now: number): number | null {
-  // Only look near a "reset" mention — scanning the whole text for a bare ISO
-  // would grab an unrelated transcript timestamp (a message stamp in the past).
-  const resetIdx = text.search(/reset/i);
-  const window = resetIdx >= 0 ? text.slice(resetIdx, resetIdx + 120) : '';
+  // Scan EVERY "reset" mention (not just the first) and return the first that
+  // yields a real time. Anchoring to a mention keeps an unrelated transcript ISO
+  // stamp out; scanning all of them means a bare count ("resets 3 times") ahead
+  // of the real "resets 4:10am" doesn't shadow it.
+  const re = /reset/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const parsed = parseResetWindow(text.slice(m.index, m.index + 120), now);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
+// Parse a single "reset …" window → ms epoch, or null. An explicit ISO wins; else
+// a wall clock, guarded against a bare count (a lone integer with no am/pm, no
+// ":MM", and no "at/by" is NOT a time).
+function parseResetWindow(window: string, now: number): number | null {
   const isoMatch = window.match(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?/);
   if (isoMatch) {
     const t = Date.parse(isoMatch[0].replace(' ', 'T'));
     if (Number.isFinite(t)) return t;
   }
-  // Wall clock: "resets 4:10am", "reset at 3pm", "resets 16:10". Guard against a
-  // bare count ("resets 3 times per hour") — a lone integer with no am/pm, no
-  // ":MM", and no "at/by" is NOT a time.
-  const clockMatch = text.match(/reset[s]?\s+(at|by)?\s*(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?/i);
+  const clockMatch = window.match(/reset[s]?\s+(at|by)?\s*(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?/i);
   if (!clockMatch) return null;
   const [, atBy, hStr, mStr, ampm] = clockMatch;
   if (!atBy && !mStr && !ampm) return null; // a bare "resets 3" is not a time

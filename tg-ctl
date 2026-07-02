@@ -4446,6 +4446,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     continueTimers.delete(s.paneId)
     scheduleStore = removeSchedule(scheduleStore, s.paneId)
     persistSchedules()
+    // A tmux restart recycles pane ids — %N may now host a DIFFERENT agent (or a
+    // bare shell). If we knew the agent at arm time, refuse to inject "continue"
+    // into a pane that no longer maps to it (executeInjectSteps only checks that
+    // SOME agent is there, not WHICH). Skip quietly rather than poke the wrong one.
+    if (s.agent) {
+      const live = listAgentCandidates().find((c) => c.paneId === s.paneId)
+      if (!live || (live.windowName && live.windowName !== s.agent)) {
+        log(`auto-continue skipped: ${s.paneId} no longer hosts ${s.agent}`)
+        return
+      }
+    }
     // Clear the card's button first so a stale card can't re-arm a second inject.
     if (s.cardMessageId !== null) await clearMessageKeyboard(ctx, s.cardMessageId)
     const res = await executeInjectSteps(buildTextInjectPlan(s.paneId, "continue"))

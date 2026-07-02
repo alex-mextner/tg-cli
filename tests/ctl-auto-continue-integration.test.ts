@@ -119,7 +119,11 @@ test('a persisted schedule survives a restart, re-arms, fires, flips 👀 on the
     JSON.stringify({
       version: 1,
       schedules: [
-        { paneId: '%9', resetAt: Date.now() - 5000, agent: 'hyperide', sourceMessageId: 55, cardMessageId: 88, armedAt: Date.now() },
+        // agent "" = identity unknown at arm time → fire proceeds best-effort.
+        { paneId: '%9', resetAt: Date.now() - 5000, agent: '', sourceMessageId: 55, cardMessageId: 88, armedAt: Date.now() },
+        // agent "ghost" with an empty tmux snapshot = pane no longer hosts it →
+        // the guard SKIPS the inject/flip (a recycled pane must not be poked).
+        { paneId: '%8', resetAt: Date.now() - 5000, agent: 'ghost', sourceMessageId: 66, cardMessageId: 99, armedAt: Date.now() },
       ],
     }),
   );
@@ -146,19 +150,22 @@ test('a persisted schedule survives a restart, re-arms, fires, flips 👀 on the
     const t0 = Date.now();
     while (Date.now() - t0 < 8000) {
       const data = JSON.parse(readFileSync(schedPath, 'utf8'));
-      if (!data.schedules.some((s: any) => s.paneId === '%9')) break;
+      if (!data.schedules.some((s: any) => s.paneId === '%9' || s.paneId === '%8')) break;
       await Bun.sleep(50);
     }
-    // Only fireAutoContinue removes an entry, and it is triggered solely by the
-    // startup re-arm timer — so %9 disappearing proves the restart re-armed + fired.
+    // Both schedules fire on the startup re-arm (only fireAutoContinue rewrites
+    // the file) — so both entries disappearing proves the restart re-armed them.
     const data = JSON.parse(readFileSync(schedPath, 'utf8'));
-    expect(data.schedules.some((s: any) => s.paneId === '%9')).toBe(false);
-    // Resume reaction lands on the SOURCE message (55), not the card, with 👀.
+    expect(data.schedules.some((s: any) => s.paneId === '%9' || s.paneId === '%8')).toBe(false);
+    // %9 (identity unknown) proceeds: 👀 lands on the SOURCE message (55), not
+    // the card; the card's (88) button is cleared so it can't re-arm.
     while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
-    expect(reactions).toHaveLength(1);
-    expect(reactions[0]).toMatchObject({ message_id: 55, reaction: [{ type: 'emoji', emoji: '👀' }] });
-    // The card's (88) button is removed so it can't re-arm.
+    expect(reactions.some((r) => r.message_id === 55 && r.reaction[0].emoji === '👀')).toBe(true);
     expect(clearedKeyboards.some((k) => k.message_id === 88)).toBe(true);
+    // %8's agent (ghost) no longer maps to the pane → guard SKIPS it: no reaction
+    // on its source (66) and its card (99) button is left alone.
+    expect(reactions.some((r) => r.message_id === 66)).toBe(false);
+    expect(clearedKeyboards.some((k) => k.message_id === 99)).toBe(false);
   } finally {
     server.stop(true);
   }
