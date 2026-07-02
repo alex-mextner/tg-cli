@@ -4258,23 +4258,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // permission with no live socket falls through to the "expired" toast below so the
     // user knows to wait for the agent's reconnect window to pass.
     if (retained.req.kind === "permission") return false
-    // A multi-question SET MEMBER is likewise retained only for reconnect
-    // re-attach. Its lone answer must never inject into the pane: the local
-    // multi-question dialog that took over may be showing a DIFFERENT question,
-    // so the injected text would answer the wrong prompt (all-or-nothing —
-    // see ButtonRequest.multiQuestion). Retire the card so the refusal is
-    // visible, then fall through to the "expired" toast.
-    if (retained.req.multiQuestion) {
-      abandonedButtons.delete(action.requestId)
-      persistQuestions()
-      const staleCardId = retained.messageId ?? action.messageId
-      if (staleCardId !== null) {
-        void clearMessageKeyboard(ctx, staleCardId)
-        void editMessageText(ctx, staleCardId, EXPIRED_TERMINAL_TEXT)
-      }
-      log(`ask-late-deliver-refused: multi-question member ${describeAskRequest(retained.req)} key=${action.requestId}`)
-      return false
-    }
     // Enforce the retention window at DELIVERY time, not only on persist/restore. On a
     // QUIET daemon (no mutation since the abandon) pruneAbandonedButtons never runs, so
     // without this check an arbitrarily-stale answer would still be injected into a pane
@@ -4290,6 +4273,20 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       log(`ask-late-deliver-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
       return false
+    }
+    // A multi-question SET MEMBER is retained ONLY for reconnect re-attach. Its
+    // lone answer must never inject into the pane: the local multi-question
+    // dialog that took over may be showing a DIFFERENT question, so the injected
+    // text would answer the wrong prompt (all-or-nothing — see
+    // ButtonRequest.multiQuestion). Refuse WITHOUT mutating state: the retained
+    // entry and the card's keyboard survive, so a `tg-ctl ask` resend across a
+    // daemon bounce still re-attaches to the original card (no duplicate), and
+    // an in-window re-fire of the whole set replays normally. A genuinely-stale
+    // member is cleaned up by the retention-window branch above.
+    if (retained.req.multiQuestion) {
+      log(`ask-late-deliver-refused: multi-question member ${describeAskRequest(retained.req)} key=${action.requestId}`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "the terminal took over — answer all questions there")
+      return true
     }
     const answer = resolveButtonCallback(retained.req, { requestId: action.requestId, value: action.value })
     if (answer.status !== "answered") return false

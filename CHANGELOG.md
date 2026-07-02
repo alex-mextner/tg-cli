@@ -24,8 +24,9 @@ semantic versioning.
   the daemon (`tg-ctl restart`) to update the daemon side too.
 - **A late tap on an abandoned multi-question member is refused** (review finding): after the
   ask client's budget elapses mid-collection, the local dialog owns ALL the questions — injecting
-  one lone late answer could answer the WRONG prompt. The card retires to "expired — answer in
-  terminal"; reconnect re-attach (daemon bounce mid-collection) is unaffected.
+  one lone late answer could answer the WRONG prompt. The tap answers "the terminal took over";
+  the retained entry and keyboard survive untouched, so reconnect re-attach across a daemon
+  bounce (no duplicate card) keeps working; stale members expire via the retention window.
 - **`tool_input` now survives the daemon socket boundary** (review finding): the daemon-side
   request parser dropped it, silently downgrading a PreToolUse ExitPlanMode "Proceed" to a bare
   allow — which the hooks docs say is not sufficient for user-interactive tools. New round-trip

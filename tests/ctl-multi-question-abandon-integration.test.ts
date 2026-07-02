@@ -162,15 +162,28 @@ test('a late tap on an abandoned multi-question member is REFUSED, never injecte
     await waitFor(() => editedMessages.some((e) => e.message_id === card2 && e.text.includes('answer all questions in the terminal')), 5000),
   ).toBe(true);
 
-  // A LATE tap on the abandoned member: must answer "expired", retire the card,
-  // and inject NOTHING into the pane.
+  // A LATE tap on the abandoned member: must be refused with a clear toast and
+  // inject NOTHING into the pane — but the retained entry MUST survive, because
+  // it doubles as the daemon-bounce reconnect state (a `tg-ctl ask` resend
+  // re-attaches to this card instead of posting a duplicate).
   tapQueue.push({ update_id: 201, message_id: card2, data: sentMessages[1].callback_data });
   expect(await waitFor(() => answeredCallbacks.length === 2, 5000)).toBe(true);
   expect(answeredCallbacks[0]).toEqual({ callback_query_id: 'cb200', text: '✓ sent to the agent' });
-  expect(answeredCallbacks[1]).toEqual({ callback_query_id: 'cb201', text: 'expired' });
-  expect(
-    await waitFor(() => editedMessages.some((e) => e.message_id === card2 && e.text === 'expired — answer in terminal'), 5000),
-  ).toBe(true);
+  expect(answeredCallbacks[1]).toEqual({
+    callback_query_id: 'cb201',
+    text: 'the terminal took over — answer all questions there',
+  });
+  // The refusal keeps state intact: the entry is still in the durable store and
+  // a SECOND tap is refused the same way (nothing was expired or retired).
+  const store = readFileSync(join(cfgDir, 'tg-ctl.123.questions.json'), 'utf8');
+  expect(store).toContain('Deploy when?');
+  expect(editedMessages.some((e) => e.message_id === card2 && e.text === 'expired — answer in terminal')).toBe(false);
+  tapQueue.push({ update_id: 202, message_id: card2, data: sentMessages[1].callback_data });
+  expect(await waitFor(() => answeredCallbacks.length === 3, 5000)).toBe(true);
+  expect(answeredCallbacks[2]).toEqual({
+    callback_query_id: 'cb202',
+    text: 'the terminal took over — answer all questions there',
+  });
   // The refusal is logged, and no tmux injection ever ran for the lone answer.
   const daemonLog = readFileSync(join(cfgDir, 'daemon.log'), 'utf8');
   expect(daemonLog).toContain('ask-late-deliver-refused: multi-question member');

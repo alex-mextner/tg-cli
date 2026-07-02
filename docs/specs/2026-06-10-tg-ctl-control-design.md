@@ -255,8 +255,10 @@ Claude Code hook installation remains an automation layer over that handoff
   record the unanswered questions as "(no option selected)"). For the same
   reason a set member is never LATE-DELIVERED: once the local dialog takes over
   it owns ALL the questions, and injecting one lone late answer could answer
-  the WRONG prompt — a late tap on an abandoned member answers "expired" and
-  retires the card (reconnect re-attach across a daemon bounce still works). The client also
+  the WRONG prompt — a late tap on an abandoned member is refused with a "the
+  terminal took over" toast WITHOUT mutating state, so the retained entry keeps
+  doubling as the daemon-bounce reconnect anchor (re-attach, no duplicate card)
+  and stale members still expire via the retention window. The client also
   REPAIRS a single-question reply from a stale RUNNING daemon that predates
   `hookEventName` (live-symlink deploys update the hook client before the
   daemon restarts).
