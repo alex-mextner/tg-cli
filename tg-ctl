@@ -103,7 +103,7 @@ import {
   serializeRegistrations,
   upsertRegistration,
 } from "./features/tg-ctl/registration-store"
-import { claudeHooksInstalled, withClaudeHooks } from "./features/tg-ctl/hook-install"
+import { claudeHooksInstalled, withClaudeHooks, withHarnessHooks } from "./features/tg-ctl/hook-install"
 import { normalizeHookPayload, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
@@ -949,9 +949,14 @@ function installHooks(home: string): void {
       process.exit(1)
     }
   }
-  const { settings, changed } = withClaudeHooks(existing, command)
+  const qButtons = withClaudeHooks(existing, command)
+  // Also provision the StopFailure harness hook (#113) in the SAME pass so a
+  // single `install-hooks` wires both q→buttons and limit/error notifications.
+  const merged = withHarnessHooks(qButtons.settings, "tg-ctl harness-event")
+  const settings = merged.settings
+  const changed = qButtons.changed || merged.changed
   if (!changed) {
-    console.log("tg-ctl: Claude Code q→buttons hooks already installed — nothing to do.")
+    console.log("tg-ctl: Claude Code q→buttons + StopFailure hooks already installed — nothing to do.")
   } else {
     if (raw) {
       try {
@@ -960,7 +965,7 @@ function installHooks(home: string): void {
     }
     mkdirSync(join(home, ".claude"), { recursive: true })
     writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`)
-    console.log(`tg-ctl: installed Claude Code q→buttons hooks → ${settingsPath}` + (raw ? ` (backup: ${settingsPath}.bak)` : ""))
+    console.log(`tg-ctl: installed Claude Code q→buttons + StopFailure hooks → ${settingsPath}` + (raw ? ` (backup: ${settingsPath}.bak)` : ""))
   }
   console.log("")
   console.log("Codex: add a PermissionRequest hook running `tg-ctl ask --agent codex`, then trust it via /hooks (manual, first run).")

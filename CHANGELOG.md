@@ -3,6 +3,32 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.24.0
+
+**Features (tg-cli#113, #114, #115): harness-limit notifications, reaction
+lifecycle, and the `/tasks` board.** From Alex (tg#5698, tg#5699).
+
+- **Harness limit/error notify + auto-continue (#113).** `tg-ctl harness-event`
+  is a `StopFailure`-hook subcommand: fed the payload on stdin (+ transcript
+  tail), it extracts the reason and reset time and messages the operator that a
+  session hit its limit / errored. When the reset time is parseable the message
+  carries an inline **auto-continue** button; tapping it arms a timer that
+  injects `continue` into the originating pane at reset time (immediately if
+  already past). Schedules persist to `*.schedules.json` and re-arm on daemon
+  restart. `tg-ctl install-hooks` now also provisions the StopFailure hook.
+  `--dry-run` renders WITHOUT sending. A **staleness guard** suppresses any
+  alert whose reset time already passed, and every string is a real template
+  (no leaked `%`-placeholder) — the two bugs a prior WIP leaked live.
+- **Reaction lifecycle (#114).** 👀 working → 😴 stalled (limit-stop) → 👌 done.
+  Alex's literal ⏳/✅ are `REACTION_INVALID` for a bot (verified live); 😴 and
+  👌 are the allowed proxies. `tg --tag answer --reply-to <id>` now flips
+  message `<id>` to the done mark.
+- **`/tasks [<agent>] [<status>]` (#115).** A new bot command that composes
+  `task list --json` + `gh pr list --json` into a rich-HTML board table (id,
+  title, state, due, PR, CI), filterable by normalized status and scoped to a
+  fuzzy-matched agent's project. Missing PR/CI renders as an em dash, never
+  fabricated. Published in the bot menu.
+
 ## 1.23.1
 
 **Fix (tg-cli#57): permission card durability — retain on socket close, re-attach on reconnect.**
