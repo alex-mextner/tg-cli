@@ -122,6 +122,7 @@ test('tg-ctl ask forwards a Claude question to inline buttons and returns hook o
 
   expect(JSON.parse(stdout)).toEqual({
     hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
       permissionDecision: 'allow',
       updatedInput: {
         questions: [

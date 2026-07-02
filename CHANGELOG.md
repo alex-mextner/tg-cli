@@ -3,6 +3,26 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.24.0
+
+**Fix (tg#5741): question buttons — the tapped answer never reached the agent; multi-question support.**
+
+- **Answer envelope now stamps the REQUIRED `hookSpecificOutput.hookEventName`.** Claude Code
+  ≥2.1.198 validates hook JSON output and DISCARDS the entire output when `hookSpecificOutput`
+  lacks `hookEventName` — the Telegram card read "answered: …" while the agent fell back to the
+  local question dialog and the answer never arrived. (The 2.1.170-era live spike passed without
+  it; the spec's predicted contract drift happened.) The envelope also echoes the ORIGINAL
+  `tool_input` (CC schema-validates `updatedInput` wholesale; option `description` is a required
+  field there) with the collected `answers` merged in.
+- **Multi-question AskUserQuestion (2-4 questions) now forwards** as one sequential Telegram card
+  per question (`(i/N)` title suffix, per-question stable requestIds); the ask client composes ONE
+  combined reply from the collected answers, so the tool completes with no local dialog and no
+  extra final Enter. ALL-OR-NOTHING: any multiSelect/free-form question or any declined/timed-out
+  card bails the whole call to the local UI — a partial answers record is never emitted.
+- **Stale-daemon repair:** the ask client rebuilds a single-question reply from a RUNNING daemon
+  that predates `hookEventName`, so the fix takes effect the moment the client updates. Restart
+  the daemon (`tg-ctl restart`) to update the daemon side too.
+
 ## 1.23.1
 
 **Fix (tg-cli#57): permission card durability — retain on socket close, re-attach on reconnect.**

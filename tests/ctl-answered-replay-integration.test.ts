@@ -69,6 +69,7 @@ const PAYLOAD = {
 
 const EXPECTED_ANSWER = {
   hookSpecificOutput: {
+    hookEventName: 'PreToolUse',
     permissionDecision: 'allow',
     updatedInput: {
       questions: [

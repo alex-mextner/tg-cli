@@ -47,12 +47,14 @@ export interface ButtonRequest {
   // PermissionRequest → decision.behavior), so the hook reply must match the
   // event that fired. Defaults to PermissionRequest (the `*` matcher we install).
   permissionEvent?: 'PreToolUse' | 'PermissionRequest';
-  // Permission-kind only: the tool's original `tool_input`, carried so a PreToolUse
-  // ExitPlanMode ALLOW can echo it back as `updatedInput`. The live hooks docs
-  // require allow + updatedInput for the user-interactive tools ("allow alone is
-  // not sufficient"); echoing the unchanged input is the documented round trip.
-  // (AskUserQuestion is a question-kind request and builds its own questions/answers
-  // updatedInput in the question branch — it never reads this field.)
+  // The tool's original `tool_input`, carried so an ALLOW can echo it back as
+  // `updatedInput`. The live hooks docs require allow + updatedInput for the
+  // user-interactive tools ("allow alone is not sufficient"); echoing the
+  // unchanged input is the documented round trip. A permission echoes it
+  // verbatim (PreToolUse ExitPlanMode); a claude QUESTION echoes it with the
+  // collected `answers` record merged in (tg#5741) — the original input is
+  // schema-valid wholesale, unlike a lossy rebuild from the request fields
+  // (which stays as the fallback for manual/back-compat callers).
   toolInput?: Record<string, unknown>;
   opencode?: OpencodeRequestRef;
 }
@@ -173,27 +175,46 @@ export function resolveButtonCallback(req: ButtonRequest, cb: ParsedButtonCallba
   };
 }
 
+// The Claude Code PreToolUse answer envelope for AskUserQuestion: allow +
+// updatedInput({questions, answers}) pre-answers the question with no local
+// dialog. `hookEventName` is REQUIRED — Claude Code (verified on 2.1.198)
+// validates hook JSON output and DISCARDS the ENTIRE output when
+// hookSpecificOutput lacks it ("hookSpecificOutput is missing required field
+// hookEventName"), so without it the card reads "answered" while the agent
+// falls back to the local question UI and the answer never arrives (tg#5741).
+// `input` should be the tool's ORIGINAL `tool_input` whenever available: CC
+// schema-validates updatedInput wholesale against the tool's input schema
+// (option `description` is a REQUIRED field there, previews must survive, …),
+// which the original input satisfies by construction.
+export function buildClaudeQuestionAnswerOutput(
+  input: Record<string, unknown>,
+  answers: Record<string, string>,
+): unknown {
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      updatedInput: { ...input, answers },
+    },
+  };
+}
+
 export function formatAgentHookOutput(req: ButtonRequest, answer: ButtonAnswer): unknown | null {
   if (answer.status !== 'answered') return null;
 
   if (req.agent === 'claude' && req.kind === 'question') {
-    return {
-      hookSpecificOutput: {
-        permissionDecision: 'allow',
-        updatedInput: {
-          questions: [
-            {
-              header: req.title,
-              question: req.question,
-              options: req.options ?? [],
-            },
-          ],
-          answers: {
-            [req.question]: answer.value,
-          },
+    // Prefer echoing the ORIGINAL tool_input; rebuild from the request fields
+    // only for manual/back-compat callers that never carried it.
+    const input = req.toolInput ?? {
+      questions: [
+        {
+          header: req.title,
+          question: req.question,
+          options: req.options ?? [],
         },
-      },
+      ],
     };
+    return buildClaudeQuestionAnswerOutput(input, { [req.question]: answer.value });
   }
 
   if (req.agent === 'claude' && req.kind === 'permission') {
@@ -246,6 +267,71 @@ export function formatAgentHookOutput(req: ButtonRequest, answer: ButtonAnswer):
   }
 
   return null;
+}
+
+// Pull the answers record out of ONE daemon reply line (the JSON the daemon
+// writes down the hook socket for an answered claude question). Tolerant of the
+// LEGACY envelope that predates `hookEventName` — the RUNNING daemon may be
+// older than this hook client (the live-symlink deploy updates the client the
+// moment main advances, the daemon only on restart) — because only the
+// `updatedInput.answers` shape matters here. null → not an answered-question
+// reply (a "null" decline, a permission envelope, or garbage).
+export function extractAnswersFromHookReply(raw: string | null): Record<string, string> | null {
+  if (!raw || raw === 'null') return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const hso = (parsed as Record<string, unknown>).hookSpecificOutput;
+  if (!hso || typeof hso !== 'object') return null;
+  const updated = (hso as Record<string, unknown>).updatedInput;
+  if (!updated || typeof updated !== 'object') return null;
+  const answers = (updated as Record<string, unknown>).answers;
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return null;
+  const out: Record<string, string> = {};
+  for (const [question, value] of Object.entries(answers as Record<string, unknown>)) {
+    if (typeof value !== 'string') return null;
+    out[question] = value;
+  }
+  return out;
+}
+
+// Sequentially collect an answer for EACH question request via the injected ask
+// function (one Telegram card at a time — the next card posts only after the
+// previous answer lands). ALL-OR-NOTHING: any decline/timeout aborts the whole
+// collection (null) so the local question UI takes over. A PARTIAL answers
+// record must never be emitted — once a hook supplies updatedInput no dialog is
+// shown, so Claude Code would silently record the unanswered questions as
+// "(no option selected)".
+export async function collectQuestionAnswers(
+  requests: ButtonRequest[],
+  ask: (req: ButtonRequest) => Promise<string | null>,
+): Promise<Record<string, string> | null> {
+  const merged: Record<string, string> = {};
+  for (const req of requests) {
+    const answers = extractAnswersFromHookReply(await ask(req));
+    const value = answers?.[req.question];
+    if (typeof value !== 'string') return null;
+    merged[req.question] = value;
+  }
+  return merged;
+}
+
+// Rebuild the answer envelope for a single claude-question reply from the
+// ORIGINAL tool input carried on the request. Repairs replies from a STALE
+// RUNNING daemon that predates `hookEventName` (see extractAnswersFromHookReply)
+// so the fix works the moment the hook client updates, before the daemon is
+// restarted. null → not repairable (no original input, or the reply carries no
+// recognizable answer); the caller then forwards the daemon reply verbatim.
+export function repairClaudeQuestionReply(req: ButtonRequest, raw: string | null): string | null {
+  if (req.agent !== 'claude' || req.kind !== 'question' || !req.toolInput) return null;
+  const answers = extractAnswersFromHookReply(raw);
+  const value = answers?.[req.question];
+  if (typeof value !== 'string') return null;
+  return JSON.stringify(buildClaudeQuestionAnswerOutput(req.toolInput, { [req.question]: value }));
 }
 
 // Allow/deny button wording for a permission request: a plan-approval relabels

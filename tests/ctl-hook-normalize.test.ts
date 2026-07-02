@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { normalizeHookPayload, type HookEnv } from '../features/tg-ctl/hook-normalize';
+import { normalizeHookPayload, normalizeHookRequests, type HookEnv } from '../features/tg-ctl/hook-normalize';
 
 const env: HookEnv = { agent: 'claude', paneId: '%5', cwd: '/env/cwd', sessionName: 'work' };
 
@@ -31,12 +31,123 @@ test('Claude AskUserQuestion (single, options) → question request', () => {
   expect(req!.requestId).toMatch(/^claude-/);
 });
 
-test('AskUserQuestion with multiple questions → null (local UI)', () => {
+test('AskUserQuestion with multiple questions → null from the SINGLE-request contract (normalizeHookPayload)', () => {
   const req = normalizeHookPayload(
     { tool_name: 'AskUserQuestion', tool_input: { questions: [{ question: 'a', options: [{ label: 'x' }] }, { question: 'b', options: [{ label: 'y' }] }] } },
     env,
   );
   expect(req).toBeNull();
+});
+
+test('normalizeHookRequests: multi-question AskUserQuestion → one request per question (tg#5741)', () => {
+  const tool_input = {
+    questions: [
+      { header: 'Deploy', question: 'Where to deploy?', options: [{ label: 'Staging' }, { label: 'Prod', description: 'live' }] },
+      { header: 'Timing', question: 'Deploy when?', options: [{ label: 'Now' }, { label: 'Tonight' }] },
+    ],
+  };
+  const reqs = normalizeHookRequests(
+    { session_id: 'abcdef123456', cwd: '/proj', hook_event_name: 'PreToolUse', tool_name: 'AskUserQuestion', tool_input },
+    env,
+  );
+  expect(reqs).toHaveLength(2);
+  expect(reqs![0]).toMatchObject({
+    agent: 'claude',
+    kind: 'question',
+    question: 'Where to deploy?',
+    title: 'Deploy (1/2)', // progress suffix so the human expects the next card
+    options: [{ label: 'Staging' }, { label: 'Prod', description: 'live' }],
+    paneId: '%5',
+    cwd: '/proj',
+    toolInput: tool_input, // the ORIGINAL input rides every request for the answer echo
+  });
+  expect(reqs![1]).toMatchObject({
+    question: 'Deploy when?',
+    title: 'Timing (2/2)',
+    toolInput: tool_input,
+  });
+  // Per-question STABLE requestIds (replay/reconnect dedup is per sub-question).
+  expect(reqs![0].requestId).toMatch(/^claude-/);
+  expect(reqs![1].requestId).toMatch(/^claude-/);
+  expect(reqs![0].requestId).not.toBe(reqs![1].requestId);
+});
+
+test('normalizeHookRequests: single question keeps the plain header title and yields one request', () => {
+  const reqs = normalizeHookRequests(
+    {
+      session_id: 'abcdef123456',
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ header: 'Deploy', question: 'Where?', options: [{ label: 'A' }, { label: 'B' }] }] },
+    },
+    env,
+  );
+  expect(reqs).toHaveLength(1);
+  expect(reqs![0]).toMatchObject({ question: 'Where?', title: 'Deploy' });
+});
+
+test('normalizeHookRequests: ALL-OR-NOTHING — any multiSelect/free-form question bails the whole call', () => {
+  // A partial forward could only produce a partial answers record, which the
+  // reply path must never emit — so one bad question sends ALL of them local.
+  expect(
+    normalizeHookRequests(
+      {
+        tool_name: 'AskUserQuestion',
+        tool_input: {
+          questions: [
+            { question: 'ok?', options: [{ label: 'x' }] },
+            { question: 'multi?', multiSelect: true, options: [{ label: 'y' }] },
+          ],
+        },
+      },
+      env,
+    ),
+  ).toBeNull();
+  expect(
+    normalizeHookRequests(
+      { tool_name: 'AskUserQuestion', tool_input: { questions: [{ question: 'ok?', options: [{ label: 'x' }] }, { question: 'free-form?' }] } },
+      env,
+    ),
+  ).toBeNull();
+  // Beyond the tool's own 4-question schema cap → malformed → local UI.
+  expect(
+    normalizeHookRequests(
+      {
+        tool_name: 'AskUserQuestion',
+        tool_input: { questions: [1, 2, 3, 4, 5].map((i) => ({ question: `q${i}?`, options: [{ label: 'x' }] })) },
+      },
+      env,
+    ),
+  ).toBeNull();
+});
+
+test('normalizeHookRequests: PermissionRequest-delivered AskUserQuestion copy still drops (tg-cli#97)', () => {
+  expect(
+    normalizeHookRequests(
+      {
+        hook_event_name: 'PermissionRequest',
+        tool_name: 'AskUserQuestion',
+        tool_input: { questions: [{ question: 'a?', options: [{ label: 'x' }] }, { question: 'b?', options: [{ label: 'y' }] }] },
+      },
+      env,
+    ),
+  ).toBeNull();
+});
+
+test('normalizeHookRequests: non-AskUserQuestion payloads delegate to the single-request path', () => {
+  const reqs = normalizeHookRequests(
+    { session_id: 'sid', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'ls' } },
+    env,
+  );
+  expect(reqs).toHaveLength(1);
+  expect(reqs![0]).toMatchObject({ kind: 'permission', question: 'Allow Bash? ls' });
+  expect(normalizeHookRequests('nope', env)).toBeNull();
+  expect(normalizeHookRequests({ hook_event_name: 'SessionStart' }, env)).toBeNull();
+});
+
+test('normalizeHookPayload: a single AskUserQuestion now carries the original tool_input for the answer echo', () => {
+  const tool_input = { questions: [{ header: 'Deploy', question: 'Where?', options: [{ label: 'A' }, { label: 'B' }] }] };
+  const req = normalizeHookPayload({ session_id: 'sid', tool_name: 'AskUserQuestion', tool_input }, env);
+  expect(req?.toolInput).toEqual(tool_input);
 });
 
 test('AskUserQuestion multiSelect → null', () => {

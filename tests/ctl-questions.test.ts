@@ -1,10 +1,14 @@
 import { expect, test } from 'bun:test';
 import {
   buildButtonMessage,
+  buildClaudeQuestionAnswerOutput,
+  collectQuestionAnswers,
+  extractAnswersFromHookReply,
   formatAgentHookOutput,
   parseButtonCallback,
   questionCapability,
   registrationAllowsHook,
+  repairClaudeQuestionReply,
   resolveButtonCallback,
   type ButtonRequest,
 } from '../features/tg-ctl/questions';
@@ -185,15 +189,19 @@ test('resolveButtonCallback maps permission callbacks to allow/deny decisions', 
   });
 });
 
-test('formatAgentHookOutput emits Claude AskUserQuestion updatedInput answer shape', () => {
+test('formatAgentHookOutput emits Claude AskUserQuestion updatedInput answer shape (hookEventName REQUIRED)', () => {
   const output = formatAgentHookOutput(QUESTION, {
     status: 'answered',
     requestId: 'q_123',
     label: 'Staging',
     value: 'Staging',
   });
+  // hookEventName is load-bearing: Claude Code (verified on 2.1.198) discards
+  // the ENTIRE hook output when hookSpecificOutput lacks it, so the tapped
+  // answer never reaches the agent while the card reads "answered" (tg#5741).
   expect(output).toEqual({
     hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
       permissionDecision: 'allow',
       updatedInput: {
         questions: [
@@ -212,6 +220,147 @@ test('formatAgentHookOutput emits Claude AskUserQuestion updatedInput answer sha
       },
     },
   });
+});
+
+test('formatAgentHookOutput echoes the ORIGINAL tool_input when the request carries it', () => {
+  // Claude Code schema-validates updatedInput wholesale against the tool's input
+  // schema (option `description` is REQUIRED there, previews must survive), so the
+  // envelope must echo the original input — not a lossy rebuild — whenever the
+  // request carries it.
+  const toolInput = {
+    questions: [
+      {
+        header: 'Deploy',
+        question: 'Where should I deploy?',
+        options: [
+          { label: 'Staging', description: 'Safe', preview: 'staging.example.com' },
+          { label: 'Production', description: 'Live' },
+        ],
+        multiSelect: false,
+      },
+    ],
+    metadata: { source: 'unit-test' },
+  };
+  const output = formatAgentHookOutput({ ...QUESTION, toolInput }, {
+    status: 'answered',
+    requestId: 'q_123',
+    label: 'Production',
+    value: 'Production',
+  });
+  expect(output).toEqual({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      updatedInput: {
+        ...toolInput,
+        answers: { 'Where should I deploy?': 'Production' },
+      },
+    },
+  });
+});
+
+test('extractAnswersFromHookReply reads current AND legacy (pre-hookEventName) envelopes', () => {
+  const answers = { 'Where should I deploy?': 'Staging' };
+  const current = JSON.stringify(buildClaudeQuestionAnswerOutput({ questions: [] }, answers));
+  expect(extractAnswersFromHookReply(current)).toEqual(answers);
+  // The RUNNING daemon may be older than the hook client (live-symlink deploy):
+  // its reply lacks hookEventName but still carries updatedInput.answers.
+  const legacy = JSON.stringify({
+    hookSpecificOutput: { permissionDecision: 'allow', updatedInput: { questions: [], answers } },
+  });
+  expect(extractAnswersFromHookReply(legacy)).toEqual(answers);
+});
+
+test('extractAnswersFromHookReply rejects declines, non-question envelopes, and garbage', () => {
+  expect(extractAnswersFromHookReply(null)).toBeNull();
+  expect(extractAnswersFromHookReply('null')).toBeNull();
+  expect(extractAnswersFromHookReply('not json')).toBeNull();
+  expect(extractAnswersFromHookReply('{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}')).toBeNull();
+  // Non-string answer values must not leak through as answers.
+  expect(extractAnswersFromHookReply('{"hookSpecificOutput":{"updatedInput":{"answers":{"q":42}}}}')).toBeNull();
+  expect(extractAnswersFromHookReply('{"hookSpecificOutput":{"updatedInput":{"answers":[]}}}')).toBeNull();
+});
+
+test('collectQuestionAnswers merges one answer per question, sequentially', async () => {
+  const q1: ButtonRequest = { ...QUESTION, requestId: 'q_1', question: 'Q one?' };
+  const q2: ButtonRequest = { ...QUESTION, requestId: 'q_2', question: 'Q two?' };
+  const asked: string[] = [];
+  const answers = await collectQuestionAnswers([q1, q2], async (req) => {
+    asked.push(req.requestId);
+    return JSON.stringify(
+      buildClaudeQuestionAnswerOutput({ questions: [] }, { [req.question]: `answer for ${req.requestId}` }),
+    );
+  });
+  expect(asked).toEqual(['q_1', 'q_2']);
+  expect(answers).toEqual({ 'Q one?': 'answer for q_1', 'Q two?': 'answer for q_2' });
+});
+
+test('collectQuestionAnswers is ALL-OR-NOTHING: a decline aborts without asking the rest', async () => {
+  const q1: ButtonRequest = { ...QUESTION, requestId: 'q_1', question: 'Q one?' };
+  const q2: ButtonRequest = { ...QUESTION, requestId: 'q_2', question: 'Q two?' };
+  const q3: ButtonRequest = { ...QUESTION, requestId: 'q_3', question: 'Q three?' };
+  const asked: string[] = [];
+  const answers = await collectQuestionAnswers([q1, q2, q3], async (req) => {
+    asked.push(req.requestId);
+    if (req.requestId === 'q_2') return null; // timeout / decline
+    return JSON.stringify(buildClaudeQuestionAnswerOutput({ questions: [] }, { [req.question]: 'ok' }));
+  });
+  expect(answers).toBeNull();
+  expect(asked).toEqual(['q_1', 'q_2']); // q_3 is never asked once the call is doomed
+});
+
+test('collectQuestionAnswers rejects a reply that answers a DIFFERENT question', async () => {
+  const q1: ButtonRequest = { ...QUESTION, requestId: 'q_1', question: 'Q one?' };
+  const answers = await collectQuestionAnswers([q1], async () =>
+    JSON.stringify(buildClaudeQuestionAnswerOutput({ questions: [] }, { 'Some other question?': 'ok' })),
+  );
+  expect(answers).toBeNull();
+});
+
+test('repairClaudeQuestionReply rebuilds a legacy daemon reply from the carried tool_input', () => {
+  const toolInput = {
+    questions: [
+      {
+        header: 'Deploy',
+        question: 'Where should I deploy?',
+        options: [
+          { label: 'Staging', description: 'Safe' },
+          { label: 'Production', description: 'Live' },
+        ],
+      },
+    ],
+  };
+  const legacy = JSON.stringify({
+    hookSpecificOutput: {
+      permissionDecision: 'allow',
+      updatedInput: { questions: [], answers: { 'Where should I deploy?': 'Staging' } },
+    },
+  });
+  const repaired = repairClaudeQuestionReply({ ...QUESTION, toolInput }, legacy);
+  expect(repaired).not.toBeNull();
+  expect(JSON.parse(repaired!)).toEqual({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      updatedInput: { ...toolInput, answers: { 'Where should I deploy?': 'Staging' } },
+    },
+  });
+});
+
+test('repairClaudeQuestionReply declines when it cannot rebuild faithfully', () => {
+  const toolInput = { questions: [] };
+  // No carried tool_input → nothing schema-valid to echo → pass through verbatim.
+  expect(repairClaudeQuestionReply(QUESTION, '{"hookSpecificOutput":{"updatedInput":{"answers":{"Where should I deploy?":"x"}}}}')).toBeNull();
+  // A permission request is a different envelope entirely.
+  expect(
+    repairClaudeQuestionReply(
+      { requestId: 'p_1', agent: 'claude', kind: 'permission', question: 'Allow?', toolInput },
+      '{"hookSpecificOutput":{"updatedInput":{"answers":{"Allow?":"x"}}}}',
+    ),
+  ).toBeNull();
+  // A reply without a recognizable answer for THIS question.
+  expect(repairClaudeQuestionReply({ ...QUESTION, toolInput }, 'null')).toBeNull();
+  expect(repairClaudeQuestionReply({ ...QUESTION, toolInput }, '{"hookSpecificOutput":{"updatedInput":{"answers":{"other?":"x"}}}}')).toBeNull();
 });
 
 test('formatAgentHookOutput emits Codex PermissionRequest shape', () => {

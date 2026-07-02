@@ -56,10 +56,13 @@ import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-command
 import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, readPidFile } from "./features/tg-ctl/lock"
 import {
   buildButtonMessage,
+  buildClaudeQuestionAnswerOutput,
   callbackRequestId,
+  collectQuestionAnswers,
   formatAgentHookOutput,
   questionCapability,
   registrationSetAllowsHook,
+  repairClaudeQuestionReply,
   resolveButtonCallback,
   type ButtonAnswer,
   type ButtonRequest,
@@ -77,7 +80,7 @@ import {
   upsertRegistration,
 } from "./features/tg-ctl/registration-store"
 import { claudeHooksInstalled, withClaudeHooks } from "./features/tg-ctl/hook-install"
-import { normalizeHookPayload, type HookEnv } from "./features/tg-ctl/hook-normalize"
+import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
   aggregateUsage,
@@ -1838,9 +1841,9 @@ function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number): Promis
 // restart): a SCOPED question whose daemon restarted (crash-relaunch in ~1s, or a
 // deliberate stop+start) keeps trying until the restored daemon answers — it either
 // re-attaches the still-pending entry (no duplicate card) or replays the stored
-// answer. Bounded by ASK_TOTAL_TIMEOUT_MS; a real "null" decline returns immediately.
-async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string): Promise<string | null> {
-  const deadline = Date.now() + ASK_TOTAL_TIMEOUT_MS
+// answer. Bounded by the caller's deadline (shared across a multi-question
+// sequence); a real "null" decline returns immediately.
+async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string, deadline: number): Promise<string | null> {
   let announcedDrop = false
   for (;;) {
     const remaining = deadline - Date.now()
@@ -1857,6 +1860,23 @@ async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string): Pr
   }
 }
 
+// One daemon round-trip for one ButtonRequest, within the caller's deadline.
+// SCOPED questions and SCOPED permissions reconnect-and-resend across a daemon
+// restart: both are retained on socket close (abandoned map + persist), so a
+// resend re-attaches to the existing card rather than posting a duplicate.
+// UNSCOPED requests keep the single-attempt path — they aren't retained (no
+// pane to late-deliver to), so a resend after a restart would post a duplicate
+// card.
+async function askDaemonOnce(ctx: Ctx, req: ButtonRequest, deadline: number): Promise<string | null> {
+  const requestLine = JSON.stringify(req)
+  const reconnectable = Boolean(req.paneId) && (req.kind === "question" || req.kind === "permission")
+  if (reconnectable) return requestHookAnswerWithReconnect(ctx, requestLine, deadline)
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) return null
+  const attempt = await oneAskAttempt(ctx, requestLine, remaining)
+  return attempt.kind === "response" ? attempt.raw : null
+}
+
 async function askDaemon(ctx: Ctx): Promise<void> {
   const input = await readStdinText()
   if (!input.trim()) return
@@ -1867,44 +1887,60 @@ async function askDaemon(ctx: Ctx): Promise<void> {
     return
   }
   // Normalize the harness's raw hook payload (or an already-normalized request)
-  // into a ButtonRequest, filling routing fields from the hook process's own
-  // env. null → unsupported shape; emit nothing so the local agent UI takes over.
+  // into ButtonRequests, filling routing fields from the hook process's own
+  // env. A claude AskUserQuestion with 2-4 questions yields one request PER
+  // question; everything else yields exactly one. null → unsupported shape;
+  // emit nothing so the local agent UI takes over.
   const env: HookEnv = {
     agent: hookAgentFromArgv(),
     paneId: process.env.TMUX_PANE || undefined,
     cwd: process.cwd(),
     sessionName: tmuxSessionName(),
   }
-  const req = normalizeHookPayload(payload, env)
-  if (!req) {
-    // Unsupported payload shape (multi-question / multi-select / free-form / an
-    // event we don't forward). This never reaches the daemon, so the daemon log
-    // can't see it — emit here (hook process stderr) so the drop isn't silent.
+  const reqs = normalizeHookRequests(payload, env)
+  if (!reqs) {
+    // Unsupported payload shape (multi-select / free-form / an event we don't
+    // forward). This never reaches the daemon, so the daemon log can't see it —
+    // emit here (hook process stderr) so the drop isn't silent.
     log(`ask-forward dropped: reason=unsupported-payload agent=${env.agent} pane=${env.paneId ?? "-"} cwd=${env.cwd ?? "-"}`)
     return
   }
-  const requestLine = JSON.stringify(req)
+  // ONE deadline shared by the whole call (all cards of a multi-question), kept
+  // under the harness's 120s hook budget so we always answer before it kills us.
+  const deadline = Date.now() + ASK_TOTAL_TIMEOUT_MS
 
-  // SCOPED questions and SCOPED permissions reconnect-and-resend across a daemon restart:
-  // both are retained on socket close (abandoned map + persist), so a resend re-attaches
-  // to the existing card rather than posting a duplicate. UNSCOPED questions keep the
-  // single-attempt path — they aren't retained (no pane to late-deliver to), so a resend
-  // after a restart would post a duplicate card.
-  const reconnectable = Boolean(req.paneId) && (req.kind === "question" || req.kind === "permission")
-  let output: string | null
-  if (reconnectable) {
-    output = await requestHookAnswerWithReconnect(ctx, requestLine)
-  } else {
-    const attempt = await oneAskAttempt(ctx, requestLine, 120_000)
-    output = attempt.kind === "response" ? attempt.raw : null
+  if (reqs.length === 1) {
+    const req = reqs[0]
+    const output = await askDaemonOnce(ctx, req, deadline)
+    if (output && output !== "null") {
+      // Repair a claude-question reply from a STALE RUNNING daemon that predates
+      // `hookEventName` in the answer envelope (Claude Code discards the whole
+      // hook output without it — tg#5741); anything else passes through verbatim.
+      console.log(repairClaudeQuestionReply(req, output) ?? output)
+    } else {
+      // The daemon declined (replied "null") or the connection failed / timed out,
+      // so nothing was forwarded and the harness UI takes over. The daemon already
+      // logs WHY it declined (ask-forward dropped: …); log here too in case the
+      // daemon was unreachable (no socket) and never got a chance to.
+      log(`ask-forward not-posted: req=${req.requestId} agent=${req.agent} pane=${req.paneId ?? "-"} — daemon declined or unreachable`)
+    }
+    return
   }
-  if (output && output !== "null") console.log(output)
-  else {
-    // The daemon declined (replied "null") or the connection failed / timed out,
-    // so nothing was forwarded and the harness UI takes over. The daemon already
-    // logs WHY it declined (ask-forward dropped: …); log here too in case the
-    // daemon was unreachable (no socket) and never got a chance to.
-    log(`ask-forward not-posted: req=${req.requestId} agent=${req.agent} pane=${req.paneId ?? "-"} — daemon declined or unreachable`)
+
+  // Multi-question (claude AskUserQuestion, 2-4 questions): one SEQUENTIAL card
+  // per question — the next card posts only after the previous answer — then ONE
+  // combined PreToolUse reply with the full answers record, so the tool completes
+  // with no local dialog and no manual Enter (tg#5741). ALL-OR-NOTHING: any
+  // decline/timeout emits nothing and the local UI re-asks everything (a partial
+  // answers record would silently skip the unanswered questions).
+  const answers = await collectQuestionAnswers(reqs, (r) => askDaemonOnce(ctx, r, deadline))
+  const toolInput = reqs[0].toolInput
+  if (answers && toolInput) {
+    console.log(JSON.stringify(buildClaudeQuestionAnswerOutput(toolInput, answers)))
+  } else {
+    log(
+      `ask-forward multi-question not-completed: req=${reqs[0].requestId} n=${reqs.length} pane=${reqs[0].paneId ?? "-"} — declined, timed out, or partial; local UI takes over`,
+    )
   }
 }
 
