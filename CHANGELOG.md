@@ -22,6 +22,11 @@ semantic versioning.
 - **Stale-daemon repair:** the ask client rebuilds a single-question reply from a RUNNING daemon
   that predates `hookEventName`, so the fix takes effect the moment the client updates. Restart
   the daemon (`tg-ctl restart`) to update the daemon side too.
+- **`tool_input` now survives the daemon socket boundary** (review finding): the daemon-side
+  request parser dropped it, silently downgrading a PreToolUse ExitPlanMode "Proceed" to a bare
+  allow — which the hooks docs say is not sufficient for user-interactive tools. New round-trip
+  integration test guards it. Duplicate question texts in one call (schema-invalid) now bail to
+  the local UI instead of colliding requestIds / collapsing the answers record.
 
 ## 1.23.1
 

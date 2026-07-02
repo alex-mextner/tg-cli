@@ -1398,6 +1398,15 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
   // permissionDecision; PermissionRequest → decision.behavior). Default
   // PermissionRequest preserves the pre-existing reply for older payloads.
   const permissionEvent = rec.permissionEvent === "PreToolUse" ? "PreToolUse" : undefined
+  // The original tool_input MUST survive the socket boundary: a PreToolUse
+  // ALLOW (ExitPlanMode Proceed, claude question) echoes it as `updatedInput`,
+  // and the live hooks docs say "allow alone is not sufficient" for the
+  // user-interactive tools — dropping it here silently downgraded the reply to
+  // a bare allow (tg#5741 review finding).
+  const toolInput =
+    rec.toolInput && typeof rec.toolInput === "object" && !Array.isArray(rec.toolInput)
+      ? (rec.toolInput as Record<string, unknown>)
+      : undefined
 
   return {
     requestId,
@@ -1412,6 +1421,7 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     options,
     decisionLabels,
     permissionEvent,
+    toolInput,
   }
 }
 

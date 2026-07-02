@@ -204,6 +204,11 @@ function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): Bu
   const questions = input.questions;
   // 4 = the tool's own schema cap; anything beyond is malformed → local UI.
   if (!Array.isArray(questions) || questions.length < 1 || questions.length > 4) return null;
+  // Duplicate question texts (the tool's schema refines them unique) would
+  // collide the per-question requestIds AND collapse the answers record (both
+  // are keyed by question text) — a malformed payload, so: local UI.
+  const texts = questions.map((q) => asRecord(q)?.question);
+  if (new Set(texts).size !== texts.length) return null;
   const cwd = typeof p.cwd === 'string' ? p.cwd : undefined;
   const session = typeof p.session_id === 'string' ? p.session_id.slice(0, 8) : '';
   const out: ButtonRequest[] = [];

@@ -120,6 +120,26 @@ test('normalizeHookRequests: ALL-OR-NOTHING — any multiSelect/free-form questi
   ).toBeNull();
 });
 
+test('normalizeHookRequests: duplicate question texts bail (requestIds and answers are keyed by text)', () => {
+  // The tool's own schema refines question texts unique; a duplicate would
+  // collide the per-question requestIds AND collapse the merged answers record,
+  // silently dropping one answer — so the whole call goes local instead.
+  expect(
+    normalizeHookRequests(
+      {
+        tool_name: 'AskUserQuestion',
+        tool_input: {
+          questions: [
+            { question: 'same?', options: [{ label: 'a' }, { label: 'b' }] },
+            { question: 'same?', options: [{ label: 'c' }, { label: 'd' }] },
+          ],
+        },
+      },
+      env,
+    ),
+  ).toBeNull();
+});
+
 test('normalizeHookRequests: PermissionRequest-delivered AskUserQuestion copy still drops (tg-cli#97)', () => {
   expect(
     normalizeHookRequests(
