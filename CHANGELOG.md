@@ -27,6 +27,10 @@ semantic versioning.
   one lone late answer could answer the WRONG prompt. The tap answers "the terminal took over";
   the retained entry and keyboard survive untouched, so reconnect re-attach across a daemon
   bounce (no duplicate card) keeps working; stale members expire via the retention window.
+- **A re-attached card is restored to its live prompt** (review finding): the socket-close path
+  edits the card to "window closed …"; when a resend re-attaches it, the original question text
+  and keyboard are re-sent (Telegram's editMessageText detaches the keyboard when reply_markup
+  is omitted), so the one card that works again no longer tells the user not to use it.
 - **Question requestIds are seeded with the ordered option labels** (review finding): a later
   call re-asking the same question text with DIFFERENT options gets a fresh id, so it can never
   re-attach a stale retained card whose buttons would resolve by index against the new options.

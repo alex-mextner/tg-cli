@@ -65,6 +65,7 @@ import {
   repairClaudeQuestionReply,
   resolveButtonCallback,
   type ButtonAnswer,
+  type ButtonMessagePayload,
   type ButtonRequest,
   type PermissionDecision,
 } from "./features/tg-ctl/questions"
@@ -371,8 +372,18 @@ async function answerCallbackQuery(ctx: Ctx, callbackQueryId: string, text: stri
   await botPost(ctx, "answerCallbackQuery", { callback_query_id: callbackQueryId, text })
 }
 
-async function editMessageText(ctx: Ctx, messageId: number, text: string): Promise<void> {
-  await botPost(ctx, "editMessageText", { chat_id: ctx.chatId, message_id: messageId, text })
+// NOTE: Telegram's editMessageText REPLACES the whole inline keyboard — omitting
+// reply_markup detaches it. Pass the markup whenever the edited card must stay
+// tappable (e.g. restoring a re-attached question card to its live prompt).
+async function editMessageText(
+  ctx: Ctx,
+  messageId: number,
+  text: string,
+  replyMarkup?: ButtonMessagePayload["reply_markup"],
+): Promise<void> {
+  const body: Record<string, unknown> = { chat_id: ctx.chatId, message_id: messageId, text }
+  if (replyMarkup) body.reply_markup = replyMarkup
+  await botPost(ctx, "editMessageText", body)
 }
 
 // Remove the inline keyboard from a previously-sent message (forum-topics increment 4): after a
@@ -1794,6 +1805,18 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       rt.pending.set(pendingKey, entry)
       armPendingSocketClose(ctx, rt, entry, pendingKey)
       rt.persist()
+      // The card is LIVE again — restore the original prompt text, which the
+      // socket-close path replaced with "window closed …" (actively misleading
+      // for a multi-question member: it tells the user NOT to tap the one card
+      // that now works — review finding). The keyboard rides along explicitly:
+      // Telegram's editMessageText DETACHES the inline keyboard when
+      // reply_markup is omitted. Best-effort like every card edit (a restart-
+      // restored card that was never edited yields "message is not modified",
+      // which botPost swallows).
+      if (retained.messageId !== null) {
+        const restored = buildButtonMessage(ctx.chatId, req)
+        void editMessageText(ctx, retained.messageId, restored.text, restored.reply_markup)
+      }
       log(`ask-forward reattached: ${describeAskRequest(req)} key=${pendingKey} messageId=${retained.messageId ?? "-"}`)
       return
     }

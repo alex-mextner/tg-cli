@@ -26,7 +26,7 @@ writeFileSync(join(cfgDir, 'bin', 'tmux'), `#!/bin/sh\necho "$@" >> "${tmuxLog}"
 
 const sentMessages: Array<{ message_id: number; text: string; callback_data: string }> = [];
 const answeredCallbacks: Array<{ callback_query_id: string; text?: string }> = [];
-const editedMessages: Array<{ message_id: number; text: string }> = [];
+const editedMessages: Array<{ message_id: number; text: string; has_markup: boolean }> = [];
 // Taps are pushed MANUALLY by the test (unlike the happy-path suite) so the
 // client can be killed between the first answer and the second tap.
 const tapQueue: Array<{ update_id: number; message_id: number; data: string }> = [];
@@ -65,7 +65,7 @@ const server = Bun.serve({
     }
     if (url.pathname.endsWith('/editMessageText')) {
       const body = await req.json();
-      editedMessages.push({ message_id: body.message_id, text: body.text });
+      editedMessages.push({ message_id: body.message_id, text: body.text, has_markup: Boolean(body.reply_markup) });
       return Response.json({ ok: true, result: true });
     }
     if (url.pathname.endsWith('/editMessageReplyMarkup')) {
@@ -231,6 +231,18 @@ test('a late tap on an abandoned multi-question member is REFUSED, never injecte
   // re-attach before tapping the old card, then answer it.
   expect(
     await waitFor(() => readFileSync(join(cfgDir, 'daemon.log'), 'utf8').includes('ask-forward reattached'), 5000),
+  ).toBe(true);
+  // The re-attached card is RESTORED to its live prompt (the abandoned text told
+  // the user not to use it) — text back to the question, keyboard re-sent
+  // explicitly (Telegram's editMessageText detaches it when omitted).
+  expect(
+    await waitFor(
+      () =>
+        editedMessages.some(
+          (e) => e.message_id === card2 && e.text.includes('Timing (2/2)') && e.text.includes('Deploy when?') && e.has_markup,
+        ),
+      5000,
+    ),
   ).toBe(true);
   tapQueue.push({ update_id: 211, message_id: card2, data: sentMessages[1].callback_data });
 
