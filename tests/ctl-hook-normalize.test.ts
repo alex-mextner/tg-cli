@@ -120,6 +120,24 @@ test('normalizeHookRequests: ALL-OR-NOTHING — any multiSelect/free-form questi
   ).toBeNull();
 });
 
+test('same question text with DIFFERENT options gets a DIFFERENT requestId (no stale-card re-attach)', () => {
+  // Reconnect re-attach and answered-replay key on the requestId. A later call
+  // re-asking the same text with different options must get a fresh id — a
+  // retained stale card's buttons would otherwise resolve by index against the
+  // NEW options. A true re-fire (same text AND same options) keeps its id, so
+  // tg-cli#97 dedup/replay is unchanged.
+  const payload = (options: Array<{ label: string }>) => ({
+    session_id: 'abcdef123456',
+    tool_name: 'AskUserQuestion',
+    tool_input: { questions: [{ header: 'Timing', question: 'Deploy when?', options }] },
+  });
+  const a = normalizeHookRequests(payload([{ label: 'Now' }, { label: 'Tonight' }]), env);
+  const b = normalizeHookRequests(payload([{ label: 'Tomorrow' }, { label: 'Next week' }]), env);
+  const again = normalizeHookRequests(payload([{ label: 'Now' }, { label: 'Tonight' }]), env);
+  expect(a![0].requestId).not.toBe(b![0].requestId);
+  expect(a![0].requestId).toBe(again![0].requestId);
+});
+
 test('normalizeHookRequests: duplicate question texts bail (requestIds and answers are keyed by text)', () => {
   // The tool's own schema refines question texts unique; a duplicate would
   // collide the per-question requestIds AND collapse the merged answers record,

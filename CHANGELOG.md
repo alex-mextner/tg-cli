@@ -27,6 +27,10 @@ semantic versioning.
   one lone late answer could answer the WRONG prompt. The tap answers "the terminal took over";
   the retained entry and keyboard survive untouched, so reconnect re-attach across a daemon
   bounce (no duplicate card) keeps working; stale members expire via the retention window.
+- **Question requestIds are seeded with the ordered option labels** (review finding): a later
+  call re-asking the same question text with DIFFERENT options gets a fresh id, so it can never
+  re-attach a stale retained card whose buttons would resolve by index against the new options.
+  True re-fires (same text and options) keep their id — tg-cli#97 dedup/replay unchanged.
 - **Multi-question member answers are never cached for replay** (review finding): an aborted
   round's partial answer must not silently stitch into a later identical re-ask — the re-run
   posts fresh cards (an outstanding member still re-attaches to its retained card).

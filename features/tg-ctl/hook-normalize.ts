@@ -223,7 +223,14 @@ function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): Bu
     // A (i/N) progress suffix so the human sees more cards are coming and the
     // agent stays blocked until the LAST one is answered.
     const title = questions.length > 1 ? `${header ?? 'Question'} (${out.length + 1}/${questions.length})` : header;
-    const req = build(env, 'question', `${session}:q:${q.question}`, q.question, title, options, cwd);
+    // The id seed includes the ORDERED option labels, not just the question
+    // text: reconnect re-attach and answered-replay both key on this id, and a
+    // LATER call re-asking the same text with DIFFERENT options must get a
+    // fresh id (a stale retained card's buttons would otherwise resolve by
+    // index against the new options — review finding). A true re-fire of the
+    // same call keeps the same id, so tg-cli#97 dedup/replay is unchanged.
+    const seed = `${session}:q:${q.question}:${options.map((o) => o.label).join('\u001F')}`;
+    const req = build(env, 'question', seed, q.question, title, options, cwd);
     // Carried so the answer envelope can echo the original input (schema-valid
     // wholesale) instead of a lossy rebuild — see buildClaudeQuestionAnswerOutput.
     req.toolInput = input;

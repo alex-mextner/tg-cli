@@ -247,7 +247,9 @@ Claude Code hook installation remains an automation layer over that handoff
   shape remains only as the fallback for manual callers that carry no tool_input.
   A MULTI-question call (2-4 questions, the tool's schema cap) forwards as one
   SEQUENTIAL card per question — each with a `(i/N)` title suffix and its own
-  stable per-question requestId (replay/reconnect dedup unchanged) — and the ask
+  stable per-question requestId, seeded by session + question text + ORDERED
+  option labels so a later same-text/different-options call never re-attaches a
+  stale card (replay/reconnect dedup for true re-fires unchanged) — and the ask
   client composes ONE combined reply from the collected answers. ALL-OR-NOTHING:
   any multiSelect/free-form question, or any declined/timed-out card, bails the
   whole call to the local UI — a PARTIAL answers record must never be emitted
