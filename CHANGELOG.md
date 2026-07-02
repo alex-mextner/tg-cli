@@ -27,6 +27,9 @@ semantic versioning.
   one lone late answer could answer the WRONG prompt. The tap answers "the terminal took over";
   the retained entry and keyboard survive untouched, so reconnect re-attach across a daemon
   bounce (no duplicate card) keeps working; stale members expire via the retention window.
+- **Multi-question member answers are never cached for replay** (review finding): an aborted
+  round's partial answer must not silently stitch into a later identical re-ask — the re-run
+  posts fresh cards (an outstanding member still re-attaches to its retained card).
 - **`tool_input` now survives the daemon socket boundary** (review finding): the daemon-side
   request parser dropped it, silently downgrading a PreToolUse ExitPlanMode "Proceed" to a bare
   allow — which the hooks docs say is not sufficient for user-interactive tools. New round-trip

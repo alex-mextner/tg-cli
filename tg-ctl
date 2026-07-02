@@ -1745,7 +1745,10 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   // is pruned here so it falls through to a fresh forward. Only QUESTIONS are ever
   // cached (the write is kind-guarded), so consult it only for questions — symmetric
   // with the write and immune to a (practically impossible) cross-kind key clash.
-  const prior = req.kind === "question" ? rt.answered.get(pendingKey) : undefined
+  // Multi-question members also skip the replay READ defensively: they are never
+  // written (all-or-nothing, see the answer branch), but an entry persisted by an
+  // older daemon must not replay into a new round either.
+  const prior = req.kind === "question" && !req.multiQuestion ? rt.answered.get(pendingKey) : undefined
   if (prior) {
     if (Date.now() - prior.at <= ANSWERED_REPLAY_MS) {
       if (prior.delivery === "pane") {
@@ -4425,7 +4428,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // Recorded AFTER the in-flight key is released, so the replay cache takes
         // over exactly where the in-flight dedup leaves off. Sweep stale entries on
         // each record so the cache can't grow unbounded.
-        if (pending.req.kind === "question") {
+        //
+        // A multi-question SET MEMBER is never cached: the group is
+        // all-or-nothing — if a later member aborts, the whole call is re-asked,
+        // and a replayed member would silently stitch a STALE answer into the
+        // NEW round without ever showing its card (review finding). The cost is
+        // symmetric honesty: a re-fired identical set re-posts its cards.
+        if (pending.req.kind === "question" && !pending.req.multiQuestion) {
           const answeredAt = Date.now()
           pruneAnsweredButtons(answeredButtons, answeredAt)
           answeredButtons.set(action.requestId, {

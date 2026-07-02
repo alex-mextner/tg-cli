@@ -190,6 +190,66 @@ test('a late tap on an abandoned multi-question member is REFUSED, never injecte
   const tmuxArgs = existsSync(tmuxLog) ? readFileSync(tmuxLog, 'utf8') : '';
   expect(tmuxArgs).not.toContain('send-keys');
 
+  // RE-RUN the SAME payload (the agent re-asks after the aborted round). The
+  // aborted round's q1 answer must NOT replay into this round (all-or-nothing:
+  // partial answers are discarded) — q1 posts a FRESH card. q2 re-attaches to
+  // its retained card (no duplicate), and the combined reply carries only the
+  // answers tapped in THIS round.
+  const ask2 = Bun.spawn([process.execPath, TG_CTL, 'ask'], {
+    env: {
+      HOME: cfgDir,
+      TG_CTL_CONFIG_DIR: cfgDir,
+      TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      TMUX_PANE: '%1',
+    },
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  procs.push(ask2);
+  ask2.stdin.write(
+    JSON.stringify({
+      session_id: 'abcdef123456',
+      cwd: cfgDir,
+      hook_event_name: 'PreToolUse',
+      tool_name: 'AskUserQuestion',
+      tool_input: {
+        questions: [
+          { header: 'Deploy', question: 'Where should I deploy?', options: [{ label: 'Staging', description: 's' }, { label: 'Production', description: 'p' }] },
+          { header: 'Timing', question: 'Deploy when?', options: [{ label: 'Now', description: 'n' }, { label: 'Tonight', description: 't' }] },
+        ],
+      },
+    }) + '\n',
+  );
+  ask2.stdin.end();
+
+  // q1 re-posts as a fresh card — the aborted round's answer did NOT replay.
+  expect(await waitFor(() => sentMessages.length === 3, 5000)).toBe(true);
+  expect(sentMessages[2].text).toContain('Where should I deploy?');
+  tapQueue.push({ update_id: 210, message_id: sentMessages[2].message_id, data: sentMessages[2].callback_data });
+  // q2 must RE-ATTACH to the retained card, not post a duplicate — wait for the
+  // re-attach before tapping the old card, then answer it.
+  expect(
+    await waitFor(() => readFileSync(join(cfgDir, 'daemon.log'), 'utf8').includes('ask-forward reattached'), 5000),
+  ).toBe(true);
+  tapQueue.push({ update_id: 211, message_id: card2, data: sentMessages[1].callback_data });
+
+  const stdout2 = await new Response(ask2.stdout).text();
+  await ask2.exited;
+  expect(sentMessages).toHaveLength(3); // q2 was never re-carded
+  expect(JSON.parse(stdout2)).toMatchObject({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      updatedInput: {
+        answers: {
+          'Where should I deploy?': 'Production',
+          'Deploy when?': 'Tonight',
+        },
+      },
+    },
+  });
+
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 25_000);
