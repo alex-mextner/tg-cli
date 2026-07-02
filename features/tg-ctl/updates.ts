@@ -15,6 +15,8 @@ import { parseButtonCallback } from './questions';
 import { parseAgentCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewModelCallback } from './new-command';
+import { parseTasksCommand } from './tasks-command';
+import { parseContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
@@ -212,6 +214,18 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         });
         continue;
       }
+      // Auto-continue taps (lc:<pane>:<resetAt>) arm the reset-time injection.
+      const contCb = cb.data ? parseContinueCallback(cb.data) : null;
+      if (contCb) {
+        callbackActions.push({
+          kind: 'limit-continue',
+          callbackQueryId: cb.id,
+          paneId: contCb.paneId,
+          resetAt: contCb.resetAt,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
+      }
       const parsed = parseButtonCallback(cb.data);
       callbackActions.push(
         parsed
@@ -352,6 +366,10 @@ function textAction(text: string, name: string, opts: StepOpts, messageId: numbe
     if (cmd === '/stop') return { kind: 'inject-key', key: 'Escape' };
     if (cmd === '/kill') return { kind: 'kill-agent' };
     if (cmd === '/status') return { kind: 'status' };
+    if (cmd === '/tasks') {
+      const p = parseTasksCommand(text);
+      return { kind: 'tasks', agent: p.agent, status: p.status };
+    }
     if (cmd === '/agent') {
       const p = parseAgentCommand(text);
       return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name };
@@ -437,7 +455,7 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // a bound topic — they control the daemon, not the topic agent. /stop and /kill are NOT
     // intercepted: they must still reach the topic's pane (kill/escape the harness session).
     // Using an explicit set (not isDaemonSlashCommand) to avoid over-intercepting.
-    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new']);
+    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks']);
     const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
     if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id)];
     // §11 deferral 1: a prose reply carries the same ↩ «…» quote-anchor as flat-chat replies.

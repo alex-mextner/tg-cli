@@ -4,6 +4,7 @@ import {
   buildLimitNotification,
   classifyFailure,
   continueCallbackData,
+  extractFailure,
   formatClock,
   formatDelta,
   MAX_TIMER_MS,
@@ -128,6 +129,27 @@ test('parseContinueCallback: round-trips a valid tap, rejects foreign data', () 
   expect(parseContinueCallback(data)).toEqual({ paneId: '%12', resetAt: 1720000000000 });
   expect(parseContinueCallback('agent:foo:1')).toBeNull();
   expect(parseContinueCallback('lc:%3:notanumber')).toBeNull();
+});
+
+test('extractFailure: a session-limit tail yields kind=session-limit + resetAt + detail', () => {
+  const text = 'Claude is thinking…\nYou have hit your session limit · resets 4:10am (Europe/Belgrade)';
+  const f = extractFailure('session_limit', text, NOW);
+  expect(f.kind).toBe('session-limit');
+  expect(f.resetAt).not.toBeNull();
+  expect(new Date(f.resetAt!).getHours()).toBe(4);
+  expect(f.detail).toContain('session limit');
+});
+
+test('extractFailure: a reset time upgrades a vague matcher to session-limit', () => {
+  const f = extractFailure('', 'rate limited, resets 3pm', NOW);
+  expect(f.kind).toBe('session-limit');
+});
+
+test('extractFailure: an API error with no reset → api-error, null resetAt', () => {
+  const f = extractFailure('overloaded', 'Error: overloaded_error (529)', NOW);
+  expect(f.kind).toBe('api-error');
+  expect(f.resetAt).toBeNull();
+  expect(f.detail).toContain('overloaded');
 });
 
 test('formatClock / formatDelta', () => {

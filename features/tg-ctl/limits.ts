@@ -100,6 +100,32 @@ function nextWallClock(now: number, hour: number, minute: number): number {
   return t;
 }
 
+// Extract the text-derived parts of a failure from the StopFailure `reason`
+// matcher plus the failure text (the synthetic transcript tail / hook message).
+// PURE: the entrypoint concatenates the reason + transcript tail and supplies the
+// pane/agent/source-message from tmux + the routes file. `detail` is the last
+// non-empty line of the failure text, trimmed to a phone-readable length.
+export function extractFailure(
+  reason: string,
+  failureText: string,
+  now: number,
+): { kind: HarnessFailureKind; reason: string; detail: string; resetAt: number | null } {
+  const resetAt = parseResetTime(failureText, now);
+  // A parseable reset time means it IS a limit even if the matcher was vague.
+  const kind = resetAt !== null ? 'session-limit' : classifyFailure(reason);
+  const lines = failureText
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const detail = truncateDetail(lines.length ? lines[lines.length - 1] : '');
+  return { kind, reason: reason.trim(), detail, resetAt };
+}
+
+function truncateDetail(s: string): string {
+  const MAX = 240;
+  return s.length <= MAX ? s : `${s.slice(0, MAX - 1)}…`;
+}
+
 // Build the operator notification, or null to SUPPRESS it. Suppressed when the
 // reset time is already in the past (stale — the leak this module prevents).
 export function buildLimitNotification(ev: HarnessFailureEvent, now: number): LimitNotification | null {

@@ -52,6 +52,33 @@ import {
   resolveByLastMessage,
 } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
+import {
+  autoContinueDelayMs,
+  buildLimitNotification,
+  continueCallbackData,
+  extractFailure,
+  formatClock,
+  parseContinueCallback,
+  type HarnessFailureEvent,
+} from "./features/tg-ctl/limits"
+import { isAllowedReaction, reactionForStage } from "./features/tg-ctl/reactions"
+import {
+  composeTasksTable,
+  matchPrsToTasks,
+  parseTasksCommand,
+  rollupCiState,
+  type PrRef,
+  type TaskItem,
+} from "./features/tg-ctl/tasks-command"
+import {
+  parseSchedules,
+  removeSchedule,
+  serializeSchedules,
+  upsertSchedule,
+  type AutoContinueSchedule,
+  type ScheduleStoreData,
+} from "./features/tg-ctl/schedule-store"
+import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
 import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, readPidFile } from "./features/tg-ctl/lock"
 import {
@@ -169,8 +196,13 @@ export const USAGE = `Usage:
                          # (--dry-run prints the plan and touches nothing)
   tg-ctl disable         # remove OS autostart AND stop
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
-  tg-ctl install-hooks   # wire q→buttons: agent questions → Telegram buttons
+  tg-ctl install-hooks   # wire q→buttons + StopFailure/UserPromptSubmit hooks
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
+  tg-ctl harness-event [--dry-run] [--pane %N] [--agent NAME] [--reason MATCHER]
+                        [--reset-at ISO] [--source-message-id ID] [--transcript PATH]
+                         # StopFailure hook: notify the chat a harness stopped on a
+                         # limit/error; offer an auto-continue button at reset time.
+                         # --dry-run renders WITHOUT sending (safe smoke, #113).
 
 The run/start/status/stop/enable/disable lifecycle follows the shared agent-tools
 service-management contract (agenttools_service). Autostart matrix: macOS → launchd
@@ -378,6 +410,40 @@ async function editMessageText(ctx: Ctx, messageId: number, text: string): Promi
 // message, a transient API error), never throwing into the poll loop.
 async function clearMessageKeyboard(ctx: Ctx, messageId: number): Promise<void> {
   await botPost(ctx, "editMessageReplyMarkup", { chat_id: ctx.chatId, message_id: messageId })
+}
+
+// Set a reaction on a message (tg-cli#114 lifecycle: 👀 working → 😴 stalled →
+// 👌 done). Skips an emoji Telegram would reject (⏳/✅ are REACTION_INVALID) so
+// we never waste a call on a guaranteed 400. Best-effort — botPost swallows
+// failures; a receipt must never break the caller.
+async function setMessageReaction(ctx: Ctx, messageId: number, emoji: string): Promise<void> {
+  if (!isAllowedReaction(emoji)) {
+    log(`setMessageReaction skipped: ${emoji} is not an allowed reaction`)
+    return
+  }
+  await botPost(ctx, "setMessageReaction", {
+    chat_id: ctx.chatId,
+    message_id: messageId,
+    reaction: [{ type: "emoji", emoji }],
+  })
+}
+
+// Send a rich-HTML message (Bot API sendRichMessage, `rich_message.html`), the
+// path /tasks uses for its table (#115). Normalizes + pre-flights the HTML with
+// the same helpers `tg` uses, so an invalid table fails locally with a clear log
+// instead of an opaque API 400. Returns the sent message id or null.
+async function sendRich(ctx: Ctx, rawHtml: string): Promise<number | null> {
+  const html = normalizeRichHtml(rawHtml)
+  const check = validateRichHtml(html)
+  if (!check.ok) {
+    log(`sendRich invalid html: ${check.error}`)
+    return null
+  }
+  const json = await botPost(ctx, "sendRichMessage", { chat_id: ctx.chatId, rich_message: { html } })
+  const result = json?.result
+  if (!result || typeof result !== "object") return null
+  const messageId = (result as { message_id?: unknown }).message_id
+  return typeof messageId === "number" ? messageId : null
 }
 
 // Publish the bot's own slash-commands to Telegram's "/" autocomplete + menu
@@ -660,10 +726,11 @@ function voiceReady(ctx: Ctx): boolean {
 async function spawnGuarded(
   argv: string[],
   timeoutMs: number,
+  opts: { cwd?: string } = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   let child: ReturnType<typeof Bun.spawn> | undefined
   try {
-    child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe" })
+    child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe", ...(opts.cwd ? { cwd: opts.cwd } : {}) })
     const proc = child
     let timedOut = false
     const timer = setTimeout(() => {
@@ -1918,6 +1985,161 @@ async function readStdinText(): Promise<string> {
     process.stdin.on("end", () => resolve(out))
     process.stdin.on("error", reject)
   })
+}
+
+// --- /tasks command (#115): compose task-cli + gh into a rich board table ---
+
+// Resolve a `/tasks <agent>` selector to the matched pane's project dir, or null
+// (no selector, or no confident fuzzy match → the daemon's own cwd is used).
+function resolveTasksScopeDir(agent: string | null): string | null {
+  if (!agent) return null
+  const m = matchWindows(agent, listAgentCandidates())
+  return m.confident && m.matches[0]?.panePath ? m.matches[0].panePath : null
+}
+
+async function loadTasks(scopeDir: string | null, status: string | null): Promise<TaskItem[]> {
+  const argv = ["task", "list", "--json", "--no-pager", "-n", "50"]
+  if (status) argv.push("--state", status)
+  if (scopeDir) argv.push("-C", scopeDir)
+  const r = await spawnGuarded(argv, 15_000)
+  if (r.exitCode !== 0) {
+    log(`/tasks: 'task list' failed (${r.exitCode}): ${r.stderr.slice(0, 200)}`)
+    return []
+  }
+  try {
+    const parsed = JSON.parse(r.stdout)
+    return Array.isArray(parsed) ? (parsed.filter((t) => t && typeof t.id === "string") as TaskItem[]) : []
+  } catch {
+    return []
+  }
+}
+
+async function loadPrRefs(scopeDir: string | null): Promise<PrRef[]> {
+  const argv = ["gh", "pr", "list", "--state", "all", "--limit", "100", "--json", "number,title,url,body,statusCheckRollup"]
+  const r = await spawnGuarded(argv, 20_000, scopeDir ? { cwd: scopeDir } : {})
+  if (r.exitCode !== 0) {
+    log(`/tasks: 'gh pr list' failed (${r.exitCode}): ${r.stderr.slice(0, 200)}`)
+    return []
+  }
+  try {
+    const parsed = JSON.parse(r.stdout)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((p) => p && typeof p.number === "number")
+      .map((p) => ({ number: p.number, url: p.url ?? "", title: p.title ?? "", body: p.body ?? "", ci: rollupCiState(p.statusCheckRollup) }))
+  } catch {
+    return []
+  }
+}
+
+async function runTasksCommand(ctx: Ctx, action: Extract<Action, { kind: "tasks" }>): Promise<void> {
+  const scopeDir = resolveTasksScopeDir(action.agent)
+  const [tasks, prs] = await Promise.all([loadTasks(scopeDir, action.status), loadPrRefs(scopeDir)])
+  const html = composeTasksTable(tasks, matchPrsToTasks(tasks, prs), { agent: action.agent, status: action.status })
+  const sent = await sendRich(ctx, html)
+  if (sent === null) await sendMessage(ctx, "couldn't render the task board — see the daemon log")
+}
+
+// --- harness-event subcommand (#113): notify on a StopFailure hook ---
+
+interface HarnessEventFlags {
+  dryRun: boolean
+  paneId: string | null
+  agent: string | null
+  reason: string | null
+  resetAtIso: string | null
+  sourceMessageId: number | null
+  transcriptPath: string | null
+}
+
+function parseHarnessEventFlags(argv: string[]): HarnessEventFlags {
+  const flags: HarnessEventFlags = {
+    dryRun: false,
+    paneId: process.env.TMUX_PANE ?? null,
+    agent: null,
+    reason: null,
+    resetAtIso: null,
+    sourceMessageId: null,
+    transcriptPath: null,
+  }
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    const next = (): string => argv[++i] ?? ""
+    if (a === "--dry-run") flags.dryRun = true
+    else if (a === "--pane") flags.paneId = next()
+    else if (a === "--agent") flags.agent = next()
+    else if (a === "--reason") flags.reason = next()
+    else if (a === "--reset-at") flags.resetAtIso = next()
+    else if (a === "--source-message-id") flags.sourceMessageId = Number(next()) || null
+    else if (a === "--transcript") flags.transcriptPath = next()
+  }
+  return flags
+}
+
+function strField(obj: unknown, key: string): string {
+  const v = obj && typeof obj === "object" ? (obj as Record<string, unknown>)[key] : undefined
+  return typeof v === "string" ? v : ""
+}
+
+// Read the tail of a Claude transcript (JSONL). The synthetic session-limit
+// message is at the end, and parseResetTime scans free text, so the last 8KB is
+// enough context without loading a multi-MB transcript.
+function transcriptTail(path: string | null): string {
+  if (!path) return ""
+  const raw = readFileOrNull(path)
+  return raw ? raw.slice(-8000) : ""
+}
+
+// Normalize the StopFailure payload + flags into a HarnessFailureEvent.
+function buildHarnessEvent(payloadText: string, flags: HarnessEventFlags, now: number): HarnessFailureEvent {
+  let payload: unknown = null
+  try {
+    payload = JSON.parse(payloadText)
+  } catch {
+    /* non-JSON stdin (or empty) — rely on flags + inline text */
+  }
+  const reason = flags.reason ?? (strField(payload, "reason") || strField(payload, "matcher"))
+  const tPath = flags.transcriptPath ?? (strField(payload, "transcript_path") || null)
+  const inline = strField(payload, "message") || strField(payload, "last_message") || payloadText
+  const failureText = [inline, transcriptTail(tPath)].filter(Boolean).join("\n")
+  const extracted = extractFailure(reason, failureText, now)
+  const explicitReset = flags.resetAtIso ? Date.parse(flags.resetAtIso) : NaN
+  const resetAt = Number.isFinite(explicitReset) ? explicitReset : extracted.resetAt
+  return {
+    kind: resetAt !== null ? "session-limit" : extracted.kind,
+    agent: flags.agent ?? "agent",
+    paneId: flags.paneId,
+    reason: extracted.reason,
+    detail: extracted.detail,
+    resetAt,
+    sourceMessageId: flags.sourceMessageId,
+  }
+}
+
+async function runHarnessEvent(ctx: Ctx, argv: string[], now: number): Promise<number> {
+  const flags = parseHarnessEventFlags(argv)
+  const payloadText = await readStdinText().catch(() => "")
+  const ev = buildHarnessEvent(payloadText, flags, now)
+  const notif = buildLimitNotification(ev, now)
+  if (!notif) {
+    // Staleness guard (#113): a reset already in the past, or nothing to report.
+    if (!flags.dryRun) log(`harness-event: suppressed (stale/none) agent=${ev.agent} reset=${ev.resetAt}`)
+    else console.log("harness-event: SUPPRESSED (reset already past or nothing to report)")
+    return 0
+  }
+  if (flags.dryRun) {
+    console.log("=== harness-event DRY-RUN (no send) ===")
+    console.log(notif.text)
+    if (notif.button) console.log(`[button] ${notif.button.label} → ${notif.button.data}`)
+    if (ev.sourceMessageId !== null) console.log(`[reaction] ${reactionForStage("stalled")} on message ${ev.sourceMessageId}`)
+    return 0
+  }
+  const keyboard = notif.button ? { inline_keyboard: [[{ text: notif.button.label, callback_data: notif.button.data }]] } : undefined
+  const extra: Record<string, unknown> = { parse_mode: "HTML" }
+  if (keyboard) extra.reply_markup = keyboard
+  await sendMessage(ctx, notif.text, extra)
+  if (ev.sourceMessageId !== null) await setMessageReaction(ctx, ev.sourceMessageId, reactionForStage("stalled"))
+  return 0
 }
 
 // --- run: the daemon itself ---
@@ -4178,6 +4400,52 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // closest allowed emoji for "deferred behind the agent's open question".
   const DEFER_REACTION = "✍️"
 
+  // --- auto-continue schedules (#113) — durable, re-armed on restart ---
+  // A button tap arms a setTimeout to inject "continue" into the stalled pane at
+  // reset time. The schedule is persisted so a daemon restart between the tap and
+  // the reset re-arms it (a past reset fires immediately). One pending continue
+  // per pane; on fire we inject, flip the card's reaction back to 👀, and drop it.
+  let scheduleStore: ScheduleStoreData = parseSchedules(readFileOrNull(ctx.paths.schedules), Date.now())
+  const continueTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const persistSchedules = (): void => {
+    try {
+      atomicWrite(ctx.paths.schedules, serializeSchedules(scheduleStore, Date.now()))
+    } catch (err) {
+      log(`persistSchedules failed: ${err}`)
+    }
+  }
+  const fireAutoContinue = async (s: AutoContinueSchedule): Promise<void> => {
+    continueTimers.delete(s.paneId)
+    scheduleStore = removeSchedule(scheduleStore, s.paneId)
+    persistSchedules()
+    const res = await executeInjectSteps(buildTextInjectPlan(s.paneId, "continue"))
+    if (!res.ok) log(`auto-continue inject failed for ${s.paneId}: ${res.error}`)
+    else log(`auto-continue fired for ${s.paneId} (agent=${s.agent})`)
+    if (s.sourceMessageId !== null) await setMessageReaction(ctx, s.sourceMessageId, reactionForStage("working"))
+  }
+  const armAutoContinue = (s: AutoContinueSchedule): void => {
+    const existing = continueTimers.get(s.paneId)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => void fireAutoContinue(s), autoContinueDelayMs(s.resetAt, Date.now()))
+    continueTimers.set(s.paneId, timer)
+  }
+  const handleLimitContinue = async (action: Extract<Action, { kind: "limit-continue" }>): Promise<boolean> => {
+    const schedule: AutoContinueSchedule = {
+      paneId: action.paneId,
+      resetAt: action.resetAt,
+      agent: "",
+      sourceMessageId: action.messageId,
+      armedAt: Date.now(),
+    }
+    scheduleStore = upsertSchedule(scheduleStore, schedule)
+    persistSchedules()
+    armAutoContinue(schedule)
+    await answerCallbackQuery(ctx, action.callbackQueryId, `auto-continue armed for ${formatClock(action.resetAt)}`)
+    return true
+  }
+  // Re-arm any schedule that survived a restart (fires now if its reset passed).
+  for (const s of scheduleStore.schedules) armAutoContinue(s)
+
   // Late-delivery (this PR — the CTO's "I pressed a button but it didn't reach the
   // harness" bug): a Telegram tap arrived for a SCOPED question whose hook socket
   // already CLOSED (its 120s window elapsed → terminal fallback, OR a daemon restart
@@ -4386,6 +4654,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "status":
         await sendMessage(ctx, composeStatus(ctx))
         return true
+      case "tasks":
+        await runTasksCommand(ctx, action)
+        return true
+      case "limit-continue":
+        return handleLimitContinue(action)
       case "agent-route":
         return handleAgentRoute(action)
       case "agent-callback":
@@ -4650,7 +4923,7 @@ if (import.meta.main) {
     console.log(USAGE)
     process.exit(0)
   }
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -4731,6 +5004,9 @@ if (import.meta.main) {
   if (cmd === "ask") {
     await askDaemon(ctx)
     process.exit(0)
+  }
+  if (cmd === "harness-event") {
+    process.exit(await runHarnessEvent(ctx, process.argv.slice(3), Date.now()))
   }
   await runDaemon(ctx)
 }
