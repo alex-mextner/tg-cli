@@ -22,6 +22,10 @@ semantic versioning.
 - **Stale-daemon repair:** the ask client rebuilds a single-question reply from a RUNNING daemon
   that predates `hookEventName`, so the fix takes effect the moment the client updates. Restart
   the daemon (`tg-ctl restart`) to update the daemon side too.
+- **A late tap on an abandoned multi-question member is refused** (review finding): after the
+  ask client's budget elapses mid-collection, the local dialog owns ALL the questions — injecting
+  one lone late answer could answer the WRONG prompt. The card retires to "expired — answer in
+  terminal"; reconnect re-attach (daemon bounce mid-collection) is unaffected.
 - **`tool_input` now survives the daemon socket boundary** (review finding): the daemon-side
   request parser dropped it, silently downgrading a PreToolUse ExitPlanMode "Proceed" to a bare
   allow — which the hooks docs say is not sufficient for user-interactive tools. New round-trip

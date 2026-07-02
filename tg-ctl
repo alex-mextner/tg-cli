@@ -1422,6 +1422,10 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     decisionLabels,
     permissionEvent,
     toolInput,
+    // Set-member marker: a multi-question sub-answer must never late-deliver
+    // into the pane (all-or-nothing — see ButtonRequest.multiQuestion). Parsed
+    // here so it survives BOTH the socket boundary and the disk restore.
+    multiQuestion: rec.multiQuestion === true ? true : undefined,
   }
 }
 
@@ -1491,6 +1495,12 @@ const ABANDONED_TAP_TEXT = "window closed — tap still delivers your answer to 
 // keyboard stays live so the user can tap once the agent reconnects and the
 // reconnect re-attach delivers the answer down the new socket.
 const ABANDONED_PERMISSION_TEXT = "hook disconnected — tap after the agent reconnects"
+// A multi-question SET MEMBER whose hook socket closed: a lone late answer must
+// NOT inject into the pane (the local multi-question dialog may be on a
+// DIFFERENT question — all-or-nothing, see ButtonRequest.multiQuestion), so the
+// card says the terminal took over. The keyboard stays for reconnect re-attach;
+// a tap without a live socket answers "expired".
+const ABANDONED_MULTI_TEXT = "window closed — answer all questions in the terminal"
 
 // A SCOPED question (with options) or a SCOPED permission can survive socket close:
 // a question still injects into its pane (late-delivery); a permission re-attaches
@@ -1538,7 +1548,11 @@ function armPendingSocketClose(
     rt.activeKeys.delete(pendingKey)
     if (retainAbandonedQuestion(rt, entry, pendingKey)) {
       rt.onAbandon(entry.req.paneId as string)
-      const abandonedText = entry.req.kind === "permission" ? ABANDONED_PERMISSION_TEXT : ABANDONED_TAP_TEXT
+      const abandonedText = entry.req.kind === "permission"
+        ? ABANDONED_PERMISSION_TEXT
+        : entry.req.multiQuestion
+          ? ABANDONED_MULTI_TEXT
+          : ABANDONED_TAP_TEXT
       if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText)
       else entry.finalText = abandonedText
     } else {
@@ -4244,6 +4258,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // permission with no live socket falls through to the "expired" toast below so the
     // user knows to wait for the agent's reconnect window to pass.
     if (retained.req.kind === "permission") return false
+    // A multi-question SET MEMBER is likewise retained only for reconnect
+    // re-attach. Its lone answer must never inject into the pane: the local
+    // multi-question dialog that took over may be showing a DIFFERENT question,
+    // so the injected text would answer the wrong prompt (all-or-nothing —
+    // see ButtonRequest.multiQuestion). Retire the card so the refusal is
+    // visible, then fall through to the "expired" toast.
+    if (retained.req.multiQuestion) {
+      abandonedButtons.delete(action.requestId)
+      persistQuestions()
+      const staleCardId = retained.messageId ?? action.messageId
+      if (staleCardId !== null) {
+        void clearMessageKeyboard(ctx, staleCardId)
+        void editMessageText(ctx, staleCardId, EXPIRED_TERMINAL_TEXT)
+      }
+      log(`ask-late-deliver-refused: multi-question member ${describeAskRequest(retained.req)} key=${action.requestId}`)
+      return false
+    }
     // Enforce the retention window at DELIVERY time, not only on persist/restore. On a
     // QUIET daemon (no mutation since the abandon) pruneAbandonedButtons never runs, so
     // without this check an arbitrarily-stale answer would still be injected into a pane

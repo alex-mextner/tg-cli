@@ -56,6 +56,14 @@ export interface ButtonRequest {
   // schema-valid wholesale, unlike a lossy rebuild from the request fields
   // (which stays as the fallback for manual/back-compat callers).
   toolInput?: Record<string, unknown>;
+  // This request is ONE member of a multi-question AskUserQuestion set. A lone
+  // answer is meaningless to the harness (the reply needs the WHOLE answers
+  // record), so a set member must never be LATE-DELIVERED into the pane — the
+  // local multi-question dialog may be showing a DIFFERENT question, and the
+  // injected text would answer the wrong prompt (all-or-nothing contract).
+  // Reconnect re-attach (daemon bounce mid-collection) still works: retention
+  // is unchanged, only the pane-injection fallback is refused.
+  multiQuestion?: boolean;
   opencode?: OpencodeRequestRef;
 }
 

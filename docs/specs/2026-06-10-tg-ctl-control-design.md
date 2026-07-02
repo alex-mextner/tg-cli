@@ -252,7 +252,11 @@ Claude Code hook installation remains an automation layer over that handoff
   any multiSelect/free-form question, or any declined/timed-out card, bails the
   whole call to the local UI — a PARTIAL answers record must never be emitted
   (once a hook supplies `updatedInput` no dialog is shown, so CC would silently
-  record the unanswered questions as "(no option selected)"). The client also
+  record the unanswered questions as "(no option selected)"). For the same
+  reason a set member is never LATE-DELIVERED: once the local dialog takes over
+  it owns ALL the questions, and injecting one lone late answer could answer
+  the WRONG prompt — a late tap on an abandoned member answers "expired" and
+  retires the card (reconnect re-attach across a daemon bounce still works). The client also
   REPAIRS a single-question reply from a stale RUNNING daemon that predates
   `hookEventName` (live-symlink deploys update the hook client before the
   daemon restarts).

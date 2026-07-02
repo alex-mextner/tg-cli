@@ -328,12 +328,16 @@ test('an answered PERMISSION is never replayed — a re-forward posts a fresh ca
     return p;
   };
 
-  // The daemon's socket-side normalize (normalizeButtonRequest) does not carry
-  // toolInput, so a PreToolUse allow emits no updatedInput — that is pre-existing
-  // behavior unrelated to this fix; this test only cares that the decision is
-  // re-asked (a fresh card), not replayed.
+  // toolInput now SURVIVES the daemon's socket-side normalize (tg#5741 review
+  // fix), so a PreToolUse allow echoes it back as updatedInput (the hooks docs:
+  // "allow alone is not sufficient" for user-interactive tools). This test only
+  // cares that the decision is re-asked (a fresh card), not replayed.
   const expectedPerm = {
-    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' },
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      updatedInput: { command: 'rm -rf /tmp/x' },
+    },
   };
 
   const ask1 = ask();

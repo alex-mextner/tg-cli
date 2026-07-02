@@ -105,6 +105,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       decisionLabels: readDecisionLabels(p.decisionLabels),
       permissionEvent: p.permissionEvent === 'PreToolUse' ? 'PreToolUse' : undefined,
       toolInput: asRecord(p.toolInput) ?? undefined,
+      multiQuestion: p.multiQuestion === true ? true : undefined,
       paneId: typeof p.paneId === 'string' ? p.paneId : env.paneId,
       cwd: typeof p.cwd === 'string' ? p.cwd : env.cwd,
       sessionName: typeof p.sessionName === 'string' ? p.sessionName : env.sessionName,
@@ -226,6 +227,9 @@ function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): Bu
     // Carried so the answer envelope can echo the original input (schema-valid
     // wholesale) instead of a lossy rebuild — see buildClaudeQuestionAnswerOutput.
     req.toolInput = input;
+    // A set member's lone answer must never late-deliver into the pane
+    // (all-or-nothing) — see ButtonRequest.multiQuestion.
+    if (questions.length > 1) req.multiQuestion = true;
     out.push(req);
   }
   return out;
