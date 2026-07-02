@@ -70,6 +70,7 @@ import { toTablePre } from "./features/render/table"
 import { formatHelp } from "./features/render/format-help"
 import { colorizeHelp, shouldColorize } from "./features/render/help-color"
 import { createTelegramTransport } from "./features/transport/telegram"
+import { doneReactionForSend } from "./features/tg-ctl/reactions"
 import {
   enumerateWorktreeRoots,
   runGitReal,
@@ -1348,6 +1349,28 @@ if (import.meta.main) {
     threadIdAdvisory,
   })
   await transmit(plan, transport)
+
+  // Reaction lifecycle (tg-cli#114): an `--tag answer --reply-to <id>` send means
+  // message <id> is now ANSWERED — flip its reaction to the done mark (👌, the
+  // allowed proxy for ✅). Best-effort: the answer already sent, so a reaction
+  // failure must never fail the command (mirrors the daemon's fail-open receipt).
+  const doneReaction = doneReactionForSend({ tag, replyToMessageId: replyTo })
+  if (doneReaction) {
+    try {
+      await fetch(`${API}/setMessageReaction`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: CHAT_ID,
+          message_id: doneReaction.messageId,
+          reaction: [{ type: "emoji", emoji: doneReaction.emoji }],
+        }),
+        signal: AbortSignal.timeout(10_000),
+      })
+    } catch {
+      // best-effort — a failed done-mark never fails an already-sent answer
+    }
+  }
 
   // Outbound history for `tg replies` recall — one `agent` record per send,
   // stamped with the first sent message id (now known). The body is the raw
