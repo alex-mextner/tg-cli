@@ -3,6 +3,210 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.25.2
+
+**Feature (HYP-891 follow-up): empty-editor watermark WARN heuristic in `pre-send-photo`.**
+
+- Added `looks_like_empty_vscode_watermark()` to
+  `features/hooks/review-descriptor/pre_send_photo.py` — detects VS Code's own "no
+  tabs open" watermark (a small, compact cluster of hint-row glyphs on an
+  overwhelmingly flat background, centered in the editor pane), the signal Alex
+  proposed (tg#6071) as a precise replacement for the removed 1.25.1 heuristic. Unlike
+  that removed check (which matched ANY full window via a dark left activity-bar
+  strip), this one is scoped to a central box and requires a small, compact glyph
+  cluster on a flat field — real content (code, a rendered preview, a webview) cannot
+  produce the pattern regardless of how busy the surrounding Explorer/Inspector/Logs
+  panels are.
+- **WARN-only, not a block** — a deliberate choice, not an automatic carry-over of the
+  old block behavior. The detector's thresholds are reasoned from VS Code's known
+  watermark layout, not calibrated against a captured reference screenshot; blocking
+  on an unvalidated pixel heuristic is exactly the HYP-891 failure mode. It surfaces a
+  stderr warning in the audit trail without bricking the send. Promoting it to a block
+  is a follow-up once real false-positive/negative field data exists.
+- New tests: `tests/hooks-watermark-detector.test.ts` (synthetic PIL fixtures — no
+  real VS Code screenshot exists to calibrate against).
+- `review diff` findings addressed pre-merge: background-color estimation is
+  quantized-bucket based (not exact-tuple) to survive PNG/JPEG re-compression
+  and font-AA noise; the compactness (span) check trims outlier coordinates
+  instead of raw min/max so a single stray non-bg pixel elsewhere in the box
+  can't blow the span up and hide the real cluster; the sample box was widened
+  and shifted (20-90% W, 15-65% H, was a symmetric 28-72%/18-62%) because the
+  watermark centers on the EDITOR PART, not the window — a symmetric box
+  misses it on the common "Explorer open, nothing docked right" layout where
+  the editor part sits right of window-center; the density lower bound was
+  lowered 0.005 -> 0.001 (safety margin below a measured ~0.006 for a
+  realistic sparse icon+text-row fixture) since real hint text could render
+  thinner than that synthetic floor case; two test-fixture aliasing bugs
+  were found and fixed where a draw pattern's pixel spacing shared a common
+  factor with the detector's own WATERMARK_SAMPLE_STEP=3 sampling grid,
+  making a fixture pass/fail for the wrong reason (a "dense random content"
+  negative fixture, and an earlier "sparse glyph" positive fixture whose 1px
+  rows landed on zero sampled pixels by phase) — both rewritten so every
+  drawn stroke is >=3px in each dimension, which guarantees a grid hit
+  regardless of phase, verified across multiple phase offsets.
+- `from __future__ import annotations` (already present, first statement
+  after the module docstring) makes the new `X | None` return annotations
+  safe on Python <3.10 — confirmed, not changed; called out here because
+  `review diff` flagged it twice without visibility into the file header
+  (outside the diff hunk it reviews).
+- Two more tests added post-review: an explicit symmetric check that a REAL,
+  busy full-window screenshot produces zero watermark-related warnings
+  end-to-end (only the positive/watermark-shaped path was covered before),
+  and a documented KNOWN LIMITATION test — the detector cannot distinguish
+  VS Code's specific watermark glyphs from any other small, compact UI
+  element on a flat background (a centered dialog, a spinner, a toast, an
+  almost-empty terminal, a lone logo on a white preview); this is an
+  accepted false-positive surface for a WARN-only, unvalidated heuristic,
+  now captured as an executable spec rather than tribal knowledge.
+- Final review round: `_trimmed_span_ratio`'s outlier trim was silently a
+  no-op for any n <= 19 (`int(n * 0.05) == 0` in that range) — fixed to
+  guarantee at least one point trimmed off each end once there are enough
+  points for that to leave a >=2-point core (n >= 4; a later fix tightened
+  this from an initial >=1-point-core version, see below), with a direct
+  unit test (a single far outlier no longer blows up the span).
+  Tests now `test.skipIf(!pilAvailable)` the whole file — Pillow is a soft
+  dependency of the hook itself, and hard-failing the suite when it's
+  missing would make this file flap by environment, matching the existing
+  `tmuxAvailable` skipIf pattern in `tests/ctl-tmux-integration.test.ts`.
+- `WATERMARK_MAX_SPAN_RATIO` tightened 0.70/0.80 -> 0.35/0.40 (review
+  finding): the old caps let a cluster cover up to 70-80% of the sample box
+  and still count as "compact", effectively disabling the check the
+  docstring/CHANGELOG claim distinguishes a watermark from real content.
+  Every measured positive fixture spans <=0.26 on either axis; the new caps
+  keep real margin above that while now correctly rejecting a moderate-
+  spread pattern (two compact glyph-sized blocks ~54% of the box apart,
+  density still in-range) that the old caps let through. New test locks in
+  that specific boundary — previously only the two extremes (whole-box
+  scatter, and density rejection) were covered, leaving the actual
+  false-positive-prone middle ground untested.
+- Performance (review finding): `_sample_box` had no upper bound on the
+  cropped box before per-pixel `PixelAccess` sampling — a Retina/4K
+  screenshot's box can be ~2700x1100, adding a few hundred ms of pure-Python
+  work to every `pre-send-photo` send, unbounded and untimed (unlike the
+  `review visual` subprocess call). Now caps the box's longest side at 1200px
+  via `Image.Resampling.BOX` downscaling (area-averaging, so a thin stroke
+  survives as a blended gray pixel instead of vanishing under a NEAREST
+  gap) before sampling; the span/compactness ratios are scale-invariant, and
+  the density ratio approximately so (walked back an earlier overclaim —
+  area-averaging COULD blend a very thin stroke enough to fall inside
+  WATERMARK_BG_TOL, nudging density down; accepted for a WARN-only,
+  unvalidated heuristic). Verified on a synthetic 3840x2160 image: ~42ms
+  (was unbounded), still detects the scaled-up cluster; new dedicated test
+  exercises the resize branch (every other fixture is 1600x900, whose box is
+  under the 1200px cap, so it was previously untested).
+- `Image.Resampling` (the enum) only exists on Pillow >= 9.1 (review
+  finding): on older Pillow, `Image.Resampling.BOX` raised AttributeError,
+  silently swallowed by the detector's blanket fail-open `except Exception`
+  — meaning it would NEVER fire on exactly the large screenshots the new cap
+  targets, on any host with an older Pillow. Fixed with
+  `getattr(Image, "Resampling", Image).BOX`, which falls back to the
+  pre-9.1 flat `Image.BOX` constant.
+- `_trimmed_span_ratio` degenerated to span=0 for any n where trimming left
+  only a 1-point core (e.g. 3 points at [0, 500, 1000] trimmed to a single
+  midpoint, reading as maximally "compact" regardless of real spread) —
+  review finding. Fixed to require a >=2-point core before trimming at all.
+  Unreachable through the full detector pipeline today (the density floor
+  guarantees far more samples), but the function is documented and
+  unit-tested as a general-purpose utility, so its own contract now holds
+  independent of the caller.
+- WARN message text softened (review finding): it named "VS Code's 'no tabs
+  open' hint rows" unconditionally, but the detector runs on every
+  `pre-send-photo` event, not just IDE screenshots — a compact logo on a
+  plain background in an unrelated photo would get the same VS-Code-specific
+  wording. Now hedged ("possible" / "consistent with") without changing the
+  detection logic.
+- `_trimmed_span_ratio` docstring now states its known limit explicitly
+  (review finding): per-axis trimming caps at ~5% of the mass on each end,
+  so it defends a LONE outlier, not a genuine minority second cluster below
+  that fraction — accepted for a WARN-only heuristic; a real fix would need
+  actual clustering, not a 1D span statistic.
+- The "REAL-content full-window" end-to-end negative test also switched to a
+  step-1 (every pixel) fill for the same aliasing reason as the unit-level
+  "dense random content" test, so it exercises the density check too, not
+  only the span check.
+- Two more review nits fixed: the `_trimmed_span_ratio` unit test and the
+  "unreadable path" fail-open test need only `python3`, not real Pillow —
+  gating them on `pilAvailable` meant they'd silently skip in exactly the
+  no-Pillow environment they exist to cover; split into a separate, narrower
+  `pythonAvailable` check. And `runCapturingWarnings`'s PATH restore now
+  guards the `savedPath === undefined` case explicitly instead of assigning
+  `process.env.PATH = undefined`, which JS coerces to the literal string
+  `"undefined"`.
+- Last review pass — all cosmetic/test nits, no further correctness issues
+  found: fixed a stale coord-count in the outlier unit test's comment (said
+  "14 clustered / n=15", the array is 13 clustered + 1 outlier = n=14); the
+  "PIL genuinely unavailable" test was gated on `pilAvailable` when it exists
+  specifically to simulate Pillow's ABSENCE (same class of gate mismatch as
+  the two tests fixed earlier) and referenced a real repo screenshot path
+  that's never actually opened (the poisoned import raises first) — moved to
+  `pythonAvailable`, path swapped for an explicit placeholder; added a direct
+  `_trimmed_span_ratio([single point])` test locking in the n=1 edge case.
+- `_trimmed_span_ratio`'s own degenerate case (a >=2-point-core requirement
+  fix, above) now has a direct assertion: `[0, 500, 1000]` at n=3 must read
+  as span 1.0 (not compact), not 0.0 — the exact case the fix's docstring
+  names as motivation, previously only implied by the code, not asserted.
+- `WATERMARK_BOX_MAX_DIM` only bounds the per-pixel SAMPLING loop, not the
+  `Image.open(...).convert("RGB")` decode itself, which forces a full
+  source-resolution decode first and has no timeout — unlike the amount of
+  work capped by `WATERMARK_BOX_MAX_DIM`, unlike `review visual`'s
+  subprocess call (review finding: a large phone photo sent through the
+  same `pre-send-photo` point would add unbounded decode latency to every
+  send). Added a cheap `os.path.getsize` guard (`WATERMARK_MAX_FILE_BYTES`
+  = 20MB, no decode at all) that skips the heuristic outright above that
+  size; ordinary screenshots are unaffected.
+- Added a fixture combining BOTH conditions CHANGELOG flagged as an
+  unverified false-negative risk together (a large/downscaled screenshot
+  AND thin, realistic (not bulky-block) hint-row strokes) — previously the
+  "4K" test used a solid block and the "thin strokes" test used a
+  1600x900 source under the resize cap, so neither test alone proved BOX-
+  averaging preserves a thin stroke through an actual downscale. It does:
+  unscaled (absolute-pixel) strokes on a 4K canvas are proportionally
+  smaller than the 1600x900 case, and still detect after the ~2.24x BOX
+  downscale.
+- The new `os.path.getsize` guard (above) still imported `from PIL import
+  Image` BEFORE the guard's own check, so the "skip large files without
+  decoding" short-circuit wasn't actually PIL-free -- a direct
+  `_sample_box()` call in a no-Pillow environment would raise `ImportError`
+  *outside* the fail-open wrapper (review finding), breaking exactly the
+  `pythonAvailable`-without-Pillow test scenario the guard's own test is
+  gated for. Reordered so the size check runs first; also extracted the
+  downscale step into its own `_downscale_box_if_needed()` helper.
+- That same reorder broke the "PIL genuinely unavailable" test's own intent
+  (review finding): it used a nonexistent placeholder path, which now hits
+  `os.path.getsize`'s `FileNotFoundError` and short-circuits BEFORE `from
+  PIL import Image` ever runs — passing regardless of whether the poisoned
+  `sys.modules['PIL'] = None` import actually fails, i.e. no longer testing
+  what it claims to. Switched to the hook's own (small, existing) source
+  file as the path, so `getsize` passes and the poisoned import is reached.
+- `WATERMARK_MAX_FILE_BYTES` bounds the COMPRESSED size on disk, not the
+  DECODED pixel count (review finding): a highly compressible source (e.g.
+  flat-color, or a heavily-compressed JPEG) can be a few MB on disk yet
+  decode to tens of megapixels, and `.convert("RGB")` forces that full
+  decode with no timeout — there's no subprocess boundary here to enforce
+  one, unlike `review visual`. Added `WATERMARK_MAX_PIXELS`, checked via
+  `im.size` BEFORE `.convert("RGB")` (Pillow reads dimensions from the file
+  header lazily, without a full pixel decode, so this check is cheap
+  regardless of true resolution). Verified: a flat 8000x6000 (48MP) PNG
+  compresses to <1MB — clears the byte guard, correctly rejected by the
+  pixel guard. Set to 24M (~6000x4000, a common phone/DSLR resolution) —
+  lowered from an initial 40M (review finding: still leaves worst-case
+  decode+convert latency effectively open-ended for a legitimate-but-huge
+  photo) to bound that cost to the low hundreds of ms.
+- Added the e2e test the "watermark scan runs before the `review`-on-PATH
+  check" comment in `main()` claimed but nothing exercised (review finding):
+  an isolated PATH with no `review` binary at all (same isolation pattern as
+  `hooks-review-descriptor.test.ts`'s "review missing on PATH" test) still
+  produces the watermark WARN, proving that invariant instead of just
+  asserting it in a comment.
+- Two more test gaps closed (review finding): the `w < 800 or h < 500` floor
+  was only tested from the "too small" side (400x300); added an exact
+  800x500 fixture proving the strict `<` boundary doesn't accidentally skip
+  the floor value itself. And a truncated/corrupt PNG (half the bytes of a
+  valid file — `Image.open` succeeds lazily on the header, `.convert("RGB")`
+  raises `OSError` partway through decode) now has a dedicated test proving
+  that specific, arguably most-likely-in-practice failure mode is caught by
+  the same blanket fail-open as every other error path, not a missed case.
+
 ## 1.25.1
 
 **Fix (HYP-891): remove the `pre-send-photo` full-window-screenshot block.**
