@@ -3,7 +3,7 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.25.0
+## 1.26.0
 
 **Features (tg-cli#113, #114, #115): harness-limit notifications, reaction
 lifecycle, and the `/tasks` board.** From Alex (tg#5698, tg#5699).
@@ -28,6 +28,23 @@ lifecycle, and the `/tasks` board.** From Alex (tg#5698, tg#5699).
   title, state, due, PR, CI), filterable by normalized status and scoped to a
   fuzzy-matched agent's project. Missing PR/CI renders as an em dash, never
   fabricated. Published in the bot menu.
+
+## 1.25.0
+
+**Feature (tg-cli#121): `tg replies --session` accepts a tmux WINDOW NAME, not only a pane id.**
+
+- **`--session <name>` now scopes recall by tmux window name** (`tg replies --session ext`).
+  Pane ids (`%7`) are un-typeable from memory; a human window name is what you actually know.
+  A `%`-prefixed argument is still treated as a pane id (backward compatible); anything else is
+  resolved as a window name.
+- **Exact match, unioned across sessions.** `--session ext` matches ONLY the window literally
+  named `ext` (never `ext: diagram`), and if several tmux sessions each have a window named `ext`
+  it recalls the union of all their panes. Resolution shells out to
+  `tmux list-panes -a -F "#{pane_id}\t#{window_name}"` (pane id first, TAB-delimited, so window
+  names containing spaces survive intact).
+- **An unknown window name is a structured error** — non-zero exit + `no tmux window named '<name>'`
+  — rather than a silent empty recall. `--all-sessions` and the default (current pane) scope are
+  unchanged.
 
 ## 1.24.0
 

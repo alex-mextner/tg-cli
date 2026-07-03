@@ -28,12 +28,16 @@ export function filterByUntil(records: HistoryRecord[], until: number | undefine
   return records.filter((r) => r.ts <= until);
 }
 
-// Scope to one tmux pane. A null pane means "no scope" (--all-sessions or no
-// detectable pane). A record whose own pane is null never matches a concrete
-// scope — it was logged outside tmux and belongs to no session.
-export function filterByPane(records: HistoryRecord[], pane: string | null): HistoryRecord[] {
-  if (pane === null) return records;
-  return records.filter((r) => r.pane === pane);
+// Scope to a SET of tmux panes. A single `--session %7` resolves to one pane; a
+// `--session <windowName>` resolves to EVERY pane of every window with that name
+// (a name can repeat across sessions), so the scope is a set and membership is a
+// union. A null set means "no scope" (--all-sessions or no detectable pane) —
+// pass-through. An empty set matches nothing. A record whose own pane is null
+// never matches a concrete set — it was logged outside tmux and belongs to no
+// session.
+export function filterByPanes(records: HistoryRecord[], panes: string[] | null): HistoryRecord[] {
+  if (panes === null) return records;
+  return records.filter((r) => r.pane !== null && panes.includes(r.pane));
 }
 
 // --- search ---
@@ -52,17 +56,17 @@ export function searchHistory(records: HistoryRecord[], query: string, regex: bo
 
 // --- selection pipeline ---
 
-// direction → pane → since/until → (find ? search) → keep the LAST `limit`,
-// oldest→newest. The pane scope is resolved by the entrypoint (args.session /
-// detected pane / null for --all-sessions) and passed in; keeping it a param
-// keeps this pure.
+// direction → panes → since/until → (find ? search) → keep the LAST `limit`,
+// oldest→newest. The pane SET is resolved by the entrypoint (a %-pane id, a
+// window name → its pane ids, the detected pane, or null for --all-sessions) and
+// passed in; keeping it a param keeps this pure.
 export function selectHistory(
   records: HistoryRecord[],
   args: RepliesQuery,
-  pane: string | null = null,
+  panes: string[] | null = null,
 ): HistoryRecord[] {
   let out = filterByDirection(records, args.direction);
-  out = filterByPane(out, pane);
+  out = filterByPanes(out, panes);
   out = filterBySince(out, args.since);
   out = filterByUntil(out, args.until);
   if (args.action === 'find' && args.query !== undefined) {

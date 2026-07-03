@@ -92,8 +92,26 @@ test('parseRepliesArgs: --session <pane> sets explicit pane scope', () => {
   expect(a.allSessions).toBe(false);
 });
 
-test('parseRepliesArgs: --session requires a value', () => {
-  expect(parseRepliesArgs(['--session']).kind).toBe('error');
+test('parseRepliesArgs: --session <windowName> stores the raw value verbatim (interpreted at resolution)', () => {
+  const a = parseRepliesArgs(['--session', 'ext']);
+  if (a.kind !== 'query') throw new Error('unreachable');
+  expect(a.session).toBe('ext');
+  expect(a.allSessions).toBe(false);
+});
+
+test('parseRepliesArgs: --session preserves a window name with spaces', () => {
+  const a = parseRepliesArgs(['--session', 'ext: diagram']);
+  if (a.kind !== 'query') throw new Error('unreachable');
+  expect(a.session).toBe('ext: diagram');
+});
+
+test('parseRepliesArgs: --session requires a value; error names window OR pane', () => {
+  const a = parseRepliesArgs(['--session']);
+  expect(a.kind).toBe('error');
+  if (a.kind === 'error') {
+    expect(a.message.toLowerCase()).toContain('window');
+    expect(a.message.toLowerCase()).toContain('pane');
+  }
 });
 
 test('parseRepliesArgs: --help → help action', () => {

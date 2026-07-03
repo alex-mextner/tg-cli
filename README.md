@@ -249,13 +249,16 @@ $ tg replies
 - **Action** (2nd positional, default `list`): `list`, or `find <query>` for a
   case-insensitive substring search (`--regex` for a regular expression).
 - **Scope** defaults to the current pane's session; `--all-sessions` searches
-  everywhere, `--session <paneId>` targets one pane.
+  everywhere, `--session <window|paneId>` targets one scope — either a tmux
+  **window name** (`--session ext`: exact match, all panes of every window named
+  `ext` across sessions) or a raw pane id (`--session %7`).
 - `-n/--limit N` (default 20), `--full` (no truncation), `--json` (a
   machine-readable array: `ts` ms, `id`, `direction`, `from`, `text`, `pane`),
   `--help`.
 
 ```
 tg replies all                  # the full back-and-forth in this session
+tg replies --session ext        # messages in the tmux window named "ext"
 tg replies user find deploy     # your messages mentioning "deploy"
 tg replies agent --all-sessions # everything the agent has sent, anywhere
 tg replies --json -n 5          # the last 5, as JSON

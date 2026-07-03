@@ -37,6 +37,7 @@ test('inbound writer → file → tg replies reader, scoped to the routed pane',
   const code = runReplies(['replies'], {
     readHistory: () => readFileSync(file, 'utf8'),
     detectPane: () => '%4',
+    resolveWindow: () => [],
     fmtTime: () => 'T',
     log: (m) => out.push(m),
     errlog: () => {},
@@ -65,6 +66,7 @@ test('outbound writer → file → tg replies agent reader', () => {
   runReplies(['replies', 'agent'], {
     readHistory: () => readFileSync(file, 'utf8'),
     detectPane: () => '%4',
+    resolveWindow: () => [],
     fmtTime: () => 'T',
     log: (m) => out.push(m),
     errlog: () => {},
@@ -109,6 +111,7 @@ test('both writers append to the SAME file; `all` shows the conversation in orde
   runReplies(['replies', 'all'], {
     readHistory: () => readFileSync(file, 'utf8'),
     detectPane: () => '%4',
+    resolveWindow: () => [],
     fmtTime: () => 'T',
     log: (m) => out.push(m),
     errlog: () => {},

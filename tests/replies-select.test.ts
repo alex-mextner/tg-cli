@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import {
   filterByDirection,
-  filterByPane,
+  filterByPanes,
   filterBySince,
   filterByUntil,
   searchHistory,
@@ -41,14 +41,23 @@ test('filterByDirection: all keeps everything', () => {
   expect(filterByDirection(sample, 'all').length).toBe(4);
 });
 
-test('filterByPane: scopes to one pane; null pane = no scope', () => {
-  expect(filterByPane(sample, '%1').map((r) => r.message_id)).toEqual([10, 11]);
-  expect(filterByPane(sample, null).length).toBe(4);
+test('filterByPanes: a single-pane set scopes to that pane; null set = no scope', () => {
+  expect(filterByPanes(sample, ['%1']).map((r) => r.message_id)).toEqual([10, 11]);
+  expect(filterByPanes(sample, null).length).toBe(4);
 });
 
-test('filterByPane: records with a null pane never match a concrete pane scope', () => {
+test('filterByPanes: a multi-pane set is a UNION across panes (window name → several panes)', () => {
+  expect(filterByPanes(sample, ['%1', '%2']).map((r) => r.message_id)).toEqual([10, 11, 12, 13]);
+});
+
+test('filterByPanes: an empty set matches nothing', () => {
+  expect(filterByPanes(sample, [])).toEqual([]);
+});
+
+test('filterByPanes: records with a null pane never match a concrete pane set', () => {
   const withNull = [...sample, R({ message_id: 99, pane: null, direction: 'agent' })];
-  expect(filterByPane(withNull, '%1').map((r) => r.message_id)).toEqual([10, 11]);
+  expect(filterByPanes(withNull, ['%1']).map((r) => r.message_id)).toEqual([10, 11]);
+  expect(filterByPanes(withNull, ['%1', '%2']).map((r) => r.message_id)).toEqual([10, 11, 12, 13]);
 });
 
 test('searchHistory: case-insensitive substring', () => {
@@ -72,9 +81,9 @@ test('searchHistory: invalid regex throws a typed error', () => {
   expect(() => searchHistory(sample, '(', true)).toThrow();
 });
 
-test('selectHistory: list, default user direction, scoped to pane %1, oldest→newest, limited', () => {
-  // The entrypoint resolves the effective pane (--session / detected / null)
-  // and passes it in; here %1 is the resolved scope.
+test('selectHistory: list, default user direction, scoped to pane-set [%1], oldest→newest, limited', () => {
+  // The entrypoint resolves the effective pane SET (--session / detected / null)
+  // and passes it in; here [%1] is the resolved scope.
   const out = selectHistory(
     sample,
     {
@@ -88,9 +97,27 @@ test('selectHistory: list, default user direction, scoped to pane %1, oldest→n
       json: false,
       regex: false,
     },
-    '%1',
+    ['%1'],
   );
   expect(out.map((r) => r.message_id)).toEqual([10]); // only user+%1
+});
+
+test('selectHistory: a multi-pane set (window→several panes) unions across them', () => {
+  const out = selectHistory(
+    sample,
+    {
+      kind: 'query',
+      direction: 'user',
+      action: 'list',
+      allSessions: false,
+      limit: 20,
+      full: false,
+      json: false,
+      regex: false,
+    },
+    ['%1', '%2'],
+  );
+  expect(out.map((r) => r.message_id)).toEqual([10, 12]); // user rows across %1 and %2
 });
 
 test('selectHistory: limit keeps the LAST N but renders oldest→newest', () => {
