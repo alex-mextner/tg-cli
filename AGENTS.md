@@ -148,12 +148,19 @@ tests can pass fakes.
 
 - **Message history & recall (`tg replies`, v1.11.0):** an append-only JSONL log at
   `tg-ctl.<botid>.history.jsonl` (path added to `CtlPaths`, next to `routes`) records one
-  `{ts, message_id, direction, from, text, pane}` object per line. TWO writers, both best-effort
-  (a corrupt/unwritable log NEVER breaks a send or an inject, exactly like `routes`): the `tg-ctl`
-  poll loop appends every inbound message it processes (stamped with the routed target pane), and
-  `tg` appends one `agent` record per OUTBOUND Telegram message_id (stamped with `$TMUX_PANE`) —
-  a >4096 split or a media-group album emits several ids for one logical send, and each gets its
-  own record (same text) so a reply anchored to any of them stays recall-able (tg-cli#131).
+  `{ts, message_id, direction, from, text, pane, groupId?}` object per line. TWO writers, both
+  best-effort (a corrupt/unwritable log NEVER breaks a send or an inject, exactly like `routes`):
+  the `tg-ctl` poll loop appends every inbound message it processes (stamped with the routed
+  target pane), and `tg` appends one `agent` record per OUTBOUND Telegram message_id (stamped
+  with `$TMUX_PANE`) — a >4096 split or a media-group album emits several ids for one logical
+  send, and each gets its own record (same text) so a reply anchored to any of them stays
+  recall-able (tg-cli#131). Every sibling of such a multi-part send shares a `groupId` (a random
+  per-send token, NOT the group's first id — Telegram message_id is sequential PER CHAT, so
+  reusing it as the key could collide across two chats sharing one bot's history file) — `tg
+  replies` groups by it so `-n`/`--limit` counts logical sends (not raw records, for BOTH the
+  plain listing and `--json`, and never truncates a kept send mid-group); the plain listing
+  additionally collapses each group to one line, while `--json` always returns every id of the
+  kept sends uncollapsed (tg-cli#131 follow-up, closes #134).
   The file is trimmed to its last ~5000 lines on each write. `tg replies` defaults to the CURRENT
   pane's session + `user` direction ("recall what the user wrote"); `--all-sessions`/`--session`
   override scope — `--session` takes a tmux WINDOW NAME (`--session ext`, exact match → the pane

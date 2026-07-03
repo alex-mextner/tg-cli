@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import {
+  collapseMultiPartSends,
   filterByDirection,
   filterByPanes,
   filterBySince,
@@ -136,6 +137,38 @@ test('selectHistory: limit keeps the LAST N but renders oldest→newest', () => 
   expect(out.map((r) => r.message_id)).toEqual([7, 8, 9]); // last 3, ascending
 });
 
+test('selectHistory: limit counts a multi-part send as ONE, never truncates it mid-send', () => {
+  // Two single-record sends, then a 3-record multi-part send (shared
+  // groupId — a >4096 split or an album, review: tg-cli#131 follow-up), then
+  // one more single-record send: 6 raw records, 4 LOGICAL sends. `-n 2` must
+  // keep the last 2 SENDS (the multi-part one + the final one) — 4 raw
+  // records — not the last 2 RAW records (which would slice the multi-part
+  // group in half and strand a non-first id as its "first").
+  const records: HistoryRecord[] = [
+    R({ ts: 1000, message_id: 1, direction: 'agent', from: 'agent', text: 'a', pane: '%1' }),
+    R({ ts: 2000, message_id: 2, direction: 'agent', from: 'agent', text: 'b', pane: '%1' }),
+    R({ ts: 3000, message_id: 201, groupId: 'grp-201', direction: 'agent', from: 'agent', text: 'long', pane: '%1' }),
+    R({ ts: 3000, message_id: 202, groupId: 'grp-201', direction: 'agent', from: 'agent', text: 'long', pane: '%1' }),
+    R({ ts: 3000, message_id: 203, groupId: 'grp-201', direction: 'agent', from: 'agent', text: 'long', pane: '%1' }),
+    R({ ts: 4000, message_id: 4, direction: 'agent', from: 'agent', text: 'd', pane: '%1' }),
+  ];
+  const out = selectHistory(records, {
+    kind: 'query',
+    direction: 'agent',
+    action: 'list',
+    allSessions: true,
+    limit: 2,
+    full: false,
+    json: false,
+    regex: false,
+  });
+  // All 3 multi-part ids survive (not truncated) + the final single send.
+  expect(out.map((r) => r.message_id)).toEqual([201, 202, 203, 4]);
+  // The plain listing still collapses to exactly 2 lines, first id 201 (not
+  // 202/203 — the group was never cut, so "first id" holds).
+  expect(collapseMultiPartSends(out).map((r) => r.message_id)).toEqual([201, 4]);
+});
+
 test('selectHistory: find applies the query after direction + pane scoping', () => {
   const out = selectHistory(sample, {
     kind: 'query',
@@ -149,6 +182,32 @@ test('selectHistory: find applies the query after direction + pane scoping', () 
     regex: false,
   });
   expect(out.map((r) => r.message_id)).toEqual([10, 11]);
+});
+
+test('selectHistory: find keeps a matching multi-part group ATOMIC — every id survives, none stranded', () => {
+  // search is the most nontrivial filter (a computed match, not a plain
+  // field compare) — the group-atomicity invariant `groupMultiPartSends`
+  // relies on holds here too, since siblings share `text` (search matches
+  // or misses ALL of them identically). Guards against a future search
+  // implementation that could inspect a per-record field instead of `text`.
+  const albumSiblings: HistoryRecord[] = [
+    R({ ts: 1700000300, message_id: 301, groupId: 'grp-301', direction: 'agent', from: 'agent', text: '[3 photos]', pane: '%2' }),
+    R({ ts: 1700000300, message_id: 302, groupId: 'grp-301', direction: 'agent', from: 'agent', text: '[3 photos]', pane: '%2' }),
+    R({ ts: 1700000300, message_id: 303, groupId: 'grp-301', direction: 'agent', from: 'agent', text: '[3 photos]', pane: '%2' }),
+  ];
+  const out = selectHistory([...sample, ...albumSiblings], {
+    kind: 'query',
+    direction: 'agent',
+    action: 'find',
+    query: 'photos',
+    allSessions: true,
+    limit: 20,
+    full: false,
+    json: false,
+    regex: false,
+  });
+  expect(out.map((r) => r.message_id)).toEqual([301, 302, 303]); // whole group, no id dropped
+  expect(collapseMultiPartSends(out).map((r) => r.message_id)).toEqual([301]); // one line
 });
 
 test('formatLine: user line shape `[YYYY-MM-DD HH:MM] #id text` with no marker for single-direction', () => {
@@ -236,6 +295,88 @@ test('buildJsonOutput: machine shape (ts ms, id, direction, from, text, pane)', 
 test('buildJsonOutput: ts is epoch MS (history stores seconds)', () => {
   const json = buildJsonOutput([R({ ts: 1700000000, message_id: 1 })]);
   expect(json[0].ts).toBe(1700000000 * 1000);
+});
+
+// collapseMultiPartSends (review: tg-cli#131 fix's own follow-up regression —
+// buildOutboundHistoryRecords now writes one record per outbound id, tagged
+// with a shared `groupId`, so the plain listing must collapse them back to
+// one line per logical send).
+
+test('collapseMultiPartSends: a >4096-split send (3 ids, same groupId) collapses to ONE record', () => {
+  const parts = [
+    R({ ts: 1700000000, message_id: 201, groupId: 'grp-201', direction: 'agent', from: 'agent', text: 'long report', pane: '%1' }),
+    R({ ts: 1700000000, message_id: 202, groupId: 'grp-201', direction: 'agent', from: 'agent', text: 'long report', pane: '%1' }),
+    R({ ts: 1700000000, message_id: 203, groupId: 'grp-201', direction: 'agent', from: 'agent', text: 'long report', pane: '%1' }),
+  ];
+  const out = collapseMultiPartSends(parts);
+  expect(out.length).toBe(1);
+  expect(out[0].message_id).toBe(201); // first id — matches the pre-fix single-record behavior
+});
+
+test('collapseMultiPartSends: distinct sends (different text) are never merged', () => {
+  const out = collapseMultiPartSends(sample);
+  expect(out.length).toBe(sample.length); // none of `sample`'s records carry a groupId
+});
+
+test('collapseMultiPartSends: two DIFFERENT messages sent in the SAME second with IDENTICAL text are NEVER merged', () => {
+  // The exact false-positive the old ts/text/pane-equality heuristic risked
+  // (review: tg-cli#131 follow-up) — e.g. the agent sends "ok" twice in one
+  // second via two separate `tg` invocations. Neither is part of a real
+  // multi-part send, so NEITHER carries a groupId — grouping must not merge
+  // them just because every other field happens to match.
+  const records = [
+    R({ ts: 5000, message_id: 1, direction: 'agent', from: 'agent', text: 'ok', pane: '%1' }), // no groupId
+    R({ ts: 5000, message_id: 2, direction: 'agent', from: 'agent', text: 'ok', pane: '%1' }), // no groupId
+  ];
+  const out = collapseMultiPartSends(records);
+  expect(out.map((r) => r.message_id)).toEqual([1, 2]); // both survive — NOT collapsed
+});
+
+test('collapseMultiPartSends: two unrelated real multi-part sends (different groupIds) stay separate', () => {
+  const records = [
+    R({ ts: 1000, message_id: 1, groupId: 'grp-1', direction: 'agent', from: 'agent', text: 'ok', pane: '%1' }),
+    R({ ts: 1000, message_id: 2, groupId: 'grp-1', direction: 'agent', from: 'agent', text: 'ok', pane: '%1' }),
+    R({ ts: 2000, message_id: 3, groupId: 'grp-3', direction: 'agent', from: 'agent', text: 'ok', pane: '%1' }),
+    R({ ts: 2000, message_id: 4, groupId: 'grp-3', direction: 'agent', from: 'agent', text: 'ok', pane: '%1' }),
+  ];
+  const out = collapseMultiPartSends(records);
+  expect(out.map((r) => r.message_id)).toEqual([1, 3]); // one line per group
+});
+
+test('collapseMultiPartSends: two DIFFERENT chats sharing one bot history, coincidentally starting at the SAME Telegram message_id, stay separate', () => {
+  // Telegram message_id is sequential PER CHAT — a bot in two different
+  // chats can see both chats' multi-part sends start at the same id (e.g.
+  // both albums' first item happens to be #301). The history file is keyed
+  // by bot, not by chat, so these could land adjacent. A groupId DERIVED
+  // from the first message_id would collide here; the caller-supplied
+  // random token does not (review: tg-cli#131 follow-up).
+  const records = [
+    R({ ts: 1000, message_id: 301, groupId: 'random-token-chatA', direction: 'agent', from: 'agent', text: 'album A', pane: null }),
+    R({ ts: 1000, message_id: 302, groupId: 'random-token-chatA', direction: 'agent', from: 'agent', text: 'album A', pane: null }),
+    R({ ts: 1000, message_id: 301, groupId: 'random-token-chatB', direction: 'agent', from: 'agent', text: 'album A', pane: null }),
+    R({ ts: 1000, message_id: 302, groupId: 'random-token-chatB', direction: 'agent', from: 'agent', text: 'album A', pane: null }),
+  ];
+  // Note: identical ts/text/pane across BOTH sends (worst case) — only the
+  // groupId distinguishes them, which is exactly the point of this test.
+  const out = collapseMultiPartSends(records);
+  expect(out.length).toBe(2); // NOT merged into one — two logical sends survive
+});
+
+test('collapseMultiPartSends: empty input → empty output', () => {
+  expect(collapseMultiPartSends([])).toEqual([]);
+});
+
+test('collapseMultiPartSends: --json (buildJsonOutput on the UN-collapsed input) still exposes every id', () => {
+  const parts = [
+    R({ ts: 1700000300, message_id: 301, groupId: 'grp-301', direction: 'agent', from: 'agent', text: '[3 photos]', pane: '%2' }),
+    R({ ts: 1700000300, message_id: 302, groupId: 'grp-301', direction: 'agent', from: 'agent', text: '[3 photos]', pane: '%2' }),
+    R({ ts: 1700000300, message_id: 303, groupId: 'grp-301', direction: 'agent', from: 'agent', text: '[3 photos]', pane: '%2' }),
+  ];
+  // The JSON path must NOT collapse — a reply to the album's 2nd item (302)
+  // has to be findable via `select(.id == 302)`.
+  expect(buildJsonOutput(parts).map((r) => r.id)).toEqual([301, 302, 303]);
+  // While the plain-listing path DOES collapse to one line.
+  expect(collapseMultiPartSends(parts).length).toBe(1);
 });
 
 // filterBySince / filterByUntil

@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { runReplies, type RepliesCliDeps } from '../features/replies/cli';
 import { serializeHistoryRecord, type HistoryRecord } from '../features/replies/history';
+import { buildOutboundHistoryRecords } from '../features/replies/outbound';
 
 const rec = (over: Partial<HistoryRecord>): HistoryRecord => ({
   ts: 1700000000,
@@ -179,4 +180,58 @@ test('runReplies: -n limits the rendered count', () => {
   });
   runReplies(['replies', 'user', '-n', '2'], deps);
   expect(out.map((l) => l.split('#')[1].split(' ')[0])).toEqual(['3', '4']); // last 2
+});
+
+// tg-cli#131 follow-up: buildOutboundHistoryRecords writes one history record
+// per outbound message_id (a >4096 split / media-group album), tagged with a
+// shared groupId, so the plain listing must collapse them back to ONE line —
+// otherwise a single logical send would print N times (review caught this on
+// the initial fix). Built via the REAL production function (not hand-rolled
+// records) so this exercises the actual groupId the write path stamps.
+test('runReplies: a multi-part send (3 ids) prints as ONE line in the plain listing', () => {
+  const multiPart = buildOutboundHistoryRecords([301, 302, 303], '[3 photos]', 1700000300, '%3', 'grp-token');
+  const { deps, out } = makeDeps({
+    readHistory: () => multiPart.map(serializeHistoryRecord).join('\n'),
+    detectPane: () => '%3',
+  });
+  runReplies(['replies', 'agent'], deps);
+  expect(out).toEqual(['[T] #301 [3 photos]']); // ONE line, not three
+});
+
+// The SAME multi-part history, but --json: every id must stay individually
+// present so a reply anchored to id 302 (the album's 2nd item) is findable
+// via `select(.id == 302)` — the exact scenario the review comment reported.
+test('runReplies: --json exposes EVERY id of a multi-part send, uncollapsed', () => {
+  const multiPart = buildOutboundHistoryRecords([301, 302, 303], '[3 photos]', 1700000300, '%3', 'grp-token');
+  const { deps, out } = makeDeps({
+    readHistory: () => multiPart.map(serializeHistoryRecord).join('\n'),
+    detectPane: () => '%3',
+  });
+  runReplies(['replies', 'agent', '--json'], deps);
+  const rows = JSON.parse(out[0]) as Array<{ id: number | null }>;
+  const secondAlbumItem = rows.find((r) => r.id === 302); // the reported bug case
+  expect(secondAlbumItem).toBeDefined();
+  expect(rows.map((r) => r.id)).toEqual([301, 302, 303]);
+});
+
+// `-n`/`--limit` now counts LOGICAL sends, not raw records — for `--json`
+// too, not only the plain listing. Three sends: two single-record, then a
+// 3-id multi-part send in the tail. `-n 2` keeps the LAST 2 SENDS (send #2 +
+// the multi-part one) = 4 raw records, so `--json -n 2` returns 4 rows, not
+// 2 — a documented contract change for any consumer that assumed
+// `--json -n N` caps the row count at N. The oldest send (#1) is correctly
+// dropped entirely.
+test('runReplies: --json -n 2 keeps a tail multi-part send WHOLE (4 rows, not 2)', () => {
+  const history = [
+    ...buildOutboundHistoryRecords([99], 'oldest — dropped by -n 2', 1699999900, '%3', 'unused'),
+    ...buildOutboundHistoryRecords([100], 'kept single', 1700000000, '%3', 'unused'),
+    ...buildOutboundHistoryRecords([301, 302, 303], '[3 photos]', 1700000300, '%3', 'grp-token'),
+  ];
+  const { deps, out } = makeDeps({
+    readHistory: () => history.map(serializeHistoryRecord).join('\n'),
+    detectPane: () => '%3',
+  });
+  runReplies(['replies', 'agent', '--json', '-n', '2'], deps);
+  const rows = JSON.parse(out[0]) as Array<{ id: number | null }>;
+  expect(rows.map((r) => r.id)).toEqual([100, 301, 302, 303]); // 2 sends, tail send whole
 });

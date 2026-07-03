@@ -48,14 +48,40 @@ export function outboundHistoryText(body: string, attach: OutboundAttachments): 
 // retry, a defensive double-record) still logs exactly one history row per
 // real Telegram message, matching routes.ts's own dedupe-by-id invariant
 // (appendRoute) instead of a naive push.
+//
+// A TRUE multi-part send (2+ ids) stamps every sibling record with `groupId`,
+// so `select.ts`'s reader can reconstruct "these N records are ONE logical
+// send" from an authoritative write-time marker instead of guessing from
+// coincidental field equality (same ts/text/pane) — the latter would wrongly
+// merge two genuinely different messages sent in the same second with
+// identical text (review: tg-cli#131 follow-up, closes #134). `groupId` is a
+// CALLER-SUPPLIED opaque token (`tg` passes crypto.randomUUID()), not derived
+// from `message_id`: Telegram's message_id is sequential PER CHAT, so reusing
+// the first id as the group key could collide across two different chats
+// sharing one bot's history file (same botId, different TG_CHAT_ID configs)
+// — a random token makes that collision probability negligible regardless
+// of chat topology. Keeping the token an injected parameter (like `ts`) —
+// rather than generating it here with crypto.randomUUID() — keeps this
+// function pure and deterministic for tests. A single-record send gets no
+// groupId — nothing to group it with, so the token is simply unused.
 export function buildOutboundHistoryRecords(
   outboundIds: number[],
   text: string,
   ts: number,
   pane: string,
+  groupToken: string,
 ): HistoryRecord[] {
   const uniqueIds = [...new Set(outboundIds)];
   const ids: (number | null)[] = uniqueIds.length > 0 ? uniqueIds : [null];
+  // An empty token is treated the same as "no token" — symmetric with
+  // history.ts's parseLine, which coerces a stored `groupId: ''` to
+  // undefined for the exact same reason: groupMultiPartSends' adjacency
+  // check (`r.groupId !== undefined && prev?.groupId === r.groupId`) would
+  // otherwise let two records both carrying `groupId: ''` wrongly satisfy
+  // it and merge. crypto.randomUUID() never produces '', but a caller
+  // passing an empty string by mistake shouldn't silently create a false
+  // grouping key.
+  const groupId = uniqueIds.length > 1 && groupToken !== '' ? groupToken : undefined;
   return ids.map((message_id) => ({
     ts,
     message_id,
@@ -63,5 +89,6 @@ export function buildOutboundHistoryRecords(
     from: 'agent',
     text,
     pane,
+    ...(groupId !== undefined ? { groupId } : {}),
   }));
 }

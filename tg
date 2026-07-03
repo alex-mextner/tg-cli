@@ -2,6 +2,9 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join, resolve } from "path"
+// Explicit import (not the global `crypto`) so the multi-part groupId token
+// doesn't depend on a runtime global being present — review: tg-cli#131 f/u.
+import { randomUUID } from "node:crypto"
 import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
 import {
   applyFeatureFlags,
@@ -1039,7 +1042,17 @@ if (import.meta.main) {
     const text = outboundHistoryText(body, { photos: plan.photos.length, documents: plan.documents.length })
     if (text === null) return
     try {
-      const recs = buildOutboundHistoryRecords(outboundIds, text, Math.floor(Date.now() / 1000), TMUX_PANE)
+      // randomUUID() only actually lands in a record when the send is truly
+      // multi-part (buildOutboundHistoryRecords ignores it otherwise) — a
+      // random token, not the group's first id, so it can't collide across
+      // two different chats sharing this bot's history file (tg-cli#131 f/u).
+      const recs = buildOutboundHistoryRecords(
+        outboundIds,
+        text,
+        Math.floor(Date.now() / 1000),
+        TMUX_PANE,
+        randomUUID(),
+      )
       // 0o600: the log is a conversation transcript — owner-only, like the daemon socket.
       writeFileSync(
         HISTORY_PATH,

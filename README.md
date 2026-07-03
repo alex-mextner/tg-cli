@@ -259,9 +259,12 @@ $ tg replies
   after / at or before the date (both inclusive). A date is an ISO date
   (`2026-06-28`, midnight UTC), an ISO datetime (`2026-06-28T10:00`, UTC), or
   relative (`3d` / `24h` — N days or hours ago from now).
-- `-n/--limit N` (default 20), `--full` (no truncation), `--json` (a
-  machine-readable array: `ts` ms, `id`, `direction`, `from`, `text`, `pane`),
-  `--help`.
+- `-n/--limit N` (default 20, counts SENDS not raw rows — a >4096-char split
+  or a media-group album is one send, never truncated mid-send), `--full`
+  (no truncation), `--json` (a machine-readable array: `ts` ms, `id`,
+  `direction`, `from`, `text`, `pane` — one row per Telegram message_id, so
+  a multi-part send is several rows and `--json -n N` can return more than N
+  rows), `--help`.
 
 ```
 tg replies all                  # the full back-and-forth in this session
@@ -270,7 +273,7 @@ tg replies user find deploy     # your messages mentioning "deploy"
 tg replies agent --all-sessions # everything the agent has sent, anywhere
 tg replies user --since 3d      # your messages in the last 3 days
 tg replies all --since 2026-06-28 --until 2026-06-30  # a date range
-tg replies --json -n 5          # the last 5, as JSON
+tg replies --json -n 5          # the last 5 sends, as JSON
 ```
 
 History is an append-only `~/.config/tg-cli/tg-ctl.<botid>.history.jsonl` (one

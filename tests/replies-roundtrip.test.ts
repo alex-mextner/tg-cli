@@ -86,7 +86,7 @@ test('outbound writer (multi-id) → file → a NON-FIRST id is recall-able via 
 
   const text = outboundHistoryText('', { photos: 3, documents: 0 });
   expect(text).not.toBeNull();
-  const recs = buildOutboundHistoryRecords([301, 302, 303], text!, 1700000300, '%4');
+  const recs = buildOutboundHistoryRecords([301, 302, 303], text!, 1700000300, '%4', 'grp-token');
   writeFileSync(file, appendRecordsToBlob(null, recs));
 
   const out: string[] = [];
@@ -102,6 +102,34 @@ test('outbound writer (multi-id) → file → a NON-FIRST id is recall-able via 
   const rows = JSON.parse(out[0]) as Array<{ id: number | null; text: string }>;
   const secondAlbumItem = rows.find((r) => r.id === 302); // the reported bug case
   expect(secondAlbumItem?.text).toBe('[3 photos]');
+});
+
+// Same multi-part write, but the PLAIN (non-JSON) listing: proves `groupId`
+// survives the REAL disk round-trip (writeFileSync → appendRecordsToBlob →
+// readFileSync → parseHistory → collapseMultiPartSends), not just the
+// hand-called serializeHistoryRecord path tests/replies-cli.test.ts exercises.
+// If appendRecordsToBlob's serializer ever dropped groupId, this would fail
+// with 3 lines instead of 1 (review: tg-cli#131 follow-up, tg-cli#134).
+test('outbound writer (multi-id) → file → plain listing collapses to ONE line', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tg-replies-'));
+  const file = join(dir, 'history.jsonl');
+
+  const text = outboundHistoryText('', { photos: 3, documents: 0 });
+  expect(text).not.toBeNull();
+  const recs = buildOutboundHistoryRecords([301, 302, 303], text!, 1700000300, '%4', 'grp-token');
+  writeFileSync(file, appendRecordsToBlob(null, recs));
+
+  const out: string[] = [];
+  const code = runReplies(['replies', 'agent'], {
+    readHistory: () => readFileSync(file, 'utf8'),
+    detectPane: () => '%4',
+    resolveWindow: () => [],
+    fmtTime: () => 'T',
+    log: (m) => out.push(m),
+    errlog: () => {},
+  });
+  expect(code).toBe(0);
+  expect(out).toEqual(['[T] #301 [3 photos]']); // ONE line, not three
 });
 
 test('both writers append to the SAME file; `all` shows the conversation in order', () => {
