@@ -3,6 +3,27 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.25.1
+
+**Fix (HYP-891): remove the `pre-send-photo` full-window-screenshot block.**
+
+- Removed `looks_like_vscode_window()` from
+  `features/hooks/review-descriptor/pre_send_photo.py` — the pixel heuristic that
+  hard-blocked EVERY full VS Code window screenshot (dark, uniform left activity-bar
+  strip) regardless of whether the content inside it was actually broken. Added
+  2026-07-01 (commit `87b4522`) to force cropped preview-pane proofs; superseded by
+  Alex's 2026-07-03 standard (tg#6041) that full-window screenshots with
+  Explorer/Inspector/Logs panels visible ARE the desired HyperIDE diagnostic proof
+  format. The heuristic false-positived on legitimate full-window proofs at least
+  twice in one day before removal — done at Alex's explicit direction (tg#6063/6064).
+- `review visual --strict` (a vision-model verdict on the actual image content)
+  remains the only gate left for a full-window send. Whether it reliably catches a
+  broken/unstyled preview pane diluted behind busy editor chrome is UNVERIFIED —
+  this is a known, accepted tradeoff, not a proven equivalent replacement. See the
+  comment in `pre_send_photo.py` and HYP-891 for the follow-up if this needs
+  strengthening later (e.g. a targeted vision check module scoped to the preview
+  region instead of the whole window).
+
 ## 1.25.0
 
 **Feature (tg-cli#121): `tg replies --session` accepts a tmux WINDOW NAME, not only a pane id.**
