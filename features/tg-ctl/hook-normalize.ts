@@ -7,13 +7,15 @@
 // environment (TMUX_PANE / cwd / tmux session) for the routing fields. PURE: the
 // entrypoint reads stdin + env and calls in here.
 //
-// Supported today: Claude Code PreToolUse `AskUserQuestion` (single,
-// non-multiSelect, concrete options), Claude Code PreToolUse `ExitPlanMode`
-// (plan-approval — a harness BLOCKING prompt mirrored as Proceed/Keep planning
-// buttons; ROADMAP "Forward harness confirmation / permission prompts to TG"),
-// and Claude Code / Codex `PermissionRequest`. Anything else returns null → the
-// hook emits nothing and the local agent UI takes over (multi-question /
-// multiSelect / free-form fall back on purpose).
+// Supported today: Claude Code PreToolUse `AskUserQuestion` (1-4 questions,
+// non-multiSelect, concrete options — a multi-question call becomes ONE
+// ButtonRequest PER question via normalizeHookRequests, and the ask client
+// composes the collected answers into a single hook reply; tg#5741), Claude
+// Code PreToolUse `ExitPlanMode` (plan-approval — a harness BLOCKING prompt
+// mirrored as Proceed/Keep planning buttons; ROADMAP "Forward harness
+// confirmation / permission prompts to TG"), and Claude Code / Codex
+// `PermissionRequest`. Anything else returns null → the hook emits nothing and
+// the local agent UI takes over (multiSelect / free-form fall back on purpose).
 
 import type { AgentKind } from './types';
 import type { ButtonOption, ButtonRequest, ButtonRequestKind, DecisionLabels } from './questions';
@@ -103,6 +105,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       decisionLabels: readDecisionLabels(p.decisionLabels),
       permissionEvent: p.permissionEvent === 'PreToolUse' ? 'PreToolUse' : undefined,
       toolInput: asRecord(p.toolInput) ?? undefined,
+      multiQuestion: p.multiQuestion === true ? true : undefined,
       paneId: typeof p.paneId === 'string' ? p.paneId : env.paneId,
       cwd: typeof p.cwd === 'string' ? p.cwd : env.cwd,
       sessionName: typeof p.sessionName === 'string' ? p.sessionName : env.sessionName,
@@ -114,26 +117,12 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
   const input = asRecord(p.tool_input);
   const toolName = typeof p.tool_name === 'string' ? p.tool_name : '';
 
-  // Claude Code AskUserQuestion → a single concrete question with options.
+  // Claude Code AskUserQuestion → one question request per concrete question
+  // (the single-request contract of THIS function keeps only the 1-question
+  // case; normalizeHookRequests exposes the full 1-4 set to the ask client).
   if (toolName === 'AskUserQuestion' && input) {
-    // AskUserQuestion is forwarded ONLY via its dedicated PreToolUse matcher. The
-    // `PermissionRequest *` catch-all (hook-install.ts) ALSO fires for it and
-    // re-normalizes to the SAME stable requestId. Once the PreToolUse card is
-    // answered the in-flight dedup key is freed, so this PermissionRequest copy
-    // would post a SECOND, superseded card whose tap reads as "expired" (tg-cli#97).
-    // Drop the PermissionRequest-delivered copy so exactly one hook forwards each
-    // AskUserQuestion. (Manual / back-compat callers leave hook_event_name unset
-    // and still pass through.)
-    if (p.hook_event_name === 'PermissionRequest') return null;
-    const questions = input.questions;
-    if (!Array.isArray(questions) || questions.length !== 1) return null; // multi-question → local UI
-    const q = asRecord(questions[0]);
-    if (!q || typeof q.question !== 'string') return null;
-    if (q.multiSelect === true) return null; // multi-select → local UI (single-tap model)
-    const options = readOptions(q.options);
-    if (!options) return null; // free-form → local UI
-    const title = typeof q.header === 'string' ? q.header : undefined;
-    return build(env, 'question', `${session}:q:${q.question}`, q.question, title, options, cwd);
+    const reqs = normalizeAskUserQuestions(p, env);
+    return reqs && reqs.length === 1 ? reqs[0] : null;
   }
 
   // ExitPlanMode → plan-approval: a harness BLOCKING prompt ("the plan is ready,
@@ -176,6 +165,81 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
   }
 
   return null;
+}
+
+// Normalize a RAW payload into the FULL set of ButtonRequests it forwards as —
+// identical to normalizeHookPayload for everything except a Claude Code
+// AskUserQuestion with 2-4 questions, which becomes one request per question
+// (each carrying the whole original tool_input, each with its own stable
+// per-question requestId so replay/reconnect dedup keeps working). The ask
+// client posts them as SEQUENTIAL cards and composes ONE combined hook reply
+// from the collected answers (tg#5741 — a multi-question call used to bail to
+// the local UI, whose flow ends on an extra manual Enter).
+export function normalizeHookRequests(payload: unknown, env: HookEnv): ButtonRequest[] | null {
+  const p = asRecord(payload);
+  if (!p) return null;
+  if (typeof p.tool_name === 'string' && p.tool_name === 'AskUserQuestion' && asRecord(p.tool_input)) {
+    return normalizeAskUserQuestions(p, env);
+  }
+  const single = normalizeHookPayload(payload, env);
+  return single ? [single] : null;
+}
+
+// The AskUserQuestion branch shared by normalizeHookPayload (1 question) and
+// normalizeHookRequests (1-4 questions). ALL-OR-NOTHING: any multiSelect or
+// option-less (free-form) question bails the whole call to the local UI — a
+// partially-forwarded call could only produce a partial answers record, which
+// the reply path must never emit (see collectQuestionAnswers).
+function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): ButtonRequest[] | null {
+  const input = asRecord(p.tool_input);
+  if (!input) return null;
+  // AskUserQuestion is forwarded ONLY via its dedicated PreToolUse matcher. The
+  // `PermissionRequest *` catch-all (hook-install.ts) ALSO fires for it and
+  // re-normalizes to the SAME stable requestId. Once the PreToolUse card is
+  // answered the in-flight dedup key is freed, so this PermissionRequest copy
+  // would post a SECOND, superseded card whose tap reads as "expired" (tg-cli#97).
+  // Drop the PermissionRequest-delivered copy so exactly one hook forwards each
+  // AskUserQuestion. (Manual / back-compat callers leave hook_event_name unset
+  // and still pass through.)
+  if (p.hook_event_name === 'PermissionRequest') return null;
+  const questions = input.questions;
+  // 4 = the tool's own schema cap; anything beyond is malformed → local UI.
+  if (!Array.isArray(questions) || questions.length < 1 || questions.length > 4) return null;
+  // Duplicate question texts (the tool's schema refines them unique) would
+  // collide the per-question requestIds AND collapse the answers record (both
+  // are keyed by question text) — a malformed payload, so: local UI.
+  const texts = questions.map((q) => asRecord(q)?.question);
+  if (new Set(texts).size !== texts.length) return null;
+  const cwd = typeof p.cwd === 'string' ? p.cwd : undefined;
+  const session = typeof p.session_id === 'string' ? p.session_id.slice(0, 8) : '';
+  const out: ButtonRequest[] = [];
+  for (const rawQuestion of questions) {
+    const q = asRecord(rawQuestion);
+    if (!q || typeof q.question !== 'string') return null;
+    if (q.multiSelect === true) return null; // multi-select → local UI (single-tap model)
+    const options = readOptions(q.options);
+    if (!options) return null; // free-form → local UI
+    const header = typeof q.header === 'string' ? q.header : undefined;
+    // A (i/N) progress suffix so the human sees more cards are coming and the
+    // agent stays blocked until the LAST one is answered.
+    const title = questions.length > 1 ? `${header ?? 'Question'} (${out.length + 1}/${questions.length})` : header;
+    // The id seed includes the ORDERED option labels, not just the question
+    // text: reconnect re-attach and answered-replay both key on this id, and a
+    // LATER call re-asking the same text with DIFFERENT options must get a
+    // fresh id (a stale retained card's buttons would otherwise resolve by
+    // index against the new options — review finding). A true re-fire of the
+    // same call keeps the same id, so tg-cli#97 dedup/replay is unchanged.
+    const seed = `${session}:q:${q.question}:${options.map((o) => o.label).join('\u001F')}`;
+    const req = build(env, 'question', seed, q.question, title, options, cwd);
+    // Carried so the answer envelope can echo the original input (schema-valid
+    // wholesale) instead of a lossy rebuild — see buildClaudeQuestionAnswerOutput.
+    req.toolInput = input;
+    // A set member's lone answer must never late-deliver into the pane
+    // (all-or-nothing) — see ButtonRequest.multiQuestion.
+    if (questions.length > 1) req.multiQuestion = true;
+    out.push(req);
+  }
+  return out;
 }
 
 // Bound the plan body so the forwarded prompt stays well inside Telegram's

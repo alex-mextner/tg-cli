@@ -56,12 +56,16 @@ import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-command
 import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, readPidFile } from "./features/tg-ctl/lock"
 import {
   buildButtonMessage,
+  buildClaudeQuestionAnswerOutput,
   callbackRequestId,
+  collectQuestionAnswers,
   formatAgentHookOutput,
   questionCapability,
   registrationSetAllowsHook,
+  repairClaudeQuestionReply,
   resolveButtonCallback,
   type ButtonAnswer,
+  type ButtonMessagePayload,
   type ButtonRequest,
   type PermissionDecision,
 } from "./features/tg-ctl/questions"
@@ -77,7 +81,7 @@ import {
   upsertRegistration,
 } from "./features/tg-ctl/registration-store"
 import { claudeHooksInstalled, withClaudeHooks } from "./features/tg-ctl/hook-install"
-import { normalizeHookPayload, type HookEnv } from "./features/tg-ctl/hook-normalize"
+import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
   aggregateUsage,
@@ -368,8 +372,18 @@ async function answerCallbackQuery(ctx: Ctx, callbackQueryId: string, text: stri
   await botPost(ctx, "answerCallbackQuery", { callback_query_id: callbackQueryId, text })
 }
 
-async function editMessageText(ctx: Ctx, messageId: number, text: string): Promise<void> {
-  await botPost(ctx, "editMessageText", { chat_id: ctx.chatId, message_id: messageId, text })
+// NOTE: Telegram's editMessageText REPLACES the whole inline keyboard — omitting
+// reply_markup detaches it. Pass the markup whenever the edited card must stay
+// tappable (e.g. restoring a re-attached question card to its live prompt).
+async function editMessageText(
+  ctx: Ctx,
+  messageId: number,
+  text: string,
+  replyMarkup?: ButtonMessagePayload["reply_markup"],
+): Promise<void> {
+  const body: Record<string, unknown> = { chat_id: ctx.chatId, message_id: messageId, text }
+  if (replyMarkup) body.reply_markup = replyMarkup
+  await botPost(ctx, "editMessageText", body)
 }
 
 // Remove the inline keyboard from a previously-sent message (forum-topics increment 4): after a
@@ -1395,6 +1409,15 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
   // permissionDecision; PermissionRequest → decision.behavior). Default
   // PermissionRequest preserves the pre-existing reply for older payloads.
   const permissionEvent = rec.permissionEvent === "PreToolUse" ? "PreToolUse" : undefined
+  // The original tool_input MUST survive the socket boundary: a PreToolUse
+  // ALLOW (ExitPlanMode Proceed, claude question) echoes it as `updatedInput`,
+  // and the live hooks docs say "allow alone is not sufficient" for the
+  // user-interactive tools — dropping it here silently downgraded the reply to
+  // a bare allow (tg#5741 review finding).
+  const toolInput =
+    rec.toolInput && typeof rec.toolInput === "object" && !Array.isArray(rec.toolInput)
+      ? (rec.toolInput as Record<string, unknown>)
+      : undefined
 
   return {
     requestId,
@@ -1409,6 +1432,11 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     options,
     decisionLabels,
     permissionEvent,
+    toolInput,
+    // Set-member marker: a multi-question sub-answer must never late-deliver
+    // into the pane (all-or-nothing — see ButtonRequest.multiQuestion). Parsed
+    // here so it survives BOTH the socket boundary and the disk restore.
+    multiQuestion: rec.multiQuestion === true ? true : undefined,
   }
 }
 
@@ -1478,6 +1506,12 @@ const ABANDONED_TAP_TEXT = "window closed — tap still delivers your answer to 
 // keyboard stays live so the user can tap once the agent reconnects and the
 // reconnect re-attach delivers the answer down the new socket.
 const ABANDONED_PERMISSION_TEXT = "hook disconnected — tap after the agent reconnects"
+// A multi-question SET MEMBER whose hook socket closed: a lone late answer must
+// NOT inject into the pane (the local multi-question dialog may be on a
+// DIFFERENT question — all-or-nothing, see ButtonRequest.multiQuestion), so the
+// card says the terminal took over. The keyboard stays for reconnect re-attach;
+// a tap without a live socket answers "expired".
+const ABANDONED_MULTI_TEXT = "window closed — answer all questions in the terminal"
 
 // A SCOPED question (with options) or a SCOPED permission can survive socket close:
 // a question still injects into its pane (late-delivery); a permission re-attaches
@@ -1525,7 +1559,11 @@ function armPendingSocketClose(
     rt.activeKeys.delete(pendingKey)
     if (retainAbandonedQuestion(rt, entry, pendingKey)) {
       rt.onAbandon(entry.req.paneId as string)
-      const abandonedText = entry.req.kind === "permission" ? ABANDONED_PERMISSION_TEXT : ABANDONED_TAP_TEXT
+      const abandonedText = entry.req.kind === "permission"
+        ? ABANDONED_PERMISSION_TEXT
+        : entry.req.multiQuestion
+          ? ABANDONED_MULTI_TEXT
+          : ABANDONED_TAP_TEXT
       if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText)
       else entry.finalText = abandonedText
     } else {
@@ -1718,7 +1756,10 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   // is pruned here so it falls through to a fresh forward. Only QUESTIONS are ever
   // cached (the write is kind-guarded), so consult it only for questions — symmetric
   // with the write and immune to a (practically impossible) cross-kind key clash.
-  const prior = req.kind === "question" ? rt.answered.get(pendingKey) : undefined
+  // Multi-question members also skip the replay READ defensively: they are never
+  // written (all-or-nothing, see the answer branch), but an entry persisted by an
+  // older daemon must not replay into a new round either.
+  const prior = req.kind === "question" && !req.multiQuestion ? rt.answered.get(pendingKey) : undefined
   if (prior) {
     if (Date.now() - prior.at <= ANSWERED_REPLAY_MS) {
       if (prior.delivery === "pane") {
@@ -1764,6 +1805,18 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       rt.pending.set(pendingKey, entry)
       armPendingSocketClose(ctx, rt, entry, pendingKey)
       rt.persist()
+      // The card is LIVE again — restore the original prompt text, which the
+      // socket-close path replaced with "window closed …" (actively misleading
+      // for a multi-question member: it tells the user NOT to tap the one card
+      // that now works — review finding). The keyboard rides along explicitly:
+      // Telegram's editMessageText DETACHES the inline keyboard when
+      // reply_markup is omitted. Best-effort like every card edit (a restart-
+      // restored card that was never edited yields "message is not modified",
+      // which botPost swallows).
+      if (retained.messageId !== null) {
+        const restored = buildButtonMessage(ctx.chatId, req)
+        void editMessageText(ctx, retained.messageId, restored.text, restored.reply_markup)
+      }
       log(`ask-forward reattached: ${describeAskRequest(req)} key=${pendingKey} messageId=${retained.messageId ?? "-"}`)
       return
     }
@@ -1838,9 +1891,9 @@ function oneAskAttempt(ctx: Ctx, requestLine: string, timeoutMs: number): Promis
 // restart): a SCOPED question whose daemon restarted (crash-relaunch in ~1s, or a
 // deliberate stop+start) keeps trying until the restored daemon answers — it either
 // re-attaches the still-pending entry (no duplicate card) or replays the stored
-// answer. Bounded by ASK_TOTAL_TIMEOUT_MS; a real "null" decline returns immediately.
-async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string): Promise<string | null> {
-  const deadline = Date.now() + ASK_TOTAL_TIMEOUT_MS
+// answer. Bounded by the caller's deadline (shared across a multi-question
+// sequence); a real "null" decline returns immediately.
+async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string, deadline: number): Promise<string | null> {
   let announcedDrop = false
   for (;;) {
     const remaining = deadline - Date.now()
@@ -1857,6 +1910,23 @@ async function requestHookAnswerWithReconnect(ctx: Ctx, requestLine: string): Pr
   }
 }
 
+// One daemon round-trip for one ButtonRequest, within the caller's deadline.
+// SCOPED questions and SCOPED permissions reconnect-and-resend across a daemon
+// restart: both are retained on socket close (abandoned map + persist), so a
+// resend re-attaches to the existing card rather than posting a duplicate.
+// UNSCOPED requests keep the single-attempt path — they aren't retained (no
+// pane to late-deliver to), so a resend after a restart would post a duplicate
+// card.
+async function askDaemonOnce(ctx: Ctx, req: ButtonRequest, deadline: number): Promise<string | null> {
+  const requestLine = JSON.stringify(req)
+  const reconnectable = Boolean(req.paneId) && (req.kind === "question" || req.kind === "permission")
+  if (reconnectable) return requestHookAnswerWithReconnect(ctx, requestLine, deadline)
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) return null
+  const attempt = await oneAskAttempt(ctx, requestLine, remaining)
+  return attempt.kind === "response" ? attempt.raw : null
+}
+
 async function askDaemon(ctx: Ctx): Promise<void> {
   const input = await readStdinText()
   if (!input.trim()) return
@@ -1867,44 +1937,60 @@ async function askDaemon(ctx: Ctx): Promise<void> {
     return
   }
   // Normalize the harness's raw hook payload (or an already-normalized request)
-  // into a ButtonRequest, filling routing fields from the hook process's own
-  // env. null → unsupported shape; emit nothing so the local agent UI takes over.
+  // into ButtonRequests, filling routing fields from the hook process's own
+  // env. A claude AskUserQuestion with 2-4 questions yields one request PER
+  // question; everything else yields exactly one. null → unsupported shape;
+  // emit nothing so the local agent UI takes over.
   const env: HookEnv = {
     agent: hookAgentFromArgv(),
     paneId: process.env.TMUX_PANE || undefined,
     cwd: process.cwd(),
     sessionName: tmuxSessionName(),
   }
-  const req = normalizeHookPayload(payload, env)
-  if (!req) {
-    // Unsupported payload shape (multi-question / multi-select / free-form / an
-    // event we don't forward). This never reaches the daemon, so the daemon log
-    // can't see it — emit here (hook process stderr) so the drop isn't silent.
+  const reqs = normalizeHookRequests(payload, env)
+  if (!reqs) {
+    // Unsupported payload shape (multi-select / free-form / an event we don't
+    // forward). This never reaches the daemon, so the daemon log can't see it —
+    // emit here (hook process stderr) so the drop isn't silent.
     log(`ask-forward dropped: reason=unsupported-payload agent=${env.agent} pane=${env.paneId ?? "-"} cwd=${env.cwd ?? "-"}`)
     return
   }
-  const requestLine = JSON.stringify(req)
+  // ONE deadline shared by the whole call (all cards of a multi-question), kept
+  // under the harness's 120s hook budget so we always answer before it kills us.
+  const deadline = Date.now() + ASK_TOTAL_TIMEOUT_MS
 
-  // SCOPED questions and SCOPED permissions reconnect-and-resend across a daemon restart:
-  // both are retained on socket close (abandoned map + persist), so a resend re-attaches
-  // to the existing card rather than posting a duplicate. UNSCOPED questions keep the
-  // single-attempt path — they aren't retained (no pane to late-deliver to), so a resend
-  // after a restart would post a duplicate card.
-  const reconnectable = Boolean(req.paneId) && (req.kind === "question" || req.kind === "permission")
-  let output: string | null
-  if (reconnectable) {
-    output = await requestHookAnswerWithReconnect(ctx, requestLine)
-  } else {
-    const attempt = await oneAskAttempt(ctx, requestLine, 120_000)
-    output = attempt.kind === "response" ? attempt.raw : null
+  if (reqs.length === 1) {
+    const req = reqs[0]
+    const output = await askDaemonOnce(ctx, req, deadline)
+    if (output && output !== "null") {
+      // Repair a claude-question reply from a STALE RUNNING daemon that predates
+      // `hookEventName` in the answer envelope (Claude Code discards the whole
+      // hook output without it — tg#5741); anything else passes through verbatim.
+      console.log(repairClaudeQuestionReply(req, output) ?? output)
+    } else {
+      // The daemon declined (replied "null") or the connection failed / timed out,
+      // so nothing was forwarded and the harness UI takes over. The daemon already
+      // logs WHY it declined (ask-forward dropped: …); log here too in case the
+      // daemon was unreachable (no socket) and never got a chance to.
+      log(`ask-forward not-posted: req=${req.requestId} agent=${req.agent} pane=${req.paneId ?? "-"} — daemon declined or unreachable`)
+    }
+    return
   }
-  if (output && output !== "null") console.log(output)
-  else {
-    // The daemon declined (replied "null") or the connection failed / timed out,
-    // so nothing was forwarded and the harness UI takes over. The daemon already
-    // logs WHY it declined (ask-forward dropped: …); log here too in case the
-    // daemon was unreachable (no socket) and never got a chance to.
-    log(`ask-forward not-posted: req=${req.requestId} agent=${req.agent} pane=${req.paneId ?? "-"} — daemon declined or unreachable`)
+
+  // Multi-question (claude AskUserQuestion, 2-4 questions): one SEQUENTIAL card
+  // per question — the next card posts only after the previous answer — then ONE
+  // combined PreToolUse reply with the full answers record, so the tool completes
+  // with no local dialog and no manual Enter (tg#5741). ALL-OR-NOTHING: any
+  // decline/timeout emits nothing and the local UI re-asks everything (a partial
+  // answers record would silently skip the unanswered questions).
+  const answers = await collectQuestionAnswers(reqs, (r) => askDaemonOnce(ctx, r, deadline))
+  const toolInput = reqs[0].toolInput
+  if (answers && toolInput) {
+    console.log(JSON.stringify(buildClaudeQuestionAnswerOutput(toolInput, answers)))
+  } else {
+    log(
+      `ask-forward multi-question not-completed: req=${reqs[0].requestId} n=${reqs.length} pane=${reqs[0].paneId ?? "-"} — declined, timed out, or partial; local UI takes over`,
+    )
   }
 }
 
@@ -4214,6 +4300,20 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`ask-late-deliver-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
       return false
     }
+    // A multi-question SET MEMBER is retained ONLY for reconnect re-attach. Its
+    // lone answer must never inject into the pane: the local multi-question
+    // dialog that took over may be showing a DIFFERENT question, so the injected
+    // text would answer the wrong prompt (all-or-nothing — see
+    // ButtonRequest.multiQuestion). Refuse WITHOUT mutating state: the retained
+    // entry and the card's keyboard survive, so a `tg-ctl ask` resend across a
+    // daemon bounce still re-attaches to the original card (no duplicate), and
+    // an in-window re-fire of the whole set replays normally. A genuinely-stale
+    // member is cleaned up by the retention-window branch above.
+    if (retained.req.multiQuestion) {
+      log(`ask-late-deliver-refused: multi-question member ${describeAskRequest(retained.req)} key=${action.requestId}`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "the terminal took over — answer all questions there")
+      return true
+    }
     const answer = resolveButtonCallback(retained.req, { requestId: action.requestId, value: action.value })
     if (answer.status !== "answered") return false
     // Inject the chosen option into the asking pane, wrapped like any inbound reply.
@@ -4351,7 +4451,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // Recorded AFTER the in-flight key is released, so the replay cache takes
         // over exactly where the in-flight dedup leaves off. Sweep stale entries on
         // each record so the cache can't grow unbounded.
-        if (pending.req.kind === "question") {
+        //
+        // A multi-question SET MEMBER is never cached: the group is
+        // all-or-nothing — if a later member aborts, the whole call is re-asked,
+        // and a replayed member would silently stitch a STALE answer into the
+        // NEW round without ever showing its card (review finding). The cost is
+        // symmetric honesty: a re-fired identical set re-posts its cards.
+        if (pending.req.kind === "question" && !pending.req.multiQuestion) {
           const answeredAt = Date.now()
           pruneAnsweredButtons(answeredButtons, answeredAt)
           answeredButtons.set(action.requestId, {

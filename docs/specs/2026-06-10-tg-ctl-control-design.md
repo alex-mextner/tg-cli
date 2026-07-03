@@ -235,7 +235,35 @@ Claude Code hook installation remains an automation layer over that handoff
 (backup first):
 - `PreToolUse` matcher `AskUserQuestion` → call `tg-ctl ask` with question +
   options → return
-  `{hookSpecificOutput:{permissionDecision:"allow", updatedInput:{questions, answers:{<q>:<label>}}}}`.
+  `{hookSpecificOutput:{hookEventName:"PreToolUse", permissionDecision:"allow",
+  updatedInput:{...tool_input, answers:{<q>:<label>}}}}`. `hookEventName` is
+  REQUIRED here too (tg#5741): Claude Code (verified on 2.1.198) validates hook
+  JSON output and DISCARDS the entire output when `hookSpecificOutput` lacks it
+  ("hookSpecificOutput is missing required field hookEventName"), so the card
+  reads "answered" while the agent falls back to the local dialog. `updatedInput`
+  echoes the ORIGINAL `tool_input` (CC schema-validates it wholesale against the
+  tool's input schema — option `description` is a required field there, previews
+  must survive) with the collected `answers` merged in; the rebuilt-from-request
+  shape remains only as the fallback for manual callers that carry no tool_input.
+  A MULTI-question call (2-4 questions, the tool's schema cap) forwards as one
+  SEQUENTIAL card per question — each with a `(i/N)` title suffix and its own
+  stable per-question requestId, seeded by session + question text + ORDERED
+  option labels so a later same-text/different-options call never re-attaches a
+  stale card (replay/reconnect dedup for true re-fires unchanged) — and the ask
+  client composes ONE combined reply from the collected answers. ALL-OR-NOTHING:
+  any multiSelect/free-form question, or any declined/timed-out card, bails the
+  whole call to the local UI — a PARTIAL answers record must never be emitted
+  (once a hook supplies `updatedInput` no dialog is shown, so CC would silently
+  record the unanswered questions as "(no option selected)"). For the same
+  reason a set member is never LATE-DELIVERED: once the local dialog takes over
+  it owns ALL the questions, and injecting one lone late answer could answer
+  the WRONG prompt — a late tap on an abandoned member is refused with a "the
+  terminal took over" toast WITHOUT mutating state, so the retained entry keeps
+  doubling as the daemon-bounce reconnect anchor (re-attach, no duplicate card)
+  and stale members still expire via the retention window. The client also
+  REPAIRS a single-question reply from a stale RUNNING daemon that predates
+  `hookEventName` (live-symlink deploys update the hook client before the
+  daemon restarts).
 - `PermissionRequest` → call `tg-ctl ask` with tool + args → Approve/Reject
   buttons → return
   `{hookSpecificOutput:{decision:{behavior:"allow"|"deny"}}}`.
@@ -284,6 +312,21 @@ it MUST include `questions`; and the contract is an UNDOCUMENTED internal of the
 permission component — add a canary e2e (synthetic payload against a real
 `claude -p`) that fails loudly on contract drift. The `PermissionRequest` shape
 (`hookSpecificOutput.decision.behavior`) is documented and exact.
+
+**Contract drift CONFIRMED (tg#5741, CC 2.1.198):** the predicted drift happened —
+2.1.198 hard-requires `hookEventName` inside `hookSpecificOutput` (its hook-output
+parser rejects the whole output otherwise, with the dedicated error
+"hookSpecificOutput is missing required field hookEventName"), so the 2.1.170-era
+question envelope silently stopped delivering answers: the daemon logged
+`ask-answered`, the card read "answered: <label>", and the agent still opened the
+local dialog. The envelope now stamps `hookEventName:"PreToolUse"` and echoes the
+original `tool_input` (2.1.198 also schema-validates `updatedInput` wholesale;
+unknown keys are tolerated, missing required option `description` is not). The
+`answers` field is part of the tool's input schema on 2.1.198 ("User answers
+collected by the permission component"), and the tool's `call()` returns
+`input.answers` directly — a complete record finishes the tool with zero local
+keypresses, including the multi-question case (previously: local dialog + the
+extra final Enter). The deferred canary is still worth adding.
 
 **Timeout semantics (review F6):** set an explicit per-hook `timeout` (~120 s) in
 settings.json; the daemon's own deadline is slightly shorter. On expiry the hook

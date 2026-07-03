@@ -3,6 +3,47 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.24.0
+
+**Fix (tg#5741): question buttons — the tapped answer never reached the agent; multi-question support.**
+
+- **Answer envelope now stamps the REQUIRED `hookSpecificOutput.hookEventName`.** Claude Code
+  ≥2.1.198 validates hook JSON output and DISCARDS the entire output when `hookSpecificOutput`
+  lacks `hookEventName` — the Telegram card read "answered: …" while the agent fell back to the
+  local question dialog and the answer never arrived. (The 2.1.170-era live spike passed without
+  it; the spec's predicted contract drift happened.) The envelope also echoes the ORIGINAL
+  `tool_input` (CC schema-validates `updatedInput` wholesale; option `description` is a required
+  field there) with the collected `answers` merged in.
+- **Multi-question AskUserQuestion (2-4 questions) now forwards** as one sequential Telegram card
+  per question (`(i/N)` title suffix, per-question stable requestIds); the ask client composes ONE
+  combined reply from the collected answers, so the tool completes with no local dialog and no
+  extra final Enter. ALL-OR-NOTHING: any multiSelect/free-form question or any declined/timed-out
+  card bails the whole call to the local UI — a partial answers record is never emitted.
+- **Stale-daemon repair:** the ask client rebuilds a single-question reply from a RUNNING daemon
+  that predates `hookEventName`, so the fix takes effect the moment the client updates. Restart
+  the daemon (`tg-ctl restart`) to update the daemon side too.
+- **A late tap on an abandoned multi-question member is refused** (review finding): after the
+  ask client's budget elapses mid-collection, the local dialog owns ALL the questions — injecting
+  one lone late answer could answer the WRONG prompt. The tap answers "the terminal took over";
+  the retained entry and keyboard survive untouched, so reconnect re-attach across a daemon
+  bounce (no duplicate card) keeps working; stale members expire via the retention window.
+- **A re-attached card is restored to its live prompt** (review finding): the socket-close path
+  edits the card to "window closed …"; when a resend re-attaches it, the original question text
+  and keyboard are re-sent (Telegram's editMessageText detaches the keyboard when reply_markup
+  is omitted), so the one card that works again no longer tells the user not to use it.
+- **Question requestIds are seeded with the ordered option labels** (review finding): a later
+  call re-asking the same question text with DIFFERENT options gets a fresh id, so it can never
+  re-attach a stale retained card whose buttons would resolve by index against the new options.
+  True re-fires (same text and options) keep their id — tg-cli#97 dedup/replay unchanged.
+- **Multi-question member answers are never cached for replay** (review finding): an aborted
+  round's partial answer must not silently stitch into a later identical re-ask — the re-run
+  posts fresh cards (an outstanding member still re-attaches to its retained card).
+- **`tool_input` now survives the daemon socket boundary** (review finding): the daemon-side
+  request parser dropped it, silently downgrading a PreToolUse ExitPlanMode "Proceed" to a bare
+  allow — which the hooks docs say is not sufficient for user-interactive tools. New round-trip
+  integration test guards it. Duplicate question texts in one call (schema-invalid) now bail to
+  the local UI instead of colliding requestIds / collapsing the answers record.
+
 ## 1.23.1
 
 **Fix (tg-cli#57): permission card durability — retain on socket close, re-attach on reconnect.**
