@@ -2083,28 +2083,81 @@ async function readStdinText(): Promise<string> {
 
 // --- /tasks command (#115): compose task-cli + gh into a rich board table ---
 
-// Resolve a `/tasks <agent>` selector to the matched pane's project dir, or null
-// (no selector, or no confident fuzzy match → the daemon's own cwd is used).
-function resolveTasksScopeDir(agent: string | null): string | null {
-  if (!agent) return null
-  const m = matchWindows(agent, listAgentCandidates())
-  return m.confident && m.matches[0]?.panePath ? m.matches[0].panePath : null
+interface TasksScopeResolution {
+  dir: string | null
+  // agent selector was given but didn't confidently match a live pane — report
+  // the miss instead of silently falling back to the daemon's own cwd (same
+  // "never silently fall back" convention as /agent's no-match guard above).
+  noMatch: boolean
+  // set when noMatch is because SEVERAL candidates tied (matchWindows'
+  // `confident` is false both for zero matches AND for >1 tied matches — review
+  // round 5: reporting "no agent matching" when agents DID match, just
+  // ambiguously, would be a lie). Empty when noMatch is a genuine zero-match.
+  ambiguousNames: string[]
+  // window names from the SAME tmux snapshot the match was decided against, so
+  // a noMatch error lists a consistent set (review round 2: a second, later
+  // listAgentCandidates() call at the call site could desync from the snapshot
+  // the match decision was actually made on). Only populated when `agent` was
+  // given — the no-selector path never touches tmux (review round 5: it used to
+  // call listAgentCandidates() unconditionally, spawning tmux on every bare
+  // `/tasks` for a value that path never reads).
+  candidateNames: string[]
 }
 
-async function loadTasks(scopeDir: string | null, status: string | null): Promise<TaskItem[]> {
+// Resolve a `/tasks <agent>` selector to the matched pane's project dir.
+// No selector → daemon's own cwd, no tmux call (dir: null, noMatch: false).
+// Selector given but no confident fuzzy match (misspelled, no longer live, or
+// AMBIGUOUS — tied between several panes) → noMatch: true so the caller can
+// report it instead of scoping to the wrong (or an arbitrary) dir.
+function resolveTasksScopeDir(agent: string | null): TasksScopeResolution {
+  if (!agent) return { dir: null, noMatch: false, ambiguousNames: [], candidateNames: [] }
+  const candidates = listAgentCandidates()
+  const candidateNames = candidates.map((c) => c.windowName)
+  const m = matchWindows(agent, candidates)
+  // A confident match is a match regardless of panePath — a live tmux pane always
+  // carries a cwd, but even if it were somehow empty that's "scope to daemon cwd",
+  // not "no agent matched" (review round 1: don't conflate the two).
+  if (m.confident) return { dir: m.matches[0]?.panePath || null, noMatch: false, ambiguousNames: [], candidateNames }
+  const ambiguousNames = m.matches.length > 1 ? m.matches.map((c) => c.windowName) : []
+  return { dir: null, noMatch: true, ambiguousNames, candidateNames }
+}
+
+interface TasksLoadResult {
+  tasks: TaskItem[]
+  // set when 'task list' failed or returned unparsable output, so the caller
+  // can tell a genuine failure apart from a truly empty backlog (both would
+  // otherwise render as the same "No matching tasks." board).
+  error: string | null
+}
+
+async function loadTasks(scopeDir: string | null, status: string | null): Promise<TasksLoadResult> {
   const argv = ["task", "list", "--json", "--no-pager", "-n", "50"]
   if (status) argv.push("--state", status)
   if (scopeDir) argv.push("-C", scopeDir)
   const r = await spawnGuarded(argv, 15_000)
   if (r.exitCode !== 0) {
-    log(`/tasks: 'task list' failed (${r.exitCode}): ${r.stderr.slice(0, 200)}`)
-    return []
+    const err = `'task list' failed (exit ${r.exitCode}): ${r.stderr.slice(0, 200) || "(no stderr)"}`
+    log(`/tasks: ${err}`)
+    return { tasks: [], error: err }
   }
+  // A blank stdout on a genuinely empty backlog is a legitimate "[]" — treat it
+  // as such rather than a JSON.parse failure (review round 2: don't turn an
+  // empty-but-successful result into a false error).
+  const stdout = r.stdout.trim()
+  if (stdout === "") return { tasks: [], error: null }
   try {
-    const parsed = JSON.parse(r.stdout)
-    return Array.isArray(parsed) ? (parsed.filter((t) => t && typeof t.id === "string") as TaskItem[]) : []
+    const parsed = JSON.parse(stdout)
+    if (!Array.isArray(parsed)) {
+      const err = "'task list' returned non-array JSON"
+      log(`/tasks: ${err}`)
+      return { tasks: [], error: err }
+    }
+    const tasks = parsed.filter((t) => t && typeof t.id === "string") as TaskItem[]
+    return { tasks, error: null }
   } catch {
-    return []
+    const err = "'task list' returned malformed JSON"
+    log(`/tasks: ${err}`)
+    return { tasks: [], error: err }
   }
 }
 
@@ -2127,8 +2180,24 @@ async function loadPrRefs(scopeDir: string | null): Promise<PrRef[]> {
 }
 
 async function runTasksCommand(ctx: Ctx, action: Extract<Action, { kind: "tasks" }>): Promise<void> {
-  const scopeDir = resolveTasksScopeDir(action.agent)
-  const [tasks, prs] = await Promise.all([loadTasks(scopeDir, action.status), loadPrRefs(scopeDir)])
+  const scope = resolveTasksScopeDir(action.agent)
+  if (scope.noMatch) {
+    if (scope.ambiguousNames.length > 0) {
+      const names = scope.ambiguousNames.join(", ")
+      log(`/tasks: selector="${action.agent}" → ambiguous (${names}) — reporting error`)
+      await sendMessage(ctx, `'${action.agent}' matches multiple agents (${names}) — be more specific`)
+      return
+    }
+    const names = scope.candidateNames.join(", ")
+    log(`/tasks: selector="${action.agent}" → NO match among [${names}] — reporting error`)
+    await sendMessage(ctx, `no agent matching '${action.agent}' (running: ${names || "none"}) — try /agent to pick`)
+    return
+  }
+  const [{ tasks, error }, prs] = await Promise.all([loadTasks(scope.dir, action.status), loadPrRefs(scope.dir)])
+  if (error) {
+    await sendMessage(ctx, `couldn't load tasks — ${error}`)
+    return
+  }
   const html = composeTasksTable(tasks, matchPrsToTasks(tasks, prs), { agent: action.agent, status: action.status })
   const sent = await sendRich(ctx, html)
   if (sent === null) await sendMessage(ctx, "couldn't render the task board — see the daemon log")
