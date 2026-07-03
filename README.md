@@ -252,6 +252,10 @@ $ tg replies
   everywhere, `--session <window|paneId>` targets one scope — either a tmux
   **window name** (`--session ext`: exact match, all panes of every window named
   `ext` across sessions) or a raw pane id (`--session %7`).
+- **Date range**: `--since <date>` / `--until <date>` keep only messages at or
+  after / at or before the date (both inclusive). A date is an ISO date
+  (`2026-06-28`, midnight UTC), an ISO datetime (`2026-06-28T10:00`, UTC), or
+  relative (`3d` / `24h` — N days or hours ago from now).
 - `-n/--limit N` (default 20), `--full` (no truncation), `--json` (a
   machine-readable array: `ts` ms, `id`, `direction`, `from`, `text`, `pane`),
   `--help`.
@@ -261,6 +265,8 @@ tg replies all                  # the full back-and-forth in this session
 tg replies --session ext        # messages in the tmux window named "ext"
 tg replies user find deploy     # your messages mentioning "deploy"
 tg replies agent --all-sessions # everything the agent has sent, anywhere
+tg replies user --since 3d      # your messages in the last 3 days
+tg replies all --since 2026-06-28 --until 2026-06-30  # a date range
 tg replies --json -n 5          # the last 5, as JSON
 ```
 
