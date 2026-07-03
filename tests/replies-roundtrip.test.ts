@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { inboundHistoryRecords } from '../features/replies/inbound';
-import { outboundHistoryText } from '../features/replies/outbound';
+import { buildOutboundHistoryRecords, outboundHistoryText } from '../features/replies/outbound';
 import { appendRecordsToBlob, type HistoryRecord } from '../features/replies/history';
 import { runReplies } from '../features/replies/cli';
 import type { TgUpdate } from '../features/tg-ctl/types';
@@ -72,6 +72,36 @@ test('outbound writer → file → tg replies agent reader', () => {
     errlog: () => {},
   });
   expect(out).toEqual(['[T] #99 done, shipped']);
+});
+
+// tg-cli#131: production writes via buildOutboundHistoryRecords(outboundIds,
+// ...), one record per Telegram message_id a send produced (a >4096 split or
+// a media-group album emits several). This exercises the REAL write path
+// (not a hand-built HistoryRecord) end to end: a reply anchored to a
+// NON-FIRST id (the album's 2nd item) must still be recall-able via
+// `tg replies --json`, matching what buildReplyAnchor promises.
+test('outbound writer (multi-id) → file → a NON-FIRST id is recall-able via --json', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tg-replies-'));
+  const file = join(dir, 'history.jsonl');
+
+  const text = outboundHistoryText('', { photos: 3, documents: 0 });
+  expect(text).not.toBeNull();
+  const recs = buildOutboundHistoryRecords([301, 302, 303], text!, 1700000300, '%4');
+  writeFileSync(file, appendRecordsToBlob(null, recs));
+
+  const out: string[] = [];
+  const code = runReplies(['replies', 'agent', '--json'], {
+    readHistory: () => readFileSync(file, 'utf8'),
+    detectPane: () => '%4',
+    resolveWindow: () => [],
+    fmtTime: () => 'T',
+    log: (m) => out.push(m),
+    errlog: () => {},
+  });
+  expect(code).toBe(0);
+  const rows = JSON.parse(out[0]) as Array<{ id: number | null; text: string }>;
+  const secondAlbumItem = rows.find((r) => r.id === 302); // the reported bug case
+  expect(secondAlbumItem?.text).toBe('[3 photos]');
 });
 
 test('both writers append to the SAME file; `all` shows the conversation in order', () => {

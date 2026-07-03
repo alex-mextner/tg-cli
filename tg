@@ -45,8 +45,8 @@ import {
   serializeRoutes,
   withRoutesLock,
 } from "./features/tg-ctl/routes"
-import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
-import { outboundHistoryText } from "./features/replies/outbound"
+import { appendRecordsToBlob } from "./features/replies/history"
+import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/replies/outbound"
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
@@ -975,11 +975,13 @@ if (import.meta.main) {
     }
     return null
   }
-  // The FIRST outbound message id of THIS send (a multi-chunk / media send is
-  // ONE logical message for recall — see recordOutboundHistory below).
-  let firstOutboundId: number | null = null
+  // EVERY outbound message id of THIS send (a multi-chunk >4096 split or a
+  // media-group send emits several Telegram message_ids for one logical
+  // agent message — see recordOutboundHistory below, which now logs a
+  // recall-able history record for each one, not just the first).
+  const outboundIds: number[] = []
   const recordRoute = (messageId: number): void => {
-    if (firstOutboundId === null) firstOutboundId = messageId
+    outboundIds.push(messageId)
     if (!ROUTES_PATH || !TMUX_PANE) return
     try {
       // Resolve the route cwd (a tmux display-message lookup) BEFORE taking the
@@ -1022,12 +1024,13 @@ if (import.meta.main) {
     }
   }
 
-  // Append ONE `agent` history record for this send so `tg replies` can recall
+  // Append `agent` history record(s) for this send so `tg replies` can recall
   // what the agent sent (mirror of the daemon's inbound writer). Best-effort:
   // tmux-only, swallow-all — history bookkeeping must never break a send. The
-  // text is the message body (or a [photo]/[document] placeholder for a media-
-  // only send); `firstOutboundId` is the FIRST sent message id (null if no send
-  // reported one). Called AFTER transmit so the id is known.
+  // text is the message body (or a [photo]/[document] placeholder for a
+  // media-only send). One record is written per outbound message_id — see
+  // `buildOutboundHistoryRecords` (features/replies/outbound.ts) for why.
+  // Called AFTER transmit so the ids are known.
   const HISTORY_PATH = TMUX_PANE
     ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).history
     : null
@@ -1036,18 +1039,11 @@ if (import.meta.main) {
     const text = outboundHistoryText(body, { photos: plan.photos.length, documents: plan.documents.length })
     if (text === null) return
     try {
-      const rec: HistoryRecord = {
-        ts: Math.floor(Date.now() / 1000),
-        message_id: firstOutboundId,
-        direction: "agent",
-        from: "agent",
-        text,
-        pane: TMUX_PANE,
-      }
+      const recs = buildOutboundHistoryRecords(outboundIds, text, Math.floor(Date.now() / 1000), TMUX_PANE)
       // 0o600: the log is a conversation transcript — owner-only, like the daemon socket.
       writeFileSync(
         HISTORY_PATH,
-        appendRecordsToBlob(existsSync(HISTORY_PATH) ? readFileSync(HISTORY_PATH, "utf8") : null, [rec]),
+        appendRecordsToBlob(existsSync(HISTORY_PATH) ? readFileSync(HISTORY_PATH, "utf8") : null, recs),
         { mode: 0o600 },
       )
       chmodSync(HISTORY_PATH, 0o600) // enforce on a pre-existing, looser-perm file too
@@ -1390,10 +1386,11 @@ if (import.meta.main) {
     }
   }
 
-  // Outbound history for `tg replies` recall — one `agent` record per send,
-  // stamped with the first sent message id (now known). The body is the raw
-  // user-typed message (caption), so recall shows what the agent meant to say,
-  // not the branded envelope. Best-effort; never blocks the (already-sent) send.
+  // Outbound history for `tg replies` recall — one `agent` record per
+  // outbound message_id (now known; see buildOutboundHistoryRecords). The
+  // body is the raw user-typed message (caption), so recall shows what the
+  // agent meant to say, not the branded envelope. Best-effort; never blocks
+  // the (already-sent) send.
   recordOutboundHistory(caption)
 
   // Generated code→pdf / md→pdf artifacts are uploaded by now — drop their temp
