@@ -17,16 +17,28 @@
 // driveFlush therefore consults isPaneBusy() before EACH paste and re-defers the
 // untouched tail the moment a new question appears.
 
-// Per-pane FIFO queues of already-wrapped inbound texts awaiting their pane's
-// open question to be answered. Keyed by tmux pane id ("%N").
-export class DeferQueues {
-  private readonly byPane = new Map<string, string[]>();
+// One queued inbound message. `messageId` is the source Telegram message id when
+// known (a plain/reply/topic message), or null for items whose origin message is
+// not directly addressable (e.g. a picker tap re-routing an earlier message). The
+// daemon uses it to flip the message's ✍️ "queued" reaction to the 👀 delivery
+// receipt once the item actually lands in the pane (tg#5855 — without it a
+// deferred message kept ✍️ forever even after a successful flush).
+export interface DeferredItem {
+  text: string;
+  messageId: number | null;
+}
+
+// Per-pane FIFO queues of already-wrapped inbound items awaiting their pane's
+// open question to be answered. Keyed by tmux pane id ("%N"). Generic so unit
+// tests can drive it with bare strings while the daemon queues DeferredItem.
+export class DeferQueues<T = string> {
+  private readonly byPane = new Map<string, T[]>();
 
   // Append one wrapped message to the back of a pane's queue.
-  enqueue(paneId: string, wrappedText: string): void {
+  enqueue(paneId: string, item: T): void {
     const q = this.byPane.get(paneId);
-    if (q) q.push(wrappedText);
-    else this.byPane.set(paneId, [wrappedText]);
+    if (q) q.push(item);
+    else this.byPane.set(paneId, [item]);
   }
 
   has(paneId: string): boolean {
@@ -45,13 +57,13 @@ export class DeferQueues {
   }
 
   // Read-only view of a pane's queue (tests; never mutate the result).
-  peek(paneId: string): readonly string[] {
+  peek(paneId: string): readonly T[] {
     return this.byPane.get(paneId) ?? [];
   }
 
   // Drain a pane's queue for a flush attempt and remove the entry. The caller
   // runs driveFlush on the result and re-defers whatever it could not inject.
-  take(paneId: string): string[] {
+  take(paneId: string): T[] {
     const q = this.byPane.get(paneId);
     if (!q) return [];
     this.byPane.delete(paneId);
@@ -61,7 +73,7 @@ export class DeferQueues {
   // Put un-flushed items back at the FRONT, ahead of anything that arrived for
   // this pane while the flush was in flight — so the user's ordering survives a
   // re-defer (the tail of an interrupted flush precedes newer messages).
-  redefer(paneId: string, items: string[]): void {
+  redefer(paneId: string, items: T[]): void {
     if (items.length === 0) return;
     const later = this.byPane.get(paneId) ?? [];
     this.byPane.set(paneId, [...items, ...later]);
@@ -72,7 +84,7 @@ export class DeferQueues {
   // those messages resurface, stale and out of order, on a LATER unrelated
   // question's flush. The caller tells the user (the messages never reached the
   // agent) rather than silently losing them.
-  drop(paneId: string): string[] {
+  drop(paneId: string): T[] {
     return this.take(paneId);
   }
 }
@@ -115,21 +127,21 @@ export class DeferQueues {
 // callbacks (button-answer / socket-close), which cannot preempt a synchronous
 // guard read, so the window is exactly one in-flight paste — accepted, not closed,
 // because no observable bridge signal marks the boundary inside a single paste.
-export interface FlushOutcome {
-  injected: string[];
-  failed: string[]; // attempted but inject() returned false (logged, dropped)
-  reDeferred: string[]; // a new question opened — flush these on its answer
-  abandoned: string[]; // a question was abandoned mid-flush — dead-letter these
+export interface FlushOutcome<T = string> {
+  injected: T[];
+  failed: T[]; // attempted but inject() returned false (logged, dropped)
+  reDeferred: T[]; // a new question opened — flush these on its answer
+  abandoned: T[]; // a question was abandoned mid-flush — dead-letter these
 }
 
-export async function driveFlush(
-  queue: readonly string[],
+export async function driveFlush<T = string>(
+  queue: readonly T[],
   isPaneBusy: () => boolean,
-  inject: (text: string) => Promise<boolean>,
+  inject: (item: T) => Promise<boolean>,
   isAbandoned: () => boolean = () => false,
-): Promise<FlushOutcome> {
-  const injected: string[] = [];
-  const failed: string[] = [];
+): Promise<FlushOutcome<T>> {
+  const injected: T[] = [];
+  const failed: T[] = [];
   // Both guards are RE-READ at the top of every iteration (not cached once): the
   // daemon mutates the underlying state from event-loop callbacks between the
   // awaited pastes, so a flag that flips mid-flush must be observed on the next

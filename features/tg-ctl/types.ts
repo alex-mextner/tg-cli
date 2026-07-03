@@ -136,13 +136,23 @@ export interface TgUpdate {
 
 // Actions are data; the entrypoint executes them in order.
 export type Action =
-  | { kind: 'inject-text'; text: string } // already wrapped (or verbatim /cmd passthrough)
+  // Already wrapped (or verbatim /cmd passthrough). messageId is the source
+  // Telegram message id — carried so a deferred inject can flip that message's
+  // ✍️ "queued" reaction to 👀 when it finally lands in the pane (tg#5855).
+  | { kind: 'inject-text'; text: string; messageId: number | null }
   | { kind: 'inject-key'; key: 'Escape' } // /stop
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
   | { kind: 'status' } // /status — entrypoint composes the reply
+  // /tasks [<agent>] [<status>] — entrypoint resolves the agent→project scope,
+  // spawns task-cli + gh, composes a rich-HTML board table, sends it (#115).
+  | { kind: 'tasks'; agent: string | null; status: string | null }
+  // A tap on a limit-stop's "auto-continue" button (lc:<pane>:<resetAt>): the
+  // entrypoint arms a timer that injects "continue" into that pane at reset time
+  // (immediately if already past), persisted so a restart re-arms it (#113).
+  | { kind: 'limit-continue'; callbackQueryId: string; paneId: string; resetAt: number; sourceMessageId: number | null; messageId: number | null }
   // /agent [<win>] <msg> — entrypoint discovers panes, fuzzy-matches the window
   // (phonetic), routes <msg> to that agent or asks via session-grouped buttons.
-  | { kind: 'agent-route'; selector: string | null; rest: string; all: string; from: string }
+  | { kind: 'agent-route'; selector: string | null; rest: string; all: string; from: string; messageId: number | null }
   // A tap on a /agent selection button (tga:<token>:<index>): the entrypoint
   // looks up the pending message + candidate and injects it into the chosen pane.
   | {
@@ -156,7 +166,9 @@ export type Action =
   // A reply: route by the recognized origin pane (routes map) when known, else
   // a session-grouped picker ordered LRU/MRU. injectText is already wrapped +
   // carries the quote anchor (items 2,3); it is injected verbatim.
-  | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string }
+  // messageId here is the REPLY message's own id (not replyToMessageId) — the
+  // reaction target when the routed text is deferred and later flushed.
+  | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string; messageId: number | null }
   | { kind: 'reply'; text: string } // sendMessage back to the chat
   | { kind: 'answer-callback'; callbackQueryId: string; text: string }
   // messageId is the Telegram message the tapped button belongs to (null when
@@ -326,6 +338,7 @@ export interface CtlPaths {
   history: string; // append-only JSONL message log for `tg replies` recall
   topics: string; // threadId→agent binding map for forum-topics mode (always allocated)
   questions: string; // durable forwarded-question state (pending/abandoned + answered-replay)
+  schedules: string; // durable auto-continue schedules (re-armed on restart, #113)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---

@@ -176,7 +176,7 @@ test('slugifyTopicName: safe tmux window name, fallback to threadId', () => {
 test('topics OFF: a topic message falls through to normal flat injection (unchanged behaviour)', () => {
   const r = stepUpdates([upd(1, { text: 'hi', message_thread_id: 99 })], makeOpts({ topicsEnabled: false }));
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex #1] hi' },
+    { kind: 'inject-text', text: '[TG from Alex #1] hi', messageId: 1 },
     { kind: 'ack', messageId: 1 },
   ]);
 });
@@ -339,7 +339,7 @@ test('topics ON: a non-forum reply-thread (thread id but NOT is_topic_message) f
     makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
   );
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex #10] reply thread msg' },
+    { kind: 'inject-text', text: '[TG from Alex #10] reply thread msg', messageId: 10 },
     { kind: 'ack', messageId: 10 },
   ]);
 });
@@ -380,7 +380,7 @@ test('topics ON: forum_topic_edited with no name (icon-only) is silently acked â
 test('topics ON: General (no message_thread_id) is unaffected', () => {
   const r = stepUpdates([upd(3, { text: 'plain' })], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex #3] plain' },
+    { kind: 'inject-text', text: '[TG from Alex #3] plain', messageId: 3 },
     { kind: 'ack', messageId: 3 },
   ]);
 });
