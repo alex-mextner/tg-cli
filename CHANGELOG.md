@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.26.0
+
+**Feature (tg-cli#115): `/tasks [<agent>] [<status>]` — the task board as a Telegram table.**
+
+- New bot command `/tasks`: the daemon runs `task list --json` (task-cli) plus
+  `gh pr list --json` per GitHub project and replies with one rich HTML table —
+  ticket (linked), title, state, referencing PR (draft/merged/review marks), CI
+  verdict folded from `statusCheckRollup`, due date.
+- `<agent>` fuzzy-matches a tmux window (same phonetic matcher as `/agent`) and
+  scopes the board to that pane's project; `<status>` filters by normalized
+  task-cli state (todo/in-progress/in-review/done/cancelled + aliases, `all`).
+  Default shows open states only.
+- Missing data is dashed, never fabricated; a gh failure dashes that project's
+  PR/CI cells with a footnote; unmatched agents and unknown statuses get explicit
+  error replies. Rows capped at 40 with an explicit "… N more" trailer.
+- Published in the bot menu (setMyCommands); works inside forum topics as a
+  daemon-global command.
+
 ## 1.23.1
 
 **Fix (tg-cli#57): permission card durability — retain on socket close, re-attach on reconnect.**

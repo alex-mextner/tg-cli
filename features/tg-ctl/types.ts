@@ -250,7 +250,13 @@ export type Action =
   // absolute path typed instead of tapping a button). `text` is the raw user text. The entrypoint
   // matches it to the SINGLE pending session in awaiting-dir (a flat chat has at most one /new in
   // flight at a time); a stray one with no pending session falls through to normal handling.
-  | { kind: 'new-answer'; text: string; from: string; messageId: number };
+  | { kind: 'new-answer'; text: string; from: string; messageId: number }
+  // `/tasks [<agent>] [<status>]` (tg-cli#115) — the entrypoint runs task-cli (+ gh for PR/CI
+  // state) and replies with a rich HTML table. `agent` is a fuzzy window selector resolved
+  // against the live pane snapshot (its pane's cwd scopes the task list); `status` is a
+  // normalized task-cli state or 'all' (null = open states). `error` carries a parse problem
+  // the entrypoint replies with verbatim (never a silently mis-read filter).
+  | { kind: 'tasks-report'; agent: string | null; status: string | null; error: string | null; from: string; messageId: number };
 
 export interface StepResult {
   actions: Action[];

@@ -15,6 +15,7 @@ import { parseButtonCallback } from './questions';
 import { parseAgentCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewModelCallback } from './new-command';
+import { parseTasksCommand } from './tasks-report';
 import { botCommandNames } from './bot-commands';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
@@ -360,6 +361,10 @@ function textAction(text: string, name: string, opts: StepOpts, messageId: numbe
       const p = parseNewCommand(text);
       return { kind: 'new-command', model: p.model, dir: p.dir, name: p.name, task: p.task, from: name };
     }
+    if (cmd === '/tasks') {
+      const p = parseTasksCommand(text);
+      return { kind: 'tasks-report', agent: p.agent, status: p.status, error: p.error, from: name, messageId };
+    }
     return { kind: 'inject-text', text };
   }
   // A plain inbound message: surface its message_id in the wrap so the agent can
@@ -433,11 +438,11 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // is increment 2; the point is it must never leak to a flat agent.
     const text = m.text ?? '';
     if (!text) return [];
-    // §11 deferral 2: intercept the 3 daemon-global verbs (/status, /agent, /new) even inside
-    // a bound topic — they control the daemon, not the topic agent. /stop and /kill are NOT
-    // intercepted: they must still reach the topic's pane (kill/escape the harness session).
+    // §11 deferral 2: intercept the daemon-global verbs (/status, /agent, /new, /tasks) even
+    // inside a bound topic — they control the daemon, not the topic agent. /stop and /kill are
+    // NOT intercepted: they must still reach the topic's pane (kill/escape the harness session).
     // Using an explicit set (not isDaemonSlashCommand) to avoid over-intercepting.
-    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new']);
+    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks']);
     const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
     if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id)];
     // §11 deferral 1: a prose reply carries the same ↩ «…» quote-anchor as flat-chat replies.

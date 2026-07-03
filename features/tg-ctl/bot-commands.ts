@@ -35,6 +35,7 @@ export const BOT_COMMANDS: readonly BotCommand[] = [
   { command: 'stop', description: 'Interrupt the current agent turn — session survives' },
   { command: 'kill', description: 'End the agent session (SIGINT)' },
   { command: 'status', description: 'Report daemon state' },
+  { command: 'tasks', description: 'Task table: /tasks [<agent>] [<status>]' },
 ];
 
 export function botCommandNames(): string[] {

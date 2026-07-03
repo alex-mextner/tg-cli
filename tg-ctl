@@ -53,6 +53,16 @@ import {
 } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
+import {
+  asPrInfo,
+  composeTasksTable,
+  emptyTasksReply,
+  normalizeTaskListJson,
+  selectPrLookupProjects,
+  type PrInfo,
+  type TaskProject,
+} from "./features/tg-ctl/tasks-report"
+import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, readPidFile } from "./features/tg-ctl/lock"
 import {
   buildButtonMessage,
@@ -2554,6 +2564,152 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
+  // /tasks (tg-cli#115): task-cli board + gh PR/CI state → one rich HTML table.
+  // Both spawns are timeout-guarded (spawnGuarded) so a hung CLI can't wedge the
+  // poll loop, and the per-project gh lookups run in PARALLEL so the worst-case
+  // stall is one task-list + one gh budget (~80s), not their sum across
+  // projects (review r1 finding #2). A gh failure dashes that project's PR/CI
+  // cells (footnoted); a task failure is an explicit error reply — data is
+  // never fabricated. Error replies return false so the 'ack' 👀 receipt is
+  // skipped (the reply IS the failure signal, spec §10).
+  const TASKS_LIST_TIMEOUT_MS = 60_000
+  const TASKS_GH_TIMEOUT_MS = 20_000
+  const TASKS_PR_PROJECT_CAP = 5
+  // The daemon may run under launchd with a bare PATH — resolve the external
+  // CLIs like the deployed `tg` symlink dir does, falling back to the
+  // conventional install locations.
+  const resolveTasksBin = (name: string, fallbacks: string[]): string => {
+    const found = Bun.which(name)
+    if (found) return found
+    for (const f of fallbacks) if (existsSync(f)) return f
+    return name
+  }
+  const handleTasksReport = async (action: Extract<Action, { kind: "tasks-report" }>): Promise<boolean> => {
+    if (action.error) {
+      await sendMessage(ctx, `tasks: ${action.error}`)
+      return false
+    }
+    const home = process.env.HOME ?? ""
+    const taskBin = resolveTasksBin("task", [join(home, ".local", "bin", "task")])
+    // Scope: a fuzzy agent selector narrows the board to the matched pane's
+    // project (its cwd); no selector → every known project.
+    let taskArgv = [taskBin, "list", "--all", "--json"]
+    if (action.agent) {
+      const candidates = listAgentCandidates()
+      const m = matchWindows(action.agent, candidates)
+      // matchWindows: confident ⇔ exactly one tied-best match, so the two error
+      // branches are "nothing matched" and "several tied" — named accurately
+      // (review r1 finding #3; mirrors handleAgentRoute's no-match wording).
+      if (m.matches.length === 0) {
+        const names = candidates.map((c) => c.windowName).join(", ") || "(none running)"
+        log(`tasks: selector="${action.agent}" → no match among [${names}]`)
+        await sendMessage(ctx, `tasks: no agent matching '${action.agent}' (running: ${names})`)
+        return false
+      }
+      if (!m.confident) {
+        const names = m.matches.map((c) => c.windowName).join(", ")
+        log(`tasks: selector="${action.agent}" → ambiguous (${m.matches.length}: ${names})`)
+        await sendMessage(ctx, `tasks: ambiguous agent '${action.agent}' (matches: ${names}) — be more specific`)
+        return false
+      }
+      const panePath = m.matches[0].panePath
+      if (!panePath) {
+        await sendMessage(ctx, `tasks: agent '${m.matches[0].windowName}' has no known cwd — try /tasks without an agent`)
+        return false
+      }
+      // `--all` here means "all tickets, not just this session's" (task-cli),
+      // NOT "all projects": without it a scoped list returns only the current
+      // session's open tickets, so `/tasks <agent> done` would silently come
+      // back empty (verified live: `-C` alone omitted done tickets, `-C --all`
+      // returned every state, grouped). Review r1 finding #1.
+      taskArgv = [taskBin, "list", "-C", panePath, "--all", "--json"]
+    }
+    const taskRes = await spawnGuarded(taskArgv, TASKS_LIST_TIMEOUT_MS)
+    if (taskRes.exitCode !== 0) {
+      log(`tasks: task list failed (${taskRes.exitCode}): ${taskRes.stderr.slice(0, 300)}`)
+      await sendMessage(ctx, `tasks: task list failed (exit ${taskRes.exitCode}): ${taskRes.stderr.trim().slice(0, 300) || "no output"}`)
+      return false
+    }
+    let projects: TaskProject[] | null = null
+    try {
+      projects = normalizeTaskListJson(JSON.parse(taskRes.stdout))
+    } catch {
+      projects = null
+    }
+    if (projects === null) {
+      await sendMessage(ctx, "tasks: could not parse task list --json output")
+      return false
+    }
+    // PR/CI state per github project (capped; each failure only dashes its own
+    // project's columns). gh emits statusCheckRollup as an array of CheckRun /
+    // StatusContext nodes; ciStateOf folds it.
+    const ghBin = resolveTasksBin("gh", ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"])
+    const prsByProject = new Map<string, PrInfo[]>()
+    const prLookupFailed: string[] = []
+    // Eligibility honors the status filter (a project contributing no rows must
+    // not spend a gh spawn or a cap slot); over-cap projects are footnoted as
+    // NOT checked — their dashed PR/CI cells must never read as "no PR exists"
+    // (review r2/r3).
+    const { check: ghProjects, notChecked: prNotChecked } = selectPrLookupProjects(
+      projects,
+      action.status,
+      TASKS_PR_PROJECT_CAP,
+    )
+    await Promise.all(
+      ghProjects.map(async (p) => {
+        // Whole callback fenced: spawnGuarded catches its own throws by
+        // contract (exit 127), but ONE rejecting callback would take the whole
+        // Promise.all — and the entire /tasks reply — with it. Any surprise
+        // here degrades to "this project's PR lookup failed" (review r2).
+        try {
+          const gh = await spawnGuarded(
+            [ghBin, "pr", "list", "--repo", p.project, "--state", "all", "--limit", "30", "--json", "number,title,body,state,isDraft,reviewDecision,statusCheckRollup,url"],
+            TASKS_GH_TIMEOUT_MS,
+          )
+          if (gh.exitCode !== 0) {
+            log(`tasks: gh pr list ${p.project} failed (${gh.exitCode}): ${gh.stderr.slice(0, 200)}`)
+            prLookupFailed.push(p.project)
+            return
+          }
+          const parsed = JSON.parse(gh.stdout)
+          if (Array.isArray(parsed)) {
+            // Per-element normalization (asPrInfo): a PR with body:null or a
+            // junk element must degrade to a skipped row, not poison the board.
+            const prs = parsed.map(asPrInfo).filter((x): x is PrInfo => x !== null)
+            prsByProject.set(p.project, prs)
+          } else prLookupFailed.push(p.project)
+        } catch (err) {
+          log(`tasks: gh pr list ${p.project} threw: ${err}`)
+          prLookupFailed.push(p.project)
+        }
+      }),
+    )
+    const table = composeTasksTable(projects, prsByProject, { status: action.status, prLookupFailed, prNotChecked })
+    if (table.empty) {
+      // An empty board must still surface backend errors — "no open tasks"
+      // while task-cli errored for a project would hide the failure (review r2).
+      const suffix = table.notes.length ? `\n${table.notes.join("\n")}` : ""
+      await sendMessage(ctx, emptyTasksReply(action.status) + suffix)
+      return table.notes.length === 0
+    }
+    const html = normalizeRichHtml(table.html)
+    const check = validateRichHtml(html)
+    if (!check.ok) {
+      // Should be unreachable given the row cap; degrade honestly, never exit
+      // the daemon (unlike tg's CLI-side validation).
+      log(`tasks: rich validation failed: ${check.error}`)
+      await sendMessage(ctx, `tasks: table too large to render — narrow with /tasks <agent> or /tasks <status>`)
+      return false
+    }
+    const sent = await botPost(ctx, "sendRichMessage", { chat_id: ctx.chatId, rich_message: { html } })
+    if (sent === null) {
+      log("tasks: sendRichMessage failed")
+      return false
+    }
+    log(`tasks: replied — ${table.rows} rows, ${ghProjects.length} projects PR-checked, agent=${action.agent ?? "-"} status=${action.status ?? "open"}`)
+    return true
+  }
+
   // /agent routing (item 1): bare `/agent` → an inline-keyboard PICKER (tappable
   // buttons, one distinct-labelled button per agent); confident phonetic match →
   // direct inject; ambiguous → the same session-grouped picker carrying the pending
@@ -4386,6 +4542,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "status":
         await sendMessage(ctx, composeStatus(ctx))
         return true
+      case "tasks-report":
+        return handleTasksReport(action)
       case "agent-route":
         return handleAgentRoute(action)
       case "agent-callback":

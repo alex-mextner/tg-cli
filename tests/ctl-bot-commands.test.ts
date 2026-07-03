@@ -55,6 +55,7 @@ test('the menu carries the user-facing routing commands', () => {
   expect(names).toContain('stop');
   expect(names).toContain('kill');
   expect(names).toContain('status');
+  expect(names).toContain('tasks');
 });
 
 // Commands `textAction` handles via `cmd === '/x'` but that are deliberately NOT
