@@ -447,6 +447,9 @@ test('a voice note that is itself a reply carries the quote anchor for reply-rou
   expect(a.replyToMessageId).toBe(3);
   expect(a.replyAnchor).toContain('↩');
   expect(a.replyAnchor).toContain('what is the plan');
+  // The anchor must carry the SAME id used for routing (tg-cli#28): a voice
+  // reply's original-message tg# is not a text-only special case.
+  expect(a.replyAnchor).toContain('tg#3 ');
 });
 
 test('voice over 20MB → too-large reply instead of transcribe', () => {

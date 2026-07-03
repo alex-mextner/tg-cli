@@ -719,8 +719,8 @@ test('§11 d2: /new model dir Name in a bound topic → daemon-intercepted (NOT 
   expect(r.actions[0]?.kind).toBe('new-command');
 });
 
-// Deferral 1: prose reply in a bound topic gets the ↩ «…» quote-anchor.
-test('§11 d1: prose reply in a bound topic → topic-route with ↩ «…» quote-anchor', () => {
+// Deferral 1: prose reply in a bound topic gets the ↩ tg#<id> «…» quote-anchor.
+test('§11 d1: prose reply in a bound topic → topic-route with ↩ tg#<id> «…» quote-anchor', () => {
   const replyTo = { message_id: 42, date: 1_749_000_000, text: 'quoted text', chat: { id: CHAT_ID, type: 'supergroup' as const } };
   const r = stepUpdates(
     [upd(25, { text: 'yes, do it', message_thread_id: 50, is_topic_message: true, reply_to_message: replyTo })],
@@ -729,7 +729,7 @@ test('§11 d1: prose reply in a bound topic → topic-route with ↩ «…» quo
   const a = r.actions[0];
   expect(a?.kind).toBe('topic-route');
   if (a?.kind === 'topic-route') {
-    expect(a.injectText).toMatch(/^↩ «/);
+    expect(a.injectText).toMatch(/^↩ tg#42 «/);
   }
 });
 

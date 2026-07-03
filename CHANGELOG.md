@@ -3,6 +3,27 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.27.0
+
+**Feature (tg-cli#130): reply quote-anchor carries the original message's
+`tg#<id>`.** From Alex (tg#5978).
+
+- `buildReplyAnchor`/`buildReplyInject` (`features/tg-ctl/updates.ts`) now
+  render `↩ tg#<id> «[date time] head…»` — `tg#<id>` is
+  `reply_to_message.message_id`, the Telegram id of the message being
+  answered (almost always the agent's own prior report), rendered with the
+  same `tg#` convention as the inbound wrap's own-message `{id}`. Previously
+  only the reply's OWN id was surfaced (via the `[TG from {name} {id}]` wrap);
+  the id of the message being REPLIED TO was invisible, so an agent whose
+  context had compacted had no way to recover the original beyond the ~60-char
+  truncated preview. Now it can pull the full text back with `tg replies` (or
+  `tg replies --json` filtered by id) instead of guessing.
+- Applies uniformly to text replies, voice-note replies, and prose replies
+  inside a bound forum topic (all three route through the same
+  `buildReplyAnchor`).
+- Docs: `docs/specs/reply-quotes.md` and the README inbound-reply section
+  updated to the new anchor format.
+
 ## 1.26.0
 
 **Features (tg-cli#113, #114, #115): harness-limit notifications, reaction

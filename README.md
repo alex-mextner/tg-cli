@@ -152,7 +152,10 @@ The agent reads it and responds by calling `tg`.
 
 **Reply with a quote (v1.6.0)** — reply to a message (optionally highlighting a
 part of it) and the agent receives a quote anchor identifying what you answered:
-`↩ «[date time] the quoted text…»` above your message.
+`↩ tg#5975 «[date time] the quoted text…»` above your message. `tg#5975` is the
+replied-to message's own Telegram id (tg-cli#130) — if the preview isn't enough
+to place it (e.g. after the agent's context compacted), it can pull the full
+original back with `tg replies`.
 
 ### Addressing a specific agent (v1.6.0)
 With several agents running, `/agent <window> <message>` routes to one of them.
