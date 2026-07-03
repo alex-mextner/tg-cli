@@ -3,7 +3,7 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.25.2
+## 1.26.2
 
 **Feature (HYP-891 follow-up): empty-editor watermark WARN heuristic in `pre-send-photo`.**
 
@@ -11,7 +11,7 @@ semantic versioning.
   `features/hooks/review-descriptor/pre_send_photo.py` — detects VS Code's own "no
   tabs open" watermark (a small, compact cluster of hint-row glyphs on an
   overwhelmingly flat background, centered in the editor pane), the signal Alex
-  proposed (tg#6071) as a precise replacement for the removed 1.25.1 heuristic. Unlike
+  proposed (tg#6071) as a precise replacement for the removed 1.26.1 heuristic. Unlike
   that removed check (which matched ANY full window via a dark left activity-bar
   strip), this one is scoped to a central box and requires a small, compact glyph
   cluster on a flat field — real content (code, a rendered preview, a webview) cannot
@@ -207,7 +207,7 @@ semantic versioning.
   that specific, arguably most-likely-in-practice failure mode is caught by
   the same blanket fail-open as every other error path, not a missed case.
 
-## 1.25.1
+## 1.26.1
 
 **Fix (HYP-891): remove the `pre-send-photo` full-window-screenshot block.**
 
@@ -227,6 +227,32 @@ semantic versioning.
   comment in `pre_send_photo.py` and HYP-891 for the follow-up if this needs
   strengthening later (e.g. a targeted vision check module scoped to the preview
   region instead of the whole window).
+
+## 1.26.0
+
+**Features (tg-cli#113, #114, #115): harness-limit notifications, reaction
+lifecycle, and the `/tasks` board.** From Alex (tg#5698, tg#5699).
+
+- **Harness limit/error notify + auto-continue (#113).** `tg-ctl harness-event`
+  is a `StopFailure`-hook subcommand: fed the payload on stdin (+ transcript
+  tail), it extracts the reason and reset time and messages the operator that a
+  session hit its limit / errored. When the reset time is parseable the message
+  carries an inline **auto-continue** button; tapping it arms a timer that
+  injects `continue` into the originating pane at reset time (immediately if
+  already past). Schedules persist to `*.schedules.json` and re-arm on daemon
+  restart. `tg-ctl install-hooks` now also provisions the StopFailure hook.
+  `--dry-run` renders WITHOUT sending. A **staleness guard** suppresses any
+  alert whose reset time already passed, and every string is a real template
+  (no leaked `%`-placeholder) — the two bugs a prior WIP leaked live.
+- **Reaction lifecycle (#114).** 👀 working → 😴 stalled (limit-stop) → 👌 done.
+  Alex's literal ⏳/✅ are `REACTION_INVALID` for a bot (verified live); 😴 and
+  👌 are the allowed proxies. `tg --tag answer --reply-to <id>` now flips
+  message `<id>` to the done mark.
+- **`/tasks [<agent>] [<status>]` (#115).** A new bot command that composes
+  `task list --json` + `gh pr list --json` into a rich-HTML board table (id,
+  title, state, due, PR, CI), filterable by normalized status and scoped to a
+  fuzzy-matched agent's project. Missing PR/CI renders as an em dash, never
+  fabricated. Published in the bot menu.
 
 ## 1.25.0
 
