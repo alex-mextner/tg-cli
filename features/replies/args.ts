@@ -6,8 +6,8 @@
 //     ("вспомнить что писал ПОЛЬЗОВАТЕЛЬ" — inbound is the primary purpose).
 //   • action    (2nd positional): list (default) | find <query>
 //   • flags: -n/--limit N, --full, --json, --regex, --all-sessions,
-//            --session <paneId>, --since <date|relative>, --until <date|relative>,
-//            -h/--help.
+//            --session <window|paneId>, --since <date|relative>,
+//            --until <date|relative>, -h/--help.
 
 export type Direction = 'user' | 'agent' | 'all';
 export type Action = 'list' | 'find';
@@ -22,7 +22,7 @@ export interface RepliesQuery {
   json: boolean;
   regex: boolean;
   allSessions: boolean;
-  session?: string; // explicit pane scope (--session %N)
+  session?: string; // explicit scope (--session): a tmux window name (`ext`) or a %-pane id (`%7`)
   since?: number; // unix seconds lower bound (inclusive), from --since
   until?: number; // unix seconds upper bound (inclusive), from --until
 }
@@ -107,7 +107,7 @@ export function parseRepliesArgs(argv: string[]): RepliesArgs {
       i += 2;
     } else if (tok === '--session') {
       const v = argv[i + 1];
-      if (v === undefined) return { kind: 'error', message: '--session requires a pane id' };
+      if (v === undefined) return { kind: 'error', message: '--session requires a window name or pane id' };
       session = v;
       i += 2;
     } else if (tok === '--since') {

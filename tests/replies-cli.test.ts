@@ -24,6 +24,7 @@ function makeDeps(over: Partial<RepliesCliDeps> = {}): { deps: RepliesCliDeps; o
   const deps: RepliesCliDeps = {
     readHistory: () => HISTORY.map(serializeHistoryRecord).join('\n') + '\n',
     detectPane: () => '%1',
+    resolveWindow: () => [], // default: no tmux windows resolve (overridden per test)
     fmtTime: () => 'T',
     log: (m) => out.push(m),
     errlog: (m) => err.push(m),
@@ -63,6 +64,59 @@ test('runReplies: --session overrides the detected pane', () => {
   const { deps, out } = makeDeps();
   runReplies(['replies', 'user', '--session', '%2'], deps);
   expect(out).toEqual(['[T] #12 roll it back']);
+});
+
+test('runReplies: --session %N (pane id) is passed through WITHOUT calling resolveWindow', () => {
+  let called = 0;
+  const { deps, out } = makeDeps({
+    resolveWindow: () => {
+      called += 1;
+      return [];
+    },
+  });
+  runReplies(['replies', 'user', '--session', '%2'], deps);
+  expect(called).toBe(0); // a %-prefixed arg is a pane id, never a window lookup
+  expect(out).toEqual(['[T] #12 roll it back']);
+});
+
+test('runReplies: --session <windowName> resolves to its panes and scopes recall', () => {
+  const { deps, out } = makeDeps({
+    resolveWindow: (name) => (name === 'ext' ? ['%2'] : []),
+  });
+  runReplies(['replies', 'user', '--session', 'ext'], deps);
+  expect(out).toEqual(['[T] #12 roll it back']); // %2 is the only pane of window "ext"
+});
+
+test('runReplies: --session <windowName> unions duplicate window names across sessions', () => {
+  const { deps, out } = makeDeps({
+    resolveWindow: (name) => (name === 'work' ? ['%1', '%2'] : []),
+  });
+  runReplies(['replies', 'all', '--session', 'work'], deps);
+  // %1 (#10 user, #11 agent) ∪ %2 (#12 user)
+  expect(out).toEqual(['← [T] #10 deploy the canary', '→ [T] #11 deployed OK', '← [T] #12 roll it back']);
+});
+
+test('runReplies: --session matches EXACTLY, not by prefix (ext ≠ "ext: diagram")', () => {
+  const resolveWindow = (name: string): string[] => {
+    if (name === 'ext') return ['%1'];
+    if (name === 'ext: diagram') return ['%2'];
+    return [];
+  };
+  const a = makeDeps({ resolveWindow });
+  runReplies(['replies', 'user', '--session', 'ext'], a.deps);
+  expect(a.out).toEqual(['[T] #10 deploy the canary']); // only %1
+
+  const b = makeDeps({ resolveWindow });
+  runReplies(['replies', 'user', '--session', 'ext: diagram'], b.deps);
+  expect(b.out).toEqual(['[T] #12 roll it back']); // only %2
+});
+
+test('runReplies: an unknown window name → exit 1 + a clear error, never a silent empty', () => {
+  const { deps, out, err } = makeDeps({ resolveWindow: () => [] });
+  const code = runReplies(['replies', 'user', '--session', 'nope'], deps);
+  expect(code).toBe(1);
+  expect(out).toEqual([]); // nothing printed to stdout
+  expect(err.join('\n')).toContain("no tmux window named 'nope'");
 });
 
 test('runReplies: find filters by query within the scope', () => {
