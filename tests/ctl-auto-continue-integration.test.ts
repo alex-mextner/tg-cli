@@ -108,6 +108,63 @@ test('tapping the auto-continue button arms + persists a schedule and answers th
   }
 });
 
+test('a stale first-time tap (reset >1 day past) is rejected, never armed or persisted', async () => {
+  const cfgDir = makeCfg();
+  const answered: any[] = [];
+  const staleResetAt = Date.now() - 25 * 60 * 60_000; // >1 day past → dead
+  let served = false;
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        if (!served) {
+          served = true;
+          return Response.json({
+            ok: true,
+            result: [
+              {
+                update_id: 401,
+                callback_query: {
+                  id: 'cb2',
+                  from: { id: 1, first_name: 'Alex' },
+                  message: { message_id: 78, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) },
+                  data: `lc:%4:${staleResetAt}`,
+                },
+              },
+            ],
+          });
+        }
+        await Bun.sleep(80);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/answerCallbackQuery')) {
+        answered.push(await req.json());
+        return Response.json({ ok: true, result: true });
+      }
+      return Response.json({ ok: true, result: {} });
+    },
+  });
+  try {
+    spawnDaemon(cfgDir, server.port);
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && answered.length === 0) await Bun.sleep(50);
+    expect(answered).toHaveLength(1);
+    // Rejected with an "expired" toast, NOT the "auto-continue armed" ack.
+    expect(answered[0].text).toContain('expired');
+    expect(answered[0].text).not.toContain('armed');
+    // Never persisted — a stale tap must not create a schedule at all.
+    const schedPath = join(cfgDir, SCHEDULES);
+    await Bun.sleep(200);
+    if (existsSync(schedPath)) {
+      const data = JSON.parse(readFileSync(schedPath, 'utf8'));
+      expect(data.schedules.map((s: any) => s.paneId)).not.toContain('%4');
+    }
+  } finally {
+    server.stop(true);
+  }
+});
+
 test('a persisted schedule survives a restart, re-arms, fires, flips 👀 on the source, and clears the card', async () => {
   const cfgDir = makeCfg();
   // Pre-seed a schedule whose reset is already past → a restarted daemon re-arms

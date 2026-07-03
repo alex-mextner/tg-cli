@@ -27,8 +27,11 @@ const STORE_VERSION = 1;
 
 // A schedule whose reset is more than a day in the PAST is dead — the daemon was
 // down long past the window, injecting "continue" now would be surprising. Drop
-// it rather than fire it on a late restart.
-const DEAD_AFTER_MS = 24 * 60 * 60 * 1000;
+// it rather than fire it on a late restart. Exported so the entrypoint can apply
+// the SAME threshold to a fresh button tap (see isDeadReset) — a stale inline
+// keyboard tapped long after its reset must not arm either (PR #120 review: it
+// used to bypass this guard entirely since it never round-trips through prune).
+export const DEAD_AFTER_MS = 24 * 60 * 60 * 1000;
 
 // Bounds the on-disk file on a long-lived daemon; freshest (latest armed) kept.
 const MAX_SCHEDULES = 100;
@@ -47,10 +50,21 @@ function isValid(r: unknown): r is AutoContinueSchedule {
   );
 }
 
+// A reset far enough in the past that arming/firing it is no longer meaningful
+// (see DEAD_AFTER_MS) — the same "dead" test `prune` applies on restart, reused
+// so a first-time button tap gets the identical guard. A non-finite resetAt
+// (NaN/Infinity — a malformed callback_data upstream of the current regex
+// parse, or a future change to it) counts as dead too: `NaN < x` is always
+// false, so without this an unparseable reset would silently SKIP the guard
+// it exists to enforce (review round on PR #120) instead of being rejected.
+export function isDeadReset(resetAt: number, now: number): boolean {
+  return !Number.isFinite(resetAt) || resetAt < now - DEAD_AFTER_MS;
+}
+
 // Keep only live schedules (reset not long past), newest-armed first, capped.
 function prune(schedules: AutoContinueSchedule[], now: number): AutoContinueSchedule[] {
   return schedules
-    .filter((s) => s.resetAt >= now - DEAD_AFTER_MS)
+    .filter((s) => !isDeadReset(s.resetAt, now))
     .sort((a, b) => b.armedAt - a.armedAt)
     .slice(0, MAX_SCHEDULES);
 }

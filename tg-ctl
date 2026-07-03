@@ -72,6 +72,7 @@ import {
   type TaskItem,
 } from "./features/tg-ctl/tasks-command"
 import {
+  isDeadReset,
   parseSchedules,
   removeSchedule,
   serializeSchedules,
@@ -2103,6 +2104,23 @@ function transcriptFailureText(path: string | null): string {
 // payload/transcript is resolved from the runtime: paneId from TMUX_PANE (flag
 // default), agent from the live pane. The failure text comes from the transcript
 // (prod) or an inline `message` field / plain-text stdin (tests / manual).
+//
+// Field names: the REAL bare-hook payload (per the StopFailure hook docs) is
+// `{ error_type, error, transcript_path, ... }` — NOT `reason`/`matcher`/
+// `message`/`last_message` (those only exist on our own test/manual-invocation
+// shape and predate reading the real payload — PR #120 review). `error_type`
+// and `error` are read as an ADDITIONAL fallback (not a replacement) so both
+// shapes keep working: a bare production hook now classifies on `error_type`
+// and shows the real `error` text instead of falling back to "unknown".
+//
+// `error_type` now feeds classifyFailure's `/limit/i` substring test (review
+// round 3): today's documented StopFailure error_type enum (rate_limit,
+// overloaded, authentication_failed, oauth_org_not_allowed, billing_error,
+// invalid_request, model_not_found, server_error, max_output_tokens, unknown)
+// has exactly ONE value containing "limit" — rate_limit — and that IS the
+// auto-continue-eligible case. If a future error_type value adds "limit" to
+// its name without being a resumable rate/session limit, this substring test
+// would need to narrow to an exact match; revisit if the enum changes.
 function buildHarnessEvent(payloadText: string, flags: HarnessEventFlags, agent: string, now: number): HarnessFailureEvent {
   let payload: unknown = null
   try {
@@ -2110,11 +2128,11 @@ function buildHarnessEvent(payloadText: string, flags: HarnessEventFlags, agent:
   } catch {
     /* non-JSON stdin (or empty) — treat it as the inline failure text */
   }
-  const reason = flags.reason ?? (strField(payload, "reason") || strField(payload, "matcher"))
+  const reason = flags.reason ?? (strField(payload, "reason") || strField(payload, "matcher") || strField(payload, "error_type"))
   const tPath = flags.transcriptPath ?? (strField(payload, "transcript_path") || null)
   // inline: an explicit message field, else plain-text (non-JSON) stdin. NEVER
   // the raw JSON payload — parseResetTime would scan JSON noise (a real bug).
-  const inline = strField(payload, "message") || strField(payload, "last_message") || (payload === null ? payloadText : "")
+  const inline = strField(payload, "message") || strField(payload, "last_message") || strField(payload, "error") || (payload === null ? payloadText : "")
   const failureText = [inline, transcriptFailureText(tPath)].filter(Boolean).join("\n")
   const extracted = extractFailure(reason, failureText, now)
   const explicitReset = flags.resetAtIso ? Date.parse(flags.resetAtIso) : NaN
@@ -4472,6 +4490,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     continueTimers.set(s.paneId, timer)
   }
   const handleLimitContinue = async (action: Extract<Action, { kind: "limit-continue" }>): Promise<boolean> => {
+    // Reject a stale FIRST-TIME tap before arming (PR #120 review): an inline
+    // keyboard tapped long after its reset would otherwise upsert + arm with
+    // autoContinueDelayMs() clamped to 0, injecting "continue" INSTANTLY into
+    // whatever now occupies that pane id — possibly a different session. A
+    // restart re-arm already drops resets this old via the schedule store's
+    // own prune(); apply the identical threshold here so a first-time tap
+    // (which never goes through prune) can't bypass it.
+    if (isDeadReset(action.resetAt, Date.now())) {
+      log(`limit-continue rejected: stale resetAt for ${action.paneId} (reset=${action.resetAt})`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "This auto-continue has expired — continue manually.")
+      return true
+    }
     // The agent name isn't in the callback_data — recover it from the live pane.
     const agent = listAgentCandidates().find((c) => c.paneId === action.paneId)?.windowName ?? ""
     const schedule: AutoContinueSchedule = {

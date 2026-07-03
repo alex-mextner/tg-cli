@@ -92,6 +92,21 @@ test('composeTasksTable: HTML in a title is escaped', () => {
   expect(html).not.toContain('<script>');
 });
 
+// CodeQL js/incomplete-html-attribute-sanitization (PR #120): a task/PR url
+// carrying a `"` used to break out of the `href="..."` attribute the row
+// builds. Proves the fixed escapeHtml neutralizes it in BOTH attribute
+// positions (task url + PR url).
+test('composeTasksTable: a `"` (or `\'`) in a url cannot break out of the href attribute', () => {
+  const evil: TaskItem[] = [{ id: '#9', title: 'safe', state: 'todo', url: `https://x/9" onmouseover="alert(1)` }];
+  const prs = matchPrsToTasks(evil, [
+    { number: 1, url: `https://x/pr/1" onmouseover="alert(2)`, title: 'ref #9', ci: null },
+  ]);
+  const html = composeTasksTable(evil, prs, { agent: null, status: null });
+  expect(html).not.toContain('" onmouseover="');
+  expect(html).toContain('href="https://x/9&quot; onmouseover=&quot;alert(1)"');
+  expect(html).toContain('href="https://x/pr/1&quot; onmouseover=&quot;alert(2)"');
+});
+
 test('tasksScopeLabel', () => {
   expect(tasksScopeLabel({ agent: null, status: null })).toBe('Tasks');
   expect(tasksScopeLabel({ agent: 'hyperide', status: 'done' })).toContain('agent <b>hyperide</b>');

@@ -139,3 +139,62 @@ test('an API error with no reset → alert, no button', async () => {
   expect(sentMessages[0].text).toContain('API error');
   expect(sentMessages[0].reply_markup).toBeUndefined();
 });
+
+// PR #120 review: the REAL bare-hook payload uses `error_type`/`error`, not our
+// test-only `reason`/`message` shape. Proves a live StopFailure hook (no
+// --reason/--message flags, no `reason`/`message` fields on the payload) still
+// classifies correctly and shows the real error text instead of "unknown".
+test('production StopFailure shape (error_type/error, no reason/message) is read correctly', async () => {
+  sentMessages.length = 0;
+  // error_type deliberately does NOT contain "limit" (classifyFailure keys off
+  // that substring) so this exercises the api-error path cleanly.
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'The service is temporarily overloaded. Please retry.',
+  });
+  const { code } = await runHarnessEvent(['--agent', 'hyperide'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  const msg = sentMessages[0];
+  // carries the REAL error_type matcher, not the "unknown" fallback the old
+  // reason/matcher-only parser produced against this payload shape.
+  expect(msg.text).toContain('API error');
+  expect(msg.text).toContain('overloaded');
+  expect(msg.text).not.toContain('unknown');
+  // the real `error` string reached the detail blockquote, not a raw JSON dump.
+  expect(msg.text).toContain('The service is temporarily overloaded. Please retry.');
+  expect(msg.text).not.toContain('"error_type"');
+});
+
+// Review round 2 (Opus, PR #120): the api-error test above deliberately picked
+// a non-"limit" error_type, which left the actual TARGET scenario of this PR
+// series untested against the real field names — a rate-limit stop, where the
+// reset time must be parsed out of `error` (not `message`) and the
+// auto-continue button must still get built + armed. `rate_limit` is one of
+// the documented StopFailure error_type values and (like the test/manual
+// `session_limit` reason used elsewhere in this file) matches classifyFailure's
+// /limit/i check, so it takes the session-limit branch exactly like a real hit
+// would.
+test('production StopFailure shape for an ACTUAL limit: button + button data + reset all resolve from error_type/error', async () => {
+  sentMessages.length = 0;
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'rate_limit',
+    error: 'You have hit your rate limit · resets 4:10am (Europe/Belgrade)',
+  });
+  const { code } = await runHarnessEvent(['--agent', 'hyperide', '--pane', '%3', '--source-message-id', '55'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  const msg = sentMessages[0];
+  expect(msg.text).toContain('hyperide');
+  expect(msg.text).not.toMatch(/%\d/); // no unrendered placeholder
+  // resetAt was parsed out of the real `error` field text (not `message`,
+  // which is absent from this payload) — the button is present and encodes it.
+  expect(msg.reply_markup).toBeDefined();
+  const button = msg.reply_markup.inline_keyboard[0][0];
+  expect(button.callback_data).toMatch(/^lc:%3:\d+:55$/);
+  expect(button.text).toContain('Auto-continue');
+});

@@ -21,6 +21,19 @@ test('escapeHtml escapes &, <, > and does & first (no double-escape)', () => {
   expect(escapeHtml('a<b')).toBe('a&lt;b');
 });
 
+// CodeQL js/incomplete-html-attribute-sanitization: a value carrying a raw `"`
+// (or `'`) that reaches an `href="..."` attribute (e.g. tasks-command.ts's
+// taskRow) can break out of the attribute and inject markup. escapeHtml must
+// neutralize both quote characters, not just the tag/entity delimiters.
+test('escapeHtml escapes both quote characters — safe to interpolate into an attribute', () => {
+  expect(escapeHtml('"')).toBe('&quot;');
+  expect(escapeHtml("'")).toBe('&#39;');
+  const evilUrl = `https://x/1" onmouseover="alert(1)`;
+  const attr = `<a href="${escapeHtml(evilUrl)}">t</a>`;
+  expect(attr).not.toContain('" onmouseover="');
+  expect(attr).toBe('<a href="https://x/1&quot; onmouseover=&quot;alert(1)">t</a>');
+});
+
 // --- detectHtmlTags ---
 test('detectHtmlTags matches known Telegram tags, case-insensitively', () => {
   expect(detectHtmlTags('<b>x</b>')).toBe(true);

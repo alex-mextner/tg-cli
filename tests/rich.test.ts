@@ -210,6 +210,19 @@ test('numeric entities also count as one visible char', () => {
   expect(validateRichHtml(html).ok).toBe(true);
 });
 
+// PR #120 review: escapeHtml (render/html.ts) now ALSO escapes quotes
+// (js/incomplete-html-attribute-sanitization fix), so a body built with it can
+// carry &quot;/&#39; where it previously never did. Both must still count as
+// ONE visible char each, not their raw multi-char spelling, or a quote-heavy
+// body would be falsely rejected as over budget.
+test('escapeHtml-produced &quot; and &#39; each count as one visible char', () => {
+  const html = '<p>' + '&quot;'.repeat(RICH_LIMITS.maxChars) + '</p>';
+  expect([...html].length).toBeGreaterThan(RICH_LIMITS.maxChars); // raw is over
+  expect(validateRichHtml(html).ok).toBe(true);
+  const html2 = '<p>' + '&#39;'.repeat(RICH_LIMITS.maxChars) + '</p>';
+  expect(validateRichHtml(html2).ok).toBe(true);
+});
+
 test('tg://emoji <img> does NOT consume the media budget', () => {
   // 60 custom-emoji images (tg://emoji) — over the 50 MEDIA limit if mis-counted,
   // but these are emoji, not attachments → must pass.
