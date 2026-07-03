@@ -113,7 +113,12 @@ tests can pass fakes.
   walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`),
   `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons),
   `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker), `hook-normalize.ts`
-  (raw harness hook payload → ButtonRequest; also forwards Claude Code `ExitPlanMode` plan-approval
+  (raw harness hook payload → ButtonRequest(s) — a multi-question AskUserQuestion (2-4 questions)
+  yields one request per question via `normalizeHookRequests`, forwarded as sequential cards whose
+  answers the ask client composes into ONE combined hook reply (tg#5741); the reply envelope stamps
+  the REQUIRED `hookSpecificOutput.hookEventName` and echoes the original `tool_input`, since
+  Claude Code ≥2.1.198 discards hook output lacking the event name and schema-validates
+  `updatedInput` wholesale; also forwards Claude Code `ExitPlanMode` plan-approval
   — delivered by the `PermissionRequest *` catch-all — as a permission with Proceed/Keep-planning
   buttons + the plan body, stamping `permissionEvent` so the hook reply matches the firing event:
   PreToolUse→`permissionDecision`, PermissionRequest→`decision.behavior`), `hook-install.ts`

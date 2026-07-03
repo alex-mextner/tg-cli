@@ -1,3 +1,12 @@
+// PreToolUse permission round trip (tg#5741 review finding): the original
+// tool_input must SURVIVE the daemon socket boundary, so an ExitPlanMode
+// "Proceed" tap replies allow + `updatedInput` (the live hooks docs: "allow
+// alone is not sufficient" for the user-interactive tools). The daemon-side
+// normalizeButtonRequest used to drop `toolInput`, silently downgrading the
+// reply to a bare allow.
+//
+// Runs against a LOCAL fake Telegram server (Bun.serve, token `123:abc`,
+// chat 1) — nothing ever reaches a real chat.
 import { afterAll, expect, test } from 'bun:test';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -6,37 +15,34 @@ import type { Subprocess } from 'bun';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
-const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-buttons-'));
+const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-perm-'));
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ cwd: cfgDir }));
 mkdirSync(join(cfgDir, 'bin'));
 writeFileSync(join(cfgDir, 'bin', 'tmux'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
-let callbackData: string | null = null;
-let callbackServed = false;
+let allowData: string | null = null;
+let tapServed = false;
 const sentMessages: unknown[] = [];
-const answeredCallbacks: unknown[] = [];
-const allowedUpdates: string[] = [];
 
 const server = Bun.serve({
   port: 0,
   async fetch(req) {
     const url = new URL(req.url);
     if (url.pathname.endsWith('/getUpdates')) {
-      allowedUpdates.push(url.searchParams.get('allowed_updates') ?? '');
-      if (callbackData && !callbackServed) {
-        callbackServed = true;
+      if (allowData && !tapServed) {
+        tapServed = true;
         return Response.json({
           ok: true,
           result: [
             {
-              update_id: 200,
+              update_id: 300,
               callback_query: {
                 id: 'cb1',
                 from: { id: 1, first_name: 'Alex' },
-                message: { message_id: 77, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) },
-                data: callbackData,
+                message: { message_id: 91, chat: { id: 1 }, date: Math.floor(Date.now() / 1000) },
+                data: allowData,
               },
             },
           ],
@@ -48,14 +54,11 @@ const server = Bun.serve({
     if (url.pathname.endsWith('/sendMessage')) {
       const body = await req.json();
       sentMessages.push(body);
-      callbackData = body.reply_markup.inline_keyboard[1][0].callback_data;
-      return Response.json({ ok: true, result: { message_id: 77 } });
+      // A permission card is ONE row with [allow, deny] — tap the allow button.
+      allowData = body.reply_markup.inline_keyboard[0][0].callback_data;
+      return Response.json({ ok: true, result: { message_id: 91 } });
     }
-    if (url.pathname.endsWith('/answerCallbackQuery')) {
-      answeredCallbacks.push(await req.json());
-      return Response.json({ ok: true, result: true });
-    }
-    if (url.pathname.endsWith('/editMessageText')) {
+    if (url.pathname.endsWith('/answerCallbackQuery') || url.pathname.endsWith('/editMessageText')) {
       return Response.json({ ok: true, result: true });
     }
     return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
@@ -74,7 +77,7 @@ afterAll(async () => {
   server.stop(true);
 });
 
-test('tg-ctl ask forwards a Claude question to inline buttons and returns hook output after callback', async () => {
+test('PreToolUse plan-approval Proceed tap replies allow + updatedInput (tool_input survives the socket)', async () => {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
   const daemon = Bun.spawn([process.execPath, TG_CTL, 'run'], {
     env: {
@@ -104,51 +107,32 @@ test('tg-ctl ask forwards a Claude question to inline buttons and returns hook o
     stderr: 'pipe',
   });
   procs.push(ask);
+  // The RAW Claude Code ExitPlanMode PreToolUse payload — hook-normalize turns
+  // it into a plan-approval permission carrying the original tool_input.
   ask.stdin.write(
     JSON.stringify({
-      requestId: 'q_123',
+      session_id: 'abcdef123456',
       cwd: cfgDir,
-      agent: 'claude',
-      kind: 'question',
-      title: 'Pick deploy target',
-      question: 'Where should I deploy?',
-      options: [{ label: 'Staging' }, { label: 'Production' }],
-    }, null, 2) + '\n',
+      hook_event_name: 'PreToolUse',
+      tool_name: 'ExitPlanMode',
+      tool_input: { plan: 'do the thing' },
+    }) + '\n',
   );
   ask.stdin.end();
 
   const stdout = await new Response(ask.stdout).text();
   await ask.exited;
 
+  // allow + the ECHOED original tool_input — a bare allow is not sufficient for
+  // the user-interactive tools per the live hooks docs.
   expect(JSON.parse(stdout)).toEqual({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       permissionDecision: 'allow',
-      updatedInput: {
-        questions: [
-          {
-            header: 'Pick deploy target',
-            question: 'Where should I deploy?',
-            options: [{ label: 'Staging' }, { label: 'Production' }],
-          },
-        ],
-        answers: { 'Where should I deploy?': 'Production' },
-      },
+      updatedInput: { plan: 'do the thing' },
     },
   });
   expect(sentMessages).toHaveLength(1);
-  expect(sentMessages[0]).toMatchObject({
-    chat_id: 1,
-    text: expect.stringContaining('Question from claude'),
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: 'Staging', callback_data: 'tgq:q_123:o0' }],
-        [{ text: 'Production', callback_data: 'tgq:q_123:o1' }],
-      ],
-    },
-  });
-  expect(answeredCallbacks).toEqual([{ callback_query_id: 'cb1', text: '✓ sent to the agent' }]);
-  expect(allowedUpdates.some((v) => decodeURIComponent(v).includes('callback_query'))).toBe(true);
 
   daemon.kill('SIGTERM');
   await daemon.exited;
