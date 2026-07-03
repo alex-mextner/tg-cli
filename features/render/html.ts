@@ -14,8 +14,22 @@ import {
 } from "../branding/emoji"
 import { type Format } from "../cli/args"
 
+// Escapes & first (so entities inserted by the later replaces are never
+// re-escaped), then the tag delimiters, then both quote characters. Quotes
+// matter beyond `<pre>`/text content: several callers (tasks-command.ts's
+// `<a href="...">`) interpolate this INTO an HTML attribute value, where an
+// unescaped `"` lets the string break out of the attribute (CodeQL
+// js/incomplete-html-attribute-sanitization). decodeHtmlEntities below
+// already round-trips &quot;/&#39;, so this has always been the intended
+// entity set — attribute callers just can't assume it without callers using
+// escapeHtml directly there.
 export function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
 }
 
 // Strip HTML tags for VISIBLE-length / text-content purposes (not a security

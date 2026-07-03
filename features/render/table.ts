@@ -11,8 +11,13 @@
 // --tag / --title exactly like any other HTML message body).
 
 // HTML-escape a cell so literal <, >, & in the data can never break the <pre>
-// wrapper's parsing. Mirrors render/html.ts escapeHtml (kept local so the pure
-// table module has no cross-feature import beyond what it needs).
+// wrapper's parsing. Deliberately narrower than render/html.ts's escapeHtml
+// (which ALSO escapes quotes, for its `<a href="...">` attribute callers,
+// e.g. tasks-command.ts — PR #120 review): a table cell only ever lands as
+// TEXT CONTENT inside <pre>, never an attribute value, so a raw `"`/`'` can't
+// break anything here and escaping it would just show literal &quot;/&#39; in
+// the rendered table. Kept local so the pure table module has no cross-
+// feature import beyond what it needs.
 export function escapeCell(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
