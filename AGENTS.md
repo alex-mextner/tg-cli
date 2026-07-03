@@ -117,9 +117,15 @@ tests can pass fakes.
   — delivered by the `PermissionRequest *` catch-all — as a permission with Proceed/Keep-planning
   buttons + the plan body, stamping `permissionEvent` so the hook reply matches the firing event:
   PreToolUse→`permissionDecision`, PermissionRequest→`decision.behavior`), `hook-install.ts`
-  (idempotent q→buttons hook merge for `tg-ctl install-hooks` — PreToolUse matches `AskUserQuestion`,
-  plus a `PermissionRequest *` catch-all that also carries plan-approval; ExitPlanMode gets NO
-  dedicated matcher to avoid double-forwarding, since both events fire for it), `question-store.ts`
+  (idempotent q→buttons + harness-event hook merge for `tg-ctl install-hooks` — PreToolUse matches
+  `AskUserQuestion`, a `PermissionRequest *` catch-all that also carries plan-approval (ExitPlanMode
+  gets NO dedicated matcher to avoid double-forwarding, since both events fire for it), plus a
+  `StopFailure *` group running `tg-ctl harness-event`), `limits.ts` (tg-cli#113: limit-stop
+  classification from the transcript's synthetic failure text, IANA-zoned reset-time parsing, the
+  durable scheduled-auto-continue store `tg-ctl.<botid>.limits.json`, the `tgw:` button codec and
+  the notification card — the daemon arms a timer per tapped card that injects «продолжай» into
+  the stopped pane at reset time; `tg-ctl harness-event` degrades to a direct button-less send
+  when the daemon is down), `question-store.ts`
   (PURE (de)serialization for the durable forwarded-question state — the on-disk envelope +
   age/count pruning; the entrypoint owns the atomic file I/O and the authoritative req
   normalization), `defer.ts` (defer-while-waiting queue model: inbound text is

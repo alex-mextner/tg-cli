@@ -173,6 +173,16 @@ export type Action =
   // emitted for it succeeded. Follows the message's delivery action(s); never
   // emitted for pure error replies (those ARE the failure signal).
   | { kind: 'ack'; messageId: number }
+  // A tap on a limit-stop card's "продолжить в <time>" button (tgw:<token>,
+  // tg-cli#113): the entrypoint marks the stored limit entry scheduled and arms
+  // the auto-continue timer for its pane. messageId is the card the button
+  // belongs to (its keyboard is cleared once the schedule is confirmed).
+  | {
+      kind: 'limit-continue';
+      callbackQueryId: string;
+      token: string;
+      messageId: number | null;
+    }
   | {
       kind: 'download-media';
       fileId: string;
@@ -326,6 +336,7 @@ export interface CtlPaths {
   history: string; // append-only JSONL message log for `tg replies` recall
   topics: string; // threadId→agent binding map for forum-topics mode (always allocated)
   questions: string; // durable forwarded-question state (pending/abandoned + answered-replay)
+  limits: string; // limit-stop entries + scheduled auto-continues (tg-cli#113)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---

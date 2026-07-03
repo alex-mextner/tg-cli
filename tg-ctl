@@ -12,7 +12,7 @@
 // (`run`) takes the flock as its FIRST action and exits 0 when another
 // instance already owns the bot.
 
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { dirname, isAbsolute, join, resolve } from "path"
 import {
@@ -76,8 +76,28 @@ import {
   serializeRegistrations,
   upsertRegistration,
 } from "./features/tg-ctl/registration-store"
-import { claudeHooksInstalled, withClaudeHooks } from "./features/tg-ctl/hook-install"
+import { claudeHooksInstalled, withClaudeHooks, type HookCommands } from "./features/tg-ctl/hook-install"
 import { normalizeHookPayload, type HookEnv } from "./features/tg-ctl/hook-normalize"
+import {
+  AUTO_CONTINUE_SENDER,
+  AUTO_CONTINUE_TEXT,
+  CONTINUE_GRACE_MS,
+  FAILURE_FRESHNESS_MS,
+  LIMIT_PAST_RESET_RETAIN_MS,
+  buildLimitNotification,
+  classifyFailure,
+  describeLimitLocation,
+  extractFailureText,
+  findDuplicateEntry,
+  formatResetClock,
+  isStaleLimitEvent,
+  normalizeLimitEvent,
+  parseLimitsStore,
+  pruneLimitEntries,
+  serializeLimitsStore,
+  type LimitEntry,
+  type LimitStopEvent,
+} from "./features/tg-ctl/limits"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
   aggregateUsage,
@@ -169,7 +189,12 @@ export const USAGE = `Usage:
                          # (--dry-run prints the plan and touches nothing)
   tg-ctl disable         # remove OS autostart AND stop
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
-  tg-ctl install-hooks   # wire q→buttons: agent questions → Telegram buttons
+  tg-ctl harness-event [--dry-run]
+                         # internal: hook client for harness lifecycle events
+                         # (StopFailure → limit-stop Telegram notify, tg-cli#113);
+                         # --dry-run renders the card to stderr, sends nothing
+                         # (the ONLY mode manual smokes may use)
+  tg-ctl install-hooks   # wire q→buttons + limit-stop notify hooks into Claude Code
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
 
 The run/start/status/stop/enable/disable lifecycle follows the shared agent-tools
@@ -870,7 +895,7 @@ function composeStatus(ctx: Ctx): string {
 // harnesses. Pure JSON merge lives in features/tg-ctl/hook-install.ts.
 function installHooks(home: string): void {
   const settingsPath = join(home, ".claude", "settings.json")
-  const command = "tg-ctl ask"
+  const commands: HookCommands = { ask: "tg-ctl ask", harnessEvent: "tg-ctl harness-event" }
   const raw = readFileOrNull(settingsPath)
   let existing: Record<string, unknown> = {}
   if (raw) {
@@ -882,9 +907,9 @@ function installHooks(home: string): void {
       process.exit(1)
     }
   }
-  const { settings, changed } = withClaudeHooks(existing, command)
+  const { settings, changed } = withClaudeHooks(existing, commands)
   if (!changed) {
-    console.log("tg-ctl: Claude Code q→buttons hooks already installed — nothing to do.")
+    console.log("tg-ctl: Claude Code q→buttons + limit-stop hooks already installed — nothing to do.")
   } else {
     if (raw) {
       try {
@@ -893,7 +918,10 @@ function installHooks(home: string): void {
     }
     mkdirSync(join(home, ".claude"), { recursive: true })
     writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`)
-    console.log(`tg-ctl: installed Claude Code q→buttons hooks → ${settingsPath}` + (raw ? ` (backup: ${settingsPath}.bak)` : ""))
+    console.log(
+      `tg-ctl: installed Claude Code q→buttons + limit-stop hooks → ${settingsPath}` +
+        (raw ? ` (backup: ${settingsPath}.bak)` : ""),
+    )
   }
   console.log("")
   console.log("Codex: add a PermissionRequest hook running `tg-ctl ask --agent codex`, then trust it via /hooks (manual, first run).")
@@ -1465,6 +1493,9 @@ interface QuestionRuntime {
   // backlog and dead-letter the idle ones (tg-cli#58). Must run AFTER the entry is
   // deleted from `pending` so the per-pane guard sees the real post-removal state.
   onUnscopedAbandon: () => void
+  // A `harness-limit` line from `tg-ctl harness-event` (tg-cli#113): the daemon
+  // notifies Telegram (with the schedule button when the reset time is known).
+  onHarnessLimit: (ev: LimitStopEvent) => Promise<void>
 }
 
 // A genuinely dead card: an UNSCOPED question (no pane to late-deliver to) that
@@ -1660,12 +1691,34 @@ function startHookServer(ctx: Ctx, rt: QuestionRuntime): Server | null {
 }
 
 async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socket, line: string): Promise<void> {
-  let req: ButtonRequest | null = null
+  let parsedLine: unknown = null
   try {
-    req = normalizeButtonRequest(JSON.parse(line))
+    parsedLine = JSON.parse(line)
   } catch {
     // malformed hook payload: let the local agent UI take over
   }
+  // Harness lifecycle events (tg-cli#113) ride the same owner-only socket as the
+  // q→buttons requests but are one-way. Ack IMMEDIATELY, before any processing:
+  // the client waits only 5s, and an ack gated on the daemon's own sendMessage
+  // latency would time the client out into its direct-send fallback — a DOUBLE
+  // notification for one incident (review catch).
+  const limitEv = normalizeLimitEvent(parsedLine)
+  if (limitEv) {
+    socket.end("ok\n")
+    if (limitEv.kind === "harness-limit") {
+      try {
+        await rt.onHarnessLimit(limitEv)
+      } catch (err) {
+        log(`harness-limit handling failed: ${err}`)
+      }
+    } else {
+      // harness-resume: reaction lifecycle lands with tg-cli#114; ack quietly here
+      // so an updated hook never errors against this daemon version.
+      log(`harness-resume received: pane=${limitEv.paneId} (no-op)`)
+    }
+    return
+  }
+  const req: ButtonRequest | null = normalizeButtonRequest(parsedLine)
   if (!req) {
     // A non-forward must NEVER be silent: the question stays in the harness and
     // the operator gets zero signal. Every drop below logs a distinct, greppable
@@ -1920,6 +1973,115 @@ async function readStdinText(): Promise<string> {
   })
 }
 
+// --- harness-event: the StopFailure hook client (tg-cli#113) ---
+
+// Bounded tail read: the transcript can be tens of MB; the synthetic failure
+// line is at the very end. Any I/O error degrades to "" (classified unknown).
+function readFileTail(path: string, maxBytes: number): string {
+  try {
+    const size = statSync(path).size
+    const start = Math.max(0, size - maxBytes)
+    const fd = openSync(path, "r")
+    try {
+      const buf = Buffer.alloc(size - start)
+      readSync(fd, buf, 0, buf.length, start)
+      return buf.toString("utf8")
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return ""
+  }
+}
+
+// The harness writes the failure as a synthetic assistant message into the
+// transcript; whether it lands before or after the hook fires is not
+// documented, so poll the tail briefly instead of assuming an order. An
+// explicit error field on the payload (if the harness ever adds one) wins.
+// Freshness-filtered: an OLD synthetic line still sitting in the tail must
+// never be resurrected as a current incident (operator feedback — a stale
+// "resets 4:10am" card reads as live state).
+async function resolveFailureText(payload: Record<string, unknown>): Promise<string | null> {
+  for (const key of ["error", "error_message", "failure_reason"]) {
+    const v = payload[key]
+    if (typeof v === "string" && v.trim()) return v.trim()
+  }
+  const path = payload.transcript_path
+  if (typeof path !== "string" || !path) return null
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const text = extractFailureText(readFileTail(path, 128 * 1024), {
+      nowMs: Date.now(),
+      maxAgeMs: FAILURE_FRESHNESS_MS,
+    })
+    if (text) return text
+    await Bun.sleep(300)
+  }
+  return null
+}
+
+// `tg-ctl harness-event [--dry-run]`: fed a Claude Code hook payload on stdin.
+// StopFailure (a turn died on a usage limit / API error) → hand a harness-limit
+// line to the daemon (which owns the card, the button and the scheduler); when
+// the daemon is unreachable, degrade to a direct button-less sendMessage so the
+// operator still hears about the dead session. Always exits 0 and prints
+// NOTHING on stdout — a hook must never wedge or confuse the harness.
+//
+// --dry-run (tests/smokes): classify and render the card, print it to STDERR,
+// send NOTHING and contact no daemon. Manual smokes must use this — a "test"
+// notification in the production chat reads as live state and trains the
+// operator to ignore real alerts (operator feedback).
+async function harnessEvent(ctx: Ctx, dryRun: boolean): Promise<void> {
+  const input = await readStdinText()
+  if (!input.trim()) return
+  let payload: Record<string, unknown>
+  try {
+    const parsed = JSON.parse(input)
+    if (!parsed || typeof parsed !== "object") return
+    payload = parsed as Record<string, unknown>
+  } catch {
+    return
+  }
+  if (payload.hook_event_name !== "StopFailure") return
+  const failureText = await resolveFailureText(payload)
+  if (failureText === null && payload.transcript_path) {
+    // A transcript with NO fresh failure line means the incident (if any) is
+    // old news — stay silent rather than sending a detail-less alarm.
+    log("harness-event: no fresh failure line in transcript — not notifying")
+    return
+  }
+  const failure = classifyFailure(failureText ?? "harness stop-failure (no details available)", Date.now())
+  const ev: LimitStopEvent = {
+    kind: "harness-limit",
+    paneId: process.env.TMUX_PANE || undefined,
+    sessionName: tmuxSessionName(),
+    cwd: typeof payload.cwd === "string" && payload.cwd ? payload.cwd : process.cwd(),
+    sessionId: typeof payload.session_id === "string" ? payload.session_id : undefined,
+    failure,
+  }
+  // Same staleness rule as the daemon (defense in depth): never report a limit
+  // whose reset time is already behind us as a current stop.
+  if (isStaleLimitEvent(ev, Date.now())) {
+    log(`harness-event: stale limit (reset already passed) — not notifying (resetAt=${failure.resetAt})`)
+    return
+  }
+  if (dryRun) {
+    const preview = buildLimitNotification(ev, "dry-run", Date.now())
+    log(`harness-event dry-run: kind=${failure.kind} resetAt=${failure.resetAt ?? "-"}`)
+    log(`harness-event dry-run card:\n${preview.text}`)
+    if (preview.reply_markup) {
+      log(`harness-event dry-run button: ${JSON.stringify(preview.reply_markup.inline_keyboard[0][0])}`)
+    }
+    return
+  }
+  const attempt = await oneAskAttempt(ctx, JSON.stringify(ev), 5_000)
+  if (attempt.kind === "response") return
+  // Daemon down → no scheduler to honor a button; send the plain notification
+  // directly (resetAt stripped so buildLimitNotification renders no button).
+  log(`harness-event: daemon unreachable — sending direct notification (kind=${failure.kind})`)
+  const fallback = buildLimitNotification({ ...ev, failure: { ...failure, resetAt: null } }, "-", Date.now())
+  await sendMessage(ctx, fallback.text)
+}
+
 // --- run: the daemon itself ---
 
 async function runDaemon(ctx: Ctx): Promise<never> {
@@ -2018,6 +2180,134 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (abandonedButtons.size || answeredButtons.size) {
       log(`questions restored: ${abandonedButtons.size} retained, ${answeredButtons.size} answered`)
     }
+  }
+  // --- limit-stop cards + scheduled auto-continues (tg-cli#113) ---
+  // token → entry; a tapped card arms a timer that injects AUTO_CONTINUE_TEXT
+  // into the stopped pane once the advertised reset time (plus grace) passes.
+  // Persisted like questions.json so a daemon restart re-arms pending timers.
+  const limitEntries = new Map<string, LimitEntry>()
+  const limitTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  // Grace past the advertised reset minute before injecting. Env-tunable so the
+  // integration tests can fire timers in milliseconds (same pattern as
+  // TG_CTL_ABANDONED_RETAIN_MS); production keeps the default.
+  const continueGraceMs = (() => {
+    const v = Number(process.env.TG_CTL_CONTINUE_GRACE_MS)
+    return Number.isFinite(v) && v >= 0 ? v : CONTINUE_GRACE_MS
+  })()
+  let limitTokenSeq = 0
+  const mintLimitToken = (): string => `${Date.now().toString(36)}-${(limitTokenSeq++).toString(36)}`
+  const persistLimits = (): void => {
+    try {
+      const pruned = pruneLimitEntries([...limitEntries.values()], Date.now())
+      limitEntries.clear()
+      for (const e of pruned) limitEntries.set(e.token, e)
+      atomicWrite(ctx.paths.limits, serializeLimitsStore({ entries: pruned }))
+    } catch (err) {
+      // Best-effort, like routes/questions: a persist failure must never break
+      // the notify/schedule path. The state simply isn't durable until the next write.
+      log(`limits persist failed: ${err}`)
+    }
+  }
+  const describeLimitTarget = (entry: LimitEntry): string => describeLimitLocation(entry) || "unknown pane"
+  // Timer fire: inject the continue text into the stopped pane. The entry is
+  // consumed FIRST (delete + persist) so a crash mid-inject can at worst lose
+  // one continue, never double-inject after a restart re-arm.
+  const fireAutoContinue = async (token: string): Promise<void> => {
+    limitTimers.delete(token)
+    const entry = limitEntries.get(token)
+    if (!entry || !entry.scheduled) return
+    // A clamped timer (reset > ~24.8 days, setTimeout's 32-bit cap) fires
+    // EARLY — re-arm instead of injecting before the limit actually reset
+    // (review catch). 1s slack tolerates timer jitter around the true instant.
+    if (entry.resetAt !== null && entry.resetAt + continueGraceMs - Date.now() > 1000) {
+      armLimitTimer(entry)
+      return
+    }
+    limitEntries.delete(token)
+    persistLimits()
+    if (!entry.paneId) return // scheduled entries always carry a pane; belt-and-braces
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, AUTO_CONTINUE_SENDER, AUTO_CONTINUE_TEXT)
+    const res = await executeInjectSteps(buildTextInjectPlan(entry.paneId, wrapped))
+    if (!res.ok) {
+      log(`limit-continue failed: token=${token} pane=${entry.paneId} err=${res.error}`)
+      await sendMessage(ctx, `⚠️ auto-continue failed for ${describeLimitTarget(entry)}: ${res.error}`)
+      return
+    }
+    log(`limit-continue fired: token=${token} pane=${entry.paneId}`)
+    await sendMessage(ctx, `▶️ auto-continue: «${AUTO_CONTINUE_TEXT}» → ${describeLimitTarget(entry)}`)
+  }
+  const armLimitTimer = (entry: LimitEntry): void => {
+    if (!entry.scheduled || entry.resetAt === null) return
+    const existing = limitTimers.get(entry.token)
+    if (existing) clearTimeout(existing)
+    // Grace past the advertised minute; clamp into setTimeout's 32-bit range
+    // (a longer wait re-arms from disk on the next daemon restart anyway).
+    const delay = Math.min(Math.max(entry.resetAt + continueGraceMs - Date.now(), 0), 0x7fffffff)
+    limitTimers.set(
+      entry.token,
+      setTimeout(() => {
+        void fireAutoContinue(entry.token)
+      }, delay),
+    )
+  }
+  const handleHarnessLimit = async (ev: LimitStopEvent): Promise<void> => {
+    // STALENESS guard (operator feedback): a limit whose reset time already
+    // passed is a PAST state — a card saying "stopped, resets at X" with X
+    // behind us reads as broken/stale and trains the operator to ignore alerts.
+    if (isStaleLimitEvent(ev, Date.now())) {
+      log(`limit-stop stale (reset already passed): pane=${ev.paneId ?? "-"} resetAt=${ev.failure.resetAt}`)
+      return
+    }
+    // StopFailure re-fires when a retry hits the same limit — same pane + same
+    // reset instant is the same incident, and it must not post a second card.
+    const existing = findDuplicateEntry([...limitEntries.values()], ev)
+    if (existing) {
+      log(`limit-stop duplicate: pane=${ev.paneId ?? "-"} token=${existing.token}`)
+      return
+    }
+    const token = mintLimitToken()
+    // RESERVE the entry BEFORE the send await (review catch: two near-simultaneous
+    // harness-limit lines both passed the dedupe while the first awaited sendMessage
+    // → two cards for one incident). The placeholder makes the second line hit the
+    // duplicate branch; the messageId is patched in after the send.
+    const entry: LimitEntry = {
+      token,
+      paneId: ev.paneId,
+      cwd: ev.cwd,
+      sessionName: ev.sessionName,
+      failureKind: ev.failure.kind,
+      failureText: ev.failure.text,
+      resetAt: ev.failure.resetAt,
+      notifyMessageId: null,
+      scheduled: false,
+      createdAt: Date.now(),
+    }
+    limitEntries.set(token, entry)
+    const notification = buildLimitNotification(ev, token, Date.now())
+    const messageId = await sendMessage(
+      ctx,
+      notification.text,
+      notification.reply_markup ? { reply_markup: notification.reply_markup } : {},
+    )
+    if (messageId === null) {
+      // No card → no button → a retained entry would only suppress the retry's
+      // notification. Roll the reservation back so a re-fire can try again.
+      limitEntries.delete(token)
+      log(`limit-stop send failed: kind=${ev.failure.kind} pane=${ev.paneId ?? "-"}`)
+      return
+    }
+    entry.notifyMessageId = messageId
+    persistLimits()
+    log(
+      `limit-stop notified: kind=${ev.failure.kind} pane=${ev.paneId ?? "-"} resetAt=${ev.failure.resetAt ?? "-"} token=${token}`,
+    )
+  }
+  // Restore + re-arm scheduled continues from disk (parse prunes stale entries).
+  {
+    const restored = parseLimitsStore(readFileOrNull(ctx.paths.limits), Date.now())
+    for (const e of restored.entries) limitEntries.set(e.token, e)
+    for (const e of restored.entries) armLimitTimer(e)
+    if (restored.entries.length) log(`limits restored: ${restored.entries.length} entries`)
   }
   // /agent (and unrecognized-reply) selection awaiting a button tap: token →
   // message + candidate list. `prewrapped` = inject the message verbatim (a reply
@@ -2309,6 +2599,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     persist: persistQuestions,
     onAbandon: onQuestionAbandoned,
     onUnscopedAbandon,
+    onHarnessLimit: handleHarnessLimit,
   }
   let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
@@ -4301,6 +4592,45 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "answer-callback":
         await answerCallbackQuery(ctx, action.callbackQueryId, action.text)
         return true
+      case "limit-continue": {
+        // A tap on a limit-stop card (tg-cli#113): schedule the pane's auto-continue
+        // at the stored reset time — or continue immediately when it already passed.
+        const entry = limitEntries.get(action.token)
+        if (!entry) {
+          await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+          return true
+        }
+        const nowTap = Date.now()
+        // A tap far past the reset is a stale card (prune only runs on writes, so
+        // a quiet daemon can still hold the entry). Expire it honestly instead of
+        // answering "continuing now" and then no-op'ing when persist prunes it.
+        if (entry.resetAt !== null && nowTap - entry.resetAt > LIMIT_PAST_RESET_RETAIN_MS) {
+          limitEntries.delete(entry.token)
+          persistLimits()
+          await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+          return true
+        }
+        if (entry.scheduled) {
+          await answerCallbackQuery(ctx, action.callbackQueryId, "already scheduled")
+          return true
+        }
+        entry.scheduled = true
+        persistLimits()
+        const now = Date.now()
+        const past = entry.resetAt === null || entry.resetAt <= now
+        const clock = entry.resetAt === null ? "" : formatResetClock(entry.resetAt, now)
+        await answerCallbackQuery(ctx, action.callbackQueryId, past ? "continuing now" : `scheduled at ${clock}`)
+        const cardId = entry.notifyMessageId ?? action.messageId
+        if (cardId !== null) {
+          // Re-render the card without its keyboard: the button is one-shot.
+          const note = past ? "▶️ continuing now" : `⏱ auto-continue scheduled at ${clock}`
+          void editMessageText(ctx, cardId, `${entry.failureText}\n\n${note}`)
+        }
+        if (past) void fireAutoContinue(entry.token)
+        else armLimitTimer(entry)
+        log(`limit-continue scheduled: token=${entry.token} pane=${entry.paneId ?? "-"} past=${past}`)
+        return true
+      }
       case "answer-question": {
         const pending = pendingButtons.get(action.requestId)
         if (!pending) {
@@ -4650,7 +4980,7 @@ if (import.meta.main) {
     console.log(USAGE)
     process.exit(0)
   }
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "harness-event", "install-hooks", "voice-setup"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -4681,7 +5011,9 @@ if (import.meta.main) {
 
   const token = env.TG_BOT_TOKEN ?? ""
   const botId = botIdFromToken(token)
-  if (cmd === "ask" && (!botId || !env.TG_CHAT_ID)) {
+  // Hook clients must exit 0 quietly when the bot isn't configured — a missing
+  // .env must never surface as a hook error inside the harness.
+  if ((cmd === "ask" || cmd === "harness-event") && (!botId || !env.TG_CHAT_ID)) {
     process.exit(0)
   }
   if (!botId || !env.TG_CHAT_ID) {
@@ -4730,6 +5062,15 @@ if (import.meta.main) {
   }
   if (cmd === "ask") {
     await askDaemon(ctx)
+    process.exit(0)
+  }
+  if (cmd === "harness-event") {
+    try {
+      await harnessEvent(ctx, process.argv.includes("--dry-run"))
+    } catch (err) {
+      // A hook failure must never bubble into the harness as a non-zero exit.
+      log(`harness-event failed: ${err}`)
+    }
     process.exit(0)
   }
   await runDaemon(ctx)

@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.24.0
+
+**Feature (tg-cli#113): harness limit-stop → Telegram notification + one-tap scheduled auto-continue.**
+
+- **`tg-ctl harness-event`** — new hook client for Claude Code's `StopFailure` event (fires when
+  a turn dies on a usage limit / API error). Reads the hook payload, extracts the failure text
+  from the transcript tail (the synthetic assistant message, e.g. *"You've hit your session
+  limit · resets 4:10am (Europe/Belgrade)"*), classifies it (`session-limit` / `weekly-limit` /
+  `api-error` / `unknown`) and hands a `harness-limit` line to the daemon over the existing hook
+  socket. Daemon unreachable → degrades to a direct button-less notification. Always exits 0,
+  prints nothing to stdout.
+- **Limit-stop card** — the daemon posts a notification naming the failure + the stopped pane.
+  When the reset time is parseable the card carries a one-tap **«продолжить в \<time\>»** inline
+  button (`tgw:<token>`); tapping it schedules an automatic «продолжай» injection into the
+  originating tmux pane at reset time (+2 min grace), or continues immediately when the reset
+  already passed. One-shot: the keyboard is cleared on tap; a re-tap reads "expired".
+- **Durable schedules** — entries persist to `tg-ctl.<botid>.limits.json` (same posture as
+  `questions.json`); a daemon restart re-arms pending timers. Same-pane/same-reset duplicates
+  (StopFailure re-fires on retry) reuse the existing card instead of posting a new one.
+- **`tg-ctl install-hooks`** now also provisions the `StopFailure` hook (`tg-ctl harness-event`,
+  30 s timeout) into `~/.claude/settings.json` — idempotent, existing installs upgrade in place.
+- New pure module `features/tg-ctl/limits.ts` (classification, IANA-zoned reset-time parsing,
+  store, callback codec, card composition) + unit tests and a daemon-level integration test
+  against the fake Bot API.
+
 ## 1.23.1
 
 **Fix (tg-cli#57): permission card durability — retain on socket close, re-attach on reconnect.**

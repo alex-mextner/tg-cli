@@ -167,6 +167,16 @@ Agent questions and permission prompts are forwarded to Telegram as inline butto
 
 While an agent is **waiting on a question**, new messages you send it are **deferred** (queued, marked ✍️ on the message) and delivered once the question is answered — they don't interrupt the prompt.
 
+### Limit-stop notify + scheduled auto-continue (v1.24.0)
+
+When a Claude Code turn dies on a **usage limit or API error** (the harness `StopFailure` hook),
+you get a Telegram notification naming the failure and the stopped pane. If the reset time is
+known (*"…resets 4:10am"*), the card carries a one-tap **«продолжить в 4:10»** button —
+tapping it schedules an automatic «продолжай» injection into that pane right after the limit
+resets (immediately, if it already did). Schedules survive a daemon restart. Setup is part of
+the same `tg-ctl install-hooks` run above; with the daemon down the hook still sends a plain
+notification (no button — there is no scheduler to honor it).
+
 ### Commands
 | Command | Effect |
 |---------|--------|

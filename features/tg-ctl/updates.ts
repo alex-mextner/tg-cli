@@ -15,6 +15,7 @@ import { parseButtonCallback } from './questions';
 import { parseAgentCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewModelCallback } from './new-command';
+import { parseLimitContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
 
 // Bot API getFile hard limit; larger files cannot be downloaded by bots.
@@ -195,6 +196,19 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
           callbackQueryId: cb.id,
           token: newDirCb.token,
           index: newDirCb.index,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
+      }
+      // Limit-stop "продолжить" taps (tgw:…, tg-cli#113): schedule the pane's
+      // auto-continue. Parsed before the q→buttons fallback so a tgw token is
+      // never misread as an expired question.
+      const limitToken = parseLimitContinueCallback(cb.data);
+      if (limitToken !== null) {
+        callbackActions.push({
+          kind: 'limit-continue',
+          callbackQueryId: cb.id,
+          token: limitToken,
           messageId: cb.message?.message_id ?? null,
         });
         continue;

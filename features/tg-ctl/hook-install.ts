@@ -28,13 +28,28 @@ interface HookGroup {
 }
 
 const TIMEOUT_SEC = 120;
+// The harness-event hook only does a socket write (or one fallback HTTP send);
+// it must never hold the harness for the full q→buttons budget.
+const HARNESS_EVENT_TIMEOUT_SEC = 30;
 
-// The hook groups we install, as (event, group) entries.
-function desiredGroups(command: string): Array<{ event: string; group: HookGroup }> {
-  const cmd: HookCmd = { type: 'command', command, timeout: TIMEOUT_SEC };
+// The commands the installed hook groups run. `ask` is the q→buttons client;
+// `harnessEvent` is the limit-stop/StopFailure reporter (tg-cli#113).
+export interface HookCommands {
+  ask: string;
+  harnessEvent: string;
+}
+
+// The hook groups we install, as (event, group) entries. StopFailure fires when
+// a turn ends on an API failure (usage limit, rate-limit, overload, …); the `*`
+// matcher catches every failure source — classification happens in
+// `tg-ctl harness-event` from the transcript's synthetic failure text.
+function desiredGroups(commands: HookCommands): Array<{ event: string; group: HookGroup }> {
+  const ask: HookCmd = { type: 'command', command: commands.ask, timeout: TIMEOUT_SEC };
+  const harness: HookCmd = { type: 'command', command: commands.harnessEvent, timeout: HARNESS_EVENT_TIMEOUT_SEC };
   return [
-    { event: 'PreToolUse', group: { matcher: 'AskUserQuestion', hooks: [cmd] } },
-    { event: 'PermissionRequest', group: { matcher: '*', hooks: [cmd] } },
+    { event: 'PreToolUse', group: { matcher: 'AskUserQuestion', hooks: [ask] } },
+    { event: 'PermissionRequest', group: { matcher: '*', hooks: [ask] } },
+    { event: 'StopFailure', group: { matcher: '*', hooks: [harness] } },
   ];
 }
 
@@ -48,28 +63,28 @@ function groupHasCommand(group: unknown, matcher: string, command: string): bool
   return hooks.some((h) => h && typeof h === 'object' && (h as Record<string, unknown>).command === command);
 }
 
-export function claudeHooksInstalled(settings: Record<string, unknown>, command: string): boolean {
+export function claudeHooksInstalled(settings: Record<string, unknown>, commands: HookCommands): boolean {
   const hooks = settings.hooks && typeof settings.hooks === 'object' ? (settings.hooks as Record<string, unknown>) : {};
-  for (const { event, group } of desiredGroups(command)) {
+  for (const { event, group } of desiredGroups(commands)) {
     const arr = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
-    if (!arr.some((g) => groupHasCommand(g, group.matcher ?? '', command))) return false;
+    if (!arr.some((g) => groupHasCommand(g, group.matcher ?? '', group.hooks[0].command))) return false;
   }
   return true;
 }
 
-// Return a deep-ish copy of `settings` with the q→buttons hook groups merged in,
-// plus whether anything changed. Existing hooks for the same event are preserved;
-// our group is appended only when an equivalent one is absent.
+// Return a deep-ish copy of `settings` with the q→buttons + harness-event hook
+// groups merged in, plus whether anything changed. Existing hooks for the same
+// event are preserved; our group is appended only when an equivalent one is absent.
 export function withClaudeHooks(
   settings: Record<string, unknown>,
-  command: string,
+  commands: HookCommands,
 ): { settings: Record<string, unknown>; changed: boolean } {
   const next: Record<string, unknown> = { ...settings };
   const hooks: Record<string, unknown> = next.hooks && typeof next.hooks === 'object' ? { ...(next.hooks as Record<string, unknown>) } : {};
   let changed = false;
-  for (const { event, group } of desiredGroups(command)) {
+  for (const { event, group } of desiredGroups(commands)) {
     const existing = Array.isArray(hooks[event]) ? [...(hooks[event] as unknown[])] : [];
-    if (!existing.some((g) => groupHasCommand(g, group.matcher ?? '', command))) {
+    if (!existing.some((g) => groupHasCommand(g, group.matcher ?? '', group.hooks[0].command))) {
       existing.push(group);
       changed = true;
     }
