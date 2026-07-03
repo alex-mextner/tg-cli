@@ -14,6 +14,13 @@ export interface ControlConfig {
   stalenessSec: number; // drop inbound older than this (default 300)
   idleExitMin: number; // daemon exits after this long with no agent pane (default 30)
   allowedSenders: number[]; // extra allowed sender user ids
+  // OPT-IN ticket triage (task-cli spec §8): when true, every inbound prose
+  // request is also shelled out to `task classify "<msg>" --create` so a ticket
+  // is created/deduped in the background. OFF by default — it spends a classifier
+  // call per message and requires the `task` CLI on PATH; arm it per machine with
+  // `control.classify: true`. Runs OFF the inject path, so it never delays the
+  // agent seeing the message (task-cli spec §8).
+  classify: boolean;
 }
 
 // enabled defaults ON (user decision 2026-06-10, post-review): inbound is armed
@@ -31,6 +38,9 @@ export const DEFAULT_CONTROL: ControlConfig = {
   stalenessSec: 300,
   idleExitMin: 30,
   allowedSenders: [],
+  // OFF by default: ticket triage is opt-in (it costs a classifier call per
+  // message and needs the `task` CLI). Arm with `control.classify: true`.
+  classify: false,
 };
 
 // --- Telegram update shapes (only the fields we read) ---

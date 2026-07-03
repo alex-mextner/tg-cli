@@ -56,6 +56,13 @@ export function parseControlConfig(yaml: string): Partial<ControlConfig> {
         // unrecognized value → ignore (don't guess)
         break;
       }
+      case 'classify': {
+        const v = value.toLowerCase();
+        if (TRUE_TOKENS.has(v)) out.classify = true;
+        else if (FALSE_TOKENS.has(v)) out.classify = false;
+        // unrecognized value → ignore (don't guess)
+        break;
+      }
       case 'transport':
         // Raw string passthrough — resolveControlConfig normalizes garbage.
         out.transport = unquote(value) as ControlConfig['transport'];
@@ -104,6 +111,7 @@ export function resolveControlConfig(partial: Partial<ControlConfig>): ControlCo
     idleExitMin: posInt(partial.idleExitMin, DEFAULT_CONTROL.idleExitMin),
     // Copy — the resolved config must never alias DEFAULT_CONTROL's array.
     allowedSenders: [...(partial.allowedSenders ?? DEFAULT_CONTROL.allowedSenders)],
+    classify: partial.classify ?? DEFAULT_CONTROL.classify,
   };
   if (partial.session !== undefined) cfg.session = partial.session;
   return cfg;

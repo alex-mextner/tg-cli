@@ -22,6 +22,12 @@ import {
   type AgentCandidate,
 } from "./features/tg-ctl/agent-match"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
+import {
+  buildClassifyArgv,
+  classifiableMessages,
+  formatClassifyReport,
+  parseClassifyResult,
+} from "./features/tg-ctl/classify"
 import { findAgentInPane, parsePaneList, parseProcList, pickTargetPane } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
 import { botIdFromToken, ctlPaths, pidStatus, readPidFile } from "./features/tg-ctl/lock"
@@ -1428,6 +1434,42 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // closest allowed emoji for "deferred behind the agent's open question".
   const DEFER_REACTION = "✍️"
 
+  // OPT-IN ticket triage (task-cli spec §8). For each inbound prose request, shell
+  // out to `task classify "<msg>" --create` so a ticket is created/deduped in the
+  // background, then report the touched ticket back THREADED under the request.
+  // This runs strictly OFF the inject path — the agent already saw the message —
+  // so a slow or missing classifier never delays delivery. Wholly best-effort:
+  // spawnGuarded returns exit 127 for a missing `task` binary and a timeout code
+  // for a wedged run, both swallowed here; nothing can crash the poll loop.
+  const classifyInbound = async (updates: TgUpdate[]): Promise<void> => {
+    const requests = classifiableMessages(updates, {
+      chatId: ctx.chatId,
+      allowedSenders: ctx.cfg.allowedSenders,
+      nowSec: Math.floor(Date.now() / 1000),
+      stalenessSec: ctx.cfg.stalenessSec,
+    })
+    if (requests.length === 0) return
+    // Pin task-cli to the agent's project so its session + ticket config resolve
+    // there; fall back to the daemon's cwd when no agent pane is discoverable.
+    const found = discover()
+    const cwd = found.ok ? found.target.pane.panePath : process.cwd()
+    for (const req of requests) {
+      try {
+        const run = await spawnGuarded(buildClassifyArgv(req.text, cwd), 90_000)
+        if (run.exitCode !== 0) {
+          log(`classify failed (exit ${run.exitCode}): ${run.stderr.trim().slice(0, 200)}`)
+          continue
+        }
+        const report = formatClassifyReport(parseClassifyResult(run.stdout))
+        if (report) await sendMessage(ctx, report, { reply_to_message_id: req.messageId })
+      } catch (err) {
+        // spawnGuarded already never throws; this is a belt-and-braces guard so a
+        // surprise in sendMessage/parse can't escape into the poll loop.
+        log(`classify error: ${err}`)
+      }
+    }
+  }
+
   // Returns true when the action was handled successfully — the 'ack' case
   // reads the PREVIOUS action's verdict to decide whether the source message
   // earns its 👀 receipt (actions for one message are contiguous, ack last).
@@ -1645,6 +1687,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
 
       for (const action of step.actions) {
         lastActionOk = await executeAction(action)
+      }
+
+      // Ticket triage (task-cli spec §8), opt-in via control.classify. Fired
+      // AFTER injection and NOT awaited — the message has already reached the
+      // agent, so the classifier shell-out runs in the background and never
+      // delays the next poll. classifyInbound swallows all its own errors.
+      if (ctx.cfg.classify && json.result.length > 0) {
+        void classifyInbound(json.result)
       }
     } catch (err) {
       // The daemon must survive anything — malformed updates, network
