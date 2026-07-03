@@ -154,7 +154,9 @@ tests can pass fakes.
   `tg` appends one `agent` record per send (stamped with `$TMUX_PANE`, the first sent message id).
   The file is trimmed to its last ~5000 lines on each write. `tg replies` defaults to the CURRENT
   pane's session + `user` direction ("recall what the user wrote"); `--all-sessions`/`--session`
-  override scope, `--json` is machine-readable, `find`/`--regex` search. Exact-match leading token
+  override scope — `--session` takes a tmux WINDOW NAME (`--session ext`, exact match → the pane
+  set of every window so named, unioned across sessions) or a raw `%`-pane id (`--session %7`);
+  `--json` is machine-readable, `find`/`--regex` search. Exact-match leading token
   in `tg` dispatch (like `hooks`/`voice`), so `tg "replies ..."` as a plain message still sends.
   - **Reply pane accuracy:** a text/voice reply is stamped with its recognized ORIGIN pane (the
     same pane reply-route delivers it to); a photo/document reply or a `/agent <window> …` routing

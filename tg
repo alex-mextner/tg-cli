@@ -48,6 +48,7 @@ import {
 import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
 import { outboundHistoryText } from "./features/replies/outbound"
 import { runReplies } from "./features/replies/cli"
+import { resolveWindowPanes } from "./features/replies/window"
 import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
@@ -361,6 +362,21 @@ if (import.meta.main) {
       const pane = process.env.TMUX_PANE
       return pane && pane.length > 0 ? pane : null
     }
+    // The real `tmux list-panes` spawn for `--session <windowName>` resolution
+    // lives HERE (the entrypoint owns I/O); features/replies/window.ts stays pure
+    // and just parses this output. pane_id FIRST + TAB so space-containing window
+    // names survive the split.
+    const runTmuxListPanes = (): { exitCode: number; stdout: string } | null => {
+      try {
+        const res = Bun.spawnSync(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{window_name}"], {
+          stdout: "pipe",
+          stderr: "pipe",
+        })
+        return { exitCode: res.exitCode, stdout: new TextDecoder().decode(res.stdout) }
+      } catch {
+        return null // tmux binary not on PATH
+      }
+    }
     const code = runReplies(rawArgs, {
       readHistory: () => {
         try {
@@ -370,6 +386,8 @@ if (import.meta.main) {
         }
       },
       detectPane: detectRepliesPane,
+      // `--session ext` → the pane ids of every tmux window named exactly "ext".
+      resolveWindow: (name: string) => resolveWindowPanes(name, runTmuxListPanes),
       // Local time (Europe/Belgrade for the CTO) — matches the daemon's wrap.
       fmtTime: (unixSec: number) => {
         const d = new Date(unixSec * 1000)
