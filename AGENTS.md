@@ -156,6 +156,10 @@ tests can pass fakes.
   pane's session + `user` direction ("recall what the user wrote"); `--all-sessions`/`--session`
   override scope — `--session` takes a tmux WINDOW NAME (`--session ext`, exact match → the pane
   set of every window so named, unioned across sessions) or a raw `%`-pane id (`--session %7`);
+  `--all-sessions` drops the pane filter entirely (`tg replies agent --all-sessions`);
+  `--since`/`--until` bound the range by date, both inclusive — an ISO date (`--since 2026-06-28`,
+  midnight UTC), an ISO datetime (`2026-06-28T10:00`, UTC), or relative `Nd`/`Nh` from now
+  (`tg replies user --since 3d`, `tg replies all --since 2026-06-28 --until 2026-06-30`);
   `--json` is machine-readable, `find`/`--regex` search. Exact-match leading token
   in `tg` dispatch (like `hooks`/`voice`), so `tg "replies ..."` as a plain message still sends.
   - **Reply pane accuracy:** a text/voice reply is stamped with its recognized ORIGIN pane (the
