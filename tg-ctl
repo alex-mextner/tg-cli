@@ -112,7 +112,14 @@ import {
   serializeRegistrations,
   upsertRegistration,
 } from "./features/tg-ctl/registration-store"
-import { claudeHooksInstalled, harnessHooksInstalled, withClaudeHooks, withHarnessHooks } from "./features/tg-ctl/hook-install"
+import {
+  claudeHooksInstalled,
+  claudeStatusLineTelemetryInstalled,
+  harnessHooksInstalled,
+  withClaudeHooks,
+  withClaudeStatusLineTelemetry,
+  withHarnessHooks,
+} from "./features/tg-ctl/hook-install"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
@@ -206,7 +213,7 @@ export const USAGE = `Usage:
                          # (--dry-run prints the plan and touches nothing)
   tg-ctl disable         # remove OS autostart AND stop
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
-  tg-ctl install-hooks   # wire q→buttons + StopFailure (limit/error) hooks
+  tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude usage telemetry
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
   tg-ctl harness-event [--dry-run] [--pane %N] [--agent NAME] [--language LANG]
                         [--reason MATCHER]
@@ -230,6 +237,10 @@ Config:      <config dir>/config.yaml, top-level control: + voice: blocks.
 Env:         TG_CTL_CONFIG_DIR (default ~/.config/tg-cli),
              TG_API_BASE (default https://api.telegram.org).
 `
+
+const CLAUDE_QUESTION_HOOK_CMD = "tg-ctl ask"
+const CLAUDE_HARNESS_HOOK_CMD = "tg-ctl harness-event"
+const CLAUDE_STATUSLINE_TELEMETRY_CMD = "tg-ctl harness-event --agent claude"
 
 // Spec §5.2 no-tmux guard, verbatim.
 export const NO_AGENT_REPLY =
@@ -320,6 +331,7 @@ interface Ctx {
   apiBase: string
   botId: string
   home: string
+  cwd: string
 }
 
 function log(msg: string): void {
@@ -332,6 +344,24 @@ function readFileOrNull(path: string): string | null {
   } catch {
     return null
   }
+}
+
+function readJsonObjectOrNull(path: string): Record<string, unknown> | null {
+  const raw = readFileOrNull(path)
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null
+  } catch {
+    return null
+  }
+}
+
+function hasClaudeStatusLineCommand(settings: Record<string, unknown>): boolean {
+  const statusLine = settings.statusLine
+  if (!statusLine || typeof statusLine !== "object" || Array.isArray(statusLine)) return false
+  const command = (statusLine as Record<string, unknown>).command
+  return typeof command === "string" && command.trim().length > 0
 }
 
 // Crash-safe write: stage into a sibling temp file then rename(2) over the target.
@@ -883,7 +913,33 @@ function runVoiceSetup(args: { configDir: string; home: string; language: string
 
 // Shared by `tg-ctl status` (CLI) and the /status command (TG reply). Works
 // with no daemon running — everything is read from files + live discovery.
-function composeStatus(ctx: Ctx): string {
+function findShadowingClaudeStatusLine(home: string, cwd: string, command: string): string | null {
+  const userSettingsPath = resolve(home, ".claude", "settings.json")
+  let dir = resolve(cwd)
+  while (true) {
+    for (const name of ["settings.local.json", "settings.json"]) {
+      const candidate = resolve(dir, ".claude", name)
+      if (candidate === userSettingsPath) continue
+      const settings = readJsonObjectOrNull(candidate)
+      if (!settings || !hasClaudeStatusLineCommand(settings)) continue
+      return claudeStatusLineTelemetryInstalled(settings, command) ? null : candidate
+    }
+    const parent = dirname(dir)
+    if (parent === dir) return null
+    dir = parent
+  }
+}
+
+function newestRegisteredCwd(regs: Registration[]): string | null {
+  let best: Registration | null = null
+  for (const reg of regs) {
+    if (!reg.cwd) continue
+    if (!best || (reg.registeredAt ?? 0) > (best.registeredAt ?? 0)) best = reg
+  }
+  return best?.cwd ?? null
+}
+
+function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   const pid = readPidFile(readFileOrNull(ctx.paths.pid))
   const alive = pidStatus(pid, kill0)
   const lines: string[] = [
@@ -912,6 +968,7 @@ function composeStatus(ctx: Ctx): string {
     }
   }
   const found = discoverTarget(ctx)
+  const statusScopeCwd = statusCwd ?? (found.ok ? found.target.pane.panePath : newestRegisteredCwd(regs) ?? ctx.cwd)
   lines.push(
     found.ok
       ? `target: ${found.target.agent} in ${found.target.pane.sessionName}:${found.target.pane.windowIndex} ` +
@@ -933,11 +990,17 @@ function composeStatus(ctx: Ctx): string {
   const hooksRaw = readFileOrNull(join(ctx.home, ".claude", "settings.json"))
   let questionHooksOk = false
   let harnessHooksOk = false
+  let statusLineTelemetryOk = false
+  let shadowingStatusLine: string | null = null
   if (hooksRaw) {
     try {
       const hooksSettings = JSON.parse(hooksRaw)
-      questionHooksOk = claudeHooksInstalled(hooksSettings, "tg-ctl ask")
-      harnessHooksOk = harnessHooksInstalled(hooksSettings, "tg-ctl harness-event")
+      questionHooksOk = claudeHooksInstalled(hooksSettings, CLAUDE_QUESTION_HOOK_CMD)
+      harnessHooksOk = harnessHooksInstalled(hooksSettings, CLAUDE_HARNESS_HOOK_CMD)
+      statusLineTelemetryOk = claudeStatusLineTelemetryInstalled(hooksSettings, CLAUDE_STATUSLINE_TELEMETRY_CMD)
+      if (statusLineTelemetryOk) {
+        shadowingStatusLine = findShadowingClaudeStatusLine(ctx.home, statusScopeCwd, CLAUDE_STATUSLINE_TELEMETRY_CMD)
+      }
     } catch {}
   }
   lines.push(
@@ -949,6 +1012,13 @@ function composeStatus(ctx: Ctx): string {
     harnessHooksOk
       ? "limit/error hooks: installed (Claude Code StopFailure)"
       : "limit/error hooks: NOT installed — run `tg-ctl install-hooks`",
+  )
+  lines.push(
+    shadowingStatusLine
+      ? `usage telemetry: shadowed by ${shadowingStatusLine} — run \`tg-ctl install-hooks\` from that scope or remove the override`
+      : statusLineTelemetryOk
+        ? "usage telemetry: installed (Claude Code statusLine)"
+        : "usage telemetry: NOT installed — run `tg-ctl install-hooks`",
   )
   // Autostart (the shared service-management lifecycle): an installed unit means the daemon
   // comes back at login. Mirrors the q→buttons line — installed reports the kind/label, absent
@@ -970,7 +1040,6 @@ function composeStatus(ctx: Ctx): string {
 // harnesses. Pure JSON merge lives in features/tg-ctl/hook-install.ts.
 function installHooks(home: string): void {
   const settingsPath = join(home, ".claude", "settings.json")
-  const command = "tg-ctl ask"
   const raw = readFileOrNull(settingsPath)
   let existing: Record<string, unknown> = {}
   if (raw) {
@@ -982,15 +1051,15 @@ function installHooks(home: string): void {
       process.exit(1)
     }
   }
-  const qButtons = withClaudeHooks(existing, command)
-  // Also provision the StopFailure harness hook (#113) in the SAME pass so a
-  // single `install-hooks` wires both q→buttons and limit/error notifications.
-  const merged = withHarnessHooks(qButtons.settings, "tg-ctl harness-event")
-  const settings = merged.settings
-  const changed = qButtons.changed || merged.changed
-  if (!changed) {
-    console.log("tg-ctl: Claude Code q→buttons + StopFailure hooks already installed — nothing to do.")
-  } else {
+  const qButtons = withClaudeHooks(existing, CLAUDE_QUESTION_HOOK_CMD)
+  // Also provision harness limit/error channels in the SAME pass so a single
+  // `install-hooks` wires q→buttons, StopFailure notifications, and proactive
+  // Claude statusLine usage telemetry.
+  const harness = withHarnessHooks(qButtons.settings, CLAUDE_HARNESS_HOOK_CMD)
+  const telemetry = withClaudeStatusLineTelemetry(harness.settings, CLAUDE_STATUSLINE_TELEMETRY_CMD)
+  const settings = telemetry.settings
+  const changed = qButtons.changed || harness.changed || telemetry.changed
+  if (changed) {
     if (raw) {
       try {
         writeFileSync(`${settingsPath}.bak`, raw)
@@ -998,7 +1067,28 @@ function installHooks(home: string): void {
     }
     mkdirSync(join(home, ".claude"), { recursive: true })
     writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`)
-    console.log(`tg-ctl: installed Claude Code q→buttons + StopFailure hooks → ${settingsPath}` + (raw ? ` (backup: ${settingsPath}.bak)` : ""))
+    console.log(`tg-ctl: installed Claude Code q→buttons + StopFailure + statusLine usage telemetry → ${settingsPath}` + (raw ? ` (backup: ${settingsPath}.bak)` : ""))
+  }
+  let shadowChanged = false
+  const shadowingStatusLine = findShadowingClaudeStatusLine(home, process.cwd(), CLAUDE_STATUSLINE_TELEMETRY_CMD)
+  if (shadowingStatusLine) {
+    const shadowRaw = readFileOrNull(shadowingStatusLine)
+    const shadowSettings = readJsonObjectOrNull(shadowingStatusLine)
+    if (shadowRaw && shadowSettings) {
+      const shadowTelemetry = withClaudeStatusLineTelemetry(shadowSettings, CLAUDE_STATUSLINE_TELEMETRY_CMD)
+      if (shadowTelemetry.changed) {
+        try {
+          writeFileSync(`${shadowingStatusLine}.bak`, shadowRaw)
+        } catch {}
+        mkdirSync(dirname(shadowingStatusLine), { recursive: true })
+        writeFileSync(shadowingStatusLine, `${JSON.stringify(shadowTelemetry.settings, null, 2)}\n`)
+        console.log(`tg-ctl: installed Claude statusLine usage telemetry → ${shadowingStatusLine} (backup: ${shadowingStatusLine}.bak)`)
+        shadowChanged = true
+      }
+    }
+  }
+  if (!changed && !shadowChanged) {
+    console.log("tg-ctl: Claude Code q→buttons + StopFailure + statusLine usage telemetry already installed — nothing to do.")
   }
   console.log("")
   console.log("Codex: add a PermissionRequest hook running `tg-ctl ask --agent codex`, then trust it via /hooks (manual, first run).")
@@ -5127,7 +5217,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return true
       }
       case "status":
-        await sendMessage(ctx, composeStatus(ctx))
+        await sendMessage(ctx, composeStatus(ctx, null))
         return true
       case "tasks":
         await runTasksCommand(ctx, action)
@@ -5457,6 +5547,7 @@ if (import.meta.main) {
     apiBase: env.TG_API_BASE || "https://api.telegram.org",
     botId,
     home,
+    cwd: process.cwd(),
   }
 
   if (cmd === "start") {
@@ -5479,7 +5570,7 @@ if (import.meta.main) {
     process.exit(disableAutostart(ctx))
   }
   if (cmd === "status") {
-    console.log(composeStatus(ctx))
+    console.log(composeStatus(ctx, null))
     process.exit(0)
   }
   if (cmd === "ask") {

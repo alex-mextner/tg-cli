@@ -4,12 +4,14 @@ Verification done 2026-06-12 on this machine.
 
 ## Short answer
 
-The **daemon half works and is tested**. As of v1.6.0 the missing pieces are now
-shipped (this branch): a one-command **installer** (`tg-ctl install-hooks`)
-idempotently wires the Claude Code hook, `tg-ctl ask` **normalizes the raw
-harness payload** (so the installed hook is trivial), and `tg-ctl status` reports
-whether the hook is installed. Run `tg-ctl install-hooks` once + restart the
-agent session, and agent questions reach Telegram as buttons.
+The **daemon half works and is tested**. As of v1.6.0 the missing q→buttons pieces
+shipped: a one-command **installer** (`tg-ctl install-hooks`) idempotently wires the
+Claude Code question/permission hooks, `tg-ctl ask` **normalizes the raw harness
+payload** (so the installed hook is trivial), and `tg-ctl status` reports whether
+the hooks are installed. Current `install-hooks` also provisions Claude StopFailure
+limit/error notifications and proactive Claude statusLine usage telemetry. Run
+`tg-ctl install-hooks` once + restart the agent session, and agent questions reach
+Telegram as buttons.
 
 > Original verification (2026-06-12) found the feature dead out of the box: the
 > hook was not installed and no installer existed. That gap is closed below.
@@ -31,19 +33,23 @@ agent session, and agent questions reach Telegram as buttons.
 ## Seamless setup (v1.6.0)
 
 - **`tg-ctl install-hooks`** — idempotently merges into `~/.claude/settings.json`
-  (backing it up first): a `PreToolUse` matcher `AskUserQuestion` and a
-  `PermissionRequest` group, both running `tg-ctl ask`. Existing hooks are
-  preserved; re-running is a no-op. Pure merge in
-  `features/tg-ctl/hook-install.ts`. Codex/opencode get printed guidance (Codex
-  needs a manual `/hooks` trust; opencode is native SSE).
+  (backing it up first): a `PreToolUse` matcher `AskUserQuestion`, a
+  `PermissionRequest` group, the Claude StopFailure hook, and a statusLine usage
+  telemetry collector. Existing hooks are preserved; re-running is a no-op. If a
+  project-local `.claude/settings*.json` statusLine overrides the user-level
+  collector, running `install-hooks` from that project wraps the local statusLine
+  too and backs up that file. Pure merge in `features/tg-ctl/hook-install.ts`.
+  Codex/opencode get printed guidance (Codex needs a manual `/hooks` trust;
+  opencode is native SSE).
 - **`tg-ctl ask` normalizes the raw harness payload** — the hook pipes Claude
   Code's native `PreToolUse(AskUserQuestion)` / `PermissionRequest` JSON straight
   in; `features/tg-ctl/hook-normalize.ts` maps it to a `ButtonRequest` using the
   hook process's own `TMUX_PANE`/cwd/session. Single non-multiSelect questions
   with concrete options forward; multi-question / multiSelect / free-form fall
   back to the local dialog. (Codex uses `tg-ctl ask --agent codex`.)
-- **`tg-ctl status`** prints `q→buttons hooks: installed / NOT installed — run
-  tg-ctl install-hooks` so the state is never silently wrong.
+- **`tg-ctl status`** prints separate `q→buttons hooks`, `limit/error hooks`, and
+  `usage telemetry` lines, including project/local statusLine overrides that shadow
+  the user-level collector, so the state is never silently wrong.
 
 The verified-live AskUserQuestion contract (CC 2.1.170) — `answers` keyed by
 question TEXT, `updatedInput` replaces wholesale — is unchanged in

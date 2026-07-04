@@ -6,10 +6,15 @@
 // loaded by the test run. (A real `launchctl load` would register a RunAtLoad agent into the
 // tester's session and actually start the daemon — exactly the side effect this avoids.)
 import { expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { withClaudeHooks } from '../features/tg-ctl/hook-install';
+import {
+  claudeStatusLineTelemetryInstalled,
+  harnessHooksInstalled,
+  withClaudeHooks,
+  withClaudeStatusLineTelemetry,
+} from '../features/tg-ctl/hook-install';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -34,8 +39,8 @@ function reapDaemon(cfg: string, botId: string): void {
   }
 }
 
-function run(args: string[], env: Record<string, string>) {
-  return Bun.spawnSync(['bun', TG_CTL, ...args], { env: { PATH: process.env.PATH ?? '', ...env } });
+function run(args: string[], env: Record<string, string>, cwd?: string) {
+  return Bun.spawnSync(['bun', TG_CTL, ...args], { cwd, env: { PATH: process.env.PATH ?? '', ...env } });
 }
 
 // A throwaway HOME + config dir with fake creds so the bot-token gate passes.
@@ -128,6 +133,121 @@ test('status reports StopFailure hook separately from q→buttons hook', () => {
   const out = proc.stdout.toString();
   expect(out).toContain('q→buttons hooks: installed');
   expect(out).toContain('limit/error hooks: NOT installed');
+  expect(out).toContain('usage telemetry: NOT installed');
+});
+
+test('install-hooks provisions Claude statusLine usage telemetry collector', () => {
+  const { home, env } = fakeEnv();
+
+  const proc = run(['install-hooks'], env);
+  expect(proc.exitCode).toBe(0);
+  const out = proc.stdout.toString();
+  expect(out).toContain('statusLine usage telemetry');
+
+  const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf8'));
+  expect(harnessHooksInstalled(settings, 'tg-ctl harness-event')).toBe(true);
+  expect(claudeStatusLineTelemetryInstalled(settings, 'tg-ctl harness-event --agent claude')).toBe(true);
+});
+
+test('status reports when a project-local Claude statusLine shadows the installed telemetry collector', () => {
+  const { home, env } = fakeEnv();
+  const installed = run(['install-hooks'], env);
+  expect(installed.exitCode).toBe(0);
+
+  const project = mkdtempSync(join(tmpdir(), 'tgctl-proj-'));
+  mkdirSync(join(project, '.claude'), { recursive: true });
+  writeFileSync(
+    join(project, '.claude', 'settings.json'),
+    `${JSON.stringify({ statusLine: { type: 'command', command: 'printf project-only' } })}\n`,
+  );
+
+  const proc = run(['status'], env, project);
+  expect(proc.exitCode).toBe(0);
+  const out = proc.stdout.toString();
+  expect(out).toContain('usage telemetry: shadowed by');
+  expect(out).toContain(join(project, '.claude', 'settings.json'));
+  expect(out).not.toContain('usage telemetry: installed (Claude Code statusLine)');
+
+  const userSettings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf8'));
+  expect(claudeStatusLineTelemetryInstalled(userSettings, 'tg-ctl harness-event --agent claude')).toBe(true);
+});
+
+test('status checks the registered active scope when invoked from another directory', () => {
+  const { cfg, env } = fakeEnv();
+  const installed = run(['install-hooks'], env);
+  expect(installed.exitCode).toBe(0);
+
+  const project = mkdtempSync(join(tmpdir(), 'tgctl-proj-'));
+  mkdirSync(join(project, '.claude'), { recursive: true });
+  writeFileSync(
+    join(project, '.claude', 'settings.json'),
+    `${JSON.stringify({ statusLine: { type: 'command', command: 'printf project-only' } })}\n`,
+  );
+  writeFileSync(join(cfg, 'tg-ctl.123456.registration.json'), `${JSON.stringify([{ cwd: project, registeredAt: 2 }])}\n`);
+
+  const shimDir = exitCodeShimDir('tmux', 0);
+  const otherDir = mkdtempSync(join(tmpdir(), 'tgctl-other-'));
+  const proc = run(['status'], { ...env, PATH: `${shimDir}:${process.env.PATH ?? ''}` }, otherDir);
+
+  expect(proc.exitCode).toBe(0);
+  const out = proc.stdout.toString();
+  expect(out).toContain('usage telemetry: shadowed by');
+  expect(out).toContain(join(project, '.claude', 'settings.json'));
+  expect(out).not.toContain('usage telemetry: installed (Claude Code statusLine)');
+});
+
+test('install-hooks from a shadowed project wraps that project-local statusLine override', () => {
+  const { home, env } = fakeEnv();
+  const installed = run(['install-hooks'], env);
+  expect(installed.exitCode).toBe(0);
+
+  const project = mkdtempSync(join(tmpdir(), 'tgctl-proj-'));
+  const projectSettingsPath = join(project, '.claude', 'settings.json');
+  mkdirSync(join(project, '.claude'), { recursive: true });
+  writeFileSync(projectSettingsPath, `${JSON.stringify({ statusLine: { type: 'command', command: 'printf project-only' } })}\n`);
+
+  const proc = run(['install-hooks'], env, project);
+  expect(proc.exitCode).toBe(0);
+  expect(proc.stdout.toString()).toContain(`installed Claude statusLine usage telemetry → ${realpathSync(projectSettingsPath)}`);
+
+  const projectSettings = JSON.parse(readFileSync(projectSettingsPath, 'utf8'));
+  expect(claudeStatusLineTelemetryInstalled(projectSettings, 'tg-ctl harness-event --agent claude')).toBe(true);
+
+  const status = run(['status'], env, project);
+  expect(status.exitCode).toBe(0);
+  const out = status.stdout.toString();
+  expect(out).toContain('usage telemetry: installed (Claude Code statusLine)');
+  expect(out).not.toContain('usage telemetry: shadowed by');
+
+  const userSettings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf8'));
+  expect(harnessHooksInstalled(userSettings, 'tg-ctl harness-event')).toBe(true);
+});
+
+test('status stops at the nearest project collector instead of reporting an ancestor shadow', () => {
+  const { env } = fakeEnv();
+  const installed = run(['install-hooks'], env);
+  expect(installed.exitCode).toBe(0);
+
+  const project = mkdtempSync(join(tmpdir(), 'tgctl-proj-'));
+  const nested = join(project, 'subdir');
+  mkdirSync(join(project, '.claude'), { recursive: true });
+  mkdirSync(join(nested, '.claude'), { recursive: true });
+  writeFileSync(
+    join(project, '.claude', 'settings.json'),
+    `${JSON.stringify({ statusLine: { type: 'command', command: 'printf parent-only' } })}\n`,
+  );
+  const nestedSettings = withClaudeStatusLineTelemetry(
+    { statusLine: { type: 'command', command: 'printf nested-collector' } },
+    'tg-ctl harness-event --agent claude',
+  ).settings;
+  writeFileSync(join(nested, '.claude', 'settings.json'), `${JSON.stringify(nestedSettings)}\n`);
+
+  const proc = run(['status'], env, nested);
+  expect(proc.exitCode).toBe(0);
+  const out = proc.stdout.toString();
+  expect(out).toContain('usage telemetry: installed (Claude Code statusLine)');
+  expect(out).not.toContain('usage telemetry: shadowed by');
+  expect(out).not.toContain(join(project, '.claude', 'settings.json'));
 });
 
 // On a host where the OS control command (launchctl/systemctl) fails, `enable` writes the unit

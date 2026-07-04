@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 import { NO_AGENT_REPLY } from '../tg-ctl';
+import { withClaudeHooks, withClaudeStatusLineTelemetry, withHarnessHooks } from '../features/tg-ctl/hook-install';
 
 // Full daemon round-trip against a local Bot-API fake (spec §11: "the daemon
 // is spawned as a real subprocess against the fake"). tmux is PATH-shimmed to
@@ -97,6 +98,7 @@ const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-daemon-'));
 writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
 writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 const pidFile = join(cfgDir, 'tg-ctl.123.pid');
+const statusProject = mkdtempSync(join(tmpdir(), 'tgctl-status-project-'));
 
 // tmux PATH shim: log argv, print NOTHING — parsePaneList('') = no panes, so
 // discovery yields no-agent and the daemon must answer with the guard text.
@@ -119,6 +121,22 @@ afterAll(async () => {
 });
 
 test('daemon round-trip: stale notice, guard replies, /status, allowlist drop, media download', async () => {
+  mkdirSync(join(cfgDir, '.claude'), { recursive: true });
+  const hooks = withClaudeHooks({}, 'tg-ctl ask');
+  const harness = withHarnessHooks(hooks.settings, 'tg-ctl harness-event');
+  const telemetry = withClaudeStatusLineTelemetry(harness.settings, 'tg-ctl harness-event --agent claude');
+  writeFileSync(join(cfgDir, '.claude', 'settings.json'), `${JSON.stringify(telemetry.settings)}\n`);
+
+  mkdirSync(join(statusProject, '.claude'), { recursive: true });
+  writeFileSync(
+    join(statusProject, '.claude', 'settings.json'),
+    `${JSON.stringify({ statusLine: { type: 'command', command: 'printf project-only' } })}\n`,
+  );
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.registration.json'),
+    `${JSON.stringify([{ paneId: '%2', cwd: statusProject, registeredAt: nowSec }])}\n`,
+  );
+
   // Daemon stderr goes to a file, not a pipe — post-mortem readable, can't block.
   // spawnDaemon tracks the proc + cfgDir BEFORE waiting on the socket, so a
   // missing socket can never leak the spawned daemon.
@@ -151,6 +169,8 @@ test('daemon round-trip: stale notice, guard replies, /status, allowlist drop, m
   // (b) /status → composed status names THIS daemon as running.
   expect(sent[2]?.text).toContain(`tg-ctl: running (pid ${daemon.pid})`);
   expect(sent[2]?.text).toContain('offset: 105');
+  expect(sent[2]?.text).toContain('usage telemetry: shadowed by');
+  expect(sent[2]?.text).toContain(join(statusProject, '.claude', 'settings.json'));
   // (e) photo → downloaded, then the inject for it degrades to the guard too.
   expect(sent[3]?.text).toBe(NO_AGENT_REPLY);
   expect(sent).toHaveLength(4);

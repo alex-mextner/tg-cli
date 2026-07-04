@@ -3,6 +3,26 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.31.1
+
+**Fix: `tg-ctl install-hooks` now wires Claude proactive usage telemetry.**
+
+- Root cause for missed Claude weekly-limit warnings: `tg-ctl harness-event` already
+  understood Claude Code `statusLine.rate_limits`, but `install-hooks` only installed
+  q→buttons and StopFailure. A session could reach 98% weekly usage without any
+  StopFailure, and nothing was piping the statusLine payload into `harness-event`.
+- `install-hooks` now wraps the existing Claude `statusLine` command, preserves its
+  visible output, and sends a secure private copy of the statusLine JSON to
+  `tg-ctl harness-event --agent claude` for the existing >=90% deduped warning path.
+  If no `statusLine` existed, it installs a silent collector instead of changing the
+  visible Claude UI.
+- `tg-ctl status` reports the proactive `usage telemetry` channel separately from the
+  StopFailure hook, including project/local `statusLine` overrides that shadow the user
+  hook, so a future missing collector is visible instead of silently dead.
+- Running `install-hooks` from a shadowed project wraps that project-local statusLine
+  override too, and the statusLine collector is throttled to one `harness-event` launch
+  per 30 seconds by default.
+
 ## 1.31.0
 
 **Feature (HYP-903 follow-up): harness-aware `/new` spawning for Codex and opencode.**

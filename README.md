@@ -166,7 +166,7 @@ buttons grouped by tmux session; tap one to route. Bare `/agent` lists the agent
 ### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
 
-**Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hooks into `~/.claude/settings.json` (backup first, existing hooks preserved), then restart the agent session. `tg-ctl status` reports q→buttons and StopFailure hook installation separately. (Codex/opencode: see the command's printed guidance.)
+**Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hooks into `~/.claude/settings.json` (backup first, existing hooks preserved), then restart the agent session. `tg-ctl status` reports q→buttons, StopFailure, and proactive statusLine usage telemetry separately, including project/local `statusLine` overrides that shadow the user-level collector. If you run `install-hooks` from such a project, it wraps that local statusLine too and backs the file up. (Codex/opencode: see the command's printed guidance.)
 
 `tg-ctl harness-event` also accepts externally-piped proactive limit telemetry
 from confirmed contracts: Claude Code statusLine `rate_limits` (and
@@ -186,8 +186,12 @@ window, or for one hour when no reset is known.
 For StopFailure compatibility, `--transcript` or a `transcript_path` payload with
 no supported usage telemetry is treated as failure input and the last assistant
 message in that transcript is scanned for the limit/error text.
-`install-hooks` wires the Claude StopFailure hook; proactive telemetry collectors
-must pipe their payloads to `tg-ctl harness-event`.
+`install-hooks` wires Claude StopFailure and Claude statusLine proactive telemetry
+automatically. Existing visible statusLine output is preserved; when no statusLine
+exists, the installed collector is silent. The collector samples statusLine payloads
+at most every 30 seconds (`TG_CTL_STATUSLINE_MIN_INTERVAL_SEC=0` disables the
+throttle for tests). Non-Claude proactive telemetry collectors must pipe their
+payloads to `tg-ctl harness-event`.
 
 While an agent is **waiting on a question**, new messages you send it are **deferred** (queued, marked ✍️ on the message) and delivered once the question is answered — they don't interrupt the prompt.
 

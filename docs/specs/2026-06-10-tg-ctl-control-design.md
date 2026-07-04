@@ -317,6 +317,14 @@ one-hour cooldown when no reset is known).
 stats only with `--agent pi`. For StopFailure compatibility, `--transcript` or a
 payload `transcript_path` with no supported usage telemetry is treated as failure
 input; the last assistant transcript message is scanned for the limit/error text.
+`tg-ctl install-hooks` installs Claude's StopFailure hook and wraps Claude's
+statusLine command so the same payload is also sent to
+`tg-ctl harness-event --agent claude`. It preserves an existing visible
+statusLine command, installs a silent collector when no statusLine exists, and
+`tg-ctl status` reports project/local statusLine overrides that shadow the
+user-level collector. Running `install-hooks` from a shadowed project wraps that
+project-local statusLine too. The statusLine collector samples at most every 30
+seconds by default; other harness collectors wire their own payload pipe.
 The question/permission hook process awaits the button answer over the UDS
 request/response path with a hard client-side timeout.
 

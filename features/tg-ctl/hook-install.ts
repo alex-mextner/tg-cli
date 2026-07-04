@@ -32,6 +32,10 @@ const TIMEOUT_SEC = 120;
 // sends one message and returns; it does not block on a Telegram round-trip the
 // way the 120s q→buttons hook does.
 const HARNESS_TIMEOUT_SEC = 30;
+const STATUSLINE_TELEMETRY_MARKER = 'tg-ctl-statusline-usage';
+const STATUSLINE_DISPLAY_COMMAND_PREFIX = 'printf \'%s\' "$input" | sh -c ';
+const STATUSLINE_TELEMETRY_MIN_INTERVAL_SEC = 30;
+const SILENT_STATUSLINE_COMMAND = ':';
 
 // The q→buttons hook groups we install, as (event, group) entries.
 function desiredGroups(command: string): Array<{ event: string; group: HookGroup }> {
@@ -110,4 +114,91 @@ export function harnessHooksInstalled(settings: Record<string, unknown>, command
 // Return a copy of `settings` with the StopFailure harness hook merged in (#113).
 export function withHarnessHooks(settings: Record<string, unknown>, command: string): { settings: Record<string, unknown>; changed: boolean } {
   return mergeGroups(settings, desiredHarnessGroups(command), command);
+}
+
+function statusLineCommand(settings: Record<string, unknown>): string | null {
+  const statusLine = settings.statusLine;
+  if (!statusLine || typeof statusLine !== 'object' || Array.isArray(statusLine)) return null;
+  const command = (statusLine as Record<string, unknown>).command;
+  return typeof command === 'string' && command.trim() ? command : null;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function parseShellSingleQuoted(value: string, start: number): string | null {
+  if (value[start] !== "'") return null;
+  let out = '';
+  for (let i = start + 1; i < value.length; i++) {
+    if (value.startsWith(`'\\''`, i)) {
+      out += "'";
+      i += 3;
+      continue;
+    }
+    if (value[i] === "'") return out;
+    out += value[i];
+  }
+  return null;
+}
+
+function unwrapStatusLineTelemetryDisplayCommand(commandText: string): string | null {
+  const markerIndex = commandText.indexOf(STATUSLINE_TELEMETRY_MARKER);
+  if (markerIndex < 0) return null;
+  const displayStart = commandText.indexOf(STATUSLINE_DISPLAY_COMMAND_PREFIX);
+  if (displayStart < 0 || displayStart > markerIndex) return null;
+  return parseShellSingleQuoted(commandText, displayStart + STATUSLINE_DISPLAY_COMMAND_PREFIX.length);
+}
+
+function buildStatusLineTelemetryCommand(displayCommand: string, telemetryCommand: string): string {
+  const telemetryScript = `trap 'rm -f "$1"' EXIT INT TERM; ${telemetryCommand} < "$1"`;
+  const prefix = [
+    'input=$(cat)',
+    `interval=\${TG_CTL_STATUSLINE_MIN_INTERVAL_SEC:-${STATUSLINE_TELEMETRY_MIN_INTERVAL_SEC}}`,
+    `case "$interval" in ''|*[!0-9]*) interval=${STATUSLINE_TELEMETRY_MIN_INTERVAL_SEC};; esac`,
+    'stamp="${TMPDIR:-/tmp}/tg-claude-statusline-usage.stamp"',
+    'now=$(date +%s 2>/dev/null || printf 0)',
+    'last=$(cat "$stamp" 2>/dev/null); case "$last" in \'\'|*[!0-9]*) last=0;; esac',
+    'tmp=',
+    'if [ "$interval" -eq 0 ] || [ $((now - last)) -ge "$interval" ]; then printf \'%s\' "$now" > "$stamp" 2>/dev/null || true; tmp=$(mktemp "${TMPDIR:-/tmp}/tg-claude-statusline-usage.XXXXXX") || tmp=; if [ -n "$tmp" ]; then chmod 600 "$tmp" 2>/dev/null || true; printf \'%s\' "$input" > "$tmp"; fi; fi',
+  ].join('; ');
+  return `${prefix}; if [ -n "$tmp" ]; then nohup sh -c ${shellQuote(telemetryScript)} sh "$tmp" >/dev/null 2>&1 & fi; ${STATUSLINE_DISPLAY_COMMAND_PREFIX}${shellQuote(displayCommand)}; # ${STATUSLINE_TELEMETRY_MARKER}`;
+}
+
+export function claudeStatusLineTelemetryInstalled(settings: Record<string, unknown>, command: string): boolean {
+  const commandText = statusLineCommand(settings);
+  return (
+    commandText !== null &&
+    commandText.includes(STATUSLINE_TELEMETRY_MARKER) &&
+    commandText.includes(command) &&
+    commandText.includes('mktemp') &&
+    commandText.includes('trap') &&
+    commandText.includes('TG_CTL_STATUSLINE_MIN_INTERVAL_SEC') &&
+    commandText.includes('tg-claude-statusline-usage.stamp')
+  );
+}
+
+export function withClaudeStatusLineTelemetry(
+  settings: Record<string, unknown>,
+  command: string,
+): { settings: Record<string, unknown>; changed: boolean } {
+  if (claudeStatusLineTelemetryInstalled(settings, command)) return { settings, changed: false };
+  const currentStatusLine = settings.statusLine && typeof settings.statusLine === 'object' && !Array.isArray(settings.statusLine)
+    ? (settings.statusLine as Record<string, unknown>)
+    : {};
+  const existingCommand = statusLineCommand(settings);
+  const displayCommand = existingCommand && existingCommand.includes(STATUSLINE_TELEMETRY_MARKER)
+    ? (unwrapStatusLineTelemetryDisplayCommand(existingCommand) ?? existingCommand)
+    : (existingCommand ?? SILENT_STATUSLINE_COMMAND);
+  return {
+    settings: {
+      ...settings,
+      statusLine: {
+        ...currentStatusLine,
+        type: 'command',
+        command: buildStatusLineTelemetryCommand(displayCommand, command),
+      },
+    },
+    changed: true,
+  };
 }

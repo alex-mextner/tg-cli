@@ -1,8 +1,16 @@
 import { expect, test } from 'bun:test';
-import { withClaudeHooks, claudeHooksInstalled, withHarnessHooks, harnessHooksInstalled } from '../features/tg-ctl/hook-install';
+import {
+  withClaudeHooks,
+  claudeHooksInstalled,
+  withHarnessHooks,
+  harnessHooksInstalled,
+  withClaudeStatusLineTelemetry,
+  claudeStatusLineTelemetryInstalled,
+} from '../features/tg-ctl/hook-install';
 
 const CMD = 'tg-ctl ask';
 const HARNESS_CMD = 'tg-ctl harness-event';
+const STATUSLINE_TELEMETRY_CMD = 'tg-ctl harness-event --agent claude';
 
 test('empty settings → both hook groups added, changed=true', () => {
   const { settings, changed } = withClaudeHooks({}, CMD);
@@ -87,4 +95,126 @@ test('harness hook merges ALONGSIDE the q→buttons hooks without clobbering the
 
 test('harnessHooksInstalled: false on empty settings', () => {
   expect(harnessHooksInstalled({}, HARNESS_CMD)).toBe(false);
+});
+
+// --- Claude statusLine proactive usage telemetry (#132 follow-up) ---
+
+test('statusLine telemetry: wraps an existing statusLine command and preserves its output path', () => {
+  const existing = {
+    statusLine: {
+      type: 'command',
+      command: 'input=$(cat); printf "model=%s" "$(echo "$input" | jq -r .model.display_name)"',
+    },
+  };
+  const { settings, changed } = withClaudeStatusLineTelemetry(existing, STATUSLINE_TELEMETRY_CMD);
+  expect(changed).toBe(true);
+  const statusLine = settings.statusLine as { type: string; command: string };
+  expect(statusLine.type).toBe('command');
+  expect(statusLine.command).toContain('tg-ctl-statusline-usage');
+  expect(statusLine.command).toContain(STATUSLINE_TELEMETRY_CMD);
+  expect(statusLine.command).toContain('mktemp');
+  expect(statusLine.command).toContain('chmod 600');
+  expect(statusLine.command).toContain('trap');
+  expect(statusLine.command).toContain('TG_CTL_STATUSLINE_MIN_INTERVAL_SEC');
+  expect(statusLine.command).toContain('tg-claude-statusline-usage.stamp');
+  expect(statusLine.command).toContain("sh -c 'input=$(cat); printf");
+  expect(statusLine.command).not.toContain('&;');
+  expect(statusLine.command).not.toContain('tg-claude-statusline-usage.$$');
+  expect(claudeStatusLineTelemetryInstalled(settings, STATUSLINE_TELEMETRY_CMD)).toBe(true);
+});
+
+test('statusLine telemetry: without an existing statusLine it installs a silent collector, not a new jq display', () => {
+  const { settings } = withClaudeStatusLineTelemetry({}, STATUSLINE_TELEMETRY_CMD);
+  const statusLine = settings.statusLine as { command: string };
+  expect(statusLine.command).toContain("sh -c ':'");
+  expect(statusLine.command).not.toContain('jq -r');
+});
+
+test('statusLine telemetry: idempotent re-run does not wrap twice', () => {
+  const once = withClaudeStatusLineTelemetry({}, STATUSLINE_TELEMETRY_CMD).settings;
+  const twice = withClaudeStatusLineTelemetry(once, STATUSLINE_TELEMETRY_CMD);
+  expect(twice.changed).toBe(false);
+  const statusLine = twice.settings.statusLine as { command: string };
+  expect(statusLine.command.match(/tg-ctl-statusline-usage/g)?.length).toBe(1);
+});
+
+test('statusLine telemetry: current display-only statusLine is not considered installed', () => {
+  const displayOnly = {
+    statusLine: {
+      type: 'command',
+      command: 'input=$(cat); cwd=$(echo "$input" | jq -r \'.workspace.current_dir\'); printf "%s" "$cwd"',
+    },
+  };
+  expect(claudeStatusLineTelemetryInstalled(displayOnly, STATUSLINE_TELEMETRY_CMD)).toBe(false);
+});
+
+test('statusLine telemetry: old predictable-temp wrapper is treated as stale and rewritten', () => {
+  const stale = {
+    statusLine: {
+      type: 'command',
+      command:
+        'input=$(cat); tmp="${TMPDIR:-/tmp}/tg-claude-statusline-usage.$$.$RANDOM.json"; printf \'%s\' "$input" > "$tmp"; nohup sh -c \'tg-ctl harness-event --agent claude < "$1"; rm -f "$1"\' sh "$tmp" >/dev/null 2>&1 & printf \'%s\' "$input" | sh -c \':\'; # tg-ctl-statusline-usage',
+    },
+  };
+  expect(claudeStatusLineTelemetryInstalled(stale, STATUSLINE_TELEMETRY_CMD)).toBe(false);
+  const rewritten = withClaudeStatusLineTelemetry(stale, STATUSLINE_TELEMETRY_CMD);
+  expect(rewritten.changed).toBe(true);
+  const statusLine = rewritten.settings.statusLine as { command: string };
+  expect(statusLine.command).toContain('mktemp');
+  expect(statusLine.command).not.toContain('tg-claude-statusline-usage.$$');
+});
+
+test('statusLine telemetry: secure wrapper without throttle is treated as stale and rewritten', () => {
+  const stale = {
+    statusLine: {
+      type: 'command',
+      command:
+        'input=$(cat); tmp=$(mktemp "${TMPDIR:-/tmp}/tg-claude-statusline-usage.XXXXXX"); trap \'rm -f "$tmp"\' EXIT INT TERM; printf \'%s\' "$input" > "$tmp"; nohup sh -c \'tg-ctl harness-event --agent claude < "$1"\' sh "$tmp" >/dev/null 2>&1 & printf \'%s\' "$input" | sh -c \':\'; # tg-ctl-statusline-usage',
+    },
+  };
+  expect(claudeStatusLineTelemetryInstalled(stale, STATUSLINE_TELEMETRY_CMD)).toBe(false);
+
+  const rewritten = withClaudeStatusLineTelemetry(stale, STATUSLINE_TELEMETRY_CMD);
+  expect(rewritten.changed).toBe(true);
+  const statusLine = rewritten.settings.statusLine as { command: string };
+  expect(statusLine.command).toContain('TG_CTL_STATUSLINE_MIN_INTERVAL_SEC');
+  expect(statusLine.command).toContain('tg-claude-statusline-usage.stamp');
+});
+
+test('statusLine telemetry: stale rewrap preserves a display command containing quotes and nested sh -c', () => {
+  const displayCommand = 'printf \'cwd: %s\' "$PWD"; printf \'%s\' "$input" | sh -c \'cat >/dev/null\'';
+  const wrapped = withClaudeStatusLineTelemetry(
+    { statusLine: { type: 'command', command: displayCommand } },
+    STATUSLINE_TELEMETRY_CMD,
+  ).settings;
+  const stale = {
+    ...wrapped,
+    statusLine: {
+      ...(wrapped.statusLine as Record<string, unknown>),
+      command: ((wrapped.statusLine as { command: string }).command).replace('mktemp', 'mktmp-old'),
+    },
+  };
+
+  const rewritten = withClaudeStatusLineTelemetry(stale, STATUSLINE_TELEMETRY_CMD);
+  expect(rewritten.changed).toBe(true);
+  const statusLine = rewritten.settings.statusLine as { command: string };
+  expect(statusLine.command).toContain('mktemp');
+  expect(statusLine.command).toContain('cwd: %s');
+  expect(statusLine.command).toContain('cat >/dev/null');
+  expect(statusLine.command.match(/tg-ctl-statusline-usage/g)?.length).toBe(1);
+});
+
+test('statusLine telemetry: primitive or array statusLine installs the silent collector', () => {
+  for (const statusLine of ['printf nope', [], { type: 'command' }]) {
+    const { settings } = withClaudeStatusLineTelemetry({ statusLine }, STATUSLINE_TELEMETRY_CMD);
+    expect((settings.statusLine as { command: string }).command).toContain("sh -c ':'");
+  }
+});
+
+test('statusLine telemetry: a user command containing the marker is preserved if it is not our wrapper', () => {
+  const command = 'printf "literal tg-ctl-statusline-usage marker"';
+  const { settings } = withClaudeStatusLineTelemetry({ statusLine: { type: 'command', command } }, STATUSLINE_TELEMETRY_CMD);
+  const statusLine = settings.statusLine as { command: string };
+  expect(statusLine.command).toContain(command);
+  expect(statusLine.command).not.toContain("sh -c ':'");
 });
