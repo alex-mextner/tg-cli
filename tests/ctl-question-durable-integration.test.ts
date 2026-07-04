@@ -289,17 +289,55 @@ test('LATE-DELIVER: a tap after the hook socket closed injects the chosen option
   // RETAINED (card keyboard kept). Confirm the card was re-labelled, not cleared.
   ask.kill(9);
   await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('tap still delivers')), 6000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
   expect(tg.keyboardClears()).toBe(0); // a retained card stays tappable — NOT cleared
 
   // A LATE tap now lands. It must inject the chosen option into pane %1, not drop.
   tg.push([tap(productionData!, 700, 1)]);
   expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
   expect(await until(() => tg.answeredCbs().some((c) => c.text === '✓ sent to the agent'), 4000)).toBe(true);
-  expect(await until(() => tg.edits().some((e) => e === 'answered: Production'), 4000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Selected answer: Production')), 4000)).toBe(true);
   expect(daemonLog(cfgDir)).toContain('ask-late-delivered');
   // Once delivered the card stops being tappable — the keyboard is cleared, so a re-tap
   // in the 5–30 min answered/retention gap can't show a misleading "expired".
+  expect(await until(() => tg.keyboardClears() >= 1, 4000)).toBe(true);
+}, 25_000);
+
+test('POST-TIMEOUT REPLY: a text reply to the retained question card injects the answer into the pane', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  await startDaemon(cfgDir, tg.port);
+
+  const ask = startAsk(cfgDir, tg.port, QUESTION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+
+  ask.kill(9);
+  await ask.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
+
+  tg.push([
+    {
+      update_id: 705,
+      message: {
+        message_id: 706,
+        from: { id: 1, first_name: 'Alex' },
+        chat: { id: 1 },
+        date: Math.floor(Date.now() / 1000),
+        text: 'Production',
+        reply_to_message: {
+          message_id: 1,
+          chat: { id: 1 },
+          date: Math.floor(Date.now() / 1000) - 30,
+          text: 'Question from claude\n\nWhere should I deploy?',
+        },
+      },
+    },
+  ]);
+
+  expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
+  expect(await until(() => daemonLog(cfgDir).includes('ask-post-timeout-reply-delivered'), 4000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Selected answer: Production')), 4000)).toBe(true);
   expect(await until(() => tg.keyboardClears() >= 1, 4000)).toBe(true);
 }, 25_000);
 
@@ -314,14 +352,14 @@ test('LATE-DELIVER failure: an unreachable pane keeps the entry retained for a r
   const productionData = tg.optionData(1)!;
   ask.kill(9);
   await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('tap still delivers')), 6000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
 
   // The pane is now GONE → the inject fails. The entry must NOT be consumed.
   writeFileSync(join(cfgDir, 'pane-gone'), '1');
   tg.push([tap(productionData, 710, 1)]);
   expect(await until(() => daemonLog(cfgDir).includes('ask-late-deliver-failed'), 6000)).toBe(true);
   expect(tg.answeredCbs().some((c) => c.text.includes('tap again'))).toBe(true);
-  expect(tg.edits().some((e) => e === 'answered: Production')).toBe(false); // NOT marked answered
+  expect(tg.edits().some((e) => e.includes('Selected answer: Production'))).toBe(false); // NOT marked answered
   // The retained entry is still on disk (recoverable by a re-tap).
   const state = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.questions.json'), 'utf8'));
   expect(state.questions.some((q: { req: { requestId: string } }) => q.req.requestId === 'q_durable')).toBe(true);
@@ -331,7 +369,7 @@ test('LATE-DELIVER failure: an unreachable pane keeps the entry retained for a r
   unlinkSync(join(cfgDir, 'pane-gone'));
   tg.push([tap(productionData, 711, 1)]);
   expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
-  expect(await until(() => tg.edits().some((e) => e === 'answered: Production'), 4000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Selected answer: Production')), 4000)).toBe(true);
 }, 25_000);
 
 test('SINGLE-DELIVERY: after a late pane-delivery, a hook re-fire returns null (no replay) — answer not delivered twice', async () => {
@@ -345,7 +383,7 @@ test('SINGLE-DELIVERY: after a late pane-delivery, a hook re-fire returns null (
   const productionData = tg.optionData(1)!;
   ask1.kill(9);
   await ask1.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('tap still delivers')), 6000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
 
   // Late tap → pane-delivered once.
   tg.push([tap(productionData, 720, 1)]);
@@ -377,7 +415,7 @@ test('PANE-DELIVERY survives a restart: after a late pane-delivery + daemon boun
   const productionData = tg.optionData(1)!;
   ask1.kill(9);
   await ask1.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('tap still delivers')), 6000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
 
   // Late tap → pane-delivered once; the answer is persisted with delivery:"pane".
   tg.push([tap(productionData, 770, 1)]);
@@ -417,7 +455,7 @@ test('LATE-DELIVER race: a hook re-fire DURING the inject sees the claim (alread
   const productionData = tg.optionData(1)!;
   ask1.kill(9);
   await ask1.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('tap still delivers')), 6000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
 
   // Hold the pane inject open so the late-delivery await stays in flight long enough
   // for a concurrent reconnect to race it.
@@ -467,7 +505,7 @@ test('LATE-DELIVER busy pane: a tap while another question is live is NOT falsel
   const q1Data = tg.optionData(1)!; // "Production" on Q1
   ask1.kill(9);
   await ask1.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('tap still delivers')), 6000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
 
   // Q2 is now LIVE-pending on the SAME pane (the agent is blocked on it).
   const ask2 = startAsk(cfgDir, tg.port, { requestId: 'q2_busy', agent: 'claude', kind: 'question', question: 'Restart service?', options: [{ label: 'Yes' }] });
@@ -478,7 +516,7 @@ test('LATE-DELIVER busy pane: a tap while another question is live is NOT falsel
   tg.push([tap(q1Data, 730, 1)]);
   expect(await until(() => tg.answeredCbs().some((c) => c.text.includes('busy')), 6000)).toBe(true);
   expect(injected(cfgDir).some((l) => l.includes('Production'))).toBe(false); // NOT delivered
-  expect(tg.edits().some((e) => e === 'answered: Production')).toBe(false);
+  expect(tg.edits().some((e) => e.includes('Selected answer: Production'))).toBe(false);
   // Q1 still retained on disk (recoverable).
   const state = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.questions.json'), 'utf8'));
   expect(state.questions.some((q: { req: { requestId: string } }) => q.req.requestId === 'q_durable')).toBe(true);
@@ -503,7 +541,7 @@ test('RETENTION prune: an abandoned question past TG_CTL_ABANDONED_RETAIN_MS is 
   const q1Data = tg.optionData(1)!;
   ask.kill(9);
   await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('tap still delivers')), 6000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
 
   // Wait past the retention window, then a NEW forward triggers a persist → prune.
   await Bun.sleep(900);
@@ -530,7 +568,7 @@ test('RETENTION enforced at DELIVERY time: a tap past the window on a quiet daem
   const q1Data = tg.optionData(1)!;
   ask.kill(9);
   await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('tap still delivers')), 6000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
 
   // Wait past the window — NO new forward, NO other mutation — then tap. The
   // delivery-time check must reject it ("expired"), retire the card, and NOT inject.
@@ -735,7 +773,7 @@ test('MID-SEND scoped backfill: a socket closing WHILE the card sends still reco
   // messageId null; when sendMessage resolves the backfill must stamp the real card id.
   ask.kill(9);
   await ask.exited;
-  expect(await until(() => tg.edits().some((e) => e.includes('tap still delivers')), 6000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Time-out expired.')), 6000)).toBe(true);
 
   // The persisted abandoned entry now carries the REAL messageId (1), not null.
   const statePath = join(cfgDir, 'tg-ctl.123.questions.json');
@@ -751,7 +789,7 @@ test('MID-SEND scoped backfill: a socket closing WHILE the card sends still reco
   // A late tap late-delivers and edits the RIGHT card (message_id 1) to answered.
   tg.push([tap(productionData, 820, 1)]);
   expect(await until(() => injected(cfgDir).some((l) => l.includes('Production')), 6000)).toBe(true);
-  expect(await until(() => tg.edits().some((e) => e === 'answered: Production'), 4000)).toBe(true);
+  expect(await until(() => tg.edits().some((e) => e.includes('Selected answer: Production')), 4000)).toBe(true);
 }, 25_000);
 
 test('EXPIRY clears the keyboard for a genuinely-dead unscoped card', async () => {

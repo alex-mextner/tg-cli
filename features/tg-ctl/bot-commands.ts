@@ -35,6 +35,7 @@ export const BOT_COMMANDS: readonly BotCommand[] = [
   { command: 'stop', description: 'Interrupt the current agent turn — session survives' },
   { command: 'kill', description: 'End the agent session (SIGINT)' },
   { command: 'status', description: 'Report daemon state' },
+  { command: 'limit', description: 'Show latest agent usage limits: /limit [agent]' },
   { command: 'tasks', description: 'Task board table: /tasks [agent] [status]' },
 ];
 

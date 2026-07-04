@@ -11,7 +11,7 @@
 // included — so nothing is ever replayed into a live agent session.
 
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
-import { parseButtonCallback } from './questions';
+import { parseButtonCallback, parseQuestionCloseCallback } from './questions';
 import { parseAgentCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback } from './new-command';
@@ -49,6 +49,10 @@ export interface StepOpts {
   // memory), like it owns routes/topics. Unset → no /new in flight → plain text injects as normal,
   // keeping 1:1 byte-identical when the feature isn't triggered.
   newSessionAwaitingDir?: () => boolean;
+  // Retained post-timeout question cards are answered by replying to the card with text.
+  // The entrypoint owns the retained-question store, so the pure step only asks whether
+  // the replied-to Telegram message_id is one of those cards.
+  postTimeoutQuestionRequestIdForMessage?: (messageId: number) => string | null;
 }
 
 // Default quote-anchor time format: deterministic UTC `YYYY-MM-DD HH:MM`.
@@ -245,6 +249,16 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         });
         continue;
       }
+      const closeQuestionCb = parseQuestionCloseCallback(cb.data);
+      if (closeQuestionCb) {
+        callbackActions.push({
+          kind: 'close-question-card',
+          callbackQueryId: cb.id,
+          requestId: closeQuestionCb.requestId,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
+      }
       const parsed = parseButtonCallback(cb.data);
       callbackActions.push(
         parsed
@@ -325,8 +339,19 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         // A reply carrying prose forwards the quote anchor (items 2,3) via
         // reply-route — the daemon picks the recognized origin pane or a LRU/MRU
         // picker. A reply whose text is a /command still runs the command verbatim.
-        action =
-          m.reply_to_message && !m.text.startsWith('/')
+        const postTimeoutRequestId = m.reply_to_message
+          ? (opts.postTimeoutQuestionRequestIdForMessage?.(m.reply_to_message.message_id) ?? null)
+          : null;
+        action = postTimeoutRequestId && !m.text.startsWith('/')
+          ? {
+              kind: 'post-timeout-question-reply',
+              requestId: postTimeoutRequestId,
+              questionMessageId: m.reply_to_message!.message_id,
+              text: m.text,
+              from: name,
+              messageId: m.message_id,
+            }
+          : m.reply_to_message && !m.text.startsWith('/')
             ? {
                 kind: 'reply-route',
                 replyToMessageId: m.reply_to_message.message_id,
@@ -386,6 +411,10 @@ function textAction(text: string, name: string, opts: StepOpts, messageId: numbe
     if (cmd === '/stop') return { kind: 'inject-key', key: 'Escape' };
     if (cmd === '/kill') return { kind: 'kill-agent' };
     if (cmd === '/status') return { kind: 'status' };
+    if (cmd === '/limit') {
+      const rest = text.slice(verb.length).trim();
+      return { kind: 'limit-status', agent: rest || null };
+    }
     if (cmd === '/tasks') {
       const p = parseTasksCommand(text);
       return { kind: 'tasks', agent: p.agent, status: p.status };
@@ -475,7 +504,7 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // a bound topic — they control the daemon, not the topic agent. /stop and /kill are NOT
     // intercepted: they must still reach the topic's pane (kill/escape the harness session).
     // Using an explicit set (not isDaemonSlashCommand) to avoid over-intercepting.
-    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks']);
+    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit']);
     const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
     if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id)];
     // §11 deferral 1: a prose reply carries the same ↩ «…» quote-anchor as flat-chat replies.

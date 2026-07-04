@@ -109,27 +109,33 @@ export function classifyFailure(reason: string): HarnessFailureKind {
  * truncated before rendering.
  */
 export function extractUsageLimitEvent(payloadText: string, opts: UsageLimitOptions = {}): UsageLimitEvent | null {
+  const events = extractUsageLimitEvents(payloadText, opts);
+  if (events.length === 0) return null;
+  events.sort((a, b) => b.percent - a.percent);
+  return events[0];
+}
+
+export function extractUsageLimitEvents(payloadText: string, opts: UsageLimitOptions = {}): UsageLimitEvent[] {
   const parsed = parseJsonOrNull(payloadText);
-  if (parsed === null) return null;
+  if (parsed === null) return [];
   const now = opts.now ?? Date.now();
   const samples = collectContractUsageSamples(parsed, { ...opts, now }).filter((sample) => sample.resetAt === null || sample.resetAt > now);
-  if (samples.length === 0) return null;
-  samples.sort((a, b) => b.percent - a.percent);
-  const sample = samples[0];
+  if (samples.length === 0) return [];
   const language =
     normalizeReportLanguage(opts.language) ??
     findLanguage(parsed) ??
     languageFromEnv(opts.env) ??
     'en';
-  return {
+  const detail = truncateDetail(detailFromUsagePayload(parsed));
+  return samples.map((sample) => ({
     kind: 'usage-warning',
     agent: sample.agent,
     percent: sample.percent,
     limitName: sample.limitName,
     resetAt: sample.resetAt,
     language,
-    detail: truncateDetail(detailFromUsagePayload(parsed)),
-  };
+    detail,
+  }));
 }
 
 function parseJsonOrNull(text: string): unknown | null {

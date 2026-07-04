@@ -80,6 +80,10 @@ export interface ParsedButtonCallback {
   value: string;
 }
 
+export interface ParsedQuestionCloseCallback {
+  requestId: string;
+}
+
 export type ButtonAnswer =
   | {
       status: 'answered';
@@ -91,6 +95,7 @@ export type ButtonAnswer =
   | { status: 'unsupported'; requestId: string; reason: string };
 
 const CALLBACK_PREFIX = 'tgq';
+const CLOSE_CALLBACK_PREFIX = 'tgqc';
 
 // Registration guard for incoming hook requests. paneId is authoritative: when
 // both sides know the pane, a mismatch REJECTS even if cwd/sessionName agree —
@@ -132,20 +137,33 @@ export function questionCapability(agent: AgentKind): QuestionCapability {
 }
 
 export function buildButtonMessage(chatId: number, req: ButtonRequest): ButtonMessagePayload {
-  const heading = req.kind === 'permission'
-    ? `Permission request from ${req.agent}`
-    : `Question from ${req.agent}`;
-  const parts = [heading];
-  if (req.title) parts.push(req.title);
-  parts.push(req.question);
-
   return {
     chat_id: chatId,
-    text: parts.join('\n\n'),
+    text: buildQuestionText(req),
     reply_markup: {
       inline_keyboard: buildInlineKeyboard(req),
     },
   };
+}
+
+export function buildPostTimeoutQuestionMessage(chatId: number, req: ButtonRequest): ButtonMessagePayload {
+  return {
+    chat_id: chatId,
+    text: [
+      buildQuestionText(req, { includeOptions: true }),
+      'Time-out expired. Reply to this message with your answer; it will still be sent to the agent.',
+    ].join('\n\n'),
+    reply_markup: {
+      inline_keyboard: [[{ text: 'Close', callback_data: closeQuestionCallbackData(callbackRequestId(req)) }]],
+    },
+  };
+}
+
+export function buildAnsweredQuestionText(req: ButtonRequest, answer: string): string {
+  return [
+    buildQuestionText(req),
+    `Selected answer: ${answer}`,
+  ].join('\n\n');
 }
 
 export function parseButtonCallback(data: string | undefined): ParsedButtonCallback | null {
@@ -153,6 +171,13 @@ export function parseButtonCallback(data: string | undefined): ParsedButtonCallb
   const parts = data.split(':');
   if (parts.length !== 3 || parts[0] !== CALLBACK_PREFIX || !parts[1] || !parts[2]) return null;
   return { requestId: parts[1], value: parts[2] };
+}
+
+export function parseQuestionCloseCallback(data: string | undefined): ParsedQuestionCloseCallback | null {
+  if (!data) return null;
+  const parts = data.split(':');
+  if (parts.length !== 2 || parts[0] !== CLOSE_CALLBACK_PREFIX || !parts[1]) return null;
+  return { requestId: parts[1] };
 }
 
 export function resolveButtonCallback(req: ButtonRequest, cb: ParsedButtonCallback): ButtonAnswer {
@@ -362,6 +387,25 @@ function buildInlineKeyboard(req: ButtonRequest): ButtonMessagePayload['reply_ma
   ]);
 }
 
+function buildQuestionText(req: ButtonRequest, opts: { includeOptions?: boolean } = {}): string {
+  const heading = req.kind === 'permission'
+    ? `Permission request from ${req.agent}`
+    : `Question from ${req.agent}`;
+  const parts = [heading];
+  if (req.title) parts.push(req.title);
+  parts.push(req.question);
+  if (opts.includeOptions && req.kind === 'question') parts.push(formatQuestionOptions(req));
+  return parts.join('\n\n');
+}
+
+function formatQuestionOptions(req: ButtonRequest): string {
+  const rows = questionOptions(req).map((option, index) => {
+    const description = option.description ? ` - ${option.description}` : '';
+    return `${index + 1}. ${option.label}${description}`;
+  });
+  return ['Options:', ...rows].join('\n');
+}
+
 function questionOptions(req: ButtonRequest): ButtonOption[] {
   return req.options?.length ? req.options : [{ label: 'OK' }];
 }
@@ -374,6 +418,10 @@ export function callbackRequestId(req: ButtonRequest): string {
 
 function callbackData(requestId: string, value: string): string {
   return `${CALLBACK_PREFIX}:${requestId}:${value}`;
+}
+
+function closeQuestionCallbackData(requestId: string): string {
+  return `${CLOSE_CALLBACK_PREFIX}:${requestId}`;
 }
 
 function hashId(value: string): string {

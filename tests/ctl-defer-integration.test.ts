@@ -312,21 +312,17 @@ test('inbound text deferred while a question is open, flushed (and not lost) aft
   await daemon.exited;
 }, 30_000);
 
-test('a follow-up question ABANDONED mid-flush dead-letters its backlog instead of pasting it into the open prompt', async () => {
-  // Regression for the codex P2 concurrent-flush race. Sequence:
+test('a follow-up scoped question socket close during a flush drains through terminal fallback', async () => {
+  // Regression coverage for the concurrent-flush race under the post-timeout
+  // terminal-fallback contract. Sequence:
   //   1. Q1 is answered → flushDeferred(%1) starts and sleeps 800ms (flushing).
   //   2. DURING that settle a follow-up Q2 opens on the SAME pane; an inbound
   //      message defers behind it (the pane is flushing AND has a pending
   //      question, so it queues — strict FIFO).
-  //   3. Q2 is abandoned with NO Telegram answer (its hook socket closes). The
-  //      pending button is deleted BEFORE onAbandon runs, so paneHasPendingQuestion
-  //      is now false for it.
-  //   4. The flush loop wakes. With the BUG, onQuestionAbandoned returned early
-  //      purely on the flushingPanes guard (no dead-letter), and the loop — seeing
-  //      no pending question — pasted the orphaned backlog into the still-open
-  //      terminal prompt (the agent is still blocked locally on Q2). FIXED: the
-  //      abandonment is recorded, the loop dead-letters the residual queue and
-  //      warns the user; nothing is pasted.
+  //   3. Q2's hook socket closes. This is NOT a dead card anymore: Telegram keeps
+  //      the question visible and the terminal fallback may still be waiting.
+  //   4. The flush loop drains both queued messages in FIFO order and does NOT send
+  //      the old misleading "were NOT delivered" notice.
   const cfgDir = makeCfgDir();
   const updateQueue: unknown[][] = [];
   const reactions: Array<Record<string, unknown>> = [];
@@ -446,37 +442,21 @@ test('a follow-up question ABANDONED mid-flush dead-letters its backlog instead 
   }
   expect(reactions.find((r) => r.message_id === 33)).toMatchObject({ reaction: [{ type: 'emoji', emoji: '✍️' }] });
 
-  // 4) Abandon Q2 with NO answer: kill its hook → socket close → onAbandon. The
-  //    pending button is deleted first, so by the time the flush loop next checks,
-  //    paneHasPendingQuestion(%1) is false. The FIX records the abandonment and the
-  //    loop dead-letters the residual instead of pasting it.
+  // 4) Close Q2's hook. The daemon enters terminal fallback for this scoped
+  //    question and drains the queued text instead of dead-lettering it.
   ask2.kill(9);
   await ask2.exited;
 
-  // Wait for the flush to actually WAKE from its 800ms settle and reach a verdict,
-  // racing the two mutually-exclusive outcomes rather than sleeping a fixed time
-  // (a fixed sleep can pass vacuously if the buggy paste simply hasn't fired yet):
-  //   - BUG  → the flush pastes 'q2 orphan' into the still-open prompt (it appears
-  //            in the inject log), and no dead-letter notice is sent.
-  //   - FIX  → the flush dead-letters the residual: nothing is pasted and the user
-  //            gets the 'were NOT delivered' notice.
-  // Poll until whichever lands first; the assertions below then decide pass/fail.
-  // This fails FAST on the regression instead of hoping a fixed window covered it.
-  const orphanPasted = (): boolean => injected(cfgDir).some((l) => l.includes('q2 orphan'));
-  const deadLetterSent = (): boolean => plainMessages.some((m) => m.includes('were NOT delivered'));
+  const q1Pasted = (): boolean => injected(cfgDir).some((l) => l.includes('q1 backlog'));
+  const q2Pasted = (): boolean => injected(cfgDir).some((l) => l.includes('q2 orphan'));
   {
     const t0 = Date.now();
-    while (Date.now() - t0 < 10_000 && !orphanPasted() && !deadLetterSent()) await Bun.sleep(50);
+    while (Date.now() - t0 < 10_000 && (!q1Pasted() || !q2Pasted())) await Bun.sleep(50);
   }
 
-  // THE REGRESSION: the orphaned 'q2 orphan' must NEVER reach the open prompt.
-  // (With the bug it injects; fixed, it is dead-lettered.)
-  expect(orphanPasted()).toBe(false);
-  // Nothing at all should have been pasted — the pane's prompt is still open.
-  expect(injected(cfgDir)).toEqual([]);
-  // The flush woke and dead-lettered: the user was told the messages did not land.
-  // (This is also the positive proof the flush ran — a no-op flush sends nothing.)
-  expect(deadLetterSent()).toBe(true);
+  expect(q1Pasted()).toBe(true);
+  expect(q2Pasted()).toBe(true);
+  expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(false);
 
   // 5) The flag must not LEAK: a later, legitimate question on the same pane must
   //    still flush normally. If abandonedDuringFlush(%1) were left set, this next
@@ -529,8 +509,8 @@ test('a follow-up question ABANDONED mid-flush dead-letters its backlog instead 
   }
   // The legitimate Q3 backlog flushed (flag was cleared, not leaked).
   expect(injected(cfgDir).some((l) => l.includes('q3 good'))).toBe(true);
-  // ...and the orphan still never resurfaced in this flush.
-  expect(injected(cfgDir).some((l) => l.includes('q2 orphan'))).toBe(false);
+  // ...and the fallback message was delivered once, not replayed by Q3's flush.
+  expect(injected(cfgDir).filter((l) => l.includes('q2 orphan'))).toHaveLength(1);
 
   daemon.kill('SIGTERM');
   await daemon.exited;
@@ -633,21 +613,21 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
   updateQueue.push([{ update_id: 43, message: { message_id: 44, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'q3 live' } }]);
   await waitForReaction(44);
 
-  // Now abandon Q2 (socket close → flag set). The flush, on waking from its 800ms
-  // settle, sees the flag AND Q3 pending → must re-defer, not dead-letter.
+  // Now close Q2's hook. The terminal-fallback flush wakes while Q3 is pending,
+  // so it must re-defer behind that live question, not dead-letter.
   ask2.kill(9);
   await ask2.exited;
 
   // Wait for the daemon to log the re-defer decision BEFORE answering Q3. This is
   // the deterministic proof the flush woke while Q3 was still pending and chose to
-  // re-defer the residual (the finding-#1 behavior). Answering Q3 earlier could
-  // race the 800ms settle and remove Q3 before the flush evaluates the gate.
+  // preserve the residual queue. Answering Q3 earlier could race the 800ms settle
+  // and remove Q3 before the flush evaluates the gate.
   {
     const t0 = Date.now();
-    while (Date.now() - t0 < 8000 && !daemonLogText(cfgDir).includes('abandon raced a new question')) await Bun.sleep(50);
+    while (Date.now() - t0 < 8000 && !daemonLogText(cfgDir).includes('re-queued behind a new question')) await Bun.sleep(50);
   }
   // The flush re-deferred (did NOT dead-letter) because a live question was pending.
-  expect(daemonLogText(cfgDir)).toContain('abandon raced a new question');
+  expect(daemonLogText(cfgDir)).toContain('re-queued behind a new question');
   // ...and it must NOT have dropped the queue.
   expect(daemonLogText(cfgDir)).not.toContain('were NOT delivered');
   expect(daemonLogText(cfgDir)).not.toMatch(/dead-lettered \d+ queued message/);
@@ -670,12 +650,10 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
   await daemon.exited;
 }, 30_000);
 
-test('a question removed WITHOUT an answer (hook socket closes) does not wedge later inbound', async () => {
-  // Regression for the review finding: extending defer to "queue non-empty" would
-  // permanently wedge a pane once its question expired without a Telegram answer
-  // (timeout / socket close / send failure delete the pending button but never
-  // flush). After the question is gone, a NEW inbound must inject normally, not
-  // sit deferred forever behind an undrainable backlog.
+test('a scoped question hook socket close drains queued text and does not wedge later inbound', async () => {
+  // Regression for the post-timeout fallback path: a scoped socket close means the
+  // terminal may still be waiting, so queued text should be flushed, not reported as
+  // lost. After the fallback drain, a NEW inbound must inject normally.
   const cfgDir = makeCfgDir();
   const updateQueue: unknown[][] = [];
   const reactions: Array<Record<string, unknown>> = [];
@@ -744,24 +722,23 @@ test('a question removed WITHOUT an answer (hook socket closes) does not wedge l
   expect(reactions.at(-1)).toMatchObject({ message_id: 21, reaction: [{ type: 'emoji', emoji: '✍️' }] });
   expect(injected(cfgDir)).toEqual([]);
 
-  // The question is removed WITHOUT an answer: kill the ask hook → its socket
-  // closes → the daemon deletes the pending button AND dead-letters the pane's
-  // backlog (so it can never resurface, stale + out of order, on a later
-  // unrelated question's answer). The user is told the queued message did not land.
+  // The question's hook socket closes. The daemon keeps the Telegram card visible
+  // as post-timeout and flushes the queued message into the terminal fallback.
   questionCallbackData = '';
   ask.kill(9);
   await ask.exited;
-  // Wait for the socket-close handler to actually run onAbandon (dead-letter the
-  // idle pane) before sending the next inbound. Poll the daemon.log marker instead
-  // of a fixed sleep: under a loaded CI runner a blind 300ms can fire the next
-  // message before the abandon is processed, racing pending-question state.
   {
     const t0 = Date.now();
-    while (Date.now() - t0 < 8000 && !daemonLogText(cfgDir).includes('question abandoned on %1 (idle)')) {
+    while (Date.now() - t0 < 8000 && !daemonLogText(cfgDir).includes('question terminal-fallback on %1')) {
       await Bun.sleep(50);
     }
-    expect(daemonLogText(cfgDir)).toContain('question abandoned on %1 (idle)');
+    expect(daemonLogText(cfgDir)).toContain('question terminal-fallback on %1');
   }
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !injected(cfgDir).some((l) => l.includes('deferred one'))) await Bun.sleep(100);
+  }
+  expect(injected(cfgDir).some((l) => l.includes('deferred one'))).toBe(true);
 
   // A NEW inbound now arrives. With the bug it would be deferred (queue non-empty
   // → ✍️, stuck forever). Fixed: no pending question, no flush in flight → it
@@ -780,21 +757,21 @@ test('a question removed WITHOUT an answer (hook socket closes) does not wedge l
       await Bun.sleep(100);
     }
   }
-  // The new message landed; the abandoned 'deferred one' was dropped (not wedged).
+  // Both the fallback-drained message and the later live message landed.
   expect(injected(cfgDir)).toContain('[TG from Alex tg#22] after expiry');
-  expect(injected(cfgDir).some((l) => l.includes('deferred one'))).toBe(false);
-  // It was DELIVERED (👀), not deferred (✍️).
+  expect(injected(cfgDir).some((l) => l.includes('deferred one'))).toBe(true);
+  // It eventually reaches DELIVERED (👀). It may briefly show ✍️ if it arrived
+  // during the fallback flush window, but it must not stay there.
   {
     const t0 = Date.now();
     const got22 = (): Record<string, unknown> | undefined =>
-      reactions.find((r) => r.message_id === 22);
+      reactions.find((r) => r.message_id === 22 && (r.reaction as Array<{ emoji?: string }>)[0]?.emoji === '👀');
     while (Date.now() - t0 < 4000 && !got22()) await Bun.sleep(50);
     expect(got22()).toMatchObject({ message_id: 22, reaction: [{ type: 'emoji', emoji: '👀' }] });
   }
 
-  // The definitive regression (review P1): open a SECOND, unrelated question and
-  // ANSWER it. The abandoned 'deferred one' from Q1 must NOT resurface in this
-  // flush — it was dead-lettered, not left in the queue.
+  // The definitive regression: open a SECOND, unrelated question and answer it.
+  // The fallback-drained message from Q1 must NOT resurface again.
   const ask2 = startAsk(cfgDir, server.port, {
     requestId: 'q_second',
     agent: 'claude',
@@ -823,7 +800,7 @@ test('a question removed WITHOUT an answer (hook socket closes) does not wedge l
   await ask2.exited;
   // Give a would-be stale flush ample time to (wrongly) fire, then assert it did not.
   await Bun.sleep(1500);
-  expect(injected(cfgDir).some((l) => l.includes('deferred one'))).toBe(false);
+  expect(injected(cfgDir).filter((l) => l.includes('deferred one'))).toHaveLength(1);
 
   daemon.kill('SIGTERM');
   await daemon.exited;
@@ -1036,18 +1013,19 @@ test('a SCOPED question stays open PAST the abandon bound — no "expired", the 
   }
   expect(injected(cfgDir)).toHaveLength(1);
   expect(injected(cfgDir)[0]).toContain('queued while waiting');
-  expect(edits.at(-1)).toContain('answered'); // prompt rewritten to the answer, never "expired"
+  expect(edits.at(-1)).toContain('Selected answer: Yes'); // prompt kept context, never "expired"
 
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 30_000);
 
-test('a SCOPED question that waits forever still cleans up on socket close (agent process dies) — backlog dead-lettered, pane freed', async () => {
+test('a SCOPED question socket close keeps the Telegram card answerable and flushes its backlog', async () => {
   const cfgDir = makeCfgDir();
   const updateQueue: unknown[][] = [];
   const reactions: Array<Record<string, unknown>> = [];
   const edits: string[] = [];
-  const server = recordingServer(updateQueue, reactions, edits);
+  const plainMessages: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits, plainMessages);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
 
@@ -1074,18 +1052,35 @@ test('a SCOPED question that waits forever still cleans up on socket close (agen
     while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
   }
 
-  // The agent process dies (hook socket closes) with NO Telegram answer. The
-  // scoped question has no timer, so socket close is the ONLY cleanup path — it
-  // must still fire: remove the entry and dead-letter the pane's backlog so a
-  // later message on %1 is not wedged behind a ghost question.
+  // The hook socket closes while the terminal fallback may still be waiting.
+  // The card must remain visible/answerable in Telegram, and the queued text is
+  // flushed instead of being dead-lettered with a misleading "resend them".
   ask.kill(9);
   await ask.exited;
   {
     const t0 = Date.now();
-    while (Date.now() - t0 < 8000 && !daemonLogText(cfgDir).includes('dead-lettered')) await Bun.sleep(50);
+    while (Date.now() - t0 < 8000 && !edits.some((e) => e.includes('Time-out expired.'))) await Bun.sleep(50);
   }
-  expect(daemonLogText(cfgDir)).toContain('dead-lettered');
-  expect(injected(cfgDir)).toEqual([]); // orphaned message NEVER pasted into the dead prompt
+  expect(edits.some((e) => e.includes('Question from claude'))).toBe(true);
+  expect(edits.some((e) => e.includes('Proceed?'))).toBe(true);
+  expect(edits.some((e) => e.includes('Reply to this message with your answer'))).toBe(true);
+  expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(false);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !injected(cfgDir).some((l) => l.includes('orphan me'))) await Bun.sleep(100);
+  }
+  expect(injected(cfgDir)[0]).toContain('orphan me');
+  {
+    const delivered = (): Record<string, unknown> | undefined =>
+      reactions.filter((r) => r.message_id === 41).find((r) => (r.reaction as Array<{ emoji?: string }>)[0]?.emoji === '👀');
+    const t0 = Date.now();
+    while (Date.now() - t0 < 4000 && !delivered()) await Bun.sleep(50);
+    expect(delivered()).toBeTruthy();
+  }
+  expect(reactions.filter((r) => r.message_id === 41).at(-1)).toMatchObject({
+    message_id: 41,
+    reaction: [{ type: 'emoji', emoji: '👀' }],
+  });
 
   // Pane is free again: a fresh inbound on %1 injects directly (no ghost defer).
   updateQueue.push([
@@ -1093,10 +1088,9 @@ test('a SCOPED question that waits forever still cleans up on socket close (agen
   ]);
   {
     const t0 = Date.now();
-    while (Date.now() - t0 < 8000 && injected(cfgDir).length < 1) await Bun.sleep(100);
+    while (Date.now() - t0 < 8000 && !injected(cfgDir).some((l) => l.includes('after the death'))) await Bun.sleep(100);
   }
-  expect(injected(cfgDir)).toHaveLength(1);
-  expect(injected(cfgDir)[0]).toContain('after the death');
+  expect(injected(cfgDir).some((l) => l.includes('after the death'))).toBe(true);
 
   daemon.kill('SIGTERM');
   await daemon.exited;

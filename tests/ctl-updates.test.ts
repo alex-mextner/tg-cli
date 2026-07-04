@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { stepUpdates } from '../features/tg-ctl/updates';
+import { stepUpdates, type StepOpts } from '../features/tg-ctl/updates';
 import { DEFAULT_CONTROL, type ControlConfig, type TgMessage, type TgUpdate } from '../features/tg-ctl/types';
 
 const CHAT_ID = 1000;
@@ -7,13 +7,15 @@ const NOW = 1_750_000_000; // unix seconds, arbitrary
 
 const wrap = (name: string, msg: string) => `[TG from ${name}] ${msg}`;
 
-function makeOpts(over: Partial<{ cfg: ControlConfig; chatId: number; nowSec: number; currentOffset: number }> = {}) {
+function makeOpts(over: Partial<StepOpts & { cfg: ControlConfig; chatId: number; nowSec: number; currentOffset: number }> = {}) {
+  const { cfg, ...rest } = over;
   return {
-    cfg: { ...DEFAULT_CONTROL, ...(over.cfg ?? {}) },
+    cfg: { ...DEFAULT_CONTROL, ...(cfg ?? {}) },
     chatId: over.chatId ?? CHAT_ID,
     nowSec: over.nowSec ?? NOW,
     currentOffset: over.currentOffset ?? 5,
     wrap,
+    ...rest,
   };
 }
 
@@ -129,6 +131,26 @@ test('callback_query with unknown data is answered as expired/unknown, not injec
   expect(r.newOffset).toBe(9);
 });
 
+test('callback_query for a post-timeout question close button emits close-card action', () => {
+  const r = stepUpdates(
+    [
+      {
+        update_id: 8,
+        callback_query: {
+          id: 'cb1',
+          from: { id: CHAT_ID, first_name: 'Alex' },
+          message: { message_id: 50, chat: { id: CHAT_ID }, date: NOW },
+          data: 'tgqc:q_123',
+        },
+      },
+    ],
+    makeOpts(),
+  );
+  expect(r.actions).toEqual([
+    { kind: 'close-question-card', callbackQueryId: 'cb1', requestId: 'q_123', messageId: 50 },
+  ]);
+});
+
 test('callback_query actions are prioritized before slower message actions in the same batch', () => {
   const r = stepUpdates(
     [
@@ -186,6 +208,34 @@ test('the default injectWrap template renders the inbound id as #<id>', () => {
   expect(r2.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #77] hi', messageId: 77 });
   // r is just exercising the default path doesn't throw.
   expect(r.actions.length).toBeGreaterThan(0);
+});
+
+test('text reply to a post-timeout question card is routed as the deferred answer', () => {
+  const r = stepUpdates(
+    [
+      upd(99, {
+        text: 'Production',
+        reply_to_message: {
+          message_id: 50,
+          chat: { id: CHAT_ID },
+          date: NOW - 60,
+          text: 'Question from claude\n\nWhere should I deploy?',
+        },
+      }),
+    ],
+    makeOpts({ postTimeoutQuestionRequestIdForMessage: (messageId) => (messageId === 50 ? 'q_123' : null) }),
+  );
+  expect(r.actions).toEqual([
+    {
+      kind: 'post-timeout-question-reply',
+      requestId: 'q_123',
+      questionMessageId: 50,
+      text: 'Production',
+      from: 'Alex',
+      messageId: 99,
+    },
+    { kind: 'ack', messageId: 99 },
+  ]);
 });
 
 // --- sender allowlist (spec §9: from.id, not chat id) ---
@@ -280,6 +330,17 @@ test('/kill → kill-agent', () => {
 test('/status → status', () => {
   const r = stepUpdates([upd(1, { text: '/status' })], makeOpts());
   expect(r.actions).toEqual([{ kind: 'status' }, { kind: 'ack', messageId: 1 }]);
+});
+
+test('/limit [agent] → limit-status', () => {
+  expect(stepUpdates([upd(1, { text: '/limit' })], makeOpts()).actions).toEqual([
+    { kind: 'limit-status', agent: null },
+    { kind: 'ack', messageId: 1 },
+  ]);
+  expect(stepUpdates([upd(2, { text: '/limit claude' })], makeOpts()).actions).toEqual([
+    { kind: 'limit-status', agent: 'claude' },
+    { kind: 'ack', messageId: 2 },
+  ]);
 });
 
 test('unknown /cmd passes through VERBATIM — full text, no wrap', () => {

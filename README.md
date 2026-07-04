@@ -183,6 +183,9 @@ then `language`/`locale`/`user_language` payload fields, then `LANG`/`LC_*`);
 if the language cannot be determined, the warning falls back to English.
 Duplicate warnings for the same agent/limit are suppressed for the current reset
 window, or for one hour when no reset is known.
+Every supported telemetry sample is also saved as the latest snapshot for
+`/limit [<agent>]`, even below the 90% warning threshold, so `/limit claude` can
+show both `5-hour` and `weekly` buckets when Claude statusLine reports them.
 For StopFailure compatibility, `--transcript` or a `transcript_path` payload with
 no supported usage telemetry is treated as failure input and the last assistant
 message in that transcript is scanned for the limit/error text.
@@ -194,6 +197,10 @@ throttle for tests). Non-Claude proactive telemetry collectors must pipe their
 payloads to `tg-ctl harness-event`.
 
 While an agent is **waiting on a question**, new messages you send it are **deferred** (queued, marked ✍️ on the message) and delivered once the question is answered — they don't interrupt the prompt.
+If the hook window closes or times out while the terminal prompt is still active,
+the Telegram question is kept visible as an expired-timeout card: the old option
+buttons are replaced with **Close**, and you can still reply to that card with
+plain text to send the answer into the agent pane post-factum.
 
 ### Commands
 | Command | Effect |
@@ -201,6 +208,7 @@ While an agent is **waiting on a question**, new messages you send it are **defe
 | `/stop` | Inject Escape — interrupts the current agent turn, session survives |
 | `/kill` | SIGINT the agent — session ends |
 | `/status` | Report daemon state |
+| `/limit [<agent>]` | Show the latest saved 5-hour/weekly/context usage telemetry for all agents or one agent |
 | `/agent [<window>] <msg>` | Route a message to a specific agent (fuzzy window match, else selection buttons) |
 
 Photos and documents sent from Telegram are downloaded to `~/.cache/tg-cli/inbound/` and the local path is injected for the agent to read.

@@ -8,6 +8,7 @@ import {
   extractAssistantText,
   extractFailure,
   extractUsageLimitEvent,
+  extractUsageLimitEvents,
   formatClock,
   formatDelta,
   MAX_TIMER_MS,
@@ -393,6 +394,24 @@ test('usage parser: Claude statusLine rate_limits shape is recognized', () => {
   );
   expect(ev).toMatchObject({ agent: 'claude', percent: 91.5, limitName: '5-hour', language: 'ru' });
   expect(ev?.resetAt).toBe(primaryReset * 1000);
+});
+
+test('usage parser: Claude statusLine snapshot returns both 5-hour and weekly buckets', () => {
+  const primaryReset = Math.floor((NOW + 2 * 60 * 60_000) / 1000);
+  const secondaryReset = Math.floor((NOW + 5 * 24 * 60 * 60_000) / 1000);
+  const events = extractUsageLimitEvents(
+    JSON.stringify({
+      rate_limits: {
+        five_hour: { used_percentage: 98, resets_at: primaryReset },
+        seven_day: { used_percentage: 64, resets_at: secondaryReset },
+      },
+    }),
+    { agent: 'claude', now: NOW },
+  );
+  expect(events.map((ev) => [ev.limitName, ev.percent, ev.resetAt])).toEqual([
+    ['5-hour', 98, primaryReset * 1000],
+    ['weekly', 64, secondaryReset * 1000],
+  ]);
 });
 
 test('usage parser: Claude context_window is accepted only when the caller identifies Claude', () => {

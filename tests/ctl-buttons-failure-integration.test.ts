@@ -335,7 +335,7 @@ test('daemon resolves a callback that arrives before sendMessage returns', async
   const t0 = Date.now();
   while (Date.now() - t0 < 5000 && edited.length === 0) await Bun.sleep(50);
   expect(edited).toEqual([
-    { chat_id: 1, message_id: 101, text: 'answered: A' },
+    { chat_id: 1, message_id: 101, text: 'Question from claude\n\nContinue?\n\nSelected answer: A' },
   ]);
 }, 10_000);
 
