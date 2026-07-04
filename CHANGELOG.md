@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.31.0
+
+**Feature (HYP-903 follow-up): harness-aware `/new` spawning for Codex and opencode.**
+
+- Flat `/new` now accepts either a harness or a concrete model around the session name:
+  `/new codex task-cli msg`, `/new task-cli opencode msg`, `/new oc task-cli msg`,
+  `/new gpt-5.5 task-cli msg`, and `/new task-cli glm-5.2 msg` all parse as expected.
+- When no harness/model is supplied, the interactive flow now asks for the harness first
+  (Claude, Codex, opencode), then filters the model buttons to that harness. The old generic
+  "Which model should ..." prompt no longer shows Claude choices after the user intended Codex.
+- Added verified Codex and opencode model catalog entries. Codex launches with
+  `codex --model <id>`; opencode launches with `opencode --model <provider/model>`.
+- The initial `/new` task is passed into the spawned agent for both plain flat sessions and
+  private-topic-backed sessions; opencode receives it through `--prompt=<text>`.
+- The flat `/new` callback namespace gained `tnh:` for harness picks; existing `tnp:` directory
+  picks and `tnm:` model picks remain unchanged.
+
 ## 1.30.1
 
 **Feature (tg#6254): subagent identification — `--agent <label>` + auto-detection.**

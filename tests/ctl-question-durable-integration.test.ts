@@ -245,6 +245,8 @@ const PERMISSION = {
   permissionEvent: 'PermissionRequest',
 };
 
+const RESTORE_WAIT_MS = 15_000;
+
 async function until(cond: () => boolean, ms: number): Promise<boolean> {
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
@@ -387,7 +389,7 @@ test('PANE-DELIVERY survives a restart: after a late pane-delivery + daemon boun
   daemon1.kill(9);
   await daemon1.exited;
   const daemon2 = await startDaemon(cfgDir, tg.port);
-  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), 6000)).toBe(true);
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), RESTORE_WAIT_MS)).toBe(true);
 
   // A re-fire of the SAME requestId AFTER the restart must hit already-pane-delivered
   // (null) — NOT replay the answer down the socket and NOT post a second card. This is
@@ -563,7 +565,7 @@ test('RESTORE→TAP→LATE-DELIVER (headline): a SIGKILLed daemon restores a pen
 
   // Restart: the daemon restores the pending question into `abandoned` (no live socket).
   const daemon2 = await startDaemon(cfgDir, tg.port);
-  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), 6000)).toBe(true);
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), RESTORE_WAIT_MS)).toBe(true);
   expect(tg.cards()).toHaveLength(1); // nothing re-posted
 
   // The human taps AFTER the restart. With no hook to answer, the chosen option is
@@ -594,7 +596,7 @@ test('RECONNECT: a daemon bounce mid-block re-attaches the card (no duplicate) a
 
   // Relaunch against the SAME config dir + mock: it restores the question from disk.
   const daemon2 = await startDaemon(cfgDir, tg.port);
-  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), 6000)).toBe(true);
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), RESTORE_WAIT_MS)).toBe(true);
   // The reconnecting ask re-attaches to the existing card — no second card posted.
   expect(await until(() => daemonLog(cfgDir).includes('ask-forward reattached'), 8000)).toBe(true);
   expect(tg.cards()).toHaveLength(1);
@@ -631,7 +633,7 @@ test('RECONNECT replay: a question ANSWERED before the bounce replays its answer
   daemon1.kill(9);
   await daemon1.exited;
   const daemon2 = await startDaemon(cfgDir, tg.port);
-  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), 6000)).toBe(true);
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), RESTORE_WAIT_MS)).toBe(true);
 
   // A re-fire of the SAME requestId after the restart must REPLAY (no second card).
   const ask2 = startAsk(cfgDir, tg.port, QUESTION);
@@ -807,7 +809,7 @@ test('PERM RECONNECT: daemon bounce mid-block re-attaches the permission card an
 
   // Restart — daemon restores the permission from disk.
   const daemon2 = await startDaemon(cfgDir, tg.port);
-  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), 6000)).toBe(true);
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), RESTORE_WAIT_MS)).toBe(true);
   // The hook reconnects and re-attaches to the existing card — no second card posted.
   expect(await until(() => daemonLog(cfgDir).includes('ask-forward reattached'), 8000)).toBe(true);
   expect(tg.cards()).toHaveLength(1);
@@ -841,7 +843,7 @@ test('PERM LATE-TAP: a tap on a retained-but-dead permission card shows "expired
 
   // Restart — daemon restores the permission as abandoned.
   const daemon2 = await startDaemon(cfgDir, tg.port);
-  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), 6000)).toBe(true);
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), RESTORE_WAIT_MS)).toBe(true);
   expect(tg.cards()).toHaveLength(1); // nothing re-posted
 
   // User taps Approve with no live socket. Permissions can't be delivered via

@@ -14,7 +14,7 @@ import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatu
 import { parseButtonCallback } from './questions';
 import { parseAgentCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
-import { parseNewCommand, parseNewDirCallback, parseNewModelCallback } from './new-command';
+import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback } from './new-command';
 import { parseTasksCommand } from './tasks-command';
 import { parseContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
@@ -183,9 +183,20 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
           continue;
         }
       }
-      // Flat-chat /new taps (tnm: model, tnp: recent-dir) route the new-session flow. NOT gated by
+      // Flat-chat /new taps (tnh: harness, tnm: model, tnp: recent-dir) route the new-session flow. NOT gated by
       // topics mode — /new is a flat-chat command. A stale tap whose session expired is rejected by
       // the entrypoint (no pending session → "expired"), never spawns.
+      const newHarnessCb = parseNewHarnessCallback(cb.data);
+      if (newHarnessCb) {
+        callbackActions.push({
+          kind: 'new-harness',
+          callbackQueryId: cb.id,
+          token: newHarnessCb.token,
+          harness: newHarnessCb.harness,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
+      }
       const newModelCb = parseNewModelCallback(cb.data);
       if (newModelCb) {
         callbackActions.push({
@@ -385,7 +396,7 @@ function textAction(text: string, name: string, opts: StepOpts, messageId: numbe
     }
     if (cmd === '/new') {
       const p = parseNewCommand(text);
-      return { kind: 'new-command', model: p.model, dir: p.dir, name: p.name, task: p.task, from: name };
+      return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, from: name };
     }
     return { kind: 'inject-text', text, messageId };
   }

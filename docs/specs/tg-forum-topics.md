@@ -74,9 +74,9 @@ tmux new-window -t <session> -n <topic-name-slug> -c <path> -P -F '#{pane_id}' \
 ```
 
 - `-P -F '#{pane_id}'` returns the new pane id → bound to the topic immediately (no discovery
-  race). `-c <path>` sets the cwd. The agent command mirrors how a human starts the agent
-  (`claude --model …`); other kinds (codex/opencode) are a follow-up via the model catalog's
-  `kind`.
+  race). `-c <path>` sets the cwd. The agent command mirrors how a human starts the agent:
+  Claude via `claude [--model …]`, Codex via `codex [--model …]`, and opencode via
+  `opencode --model <provider/model>`.
 - The window name is a slug of the topic name (so `/agent` still works as a fallback address).
 - Guardrails: `<path>` must exist and be a directory (else re-ask in `awaiting-path`); the model
   must be in the catalog; refuse to spawn a second pane for an already-`bound` topic.
@@ -85,9 +85,14 @@ tmux new-window -t <session> -n <topic-name-slug> -c <path> -P -F '#{pane_id}' \
 
 A small declared catalog `features/tg-ctl/models.ts` (pure data) → the `awaiting-model`
 buttons and the spawn command. Each entry: `{ id, label, kind: 'claude'|'codex'|'opencode',
-argv: (path) => string[] }`. v1 ships the claude tiers (opus/sonnet/haiku) + a "default"
-(no `--model`); codex/opencode entries land when their spawn recipe is verified. The catalog
-is the single source of truth for both the buttons and the spawn argv (no drift).
+argv: (path) => string[], promptArgv?: (task) => string[] }`. The catalog ships Claude
+tiers (opus/sonnet/haiku) + default, Codex default/GPT entries, and opencode provider/model
+entries. The catalog is the single source of truth for both the buttons and the spawn argv
+(no drift); flat `/new` filters model buttons by the selected harness, and a concrete model
+token infers its harness. Initial task text from flat `/new` is passed as a positional prompt
+after `--` for Claude/Codex and as one `--prompt=<text>` argv element for opencode; when
+private-chat topics are enabled, the private-topic-backed `/new` spawn gets the same task argv
+and also receives `TG_TOPIC`.
 
 ## 7. Persistence
 
