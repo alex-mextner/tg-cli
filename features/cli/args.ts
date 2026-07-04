@@ -11,6 +11,7 @@ import { parseLineSpec, stripSpecWrappers } from '../auto-attach/snippet';
 import { buildFileIndex, isRecursiveCandidate, matchFromIndex, type ListDir } from '../auto-attach/recursive';
 import { looksPathLike, resolveAcrossWorktrees } from '../auto-attach/worktree';
 import { validateTag } from '../render/tag';
+import { detectMsgRefs } from '../autolink-msgrefs/detect';
 
 export interface ItemLineSpec {
   // The full original token as written (e.g. "src/a.ts:42-50"), kept so the
@@ -235,6 +236,18 @@ export function parseArgs(
       // silently swallowing the next flag as the title.
       if (!nextArg || nextArg.startsWith('--')) {
         return { action: 'error', message: '--title requires a value' };
+      }
+      // A `tg#<id>` message reference in the header line defeats its own
+      // purpose: --title is a one-line header (`✳️ [window] <title>`), not a
+      // place a reader can follow a reference from — and unlike the message
+      // body, nothing here ever gets linkified. Refuse instrumentally (the
+      // same rule task-cli/gh-ship enforce on a ticket/PR title) rather than
+      // silently sending an inert `tg#1234` in the header.
+      if (detectMsgRefs(nextArg).length > 0) {
+        return {
+          action: 'error',
+          message: 'Refusing: --title contains a tg#<id> reference — move it into the message body.',
+        };
       }
       title = nextArg;
       i += 2;
