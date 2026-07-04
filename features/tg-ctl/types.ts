@@ -25,6 +25,13 @@ export interface ControlConfig {
   // to be enabled for the bot — if `createForumTopic` fails the daemon falls back silently
   // to the current flat-chat behaviour. Opt in with `control.private_topics: true`.
   privateTopics: boolean;
+  // Git-state-check banner (git-state.ts): default ON. Before auto-binding a fresh, non-reply
+  // message into the discovered pane, the entrypoint checks that pane's cwd for uncommitted
+  // changes / a non-main branch and prepends a warning banner when found — the root-cause fix
+  // for a new, unrelated message silently reading as "more of the same task" in an occupied
+  // pane. An agent that always works on a feature branch sees this on every delivery to that
+  // pane; opt out per machine with `control.git_state_banner: false` if that's too noisy.
+  gitStateBanner: boolean;
 }
 
 // enabled defaults ON (user decision 2026-06-10, post-review): inbound is armed
@@ -48,6 +55,9 @@ export const DEFAULT_CONTROL: ControlConfig = {
   // OFF by default — private-chat topics auto-degrade when BotFather Threaded Mode is not
   // enabled (createForumTopic fails → fall through to flat behaviour).
   privateTopics: false,
+  // ON by default — the banner is a heads-up nudge, not a hard gate; opt out per machine with
+  // `control.git_state_banner: false`.
+  gitStateBanner: true,
 };
 
 // --- Telegram update shapes (only the fields we read) ---

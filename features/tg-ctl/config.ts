@@ -70,6 +70,13 @@ export function parseControlConfig(yaml: string): Partial<ControlConfig> {
         // unrecognized value → ignore (don't guess)
         break;
       }
+      case 'git_state_banner': {
+        const v = value.toLowerCase();
+        if (TRUE_TOKENS.has(v)) out.gitStateBanner = true;
+        else if (FALSE_TOKENS.has(v)) out.gitStateBanner = false;
+        // unrecognized value → ignore (don't guess)
+        break;
+      }
       case 'transport':
         // Raw string passthrough — resolveControlConfig normalizes garbage.
         out.transport = unquote(value) as ControlConfig['transport'];
@@ -120,6 +127,7 @@ export function resolveControlConfig(partial: Partial<ControlConfig>): ControlCo
     allowedSenders: [...(partial.allowedSenders ?? DEFAULT_CONTROL.allowedSenders)],
     topics: partial.topics ?? DEFAULT_CONTROL.topics,
     privateTopics: partial.privateTopics ?? DEFAULT_CONTROL.privateTopics,
+    gitStateBanner: partial.gitStateBanner ?? DEFAULT_CONTROL.gitStateBanner,
   };
   if (partial.session !== undefined) cfg.session = partial.session;
   return cfg;
