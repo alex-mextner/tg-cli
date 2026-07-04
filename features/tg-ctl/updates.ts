@@ -62,10 +62,16 @@ function fmtQuoteTimeUtc(unixSec: number): string {
 // ellipsis (item 3: «… начало сообщения и многоточие …»).
 const QUOTE_HEAD_MAX = 60;
 
-// The quote anchor for a REPLY (items 2, 3): `↩ «[date time] <quote>…»`. The
-// quoted content is the user's PARTIAL selection when present (item 2),
+// The quote anchor for a REPLY (items 2, 3): `↩ tg#<id> «[date time] <quote>…»`.
+// The quoted content is the user's PARTIAL selection when present (item 2),
 // otherwise the beginning of the replied-to message (item 3). Shared by text
 // replies and voice-note replies so both anchor identically.
+//
+// `tg#<id>` is the replied-to message's OWN Telegram message_id — same
+// convention as the `{id}` substitution in wrapInbound (tg-cli#28) — so an
+// agent whose context has compacted/forgotten the original can still recover
+// it verbatim via `tg replies --json` (grep the id) instead of relying on the
+// truncated `head` preview below (tg-cli#130).
 export function buildReplyAnchor(m: TgMessage, opts: StepOpts): string {
   const rtm = m.reply_to_message;
   const original = (rtm?.text ?? rtm?.caption ?? '').replace(/\s+/g, ' ').trim();
@@ -73,7 +79,8 @@ export function buildReplyAnchor(m: TgMessage, opts: StepOpts): string {
   const body = selected || original;
   const head = body.length > QUOTE_HEAD_MAX ? `${body.slice(0, QUOTE_HEAD_MAX)}…` : `${body}…`;
   const when = rtm ? (opts.fmtTime ?? fmtQuoteTimeUtc)(rtm.date) : '';
-  return `↩ «[${when}] ${head}»`;
+  const origId = rtm ? `tg#${rtm.message_id} ` : '';
+  return `↩ ${origId}«[${when}] ${head}»`;
 }
 
 // Build the injected text for a REPLY (items 2, 3). The agent sees which message

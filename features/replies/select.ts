@@ -54,6 +54,51 @@ export function searchHistory(records: HistoryRecord[], query: string, regex: bo
   return records.filter((r) => r.text.toLowerCase().includes(needle));
 }
 
+// --- multi-part sends ---
+//
+// A >4096 split or a media-group album writes one history record PER
+// outbound message_id, every sibling stamped with the SAME `groupId` (see
+// buildOutboundHistoryRecords, review: tg-cli#131) — needed so `--json |
+// select(.id == <tg#>)` can recall ANY chunk/item. Group ADJACENT records
+// sharing a (defined) groupId into one logical send; a record with no
+// groupId is always its own group of one. Grouping by this authoritative
+// write-time marker — rather than by coincidental field equality (same ts/
+// text/pane) — means two genuinely different messages sent in the same
+// second with identical text are NEVER wrongly merged (each lacks a
+// groupId, so `undefined !== undefined` never matches).
+//
+// ADJACENCY dependency: this only groups CONSECUTIVE same-groupId records,
+// so it relies on siblings of one send staying contiguous in `records` —
+// true today because (a) buildOutboundHistoryRecords' output is written in
+// one `writeFileSync` call, so siblings land as consecutive JSONL lines, and
+// (b) every filter upstream in selectHistory (direction/panes/since/until/
+// search) keeps-or-drops a whole group atomically, since siblings share
+// direction/pane/ts/text/from. A future filter keyed on a field that
+// DIFFERS across siblings (e.g. message_id itself), or any reordering of
+// `records`, would silently split a group and strand a non-first id as
+// collapseMultiPartSends' representative — keep that invariant in mind
+// before adding either.
+function groupMultiPartSends(records: HistoryRecord[]): HistoryRecord[][] {
+  const groups: HistoryRecord[][] = [];
+  for (const r of records) {
+    const lastGroup = groups[groups.length - 1];
+    const prev = lastGroup?.[lastGroup.length - 1];
+    const samePart = r.groupId !== undefined && prev?.groupId === r.groupId;
+    if (samePart) lastGroup.push(r);
+    else groups.push([r]);
+  }
+  return groups;
+}
+
+// The plain (non-JSON) listing renders one line per record, so without
+// collapsing, a single logical send would print as N identical-looking
+// lines. Collapse each group down to its first record (matching the pre-fix
+// single-record behavior); only json output (buildJsonOutput, called on the
+// un-collapsed `selected`) exposes every id.
+export function collapseMultiPartSends(records: HistoryRecord[]): HistoryRecord[] {
+  return groupMultiPartSends(records).map((group) => group[0]);
+}
+
 // --- selection pipeline ---
 
 // direction → panes → since/until → (find ? search) → keep the LAST `limit`,
@@ -72,8 +117,24 @@ export function selectHistory(
   if (args.action === 'find' && args.query !== undefined) {
     out = searchHistory(out, args.query, args.regex);
   }
-  // History is already chronological; take the tail, render ascending.
-  return out.length > args.limit ? out.slice(out.length - args.limit) : out;
+  // `--limit` counts LOGICAL sends, not raw stored records: a multi-part
+  // send must count as ONE toward `-n`, and must never be truncated
+  // mid-send (a partial group would strand a non-first id as if it were the
+  // group's representative, breaking collapseMultiPartSends' "first id"
+  // contract — review: tg-cli#131 follow-up). Group first, keep the LAST N
+  // groups, then flatten back to records: buildJsonOutput (which wants every
+  // id) gets the full membership of the N kept sends; collapseMultiPartSends
+  // (which wants one line per send) gets exactly those N groups back. Known
+  // limitation this doesn't cover: `appendRecordsToBlob`'s ~5000-line file
+  // TRIM (history.ts) cuts from the head and could, in principle, remove an
+  // old group's first sibling while keeping its later ones — the "first id"
+  // contract is a promise about THIS function's own slicing, not about what
+  // survived a prior on-disk trim. Purely cosmetic (a stale group's
+  // collapsed line would show a non-first id); `--json` recall of a
+  // surviving sibling is unaffected.
+  const groups = groupMultiPartSends(out);
+  const keptGroups = groups.length > args.limit ? groups.slice(groups.length - args.limit) : groups;
+  return keptGroups.flat();
 }
 
 // --- formatting ---

@@ -11,7 +11,7 @@ an agent's own report — the agent should see *what you are answering*. The dae
 injects the reply with a one-line quote anchor:
 
 ```
-↩ «[2026-06-12 14:30] migrated the DB…»
+↩ tg#5975 «[2026-06-12 14:30] migrated the DB…»
 [TG from Alex] fix this — reply via tg
 ```
 
@@ -19,11 +19,19 @@ injects the reply with a one-line quote anchor:
   selection, `message.quote.text`), that exact selection is the forwarded quote.
 - **Item 3** — the anchor is `«[<date> <time>] <beginning of the message>…»`:
   the replied-to message's timestamp plus the start of its text and an ellipsis.
+- **Original id (tg-cli#130)** — `tg#<id>` is `reply_to_message.message_id`, the
+  Telegram id of the message you're answering (almost always the agent's own
+  prior report). The `head` preview is truncated to 60 chars, so if the agent's
+  context has compacted and the preview isn't enough to place it, it can pull
+  the full original back with `tg replies agent --all-sessions --json | jq
+  '.[] | select(.id == 5975)'` (or `tg replies find <snippet>`) instead of
+  guessing. Renders even when the id happens to be `0` in a test fixture — the
+  token is never silently dropped for a falsy-but-present id.
 
 When both apply, the partial selection is the quoted content and it still carries
 the `[date time]` + `…` framing.
 
-## `buildReplyInject(m, name, opts)` (pure)
+## `buildReplyAnchor(m, opts)` / `buildReplyInject(m, name, opts)` (pure)
 
 1. `original` = `reply_to_message.text` (or `.caption`), whitespace-collapsed.
 2. `selected` = `m.quote.text` (the partial selection), whitespace-collapsed.
@@ -32,7 +40,12 @@ the `[date time]` + `…` framing.
 5. `when` = `opts.fmtTime(reply_to_message.date)`; defaults to a deterministic
    **UTC** `YYYY-MM-DD HH:MM`. The daemon injects a **local-time** formatter so
    the human sees Belgrade time while the pure module + tests stay deterministic.
-6. Result: `↩ «[when] head»` + newline + the normal `wrap(name, replyText)`.
+6. `origId` = `reply_to_message.message_id`, rendered `tg#<id> ` — same
+   convention as the `{id}` substitution in `wrapInbound` (tg-cli#28).
+7. Result (`buildReplyAnchor`): `↩ origId«[when] head»`. `buildReplyInject`
+   appends a newline + the normal `wrap(name, replyText, m.message_id)` — note
+   THIS is the reply's own id (for `tg --reply-to`), distinct from `origId`
+   above (the message being answered).
 
 ## Routing into the step function
 

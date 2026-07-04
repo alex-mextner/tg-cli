@@ -52,6 +52,24 @@ test('parseHistory: rejects records with a bad direction', () => {
   expect(parseHistory(raw)).toEqual([]);
 });
 
+test('parseHistory: a numeric or empty-string groupId parses as absent, not a group key', () => {
+  // The write path (buildOutboundHistoryRecords) only ever emits
+  // crypto.randomUUID() or omits the field — a numeric or empty-string
+  // groupId can only come from a hand-edited/corrupted line. Treating '' as
+  // present would let two DIFFERENT unrelated records with a corrupted
+  // `groupId: ''` satisfy select.ts's `prev?.groupId === r.groupId` check
+  // and wrongly merge in the plain listing (review: tg-cli#131 follow-up).
+  const numeric = JSON.stringify({ ...rec(), groupId: 42 });
+  const empty = JSON.stringify({ ...rec(), groupId: '' });
+  expect(parseHistory(numeric)[0].groupId).toBeUndefined();
+  expect(parseHistory(empty)[0].groupId).toBeUndefined();
+});
+
+test('parseHistory: a valid non-empty string groupId round-trips', () => {
+  const raw = JSON.stringify({ ...rec(), groupId: 'grp-abc123' });
+  expect(parseHistory(raw)[0].groupId).toBe('grp-abc123');
+});
+
 test('parseHistory: pane may be null (sent outside tmux)', () => {
   const raw = JSON.stringify(rec({ pane: null, direction: 'agent' }));
   const out = parseHistory(raw);

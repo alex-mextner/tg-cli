@@ -9,7 +9,7 @@
 
 import { parseRepliesArgs, type RepliesQuery } from './args';
 import { parseHistory } from './history';
-import { buildJsonOutput, formatLines, selectHistory } from './select';
+import { buildJsonOutput, collapseMultiPartSends, formatLines, selectHistory } from './select';
 
 export interface RepliesCliDeps {
   // The raw JSONL history blob, or null when the file is absent/unreadable.
@@ -43,9 +43,14 @@ Action (2nd positional, default: list):
   find <query>         case-insensitive substring search (add --regex for regex)
 
 Flags:
-  -n, --limit <N>      max messages to show (default 20)
+  -n, --limit <N>      max SENDS to show (default 20) — a >4096-char split or a
+                       media-group album counts as ONE send, never truncated
+                       mid-send, so --json can return more than N rows when
+                       the tail includes one (tg-cli#131 follow-up)
   --full               do not truncate long messages (~200 chars otherwise)
-  --json               machine-readable JSON array (ts ms, id, direction, from, text, pane)
+  --json               machine-readable JSON array (ts ms, id, direction, from, text, pane) —
+                       one row per Telegram message_id, so a multi-part send
+                       is several rows sharing one ts/text
   --regex              treat the find <query> as a regular expression
   --all-sessions       ignore the current pane; search across every session
   --session <window|paneId>
@@ -136,18 +141,24 @@ export function runReplies(argv: string[], deps: RepliesCliDeps): number | null 
   }
 
   if (parsed.json) {
+    // Every outbound message_id, uncollapsed — a multi-part send's chunks/
+    // album-items each keep their own row so `select(.id == <tg#>)` can find
+    // any of them (tg-cli#131).
     deps.log(JSON.stringify(buildJsonOutput(selected)));
     return 0;
   }
 
-  if (selected.length === 0) {
+  // The plain listing collapses a multi-part send back to ONE line (see
+  // collapseMultiPartSends) — emptiness is unaffected by collapsing.
+  const displayed = collapseMultiPartSends(selected);
+  if (displayed.length === 0) {
     const suffix = scopeSuffix(parsed, panes);
     const what = parsed.action === 'find' ? ` matching "${parsed.query}"` : '';
     deps.log(`no ${parsed.direction === 'all' ? '' : parsed.direction + ' '}messages${what}${suffix}.`);
     return 0;
   }
 
-  for (const line of formatLines(selected, {
+  for (const line of formatLines(displayed, {
     direction: parsed.direction,
     full: parsed.full,
     fmtTime: deps.fmtTime,

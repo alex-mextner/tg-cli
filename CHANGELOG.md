@@ -3,6 +3,51 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.27.0
+
+**Feature (tg-cli#130): reply quote-anchor carries the original message's
+`tg#<id>`.** From Alex (tg#5978).
+
+- `buildReplyAnchor`/`buildReplyInject` (`features/tg-ctl/updates.ts`) now
+  render `↩ tg#<id> «[date time] head…»` — `tg#<id>` is
+  `reply_to_message.message_id`, the Telegram id of the message being
+  answered (almost always the agent's own prior report), rendered with the
+  same `tg#` convention as the inbound wrap's own-message `{id}`. Previously
+  only the reply's OWN id was surfaced (via the `[TG from {name} {id}]` wrap);
+  the id of the message being REPLIED TO was invisible, so an agent whose
+  context had compacted had no way to recover the original beyond the ~60-char
+  truncated preview. Now it can pull the full text back with `tg replies` (or
+  `tg replies --json` filtered by id) instead of guessing.
+- Applies uniformly to text replies, voice-note replies, and prose replies
+  inside a bound forum topic (all three route through the same
+  `buildReplyAnchor`).
+- Docs: `docs/specs/reply-quotes.md` and the README inbound-reply section
+  updated to the new anchor format.
+- **Fix (review: tg-cli#131):** a reply anchored to a non-first chunk of a
+  >4096 split, or a non-first item of a media-group album, was NOT
+  recall-able via `tg replies --json | select(.id == <tg#>)` — `tg` only
+  wrote ONE history record, keyed to the first outbound message id, even
+  though the route map (used to route an inbound reply back to its origin
+  pane) already tracked every id. `buildOutboundHistoryRecords`
+  (`features/replies/outbound.ts`) now writes one `agent` history record per
+  outbound message_id, so every anchored id stays recall-able.
+  `outboundHistoryText` also now combines a mixed photo+document send into
+  one placeholder (`[2 photos, 3 files]`) instead of silently dropping the
+  document count.
+- **Fix (tg-cli#134, review: tg-cli#131 follow-up):** writing multiple
+  records per send meant the plain (non-`--json`) `tg replies agent` listing
+  printed one logical send as N duplicate-looking lines, and `-n`/`--limit`
+  counted raw records instead of sends. Every true multi-part send is now
+  tagged with a shared `groupId` (a caller-supplied random token, not the
+  group's first id — Telegram message_id is per-chat-sequential, so reusing
+  it as the key could collide across two chats sharing one bot's history
+  file) and `select.ts` groups by that authoritative marker; `-n`/`--limit`
+  now counts logical sends (not raw records) for BOTH the plain listing and
+  `--json` — a kept multi-part send is never truncated mid-group, so a
+  `--json -n N` result can carry more than N rows when the tail includes a
+  multi-part send. The plain listing additionally collapses each group to
+  one line; `--json` always returns every id of the kept sends, uncollapsed.
+
 ## 1.26.0
 
 **Features (tg-cli#113, #114, #115): harness-limit notifications, reaction
