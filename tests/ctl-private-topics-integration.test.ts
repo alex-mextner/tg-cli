@@ -50,9 +50,46 @@ exit 0
 `;
 }
 
+function fakeTmuxCrashAfterStamp(cwd: string, spawnLog: string, tokenFile: string): string {
+  return `#!/bin/sh
+sub="$1"; shift
+case "$sub" in
+  list-panes)
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '%1' '4241' 'claude' 'main' '' '${cwd}'
+    if [ -f '${tokenFile}' ]; then
+      token="$(cat '${tokenFile}')"
+      printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '1' '${SPAWNED_PANE}' '4248' 'claude' 'crashpt' "$token" '${cwd}'
+    fi
+    ;;
+  display-message) printf 'main\\n' ;;
+  new-window)
+    printf 'new-window %s\\n' "$*" >> '${spawnLog}'
+    printf '%s\\n' '${SPAWNED_PANE}'
+    ;;
+  set-option)
+    if [ "$4" = '@tg_spawn_token' ]; then
+      printf '%s' "$5" > '${tokenFile}'
+      kill -9 "$PPID"
+    fi
+    ;;
+  send-keys) : ;;
+  load-buffer) cat > /dev/null ;;
+esac
+exit 0
+`;
+}
+
 function fakePs(): string {
   return `#!/bin/sh
 printf '%s %s %s\\n' '4241' '1' 'claude'
+exit 0
+`;
+}
+
+function fakePsWithOrphan(): string {
+  return `#!/bin/sh
+printf '%s %s %s\\n' '4241' '1' 'claude'
+printf '%s %s %s\\n' '4248' '1' 'claude'
 exit 0
 `;
 }
@@ -204,7 +241,10 @@ test(
     expect(creates[0].name).toBe('myproj');
 
     // The topics store must carry a `bound` binding for threadId=42.
-    await waitFor(() => existsSync(topicsFile), 4000);
+    await waitFor(
+      () => existsSync(topicsFile) && parseTopics(readFileSync(topicsFile, 'utf8')).some((x) => x.threadId === 42 && x.status === 'bound'),
+      4000,
+    );
     const bindings = parseTopics(existsSync(topicsFile) ? readFileSync(topicsFile, 'utf8') : null);
     const b = bindings.find((x) => x.threadId === 42);
     expect(b).toBeDefined();
@@ -218,6 +258,147 @@ test(
     expect(sent(sends, 'spawned `claude-default`')).toBe(true);
 
     daemon.kill();
+  },
+);
+
+test(
+  'private_topics: opencode spawn keeps the initial task via --prompt',
+  async () => {
+    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const queue: unknown[][] = [[textMsg(15, `/new opencode-zai-glm-5.2 ${cfgDir} ocproj fix blank preview`)]];
+    const sends: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          const body = (await req.json()) as Record<string, unknown>;
+          return Response.json({ ok: true, result: { message_thread_id: 43, name: body.name } });
+        }
+        if (url.pathname.endsWith('/sendMessage')) {
+          sends.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_id: 900 + sends.length } });
+        }
+        if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const daemon: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd,
+    });
+    closeSync(logFd);
+
+    await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+    const argv = spawnArgvLog(spawnLog);
+    expect(argv.length).toBe(1);
+    expect(argv[0]).toContain('-e TG_TOPIC=43');
+    expect(argv[0]).toContain('-n ocproj');
+    expect(argv[0]).toContain('opencode --model zai/glm-5.2 --prompt=fix blank preview');
+
+    daemon.kill();
+  },
+);
+
+test(
+  'private_topics: crash after new-window is adopted on restart, not double-spawned',
+  async () => {
+    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const tokenFile = join(cfgDir, 'spawn-token.txt');
+    const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
+    writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmuxCrashAfterStamp(cfgDir, spawnLog, tokenFile), { mode: 0o755 });
+    writeFileSync(join(cfgDir, 'bin', 'ps'), fakePsWithOrphan(), { mode: 0o755 });
+
+    const queue: unknown[][] = [[textMsg(17, `/new claude-default ${cfgDir} crashpt`)]];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          return Response.json({ ok: true, result: { message_thread_id: 44, name: 'crashpt' } });
+        }
+        if (url.pathname.endsWith('/sendMessage')) return Response.json({ ok: true, result: { message_id: 901 } });
+        if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const crashed: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd,
+    });
+    closeSync(logFd);
+
+    await waitFor(() => existsSync(tokenFile));
+    await Bun.sleep(150);
+    crashed.kill();
+
+    const pending = parseTopics(readFileSync(topicsFile, 'utf8')).find((b) => b.threadId === 44);
+    expect(pending?.status).toBe('awaiting-model');
+    expect(pending?.spawnPending).toBe(true);
+    expect(pending?.spawnToken).toBe(readFileSync(tokenFile, 'utf8'));
+    expect(pending?.paneId).toBeUndefined();
+
+    const restartedLogFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const restarted: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd: restartedLogFd,
+    });
+    closeSync(restartedLogFd);
+
+    await waitFor(
+      () => existsSync(topicsFile) && parseTopics(readFileSync(topicsFile, 'utf8')).some((b) => b.threadId === 44 && b.status === 'bound'),
+    );
+    const rebound = parseTopics(readFileSync(topicsFile, 'utf8')).find((b) => b.threadId === 44);
+    expect(rebound?.status).toBe('bound');
+    expect(rebound?.paneId).toBe(SPAWNED_PANE);
+    expect(spawnArgvLog(spawnLog)).toHaveLength(1);
+
+    restarted.kill();
   },
 );
 

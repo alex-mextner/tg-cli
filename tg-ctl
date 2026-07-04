@@ -149,9 +149,10 @@ import {
   serializeTopics,
   slugifyTopicName,
 } from "./features/tg-ctl/topics"
-import { findModel, MODEL_CATALOG, spawnArgv } from "./features/tg-ctl/models"
+import { findModel, harnessLabel, MODEL_CATALOG, modelsForHarness, spawnArgv, spawnArgvWithTask } from "./features/tg-ctl/models"
 import {
   buildNewDirKeyboard,
+  buildNewHarnessKeyboard,
   buildNewModelKeyboard,
   nameCollides,
   parseNewCommand,
@@ -3603,15 +3604,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // spawned agent's plain `tg "reply"` threads back INTO this topic automatically — no `--topic`
   // needed (spec §9.4 deferral; codex r8 #1). The `tg` send side already reads TG_TOPIC and fails
   // soft on a stale/closed topic. Fully guarded: a spawn throw (tmux missing) or a non-zero exit
-  // becomes a typed error, never an exception. The path + argv are discrete argv elements (never
-  // shell-split), so a directory with spaces is safe.
+  // becomes a typed error, never an exception. `task` is passed through the model catalog as the
+  // spawned agent's initial prompt. The path + argv are discrete argv elements (never shell-split),
+  // so a directory with spaces is safe.
   const spawnTopicWindow = (
     threadId: number,
     windowSlug: string,
     path: string,
     model: string,
+    task = "",
   ): { ok: true; paneId: string } | { ok: false; error: string } => {
-    const argv = spawnArgv(model, path)
+    const argv = spawnArgvWithTask(model, path, task)
     if (!argv) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
     try {
       // sessionForSpawn() runs snapshot() (tmux list-panes / ps), which CAN throw if a binary is
@@ -4205,10 +4208,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
 
   // --- flat-chat `/new` command (issue #27, NON-topic) ---
-  // The flat sibling of the forum-topics /new flow: a `/new [<model>] [<dir>] name [<task>]`
-  // slash command in the flat chat spawns a fresh agent in a named tmux window. SAFETY (this is
-  // the CTO's daily lifeline): every step is exception-guarded — a bad path, missing tmux, unknown
-  // model, or spawn error NEVER throws into the poll loop; it logs and replies, leaving the pending
+  // The flat sibling of the forum-topics /new flow: a `/new [<harness>|<model>] [<dir>] name
+  // [<task>]` slash command in the flat chat spawns a fresh agent in a named tmux window. SAFETY
+  // (this is the CTO's daily lifeline): every step is exception-guarded — a bad path, missing tmux,
+  // unknown model, or spawn error NEVER throws into the poll loop; it logs and replies, leaving the pending
   // session so the user can retry/answer again. Unlike the topic flow there is NO persistent
   // binding: once the agent spawns the pending session is deleted (the new pane is a plain pane,
   // addressed by /agent afterwards). The pending store is in-memory (pendingNew).
@@ -4267,14 +4270,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     task: string,
     spawnToken: string,
   ): { ok: true; paneId: string } | { ok: false; error: string } => {
-    const baseArgv = spawnArgv(model, path)
-    if (!baseArgv) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
-    // Append the initial task as a positional prompt, after a `--` end-of-options separator (review
-    // #1): without `--`, a task beginning with a dash (`--continue`, `-p`, …) would be parsed by the
-    // agent as a FLAG, not a prompt — the agent would mis-launch or run an unintended action. `--`
-    // makes everything after it positional. A discrete argv element (never shell-split), so a task
-    // with spaces/quotes is also safe.
-    const argv = task.trim().length > 0 ? [...baseArgv, "--", task.trim()] : baseArgv
+    const argv = spawnArgvWithTask(model, path, task)
+    if (!argv) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
     try {
       const session = sessionForSpawn()
       const tmuxArgv = [
@@ -4321,13 +4318,31 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     session.promptMessageId = await sendMessage(ctx, prompt, extra)
   }
 
-  // Post the model-pick prompt for a pending /new session (one button per catalog model).
+  // Post the harness-pick prompt for a pending /new session (one button per agent harness).
+  const askNewHarness = async (session: NewSession): Promise<void> => {
+    session.status = "awaiting-harness"
+    session.ts = Math.floor(Date.now() / 1000)
+    session.promptMessageId = await sendMessage(ctx, `Which harness should \`${session.name}\` use?`, {
+      reply_markup: { inline_keyboard: buildNewHarnessKeyboard(session.token) },
+    })
+  }
+
+  // Post the model-pick prompt for a pending /new session (filtered to the chosen harness).
   const askNewModel = async (session: NewSession): Promise<void> => {
     session.status = "awaiting-model"
     session.ts = Math.floor(Date.now() / 1000)
-    session.promptMessageId = await sendMessage(ctx, `Which model should \`${session.name}\` run?`, {
-      reply_markup: { inline_keyboard: buildNewModelKeyboard(session.token) },
+    const catalog = session.harness ? modelsForHarness(session.harness) : MODEL_CATALOG
+    const harnessName = session.harness ? `${harnessLabel(session.harness)} ` : ""
+    session.promptMessageId = await sendMessage(ctx, `Which ${harnessName}model should \`${session.name}\` run?`, {
+      reply_markup: { inline_keyboard: buildNewModelKeyboard(session.token, catalog) },
     })
+  }
+
+  const advanceNewAfterDir = async (session: NewSession): Promise<boolean> => {
+    if (session.model && findModel(session.model)) return spawnNewSession(session, session.model, null)
+    if (session.harness) await askNewModel(session)
+    else await askNewHarness(session)
+    return true
   }
 
   // Do the actual spawn for a session that has name + dir + model, then DELETE the session (the
@@ -4378,8 +4393,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   //     (already in flight from Telegram) is silently absorbed whether the spawn succeeds or fails.
   //   - On spawn FAILURE: the preliminary binding stays → echo is absorbed, user retries via model tap.
   //   - On spawn SUCCESS: upgrade to a `bound` binding; call stampSpawnToken for log greppability.
-  // NOTE: spawnTopicWindow has no `task` param (same as the supergroup topic flow). The confirmation
-  // message suppresses the task note so the user is not misled about whether the task was applied.
+  // Supergroup topic /new has no task tail, but private-chat flat /new can pass one through here.
   const spawnNewSessionWithTopic = async (
     session: NewSession,
     modelId: string,
@@ -4391,33 +4405,36 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // Write a preliminary binding BEFORE spawn so the forum_topic_created echo is absorbed even if
     // the spawn fails (no dangling untracked threadId that triggers the /new flow from a Telegram echo).
     const preliminary = { threadId, name: session.name, status: "awaiting-model" as const, path: session.dir, model: modelId, ts }
-    persistTopics(appendTopic(loadTopics(), preliminary))
-    const spawnToken = `topic-${session.token}-${ts}`
-    const spawned = spawnTopicWindow(threadId, slug, session.dir, modelId)
+    const spawnToken = `${threadId}-${ts}-${nextPathNonce()}`
+    persistTopics(appendTopic(loadTopics(), markSpawnPending(preliminary, spawnToken, ts)))
+    const spawned = spawnTopicWindow(threadId, slug, session.dir, modelId, session.task)
     if (!spawned.ok) {
+      persistTopics(appendTopic(loadTopics(), clearSpawnPending(preliminary, Math.floor(Date.now() / 1000))))
       if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
       await sendMessage(ctx, spawned.error)
       await askNewModel(session)
       return false
     }
-    // Upgrade the preliminary binding to `bound` now that the pane exists.
+    // Upgrade the preliminary binding to `bound` now that the pane exists. Do not persist a
+    // spawnPending record with paneId: a crash between that write and markBound would leave a
+    // contradictory durable state.
+    stampSpawnToken(spawned.paneId, spawnToken)
     const boundTs = Math.floor(Date.now() / 1000)
     persistTopics(appendTopic(loadTopics(), markBound(preliminary, spawned.paneId, boundTs)))
-    stampSpawnToken(spawned.paneId, spawnToken)
     pendingNew.delete(session.token)
     if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
-    // NOTE: task is not applied via spawnTopicWindow (no task argv support) — suppress the task note
-    // so the user is not told a task was started that wasn't.
-    await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`) — use \`/agent ${slug}\` to talk to it`)
+    const taskNote = session.task.trim().length > 0 ? ` with task: ${session.task.trim()}` : ""
+    await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`)${taskNote} — use \`/agent ${slug}\` to talk to it`)
     return true
   }
 
-  // A `/new [<model>] [<dir>] name [<task>]` command → start (or short-circuit) the flow. With a
-  // name+dir+model all supplied the agent spawns immediately; otherwise the missing piece is asked
-  // via buttons. A name collision with a live window is a non-fatal WARNING (tmux allows dup names).
+  // A `/new [<harness>|<model>] [<dir>] name [<task>]` command → start (or short-circuit) the
+  // flow. With a name+dir+model all supplied the agent spawns immediately; otherwise the missing
+  // piece is asked via buttons. A name collision with a live window is a non-fatal WARNING (tmux
+  // allows dup names).
   const handleNewCommand = async (action: Extract<Action, { kind: "new-command" }>): Promise<boolean> => {
     if (!action.name) {
-      await sendMessage(ctx, "usage: /new [<model>] [<dir>] <name> [<task>] — e.g. `/new opus /Users/you/app api fix the build`")
+      await sendMessage(ctx, "usage: /new [<harness>|<model>] [<dir>] <name> [<task>] — e.g. `/new codex /Users/you/app api fix the build`")
       return false
     }
     // Name-uniqueness WARNING (issue #27): warn if the resulting window slug collides, don't block.
@@ -4436,23 +4453,25 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       dir = null
     }
     const token = `n${++newTokenSeq}`
+    const modelEntry = action.model ? findModel(action.model) : null
     const session: NewSession = {
       token,
       name: action.name,
-      status: dir ? "awaiting-model" : "awaiting-dir",
+      status: "awaiting-dir",
       task: action.task,
       ts: Math.floor(Date.now() / 1000),
       ...(dir ? { dir } : {}),
+      ...(action.harness ? { harness: action.harness } : {}),
+    }
+    if (modelEntry) {
+      session.model = modelEntry.id
+      session.harness = modelEntry.kind
     }
     pendingNew.set(token, session)
     // Model already supplied AND dir resolved → spawn straight away (no buttons).
-    if (dir && action.model && findModel(action.model)) {
-      session.model = action.model
-      return spawnNewSession(session, action.model, null)
-    }
+    if (dir && session.model) return spawnNewSession(session, session.model, null)
     // Model supplied but dir missing → ask dir; we'll spawn with the supplied model once dir lands.
-    if (action.model && findModel(action.model)) session.model = action.model
-    if (dir) await askNewModel(session)
+    if (dir) return advanceNewAfterDir(session)
     else await askNewDir(session)
     return true
   }
@@ -4494,10 +4513,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     session.dir = path
     session.ts = Math.floor(Date.now() / 1000)
     if (session.promptMessageId != null) await clearMessageKeyboard(ctx, session.promptMessageId)
-    // If a model was supplied on the /new line, spawn immediately; else ask the model.
-    if (session.model && findModel(session.model)) return spawnNewSession(session, session.model, null)
-    await askNewModel(session)
-    return true
+    // If a model was supplied on the /new line, spawn immediately; else ask harness/model.
+    return advanceNewAfterDir(session)
   }
 
   // A recent-dir button tap (tnp:<token>:<index>) → resolve the index against the session's
@@ -4520,7 +4537,31 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     session.dir = path
     session.ts = Math.floor(Date.now() / 1000)
     if (action.messageId !== null) await clearMessageKeyboard(ctx, action.messageId)
-    if (session.model && findModel(session.model)) return spawnNewSession(session, session.model, null)
+    return advanceNewAfterDir(session)
+  }
+
+  // A harness button tap (tnh:<token>:<harness>) → ask the model picker for that harness only.
+  const handleNewHarness = async (action: Extract<Action, { kind: "new-harness" }>): Promise<boolean> => {
+    reapNewSessions()
+    const session = pendingNew.get(action.token)
+    if (!session) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired — run /new again")
+      return false
+    }
+    if (session.status !== "awaiting-harness" || !session.dir) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "pick a directory first")
+      return false
+    }
+    const catalog = modelsForHarness(action.harness)
+    if (catalog.length === 0) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "no models")
+      await sendMessage(ctx, `no models configured for \`${harnessLabel(action.harness)}\``)
+      return false
+    }
+    await answerCallbackQuery(ctx, action.callbackQueryId, "ok")
+    session.harness = action.harness
+    session.ts = Math.floor(Date.now() / 1000)
+    if (action.messageId !== null) await clearMessageKeyboard(ctx, action.messageId)
     await askNewModel(session)
     return true
   }
@@ -4538,13 +4579,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await answerCallbackQuery(ctx, action.callbackQueryId, "send a directory first")
       return false
     }
-    if (!findModel(action.modelId)) {
+    const modelEntry = findModel(action.modelId)
+    if (!modelEntry) {
       await answerCallbackQuery(ctx, action.callbackQueryId, "unknown model")
       await sendMessage(ctx, `unknown model \`${action.modelId}\` — pick a model again`)
       return false
     }
+    if (session.harness && modelEntry.kind !== session.harness) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, `pick a ${harnessLabel(session.harness)} model`)
+      return false
+    }
     await answerCallbackQuery(ctx, action.callbackQueryId, "starting…")
     session.model = action.modelId
+    session.harness = modelEntry.kind
     return spawnNewSession(session, action.modelId, action.messageId)
   }
 
@@ -4557,9 +4604,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // window already hosts a live agent, RE-BIND that pane (adopt the orphan, no second spawn);
   // also mark any `bound` binding whose recorded pane is gone as `closed` (its agent died while
   // the daemon was down) so the next message offers a re-spawn instead of injecting into nothing.
-  // Runs ONCE at startup, gated behind ctx.cfg.topics, fully guarded (never aborts startup).
+  // Runs ONCE at startup when either public forum topics or private-chat topics use the TopicBinding
+  // store, fully guarded (never aborts startup).
   const reconcileTopicsOnStartup = (): void => {
-    if (!ctx.cfg.topics) return
+    if (!ctx.cfg.topics && !ctx.cfg.privateTopics) return
     try {
       const topics = loadTopics()
       if (topics.length === 0) return
@@ -5160,6 +5208,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return handleNewAnswer(action)
       case "new-dir":
         return handleNewDir(action)
+      case "new-harness":
+        return handleNewHarness(action)
       case "new-model":
         return handleNewModel(action)
       case "ack":

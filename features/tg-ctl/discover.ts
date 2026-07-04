@@ -32,12 +32,14 @@ export function parsePaneList(out: string): PaneInfo[] {
     // path(greedy). The `@tg_spawn_token` field (index 6) is the forum-topics increment-4 addition.
     // Accept BOTH the 8-field shape (token at index 6) and the legacy 7-field shape (no token field).
     // DISAMBIGUATION (codex r12 P2): a 7-field line whose PATH contains a literal tab ALSO yields 8+
-    // parts — but its parts[6] is a path fragment, NOT a token. Our tokens have a fixed shape
-    // (`<threadId>-<unixSec>-<nonce>`, all digits + dashes) and an unset option is ''. So treat
-    // parts[6] as a token ONLY when it is '' or matches that shape; otherwise it's a tab-split path
-    // (legacy) and the path is the greedy tail from index 6.
+    // parts — but its parts[6] is a path fragment, NOT a token. Our tokens have fixed shapes
+    // (`<threadId>-<unixSec>-<nonce>` for topic spawns, `new-<sessionToken>-<unixSec>` for flat
+    // /new spawns) and an unset option is ''. So treat parts[6] as a token ONLY when it is '' or
+    // matches one of those shapes; otherwise it's a tab-split path (legacy) and the path is the
+    // greedy tail from index 6.
     const tokenField = parts.length >= 8 ? parts[6] : undefined;
-    const looksLikeToken = tokenField !== undefined && (tokenField === '' || /^\d+-\d+-\d+$/.test(tokenField));
+    const looksLikeToken =
+      tokenField !== undefined && (tokenField === '' || /^\d+-\d+-\d+$/.test(tokenField) || /^new-[A-Za-z0-9_-]+-\d+$/.test(tokenField));
     panes.push({
       sessionName: parts[0],
       windowIndex,

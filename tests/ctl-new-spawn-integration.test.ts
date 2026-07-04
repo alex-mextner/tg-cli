@@ -6,15 +6,16 @@ import type { Subprocess } from 'bun';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 
 // End-to-end flat `/new` command (issue #27): the REAL daemon + a fake Telegram server + a fake
-// tmux/ps. A `/new [<model>] [<dir>] name [<task>]` message drives the interactive flow (ask dir →
-// ask model via buttons → `tmux new-window` spawn into a named window). The fake tmux's new-window
-// logs its full argv so a test asserts the spawn shape (model argv, -c <dir>, -n <slug>, the task
-// as a trailing prompt arg). Distinct from the forum-topics spawn (no topic, no binding) — this
-// exercises the in-memory pending-session machine + the non-topic spawn path.
+// tmux/ps. A `/new [<harness>|<model>] [<dir>] name [<task>]` message drives the interactive flow
+// (ask dir → ask harness when omitted → ask model → `tmux new-window` spawn into a named window).
+// The fake tmux's new-window logs its full argv so a test asserts the spawn shape (model argv,
+// -c <dir>, -n <slug>, the task as a trailing prompt arg). Distinct from the forum-topics spawn
+// (no topic, no binding) — this exercises the in-memory pending-session machine + the non-topic
+// spawn path.
 //
 // Load-bearing guarantees (this is the CTO's daily lifeline daemon):
-//   1. `/new <name>` → dir button tap → model button tap SPAWNS exactly one agent in the named
-//      window, with the model argv + -c <dir>.
+//   1. `/new <name>` → dir button tap → harness tap → model button tap SPAWNS exactly one agent in
+//      the named window, with the model argv + -c <dir>.
 //   2. `/new <model> <dir> <name> <task>` with everything supplied spawns IMMEDIATELY (no buttons),
 //      passing the task as the agent's initial prompt arg.
 //   3. `/new` with no name replies with the usage hint and does NOT spawn.
@@ -128,8 +129,10 @@ function spawnArgvLog(spawnLog: string): string[] {
 function makeServer(updateQueue: unknown[][]): {
   server: ReturnType<typeof Bun.serve>;
   sends: Array<Record<string, unknown>>;
+  callbacks: Array<Record<string, unknown>>;
 } {
   const sends: Array<Record<string, unknown>> = [];
+  const callbacks: Array<Record<string, unknown>> = [];
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -144,7 +147,10 @@ function makeServer(updateQueue: unknown[][]): {
         sends.push((await req.json()) as Record<string, unknown>);
         return Response.json({ ok: true, result: { message_id: 900 + sends.length } });
       }
-      if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+      if (url.pathname.endsWith('/answerCallbackQuery')) {
+        callbacks.push((await req.json()) as Record<string, unknown>);
+        return Response.json({ ok: true, result: true });
+      }
       if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
       if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
       if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
@@ -152,7 +158,7 @@ function makeServer(updateQueue: unknown[][]): {
     },
   });
   servers.push(server);
-  return { server, sends };
+  return { server, sends, callbacks };
 }
 
 // `date` must be CURRENT (the daemon drops messages older than stalenessSec, 300s) — a date of 0
@@ -177,6 +183,13 @@ function modelTap(id: number, token: string, modelId: string): unknown {
   };
 }
 
+function harnessTap(id: number, token: string, harness: string): unknown {
+  return {
+    update_id: id,
+    callback_query: { id: `cb${id}`, from: { id: 1, first_name: 'Alex' }, message: { message_id: id, chat: { id: 1 }, date: 0 }, data: `tnh:${token}:${harness}` },
+  };
+}
+
 async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess> {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
   const daemon = await spawnDaemon(reg, {
@@ -197,7 +210,7 @@ async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
 const sent = (sends: Array<Record<string, unknown>>, needle: string): boolean =>
   sends.some((s) => String(s.text ?? '').includes(needle));
 
-test('full /new flow: command → dir tap → model tap spawns one agent in the named window', async () => {
+test('full /new flow: command → dir tap → harness tap → model tap spawns one agent in the named window', async () => {
   const { cfgDir, spawnLog } = makeCfgDir(false);
   // LIVE queue: start with /new, push later batches as the prompts arrive. The daemon mints the
   // session token `n1` for the first /new of its lifetime.
@@ -210,11 +223,15 @@ test('full /new flow: command → dir tap → model tap spawns one agent in the 
 
   // Tap dir button index 0 (the cfgDir, the only/newest recent cwd).
   queue.push([dirTap(11, 'n1', 0)]);
-  await waitFor(() => sent(sends, 'Which model should `myproj` run?'));
-  expect(sent(sends, 'Which model should `myproj` run?')).toBe(true);
+  await waitFor(() => sent(sends, 'Which harness should `myproj` use?'));
+  expect(sent(sends, 'Which harness should `myproj` use?')).toBe(true);
+
+  queue.push([harnessTap(12, 'n1', 'claude')]);
+  await waitFor(() => sent(sends, 'Which Claude model should `myproj` run?'));
+  expect(sent(sends, 'Which Claude model should `myproj` run?')).toBe(true);
 
   // Tap the model button.
-  queue.push([modelTap(12, 'n1', 'claude-opus')]);
+  queue.push([modelTap(13, 'n1', 'claude-opus')]);
   await waitFor(() => spawnArgvLog(spawnLog).length > 0);
   const argv = spawnArgvLog(spawnLog);
   expect(argv.length).toBe(1);
@@ -271,7 +288,7 @@ test('/new with no name replies usage and does NOT spawn', async () => {
   daemon.kill();
 });
 
-test('/new <name> then a TYPED absolute path advances to the model step and spawns on a model tap', async () => {
+test('/new <name> then a TYPED absolute path advances to harness/model picks and spawns', async () => {
   const { cfgDir, spawnLog } = makeCfgDir(false);
   const queue: unknown[][] = [[textMsg(40, '/new typed')]];
   const { server, sends } = makeServer(queue);
@@ -280,10 +297,14 @@ test('/new <name> then a TYPED absolute path advances to the model step and spaw
   await waitFor(() => sent(sends, 'New agent `typed`'));
   // Type the absolute path instead of tapping a button (cfgDir is a real dir).
   queue.push([textMsg(41, cfgDir)]);
-  await waitFor(() => sent(sends, 'Which model should `typed` run?'));
-  expect(sent(sends, 'Which model should `typed` run?')).toBe(true);
+  await waitFor(() => sent(sends, 'Which harness should `typed` use?'));
+  expect(sent(sends, 'Which harness should `typed` use?')).toBe(true);
 
-  queue.push([modelTap(42, 'n1', 'claude-default')]);
+  queue.push([harnessTap(42, 'n1', 'claude')]);
+  await waitFor(() => sent(sends, 'Which Claude model should `typed` run?'));
+  expect(sent(sends, 'Which Claude model should `typed` run?')).toBe(true);
+
+  queue.push([modelTap(43, 'n1', 'claude-default')]);
   await waitFor(() => spawnArgvLog(spawnLog).length > 0);
   const argv = spawnArgvLog(spawnLog);
   expect(argv.length).toBe(1);
@@ -332,10 +353,10 @@ test('/new <name> whose slug collides with a live window WARNS but still proceed
 
 test('an unknown model tap re-asks and does NOT spawn (review #5)', async () => {
   const { cfgDir, spawnLog } = makeCfgDir(false);
-  const queue: unknown[][] = [[textMsg(60, `/new ${cfgDir} um`)]]; // dir supplied → straight to model step
+  const queue: unknown[][] = [[textMsg(60, `/new codex ${cfgDir} um`)]]; // harness+dir supplied → straight to model step
   const { server, sends } = makeServer(queue);
   const daemon = await startDaemon(cfgDir, server.port);
-  await waitFor(() => sent(sends, 'Which model should `um` run?'));
+  await waitFor(() => sent(sends, 'Which Codex model should `um` run?'));
 
   // A forged/stale callback with a model id not in the catalog.
   queue.push([modelTap(61, 'n1', 'gpt-9')]);
@@ -343,6 +364,25 @@ test('an unknown model tap re-asks and does NOT spawn (review #5)', async () => 
   expect(sent(sends, 'unknown model `gpt-9`')).toBe(true);
   await Bun.sleep(150);
   expect(spawnArgvLog(spawnLog)).toEqual([]); // never spawned
+  daemon.kill();
+});
+
+test('a forged cross-harness model tap is rejected and does NOT spawn', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  const queue: unknown[][] = [[textMsg(62, `/new codex ${cfgDir} cdx`)]];
+  const { server, sends, callbacks } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'Which Codex model should `cdx` run?'));
+
+  queue.push([modelTap(63, 'n1', 'claude-opus')]);
+  await waitFor(() => callbacks.some((c) => String(c.text ?? '').includes('pick a Codex model')));
+  expect(callbacks.some((c) => String(c.text ?? '').includes('pick a Codex model'))).toBe(true);
+  await Bun.sleep(150);
+  expect(spawnArgvLog(spawnLog)).toEqual([]);
+
+  queue.push([modelTap(64, 'n1', 'codex-gpt-5.5')]);
+  await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+  expect(spawnArgvLog(spawnLog)[0]).toContain('codex --model gpt-5.5');
   daemon.kill();
 });
 
@@ -374,7 +414,61 @@ test('/new <model> <name> (dir via flow) spawns with the supplied model, skippin
   expect(argv.length).toBe(1);
   expect(argv[0]).toContain('claude --model opus');
   expect(sent(sends, 'Which model should')).toBe(false); // model prompt was skipped
+  await waitFor(() => sent(sends, 'spawned `claude-opus`'));
   expect(sent(sends, 'spawned `claude-opus`')).toBe(true);
+  daemon.kill();
+});
+
+test('/new <harness> <name> <task> asks that harness models after path, then spawns that harness', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  const queue: unknown[][] = [[textMsg(130, '/new codex task-cli msg')]];
+  const { server, sends } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'New agent `task-cli`'));
+  expect(sent(sends, 'New agent `codex`')).toBe(false);
+
+  queue.push([dirTap(131, 'n1', 0)]);
+  await waitFor(() => sent(sends, 'Which Codex model should `task-cli` run?'));
+  expect(sent(sends, 'Which Codex model should `task-cli` run?')).toBe(true);
+  const modelPrompt = sends.find((s) => String(s.text ?? '').includes('Which Codex model should `task-cli` run?'));
+  const keyboard = (modelPrompt?.reply_markup as { inline_keyboard?: Array<Array<{ text: string }>> } | undefined)?.inline_keyboard ?? [];
+  const labels = keyboard.map((row) => row[0]?.text).filter(Boolean);
+  expect(labels.some((label) => label.includes('Codex'))).toBe(true);
+  expect(labels.some((label) => label.includes('Claude'))).toBe(false);
+
+  queue.push([modelTap(132, 'n1', 'codex-gpt-5.5')]);
+  await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+  const argv = spawnArgvLog(spawnLog);
+  expect(argv.length).toBe(1);
+  expect(argv[0]).toContain('-n task-cli');
+  expect(argv[0]).toContain('codex --model gpt-5.5 -- msg');
+  expect(sent(sends, 'spawned `codex-gpt-5.5`')).toBe(true);
+  daemon.kill();
+});
+
+test('/new with no harness/model asks harness first, then models for that harness', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  const queue: unknown[][] = [[textMsg(140, '/new pickme do it')]];
+  const { server, sends } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'New agent `pickme`'));
+
+  queue.push([dirTap(141, 'n1', 0)]);
+  await waitFor(() => sent(sends, 'Which harness should `pickme` use?'));
+  const harnessPrompt = sends.find((s) => String(s.text ?? '').includes('Which harness should `pickme` use?'));
+  const harnessKeyboard = (harnessPrompt?.reply_markup as { inline_keyboard?: Array<Array<{ text: string }>> } | undefined)?.inline_keyboard ?? [];
+  const harnessLabels = harnessKeyboard.map((row) => row[0]?.text).filter(Boolean);
+  expect(harnessLabels).toEqual(['Claude', 'Codex', 'opencode']);
+
+  queue.push([harnessTap(142, 'n1', 'opencode')]);
+  await waitFor(() => sent(sends, 'Which opencode model should `pickme` run?'));
+  expect(sent(sends, 'Which opencode model should `pickme` run?')).toBe(true);
+  queue.push([modelTap(143, 'n1', 'opencode-zai-glm-5.2')]);
+  await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+  const argv = spawnArgvLog(spawnLog);
+  expect(argv.length).toBe(1);
+  expect(argv[0]).toContain('-n pickme');
+  expect(argv[0]).toContain('opencode --model zai/glm-5.2 --prompt=do it');
   daemon.kill();
 });
 
@@ -391,26 +485,27 @@ test('a spawn FAILURE leaves the session retryable and re-posts the model keyboa
   writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmuxFailable(cfgDir, spawnLog, failFlag), { mode: 0o755 });
   writeFileSync(join(cfgDir, 'bin', 'ps'), fakePs(), { mode: 0o755 });
 
-  // dir on the line → straight to model step; the tap triggers the (failing) spawn.
-  const queue: unknown[][] = [[textMsg(110, `/new ${cfgDir} retryme`)]];
+  // harness+dir on the line → straight to model step; the tap triggers the (failing) spawn.
+  const queue: unknown[][] = [[textMsg(110, `/new codex ${cfgDir} retryme`)]];
   const { server, sends } = makeServer(queue);
   const daemon = await startDaemon(cfgDir, server.port);
-  await waitFor(() => sent(sends, 'Which model should `retryme` run?'));
-  queue.push([modelTap(111, 'n1', 'claude-default')]);
+  await waitFor(() => sent(sends, 'Which Codex model should `retryme` run?'));
+  queue.push([modelTap(111, 'n1', 'codex-gpt-5.5')]);
 
   // The spawn fails → an error posts AND a fresh model keyboard is re-offered (session retryable).
   await waitFor(() => sent(sends, "couldn't start the agent"));
   expect(sent(sends, "couldn't start the agent")).toBe(true);
   // The model prompt re-appears (count >= 2: the first ask + the re-ask after failure).
-  const modelPrompts = sends.filter((s) => String(s.text ?? '').includes('Which model should `retryme` run?'));
+  const modelPrompts = sends.filter((s) => String(s.text ?? '').includes('Which Codex model should `retryme` run?'));
   expect(modelPrompts.length).toBeGreaterThanOrEqual(2);
 
   // Now clear the failure and re-tap → it spawns.
   rmSync(failFlag, { force: true });
-  queue.push([modelTap(112, 'n1', 'claude-default')]);
+  queue.push([modelTap(112, 'n1', 'codex-gpt-5.5')]);
   await waitFor(() => spawnArgvLog(spawnLog).length > 0);
   expect(spawnArgvLog(spawnLog).length).toBe(1);
-  expect(sent(sends, 'spawned `claude-default`')).toBe(true);
+  await waitFor(() => sent(sends, 'spawned `codex-gpt-5.5`'));
+  expect(sent(sends, 'spawned `codex-gpt-5.5`')).toBe(true);
   daemon.kill();
 });
 

@@ -1013,7 +1013,10 @@ test('increment 4: reconcile is a NO-OP on a flaky empty-procs read — a bound 
   closeSync(logFd);
 
   // Give the startup reconcile time to run, then assert the binding is STILL bound (not closed).
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    return store.find((b) => b.threadId === 121)?.status === 'bound';
+  });
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   expect(store.find((b) => b.threadId === 121)?.status).toBe('bound'); // NOT falsely closed
 
@@ -1054,7 +1057,10 @@ test('increment 4: reconcile slug-collision — two same-slug orphan bindings do
   });
   closeSync(logFd);
 
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    return store.filter((b) => (b.threadId === 122 || b.threadId === 123) && b.status === 'bound' && b.paneId === '%6').length === 1;
+  });
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   const bound = store.filter((b) => (b.threadId === 122 || b.threadId === 123) && b.status === 'bound' && b.paneId === '%6');
   expect(bound).toHaveLength(1); // exactly ONE binding adopted %6 — never two on the same pane
@@ -1123,7 +1129,11 @@ test('increment 4: reconcile does NOT adopt a same-slug window in a DIFFERENT pr
   });
   closeSync(logFd);
 
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    const b = store.find((x) => x.threadId === 131);
+    return b?.status === 'awaiting-model' && b.paneId === undefined;
+  });
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   const b = store.find((x) => x.threadId === 131);
   expect(b?.status).toBe('awaiting-model'); // NOT adopted — wrong project
@@ -1161,7 +1171,11 @@ test('increment 4: reconcile does NOT re-bind a deliberately CLOSED topic with a
   });
   closeSync(logFd);
 
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    const b = store.find((x) => x.threadId === 140);
+    return b?.status === 'closed' && b.paneId === '%8';
+  });
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   expect(store.find((x) => x.threadId === 140)?.status).toBe('closed'); // stays closed — NOT resurrected
 
@@ -1548,7 +1562,11 @@ test('increment 4: a reused-pane bound binding does NOT block a real spawnPendin
   });
   closeSync(logFd);
 
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    const b = store.find((x) => x.threadId === 211);
+    return b?.status === 'bound' && b.paneId === '%5';
+  });
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   // B2 adopted %5 (its claim wasn't blocked by B1's stale reused-pane claim).
   expect(store.find((x) => x.threadId === 211)?.status).toBe('bound');
@@ -1734,7 +1752,11 @@ test('increment 4: a binding with a recorded paneId but a window MISSING the tok
   });
   closeSync(logFd);
 
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    const b = store.find((x) => x.threadId === 260);
+    return b?.status === 'bound' && b.paneId === '%5';
+  });
   const store = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   const b = store.find((x) => x.threadId === 260);
   expect(b?.status).toBe('bound'); // adopted by the recorded paneId fallback
@@ -2083,7 +2105,10 @@ test('increment 4: a multi-pane window with an AMBIGUOUS token (no recorded pane
     logFd: fdB,
   });
   closeSync(fdB);
-  await Bun.sleep(700);
+  await waitFor(() => {
+    const store = JSON.parse(readFileSync(join(cfgB, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
+    return store.some((x) => x.threadId === 401 && x.status === 'bound' && x.paneId === '%6');
+  });
   const storeB = JSON.parse(readFileSync(join(cfgB, 'tg-ctl.123.topics.json'), 'utf8')) as Array<Record<string, unknown>>;
   expect(storeB.find((x) => x.threadId === 401)?.status).toBe('bound'); // adopted via the recorded paneId
   expect(storeB.find((x) => x.threadId === 401)?.paneId).toBe('%6'); // the EXACT recorded pane, not %5

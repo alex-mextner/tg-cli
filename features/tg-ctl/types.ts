@@ -134,6 +134,10 @@ export interface TgUpdate {
 
 // --- update step function (spec §16 module 4) ---
 
+// Agent kinds that `/new` can launch directly from the model catalog. `AgentKind` below is wider:
+// it also covers agents we can detect/route to but do not spawn from `/new`.
+export type SpawnHarness = 'claude' | 'codex' | 'opencode';
+
 // Actions are data; the entrypoint executes them in order.
 export type Action =
   | { kind: 'inject-text'; text: string; messageId: number } // already wrapped (or verbatim /cmd passthrough)
@@ -242,11 +246,29 @@ export type Action =
   // Topic renamed service message → persist new name + update the tmux-window slug.
   | { kind: 'topic-rename'; threadId: number; name: string }
   // --- flat-chat /new command (issue #27; NON-topic) ---
-  // A `/new [<model>] [<dir>] name [<task>]` slash command in the flat chat → start the
-  // interactive new-session flow (ask dir, then model, then spawn). All parts but `name` are
-  // optional; omitted model/dir are picked via inline buttons. Distinct from topic-new (which is
-  // keyed to a forum threadId) — a flat /new carries no thread, so the entrypoint mints a token.
-  | { kind: 'new-command'; model: string | null; dir: string | null; name: string; task: string; from: string }
+  // A `/new [<harness>|<model>] [<dir>] name [<task>]` slash command in the flat chat → start
+  // the interactive new-session flow (ask dir, then harness/model, then spawn). All parts but
+  // `name` are optional; omitted model/dir are picked via inline buttons. Distinct from topic-new
+  // (which is keyed to a forum threadId) — a flat /new carries no thread, so the entrypoint mints
+  // a token.
+  | {
+      kind: 'new-command';
+      harness: SpawnHarness | null;
+      model: string | null;
+      dir: string | null;
+      name: string;
+      task: string;
+      from: string;
+    }
+  // A tap on a flat-/new harness button (tnh:<token>:<harness>) → ask models for that harness.
+  // callbackQueryId answers the tap; messageId is the prompt (its keyboard is cleared on advance).
+  | {
+      kind: 'new-harness';
+      callbackQueryId: string;
+      token: string;
+      harness: SpawnHarness;
+      messageId: number | null;
+    }
   // A tap on a flat-/new model button (tnm:<token>:<modelId>) → spawn the agent with that model.
   // callbackQueryId answers the tap; messageId is the prompt (its keyboard is cleared on spawn).
   | { kind: 'new-model'; callbackQueryId: string; token: string; modelId: string; messageId: number | null }
@@ -300,7 +322,7 @@ export interface ProcInfo {
   command: string; // full command line
 }
 
-export type AgentKind = 'claude' | 'opencode' | 'codex' | 'pi' | 'aider' | 'unknown';
+export type AgentKind = SpawnHarness | 'pi' | 'aider' | 'unknown';
 
 // Snapshot written by `tg` / `tg-ctl start` at auto-start time (spec §5.2).
 export interface Registration {

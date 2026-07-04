@@ -1,5 +1,5 @@
 // Update→action tests for the flat `/new` command (issue #27): the slash parses to a
-// new-command action, the tnm:/tnp: taps route to new-model/new-dir, and a plain message while
+// new-command action, the tnh:/tnm:/tnp: taps route to new-harness/new-model/new-dir, and a plain message while
 // a /new awaits its dir becomes a new-answer (else it injects as normal — 1:1 byte-identical).
 
 import { expect, test } from 'bun:test';
@@ -43,19 +43,38 @@ function cbUpd(id: number, data: string): TgUpdate {
 test('/new <name> parses to a new-command action', () => {
   const r = stepUpdates([upd(10, { text: '/new myproj fix it' })], makeOpts());
   const a = r.actions.find((x) => x.kind === 'new-command');
-  expect(a).toEqual({ kind: 'new-command', model: null, dir: null, name: 'myproj', task: 'fix it', from: 'Alex' });
+  expect(a).toEqual({ kind: 'new-command', harness: null, model: null, dir: null, name: 'myproj', task: 'fix it', from: 'Alex' });
 });
 
 test('/new with model + dir parses both', () => {
   const r = stepUpdates([upd(11, { text: '/new opus /Users/me/app api do thing' })], makeOpts());
   const a = r.actions.find((x) => x.kind === 'new-command');
-  expect(a).toMatchObject({ kind: 'new-command', model: 'claude-opus', dir: '/Users/me/app', name: 'api', task: 'do thing' });
+  expect(a).toMatchObject({ kind: 'new-command', harness: 'claude', model: 'claude-opus', dir: '/Users/me/app', name: 'api', task: 'do thing' });
+});
+
+test('/new with harness + name + task parses the harness separately from the name', () => {
+  const r = stepUpdates([upd(17, { text: '/new codex task-cli msg' })], makeOpts());
+  const a = r.actions.find((x) => x.kind === 'new-command');
+  expect(a).toMatchObject({ kind: 'new-command', harness: 'codex', model: null, dir: null, name: 'task-cli', task: 'msg' });
+});
+
+test('/new with name + harness + task parses the swapped order too', () => {
+  const r = stepUpdates([upd(18, { text: '/new task-cli oc msg' })], makeOpts());
+  const a = r.actions.find((x) => x.kind === 'new-command');
+  expect(a).toMatchObject({ kind: 'new-command', harness: 'opencode', model: null, dir: null, name: 'task-cli', task: 'msg' });
 });
 
 test('tnm: tap → new-model action carrying token + modelId + messageId', () => {
   const r = stepUpdates([cbUpd(12, 'tnm:n1:claude-sonnet')], makeOpts());
   expect(r.actions).toEqual([
     { kind: 'new-model', callbackQueryId: 'cb12', token: 'n1', modelId: 'claude-sonnet', messageId: 120 },
+  ]);
+});
+
+test('tnh: tap → new-harness action carrying token + harness + messageId', () => {
+  const r = stepUpdates([cbUpd(25, 'tnh:n1:codex')], makeOpts());
+  expect(r.actions).toEqual([
+    { kind: 'new-harness', callbackQueryId: 'cb25', token: 'n1', harness: 'codex', messageId: 250 },
   ]);
 });
 

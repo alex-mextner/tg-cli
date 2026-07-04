@@ -5,21 +5,25 @@
 // `tmux new-window` spawn, the sendMessage, and the inject-defer guard — exactly like
 // the forum-topics flow owns its threadId-keyed binding store. This is the NON-TOPIC
 // sibling: a flat `/new` has no forum threadId, so it carries its own session token
-// and its own callback prefixes (tnm:/tnp:) that never collide with the topic flow's
+// and its own callback prefixes (tnh:/tnm:/tnp:) that never collide with the topic flow's
 // tgm:/tgp:/tgr:.
 //
-// Grammar (issue #27): `/new [<model>] [<dir>] name [<task>]`. The leading <model> and
-// <dir> are OPTIONAL and order-tolerant — a token is recognized as a model when it is a
-// known catalog id/alias, as a dir when it is an absolute path; the FIRST remaining token
-// is the mandatory <name>, and everything after it is the optional <task>. Omitted model
-// and/or dir are then chosen interactively via inline buttons (the entrypoint's job).
+// Grammar (issue #27 + HYP-903 follow-up): `/new [<harness>|<model>] [<dir>] name [<task>]`.
+// The harness/model/dir selectors are optional and order-tolerant around the name, so both
+// `/new codex task-cli msg` and `/new task-cli codex msg` mean name=task-cli, harness=codex.
+// A concrete model token infers its harness. After the name, only harnesses and concrete
+// model-looking tokens can be treated as selectors; at most one selector is consumed after the
+// name, and soft aliases like `default` stay in the task. Omitted dir/harness/model are chosen
+// via buttons.
 
-import { MODEL_CATALOG, findModel } from './models';
-import type { ModelEntry } from './models';
+import { MODEL_CATALOG, SPAWN_HARNESSES, findModel, harnessLabel } from './models';
+import type { ModelEntry, SpawnHarness } from './models';
 
 // --- arg parser ---
 
 export interface ParsedNewCommand {
+  // The recognized harness, or null when omitted (→ ask via buttons before asking models).
+  harness: SpawnHarness | null;
   // The recognized catalog model id, or null when omitted (→ ask via buttons).
   model: string | null;
   // The recognized absolute working directory, or null when omitted (→ ask via buttons).
@@ -35,11 +39,36 @@ export interface ParsedNewCommand {
 // resolves without the full `claude-opus` id. Only maps to ids that EXIST in MODEL_CATALOG;
 // an alias whose target was removed from the catalog simply stops resolving (findModel guards).
 const MODEL_ALIASES: Record<string, string> = {
-  claude: 'claude-default',
   default: 'claude-default',
   opus: 'claude-opus',
   sonnet: 'claude-sonnet',
   haiku: 'claude-haiku',
+  'gpt-5.5': 'codex-gpt-5.5',
+  gpt55: 'codex-gpt-5.5',
+  'gpt-5.4': 'codex-gpt-5.4',
+  gpt54: 'codex-gpt-5.4',
+  mini: 'codex-gpt-5.4-mini',
+  spark: 'codex-spark',
+  'gpt-5.3-codex-spark': 'codex-spark',
+  'glm-5.2': 'opencode-zai-glm-5.2',
+  glm: 'opencode-zai-glm-5.2',
+  'zai/glm-5.2': 'opencode-zai-glm-5.2',
+  kimi: 'opencode-kimi',
+  'moonshotai/kimi-k2.7-code': 'opencode-kimi',
+  'commandcode/moonshotai/kimi-k2.7-code': 'opencode-kimi',
+  deepseek: 'opencode-deepseek',
+  'deepseek/deepseek-v4-pro': 'opencode-deepseek',
+  'commandcode/deepseek/deepseek-v4-pro': 'opencode-deepseek',
+  qwen: 'opencode-qwen',
+  'qwen/qwen3.7-max': 'opencode-qwen',
+  'commandcode/qwen/qwen3.7-max': 'opencode-qwen',
+};
+
+const HARNESS_ALIASES: Record<string, SpawnHarness> = {
+  claude: 'claude',
+  codex: 'codex',
+  oc: 'opencode',
+  opencode: 'opencode',
 };
 
 // Resolve a token to a catalog model id, or null if it is not a model. Tries the exact
@@ -51,6 +80,20 @@ export function resolveModelToken(token: string): string | null {
   return aliased && findModel(aliased) ? aliased : null;
 }
 
+export function resolveHarnessToken(token: string): SpawnHarness | null {
+  const normalized = token.toLowerCase();
+  const exact = SPAWN_HARNESSES.find((h) => h === normalized);
+  if (exact) return exact;
+  return HARNESS_ALIASES[normalized] ?? null;
+}
+
+function resolvePostNameModelToken(token: string): string | null {
+  if (findModel(token)) return token;
+  if (!/[0-9./-]/.test(token)) return null;
+  const aliased = MODEL_ALIASES[token.toLowerCase()];
+  return aliased && findModel(aliased) ? aliased : null;
+}
+
 // Parse the text of a `/new …` message into its parts. Tolerant of extra whitespace and of
 // the optional model/dir appearing in either order before the name. Never throws: a `/new`
 // with no name yields name === '' so the caller can show the usage hint.
@@ -58,43 +101,86 @@ export function parseNewCommand(text: string): ParsedNewCommand {
   // Drop the leading verb (`/new` or `/new@botname`) and split the remainder on whitespace.
   const rest = text.replace(/^\/new(@\w+)?\s*/, '');
   const tokens = rest.length > 0 ? rest.split(/\s+/) : [];
+  let harness: SpawnHarness | null = null;
   let model: string | null = null;
   let dir: string | null = null;
   // Track what each consumed prefix token was, so the last one can be RECLAIMED as the name if the
   // prefix swallowed every token (review #1: `/new opus` should NAME the session `opus`, not pick a
   // model and leave no name).
-  const consumed: Array<{ kind: 'model' | 'dir'; raw: string }> = [];
+  const consumed: Array<
+    | { kind: 'harness'; raw: string; harness: SpawnHarness }
+    | { kind: 'model'; raw: string; model: string }
+    | { kind: 'dir'; raw: string; dir: string }
+  > = [];
   let i = 0;
-  // Consume a LEADING run of model/dir tokens, in either order, each at most once. The first
-  // token that is neither (or a second model / second dir) ends the prefix and becomes the name.
-  for (; i < tokens.length; i++) {
+  let name = '';
+  let nameSeen = false;
+  let postNameSelectorConsumed = false;
+  // Consume selectors before OR immediately after the name. The first non-selector, or the first
+  // token after one post-name selector, starts the task tail. This lets the harness/name order swap
+  // without making the entire task tail magical.
+  for (; i < tokens.length;) {
     const tok = tokens[i];
-    const asModel = resolveModelToken(tok);
-    if (asModel && model === null) {
-      model = asModel;
-      consumed.push({ kind: 'model', raw: tok });
-      continue;
+    if (!nameSeen || !postNameSelectorConsumed) {
+      const asHarness = resolveHarnessToken(tok);
+      if (asHarness && harness === null) {
+        harness = asHarness;
+        consumed.push({ kind: 'harness', raw: tok, harness: asHarness });
+        if (nameSeen) postNameSelectorConsumed = true;
+        i++;
+        continue;
+      }
+      const asModel = nameSeen ? resolvePostNameModelToken(tok) : resolveModelToken(tok);
+      if (asModel && model === null) {
+        const entry = findModel(asModel);
+        if (entry && (harness === null || harness === entry.kind)) {
+          harness = entry.kind;
+          model = asModel;
+          consumed.push({ kind: 'model', raw: tok, model: asModel });
+          if (nameSeen) postNameSelectorConsumed = true;
+          i++;
+          continue;
+        }
+      }
+      if (!nameSeen && tok.startsWith('/') && dir === null) {
+        dir = tok;
+        consumed.push({ kind: 'dir', raw: tok, dir: tok });
+        i++;
+        continue;
+      }
     }
-    if (tok.startsWith('/') && dir === null) {
-      dir = tok;
-      consumed.push({ kind: 'dir', raw: tok });
+    if (!nameSeen) {
+      name = tok;
+      nameSeen = true;
+      i++;
       continue;
     }
     break;
   }
   // The prefix consumed EVERY token → there's no name. Reclaim the LAST consumed token as the name
   // (review #1): a bare `/new opus` / `/new sonnet` then NAMES the session after that word instead
-  // of resolving it to a model with an empty name (which would only print the usage hint). Model and
-  // dir each appear at most once, so undoing the last token's kind is a single null-out.
-  if (i >= tokens.length && consumed.length > 0) {
+  // of resolving it to a model with an empty name (which would only print the usage hint). Selector
+  // slots each appear at most once, so replaying the remaining consumed selectors is unambiguous.
+  if (!nameSeen && consumed.length > 0) {
     const last = consumed[consumed.length - 1];
-    if (last.kind === 'model') model = null;
-    else dir = null;
-    return { model, dir, name: last.raw, task: '' };
+    harness = null;
+    model = null;
+    dir = null;
+    for (const c of consumed.slice(0, -1)) {
+      if (c.kind === 'model') {
+        const entry = findModel(c.model);
+        model = c.model;
+        harness = entry?.kind ?? harness;
+      } else if (c.kind === 'harness') {
+        harness = c.harness;
+      } else {
+        dir = c.dir;
+      }
+    }
+    return { harness, model, dir, name: last.raw, task: '' };
   }
-  const name = i < tokens.length ? tokens[i] : '';
-  const task = tokens.slice(i + 1).join(' ');
-  return { model, dir, name, task };
+  const task = tokens.slice(i).join(' ');
+  return { harness, model, dir, name, task };
 }
 
 // --- parents-aware LRU/MRU directory ranker (issue #27 acceptance) ---
@@ -173,6 +259,7 @@ export function nameCollides(slug: string, existingWindowNames: ReadonlyArray<st
 
 // Callback-data prefixes for the flat `/new` flow. DISTINCT from the topic flow's tgm:/tgp:/tgr:
 // so a flat-chat tap never routes into a forum-topic binding and vice-versa. Shape:
+//   tnh:<token>:<harness>   — a harness pick
 //   tnm:<token>:<modelId>   — a model pick
 //   tnp:<token>:<index>     — a recent-dir pick (index into the pending session's dirChoices)
 // The <token> is the pending NewSession's id (an opaque short string the entrypoint mints), not a
@@ -180,6 +267,12 @@ export function nameCollides(slug: string, existingWindowNames: ReadonlyArray<st
 // bytes, too small for an absolute path (same constraint the topic flow hit).
 export const NEW_MODEL_CALLBACK_PREFIX = 'tnm';
 export const NEW_DIR_CALLBACK_PREFIX = 'tnp';
+export const NEW_HARNESS_CALLBACK_PREFIX = 'tnh';
+
+export interface ParsedNewHarnessCallback {
+  token: string;
+  harness: SpawnHarness;
+}
 
 export interface ParsedNewModelCallback {
   token: string;
@@ -189,6 +282,14 @@ export interface ParsedNewModelCallback {
 export interface ParsedNewDirCallback {
   token: string;
   index: number;
+}
+
+export function parseNewHarnessCallback(data: string | undefined): ParsedNewHarnessCallback | null {
+  if (!data) return null;
+  const parts = data.split(':');
+  if (parts.length !== 3 || parts[0] !== NEW_HARNESS_CALLBACK_PREFIX || !parts[1] || !parts[2]) return null;
+  const harness = resolveHarnessToken(parts[2]);
+  return harness ? { token: parts[1], harness } : null;
 }
 
 // Parse `tnm:<token>:<modelId>` → {token, modelId}, or null on mismatch. The modelId is NOT
@@ -223,6 +324,15 @@ export function buildNewModelKeyboard(
   ]);
 }
 
+export function buildNewHarnessKeyboard(
+  token: string,
+  harnesses: ReadonlyArray<SpawnHarness> = SPAWN_HARNESSES,
+): Array<Array<{ text: string; callback_data: string }>> {
+  return harnesses.map((h) => [
+    { text: harnessLabel(h), callback_data: `${NEW_HARNESS_CALLBACK_PREFIX}:${token}:${h}` },
+  ]);
+}
+
 // The recent-dir keyboard for a flat `/new` session: one button per ranked dir (callback
 // `tnp:<token>:<index>`), one dir per row so a long path stays readable. PURE — empty when there
 // are no choices (the entrypoint then asks for a free-text absolute path only).
@@ -241,8 +351,9 @@ export function buildNewDirKeyboard(
 // `bound`/`closed` lifecycle — once the agent is spawned the pending session is DELETED (a flat
 // `/new` agent is just a normal pane afterwards, addressed by `/agent`, not a persistent binding).
 //   awaiting-dir   — have a name; asked for the working directory (buttons + free text)
-//   awaiting-model — have name + dir; asked for the model (buttons)
-export type NewSessionStatus = 'awaiting-dir' | 'awaiting-model';
+//   awaiting-harness — have name + dir; asked for the harness (buttons)
+//   awaiting-model   — have name + dir + harness; asked for that harness's model (buttons)
+export type NewSessionStatus = 'awaiting-dir' | 'awaiting-harness' | 'awaiting-model';
 
 // One in-flight flat `/new` session, held in memory by the entrypoint (NOT persisted: a `/new`
 // that a daemon restart interrupts is simply abandoned — the user re-runs `/new`, far simpler
@@ -253,6 +364,8 @@ export interface NewSession {
   status: NewSessionStatus;
   // Chosen working directory (set when advancing to awaiting-model).
   dir?: string;
+  // Chosen harness (set by a token on the /new line or by the harness picker).
+  harness?: SpawnHarness;
   // Chosen catalog model id (set just before spawn).
   model?: string;
   // The initial task to inject once the agent is up (from the `/new … name <task>` tail). Empty

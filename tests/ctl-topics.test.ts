@@ -35,7 +35,7 @@ import {
   serializeTopics,
   slugifyTopicName,
 } from '../features/tg-ctl/topics';
-import { DEFAULT_MODEL_ID, findModel, MODEL_CATALOG, spawnArgv } from '../features/tg-ctl/models';
+import { DEFAULT_MODEL_ID, findModel, harnessLabel, MODEL_CATALOG, modelsForHarness, spawnArgv, spawnArgvWithTask } from '../features/tg-ctl/models';
 
 const CHAT_ID = 1000;
 const NOW = 1_750_000_000;
@@ -81,6 +81,27 @@ test('spawnArgv keeps a spaced path as a single argv element (no shell split)', 
   // path is not part of the claude argv today, but the builder must never split it
   // — assert the builder is called with the path intact and returns a clean argv.
   expect(spawnArgv('claude-default', '/a b/c')).toEqual(['claude']);
+});
+
+test('model catalog helpers: harness labels, harness filters, and task argv', () => {
+  expect(harnessLabel('claude')).toBe('Claude');
+  expect(harnessLabel('codex')).toBe('Codex');
+  expect(harnessLabel('opencode')).toBe('opencode');
+  expect(modelsForHarness('codex').every((m) => m.kind === 'codex')).toBe(true);
+  expect(modelsForHarness('codex').length).toBeGreaterThan(0);
+  expect(spawnArgvWithTask('claude-opus', '/x', '')).toEqual(['claude', '--model', 'opus']);
+  expect(spawnArgvWithTask('claude-opus', '/x', 'do it')).toEqual(['claude', '--model', 'opus', '--', 'do it']);
+  expect(spawnArgvWithTask('claude-opus', '/x', '--force --all')).toEqual(['claude', '--model', 'opus', '--', '--force --all']);
+  expect(spawnArgvWithTask('codex-gpt-5.5', '/x', 'do it')).toEqual(['codex', '--model', 'gpt-5.5', '--', 'do it']);
+  expect(spawnArgvWithTask('codex-gpt-5.5', '/x', '; rm -rf /')).toEqual(['codex', '--model', 'gpt-5.5', '--', '; rm -rf /']);
+  expect(spawnArgvWithTask('opencode-zai-glm-5.2', '/x', 'do it')).toEqual(['opencode', '--model', 'zai/glm-5.2', '--prompt=do it']);
+  expect(spawnArgvWithTask('opencode-zai-glm-5.2', '/x', '--continue please')).toEqual([
+    'opencode',
+    '--model',
+    'zai/glm-5.2',
+    '--prompt=--continue please',
+  ]);
+  expect(spawnArgvWithTask('nope', '/x', 'do it')).toBeNull();
 });
 
 // --- store ---

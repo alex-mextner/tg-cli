@@ -63,8 +63,16 @@ test('parsePaneList reads the 8-field @tg_spawn_token field (forum-topics increm
   expect(panes[1].panePath).toBe('/tmp/x');
 });
 
+test('parsePaneList reads a flat /new spawn token without shifting the cwd', () => {
+  const out = 'main\t1\t%7\t4277\tcodex\tnewwin\tnew-n1-1700000000\t/Users/ultra/project\n';
+  const panes = parsePaneList(out);
+  expect(panes).toHaveLength(1);
+  expect(panes[0].spawnToken).toBe('new-n1-1700000000');
+  expect(panes[0].panePath).toBe('/Users/ultra/project');
+});
+
 test('parsePaneList keeps a token + a path-with-tab intact (token fixed, path greedy)', () => {
-  // Token shape is `<threadId>-<unixSec>-<nonce>` (digits + dashes); path is the greedy tail.
+  // Topic token shape is `<threadId>-<unixSec>-<nonce>` (digits + dashes); path is the greedy tail.
   const out = 'main\t1\t%3\t4242\t2.1.150\tapi-bot\t113-1700000000-5\t/Users/ultra/my\tproject\n';
   const panes = parsePaneList(out);
   expect(panes).toHaveLength(1);
