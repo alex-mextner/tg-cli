@@ -256,6 +256,15 @@ async function until(cond: () => boolean, ms: number): Promise<boolean> {
   return cond();
 }
 
+function hasPersistedQuestion(cfgDir: string, requestId: string): boolean {
+  const statePath = join(cfgDir, 'tg-ctl.123.questions.json');
+  if (!existsSync(statePath)) return false;
+  const state = JSON.parse(readFileSync(statePath, 'utf8')) as {
+    questions?: Array<{ req?: { requestId?: string } }>;
+  };
+  return Boolean(state.questions?.some((q) => q.req?.requestId === requestId));
+}
+
 test('persist: a forwarded scoped question is written to the durable state file', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
@@ -840,6 +849,7 @@ test('PERM RECONNECT: daemon bounce mid-block re-attaches the permission card an
   const daemon1 = await startDaemon(cfgDir, tg.port);
   const ask = startAsk(cfgDir, tg.port, PERMISSION);
   expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  expect(await until(() => hasPersistedQuestion(cfgDir, 'p_durable'), 4000)).toBe(true);
 
   // SIGKILL the daemon (socket drops; hook reconnect loop begins resending the same requestId).
   daemon1.kill(9);
@@ -872,6 +882,7 @@ test('PERM LATE-TAP: a tap on a retained-but-dead permission card shows "expired
   const daemon1 = await startDaemon(cfgDir, tg.port);
   const ask = startAsk(cfgDir, tg.port, PERMISSION);
   expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  expect(await until(() => hasPersistedQuestion(cfgDir, 'p_durable'), 4000)).toBe(true);
 
   // Kill BOTH daemon and hook (hook budget expired — won't reconnect).
   daemon1.kill(9);

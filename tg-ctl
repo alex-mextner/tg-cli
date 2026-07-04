@@ -15,6 +15,7 @@
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { dirname, isAbsolute, join, resolve } from "path"
+import { detectAgentLabel } from "./features/agent-detect/detect"
 import {
   buildAgentSelectMessage,
   dedupeCandidates,
@@ -942,6 +943,18 @@ function newestRegisteredCwd(regs: Registration[]): string | null {
   return best?.cwd ?? null
 }
 
+function registeredCwdForPane(regs: Registration[], pane: Pick<PaneInfo, "paneId" | "sessionName">): string | null {
+  const exact = regs.find((reg) => reg.cwd && reg.paneId && reg.paneId === pane.paneId)
+  if (exact?.cwd) return exact.cwd
+  const sessionMatches = regs.filter((reg) => reg.cwd && !reg.paneId && reg.sessionName && reg.sessionName === pane.sessionName)
+  return sessionMatches.length === 1 ? sessionMatches[0].cwd! : null
+}
+
+function singleRegisteredCwd(regs: Registration[]): string | null {
+  const unique = [...new Set(regs.map((reg) => reg.cwd).filter((cwd): cwd is string => Boolean(cwd)))]
+  return unique.length === 1 ? unique[0] : null
+}
+
 function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   const pid = readPidFile(readFileOrNull(ctx.paths.pid))
   const alive = pidStatus(pid, kill0)
@@ -1143,10 +1156,15 @@ function startLauncher(ctx: Ctx, flags: StartFlags): void {
   // No lock, no pipes (see header). The daemon flocks first and exits 0 if
   // another instance holds the bot, so double-starts are a cheap no-op.
   const logFd = openSync(ctx.paths.log, "a")
-  const proc = Bun.spawn([process.execPath, import.meta.path, "run"], {
+  const runBin = resolveDeployedBin(ctx.home)
+  const runCwd = dirname(runBin)
+  // Pin cwd + PWD to the deployed bin dir so a caller's worktree can be removed
+  // after `start` without leaving the long-lived daemon on a deleted cwd.
+  const proc = Bun.spawn([process.execPath, runBin, "run"], {
     detached: true,
     stdio: ["ignore", logFd, logFd],
-    env: { ...process.env, TG_CTL_CONFIG_DIR: ctx.configDir },
+    cwd: runCwd,
+    env: { ...process.env, PWD: runCwd, TG_CTL_CONFIG_DIR: ctx.configDir },
   })
   proc.unref()
   closeSync(logFd) // the child holds its own dup
@@ -1610,6 +1628,8 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     paneId: typeof rec.paneId === "string" ? rec.paneId : undefined,
     cwd: typeof rec.cwd === "string" ? rec.cwd : undefined,
     sessionName: typeof rec.sessionName === "string" ? rec.sessionName : undefined,
+    windowName: typeof rec.windowName === "string" ? rec.windowName : undefined,
+    subagent: typeof rec.subagent === "string" ? rec.subagent : undefined,
     agent: agent as ButtonRequest["agent"],
     kind,
     question,
@@ -1639,7 +1659,7 @@ function hookMatchesRegistration(regs: Registration[], req: ButtonRequest): bool
 // non-forward (the question stays in the harness) becomes a visible log line
 // stating exactly why it was dropped — never a bare socket.end("null").
 function describeAskRequest(req: ButtonRequest): string {
-  return `agent=${req.agent} kind=${req.kind} req=${req.requestId} pane=${req.paneId ?? "-"} cwd=${req.cwd ?? "-"} session=${req.sessionName ?? "-"}`
+  return `agent=${req.agent} kind=${req.kind} req=${req.requestId} subagent=${req.subagent ?? "-"} window=${req.windowName ?? "-"} pane=${req.paneId ?? "-"} cwd=${req.cwd ?? "-"} session=${req.sessionName ?? "-"}`
 }
 
 function describeRegistration(regs: Registration[]): string {
@@ -2026,9 +2046,17 @@ function hookAgentFromArgv(): AgentKind {
 }
 
 function tmuxSessionName(): string | undefined {
+  return tmuxDisplay("#{session_name}")
+}
+
+function tmuxWindowName(): string | undefined {
+  return tmuxDisplay("#{window_name}")
+}
+
+function tmuxDisplay(format: string): string | undefined {
   if (!process.env.TMUX) return undefined
   try {
-    const r = Bun.spawnSync(["tmux", "display-message", "-p", "#{session_name}"], { stdout: "pipe", stderr: "pipe" })
+    const r = Bun.spawnSync(["tmux", "display-message", "-p", format], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
     if (r.exitCode === 0) return r.stdout.toString().trim() || undefined
   } catch {}
   return undefined
@@ -2137,6 +2165,8 @@ async function askDaemon(ctx: Ctx): Promise<void> {
     paneId: process.env.TMUX_PANE || undefined,
     cwd: process.cwd(),
     sessionName: tmuxSessionName(),
+    windowName: tmuxWindowName(),
+    subagent: detectAgentLabel(process.env) || undefined,
   }
   const reqs = normalizeHookRequests(payload, env)
   if (!reqs) {
@@ -2199,12 +2229,29 @@ async function readStdinText(): Promise<string> {
 
 // --- /tasks command (#115): compose task-cli + gh into a rich board table ---
 
-// Resolve a `/tasks <agent>` selector to the matched pane's project dir, or null
-// (no selector, or no confident fuzzy match → the daemon's own cwd is used).
-function resolveTasksScopeDir(agent: string | null): string | null {
-  if (!agent) return null
-  const m = matchWindows(agent, listAgentCandidates())
-  return m.confident && m.matches[0]?.panePath ? m.matches[0].panePath : null
+// Resolve a `/tasks [<agent>]` selector to the relevant project dir. With no
+// selector, replies target the replied-to agent, otherwise the command uses the
+// same default target the daemon would route an inbound message to. Ambiguous
+// fleets without a reply/last-message signal fail explicitly instead of guessing.
+function resolveTasksScopeDir(ctx: Ctx, action: Pick<Extract<Action, { kind: "tasks" }>, "agent" | "replyToMessageId">): string | null {
+  const regs = readRegistrations(ctx.paths)
+  if (action.agent) {
+    const m = matchWindows(action.agent, listAgentCandidates())
+    if (!m.confident) return null
+    const pane = m.matches[0]
+    return pane?.panePath || (pane ? registeredCwdForPane(regs, pane) : null)
+  }
+  const routes = parseRoutes(readFileOrNull(ctx.paths.routes))
+  if (action.replyToMessageId !== null) {
+    const recognized = recognizeRoute(routes, action.replyToMessageId)
+    if (recognized?.cwd) return recognized.cwd
+  }
+  const target = discoverTarget(ctx)
+  const routed =
+    target.ok || target.reason !== "ambiguous" ? target : resolveByLastMessage(target, lastMessagePane(routes))
+  if (routed.ok) return routed.target.pane.panePath || registeredCwdForPane(regs, routed.target.pane)
+  if (routed.reason === "no-agent") return singleRegisteredCwd(regs)
+  return null
 }
 
 async function loadTasks(scopeDir: string | null, status: string | null): Promise<TaskItem[]> {
@@ -2243,7 +2290,12 @@ async function loadPrRefs(scopeDir: string | null): Promise<PrRef[]> {
 }
 
 async function runTasksCommand(ctx: Ctx, action: Extract<Action, { kind: "tasks" }>): Promise<void> {
-  const scopeDir = resolveTasksScopeDir(action.agent)
+  const scopeDir = resolveTasksScopeDir(ctx, action)
+  if (!scopeDir) {
+    const suffix = action.agent ? ` for /tasks ${action.agent}` : " for /tasks"
+    await sendMessage(ctx, `couldn't resolve a project${suffix} — reply to an agent message or use /tasks <agent>`)
+    return
+  }
   const [tasks, prs] = await Promise.all([loadTasks(scopeDir, action.status), loadPrRefs(scopeDir)])
   const html = composeTasksTable(tasks, matchPrsToTasks(tasks, prs), { agent: action.agent, status: action.status })
   const sent = await sendRich(ctx, html)

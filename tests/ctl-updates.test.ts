@@ -343,6 +343,22 @@ test('/limit [agent] → limit-status', () => {
   ]);
 });
 
+test('/tasks carries reply target for scoped board lookup', () => {
+  const r = stepUpdates(
+    [
+      upd(10, {
+        text: '/tasks',
+        reply_to_message: { message_id: 77, chat: { id: CHAT_ID }, date: NOW },
+      }),
+    ],
+    makeOpts(),
+  );
+  expect(r.actions).toEqual([
+    { kind: 'tasks', agent: null, status: null, replyToMessageId: 77 },
+    { kind: 'ack', messageId: 10 },
+  ]);
+});
+
 test('unknown /cmd passes through VERBATIM — full text, no wrap', () => {
   const r = stepUpdates([upd(1, { text: '/compact keep the notes' })], makeOpts());
   expect(r.actions).toEqual([

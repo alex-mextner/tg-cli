@@ -34,6 +34,8 @@ export interface ButtonRequest {
   paneId?: string;
   cwd?: string;
   sessionName?: string;
+  windowName?: string;
+  subagent?: string;
   agent: AgentKind;
   kind: ButtonRequestKind;
   question: string;
@@ -392,10 +394,22 @@ function buildQuestionText(req: ButtonRequest, opts: { includeOptions?: boolean 
     ? `Permission request from ${req.agent}`
     : `Question from ${req.agent}`;
   const parts = [heading];
+  parts.push(formatQuestionSource(req));
   if (req.title) parts.push(req.title);
   parts.push(req.question);
   if (opts.includeOptions && req.kind === 'question') parts.push(formatQuestionOptions(req));
   return parts.join('\n\n');
+}
+
+function formatQuestionSource(req: ButtonRequest): string {
+  const labels = [`agent=${req.agent}`];
+  if (req.subagent) labels.push(`subagent=${req.subagent}`);
+  if (req.windowName) labels.push(`window=${req.windowName}`);
+  if (req.paneId) labels.push(`pane=${req.paneId}`);
+  if (req.sessionName) labels.push(`session=${req.sessionName}`);
+  const lines = [`Source: ${labels.join(' · ')}`];
+  if (req.cwd) lines.push(`Cwd: ${req.cwd}`);
+  return lines.join('\n');
 }
 
 function formatQuestionOptions(req: ButtonRequest): string {

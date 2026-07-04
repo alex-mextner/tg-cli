@@ -1,7 +1,14 @@
 import { expect, test } from 'bun:test';
 import { normalizeHookPayload, normalizeHookRequests, type HookEnv } from '../features/tg-ctl/hook-normalize';
 
-const env: HookEnv = { agent: 'claude', paneId: '%5', cwd: '/env/cwd', sessionName: 'work' };
+const env: HookEnv = {
+  agent: 'claude',
+  paneId: '%5',
+  cwd: '/env/cwd',
+  sessionName: 'work',
+  windowName: 'ext',
+  subagent: 'review-worker',
+};
 
 test('Claude AskUserQuestion (single, options) → question request', () => {
   const req = normalizeHookPayload(
@@ -27,6 +34,8 @@ test('Claude AskUserQuestion (single, options) → question request', () => {
     paneId: '%5',
     cwd: '/proj', // payload cwd wins over env
     sessionName: 'work',
+    windowName: 'ext',
+    subagent: 'review-worker',
   });
   expect(req!.requestId).toMatch(/^claude-/);
 });
@@ -253,7 +262,42 @@ test('an already-normalized ButtonRequest passes through, env fills missing rout
     { requestId: 'r1', agent: 'claude', kind: 'question', question: 'q?', options: [{ label: 'ok' }] },
     env,
   );
-  expect(req).toMatchObject({ requestId: 'r1', kind: 'question', question: 'q?', paneId: '%5', cwd: '/env/cwd' });
+  expect(req).toMatchObject({
+    requestId: 'r1',
+    kind: 'question',
+    question: 'q?',
+    paneId: '%5',
+    cwd: '/env/cwd',
+    windowName: 'ext',
+    subagent: 'review-worker',
+  });
+});
+
+test('an already-normalized ButtonRequest keeps explicit source fields over env defaults', () => {
+  const req = normalizeHookPayload(
+    {
+      requestId: 'r2',
+      agent: 'claude',
+      kind: 'permission',
+      question: 'ok?',
+      windowName: 'api',
+      subagent: 'qa-worker',
+      paneId: '%9',
+      cwd: '/payload/cwd',
+      sessionName: 'payload-session',
+    },
+    env,
+  );
+  expect(req).toMatchObject({
+    requestId: 'r2',
+    kind: 'permission',
+    question: 'ok?',
+    windowName: 'api',
+    subagent: 'qa-worker',
+    paneId: '%9',
+    cwd: '/payload/cwd',
+    sessionName: 'payload-session',
+  });
 });
 
 test('garbage → null', () => {
