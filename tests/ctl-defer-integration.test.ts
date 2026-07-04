@@ -91,12 +91,47 @@ function injected(cfgDir: string): string[] {
   return readFileSync(p, 'utf8').split('\n').filter((l) => l.length > 0);
 }
 
-// The daemon's stdout/stderr log (markers like the dead-letter / re-defer lines)
+// The daemon's stdout/stderr log (markers like release / re-defer lines)
 // — polled by tests to gate on an async handler having run, rather than sleeping
 // a fixed time that a loaded CI runner can outrun.
 function daemonLogText(cfgDir: string): string {
   const p = join(cfgDir, 'daemon.log');
   return existsSync(p) ? readFileSync(p, 'utf8') : '';
+}
+
+function reactionEmoji(reaction: Record<string, unknown>): string | undefined {
+  return (reaction.reaction as Array<{ emoji?: string }> | undefined)?.[0]?.emoji;
+}
+
+function reactionSequence(reactions: Array<Record<string, unknown>>, messageId: number): Array<string | undefined> {
+  return reactions.filter((r) => r.message_id === messageId).map(reactionEmoji);
+}
+
+function expectReactionSequence(
+  reactions: Array<Record<string, unknown>>,
+  messageId: number,
+  expected: string[],
+): void {
+  expect(reactionSequence(reactions, messageId)).toEqual(expected);
+}
+
+async function waitForTelegramReaction(
+  reactions: Array<Record<string, unknown>>,
+  messageId: number,
+  emoji: string,
+  timeoutMs = 8000,
+): Promise<void> {
+  const matched = (): Record<string, unknown> | undefined =>
+    reactions.filter((r) => r.message_id === messageId).find((r) => reactionEmoji(r) === emoji);
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs && !matched()) await Bun.sleep(50);
+  expect(matched()).toMatchObject({ message_id: messageId, reaction: [{ type: 'emoji', emoji }] });
+}
+
+async function waitForInjected(cfgDir: string, text: string, timeoutMs = 8000): Promise<void> {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs && !injected(cfgDir).some((l) => l.includes(text))) await Bun.sleep(100);
+  expect(injected(cfgDir).some((l) => l.includes(text))).toBe(true);
 }
 
 async function startDaemon(
@@ -443,7 +478,7 @@ test('a follow-up scoped question socket close during a flush drains through ter
   expect(reactions.find((r) => r.message_id === 33)).toMatchObject({ reaction: [{ type: 'emoji', emoji: '✍️' }] });
 
   // 4) Close Q2's hook. The daemon enters terminal fallback for this scoped
-  //    question and drains the queued text instead of dead-lettering it.
+  //    question and drains the queued text instead of requiring a resend.
   ask2.kill(9);
   await ask2.exited;
 
@@ -458,11 +493,8 @@ test('a follow-up scoped question socket close during a flush drains through ter
   expect(q2Pasted()).toBe(true);
   expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(false);
 
-  // 5) The flag must not LEAK: a later, legitimate question on the same pane must
-  //    still flush normally. If abandonedDuringFlush(%1) were left set, this next
-  //    flush would wrongly dead-letter a valid backlog (the most dangerous failure
-  //    mode of the new flag — silently dropping good messages). Open Q3, defer a
-  //    message behind it, answer it, and assert the message actually lands.
+  // 5) A later, legitimate question on the same pane must still flush normally.
+  //    Open Q3, defer a message behind it, answer it, and assert the message lands.
   questionCallbackData = '';
   const ask3 = startAsk(cfgDir, server.port, {
     requestId: 'q3',
@@ -507,7 +539,7 @@ test('a follow-up scoped question socket close during a flush drains through ter
     const t0 = Date.now();
     while (Date.now() - t0 < 8000 && !injected(cfgDir).some((l) => l.includes('q3 good'))) await Bun.sleep(100);
   }
-  // The legitimate Q3 backlog flushed (flag was cleared, not leaked).
+  // The legitimate Q3 backlog flushed after the later question answered.
   expect(injected(cfgDir).some((l) => l.includes('q3 good'))).toBe(true);
   // ...and the fallback message was delivered once, not replayed by Q3's flush.
   expect(injected(cfgDir).filter((l) => l.includes('q2 orphan'))).toHaveLength(1);
@@ -516,15 +548,14 @@ test('a follow-up scoped question socket close during a flush drains through ter
   await daemon.exited;
 }, 30_000);
 
-test('an abandonment racing a NEW live question re-defers (does not drop the live question backlog)', async () => {
-  // Regression for review finding #1: the abandoned-during-flush flag is keyed by
-  // PANE, but a pane can host a second LIVE question whose backlog must still be
-  // delivered. Sequence:
+test('a release racing a NEW live question re-defers (does not drop the live question backlog)', async () => {
+  // Regression for review finding #1: a pane can host a second LIVE question whose
+  // backlog must still be delivered. Sequence:
   //   1. Q1 answered → flushDeferred(%1) starts, sleeps 800ms (flushing).
-  //   2. During the settle Q2 opens; m2 defers behind it; Q2 is abandoned (flag set).
+  //   2. During the settle Q2 opens; m2 defers behind it; Q2 is released.
   //   3. ALSO during the settle Q3 opens (a real, still-pending question); m3 defers.
-  //   4. The flush wakes: the flag is set, but Q3 is pending. It must RE-DEFER the
-  //      residual (Q3's answer will flush it), NOT dead-letter it — dropping here
+  //   4. The flush wakes, sees Q3 pending, and must RE-DEFER the residual
+  //      (Q3's answer will flush it), NOT drop it — dropping here
   //      would silently lose m3, a legitimately-queued message of a live question.
   //   5. Answer Q3 → m3 lands. (m2 rides along; per the per-pane design that is the
   //      accepted lesser evil vs. dropping the live question's message.)
@@ -574,9 +605,7 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
     expect(questionCallbackData).not.toBe('');
   };
   const waitForReaction = async (id: number): Promise<void> => {
-    const t0 = Date.now();
-    while (Date.now() - t0 < 8000 && !reactions.some((r) => r.message_id === id)) await Bun.sleep(50);
-    expect(reactions.find((r) => r.message_id === id)).toMatchObject({ reaction: [{ type: 'emoji', emoji: '✍️' }] });
+    await waitForTelegramReaction(reactions, id, '✍️');
   };
   const nowSec = Math.floor(Date.now() / 1000);
 
@@ -595,7 +624,7 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
   await new Response(ask1.stdout).text();
   await ask1.exited;
 
-  // During the settle: Q2 opens, m2 defers, Q2 abandoned.
+  // During the settle: Q2 opens, m2 defers, Q2 releases.
   const ask2 = startAsk(cfgDir, server.port, { requestId: 'q2', agent: 'claude', kind: 'question', question: 'Second?', options: [{ label: 'Y' }] });
   trackProc(reg, ask2);
   await waitForButton();
@@ -604,7 +633,7 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
   await waitForReaction(43);
 
   // Q3 opens (a real, still-pending question) and m3 defers behind it — BEFORE we
-  // abandon Q2, so the flush is guaranteed to see Q3 pending when it wakes.
+  // release Q2, so the flush is guaranteed to see Q3 pending when it wakes.
   const ask3 = startAsk(cfgDir, server.port, { requestId: 'q3', agent: 'claude', kind: 'question', question: 'Third?', options: [{ label: 'Go' }] });
   trackProc(reg, ask3);
   await waitForButton();
@@ -614,7 +643,7 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
   await waitForReaction(44);
 
   // Now close Q2's hook. The terminal-fallback flush wakes while Q3 is pending,
-  // so it must re-defer behind that live question, not dead-letter.
+  // so it must re-defer behind that live question, not drop the queue.
   ask2.kill(9);
   await ask2.exited;
 
@@ -626,11 +655,14 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
     const t0 = Date.now();
     while (Date.now() - t0 < 8000 && !daemonLogText(cfgDir).includes('re-queued behind a new question')) await Bun.sleep(50);
   }
-  // The flush re-deferred (did NOT dead-letter) because a live question was pending.
+  // The flush re-deferred because a live question was pending.
   expect(daemonLogText(cfgDir)).toContain('re-queued behind a new question');
   // ...and it must NOT have dropped the queue.
   expect(daemonLogText(cfgDir)).not.toContain('were NOT delivered');
-  expect(daemonLogText(cfgDir)).not.toMatch(/dead-lettered \d+ queued message/);
+  // Re-defer is still "queued", not "delivered": no 👀 should appear until the
+  // live Q3 question is answered and the residual queue actually flushes.
+  expectReactionSequence(reactions, 43, ['✍️']);
+  expectReactionSequence(reactions, 44, ['✍️']);
 
   // Answer Q3 → its flush delivers m3 (the live question's message). The fix is
   // proven by m3 landing; with the bug (drop-everything) m3 would be lost.
@@ -645,6 +677,8 @@ test('an abandonment racing a NEW live question re-defers (does not drop the liv
   }
   // The live question's message was delivered, NOT dropped (review finding #1).
   expect(injected(cfgDir).some((l) => l.includes('q3 live'))).toBe(true);
+  await waitForTelegramReaction(reactions, 44, '👀', 4000);
+  expectReactionSequence(reactions, 44, ['✍️', '👀']);
 
   daemon.kill('SIGTERM');
   await daemon.exited;
@@ -903,9 +937,13 @@ function recordingServer(
   updateQueue: unknown[][],
   reactions: Array<Record<string, unknown>>,
   edits: string[],
-  // Optional collector for plain (button-less) sendMessage bodies — e.g. the
-  // dead-letter notice (tg-cli#58). Omitted by callers that don't assert on it.
+  // Optional collector for plain (button-less) sendMessage bodies. Omitted by
+  // callers that don't assert on them.
   plainMessages?: string[],
+  sendMessageOverride?: (
+    body: Record<string, unknown>,
+    hasQuestionKeyboard: boolean,
+  ) => Response | null | undefined | Promise<Response | null | undefined>,
 ): {
   port: number;
   cb: () => string;
@@ -927,6 +965,8 @@ function recordingServer(
         const body = (await req.json()) as Record<string, unknown>;
         const kb = (body.reply_markup as { inline_keyboard?: Array<Array<{ callback_data: string }>> } | undefined)
           ?.inline_keyboard;
+        const override = await sendMessageOverride?.(body, Boolean(kb?.length));
+        if (override) return override;
         if (kb?.length) {
           buttonMessageId += 1;
           questionCallbackData = kb[0][0].callback_data;
@@ -1054,7 +1094,7 @@ test('a SCOPED question socket close keeps the Telegram card answerable and flus
 
   // The hook socket closes while the terminal fallback may still be waiting.
   // The card must remain visible/answerable in Telegram, and the queued text is
-  // flushed instead of being dead-lettered with a misleading "resend them".
+  // flushed instead of producing a misleading "resend them" notice.
   ask.kill(9);
   await ask.exited;
   {
@@ -1065,22 +1105,10 @@ test('a SCOPED question socket close keeps the Telegram card answerable and flus
   expect(edits.some((e) => e.includes('Proceed?'))).toBe(true);
   expect(edits.some((e) => e.includes('Reply to this message with your answer'))).toBe(true);
   expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(false);
-  {
-    const t0 = Date.now();
-    while (Date.now() - t0 < 8000 && !injected(cfgDir).some((l) => l.includes('orphan me'))) await Bun.sleep(100);
-  }
+  await waitForInjected(cfgDir, 'orphan me');
   expect(injected(cfgDir)[0]).toContain('orphan me');
-  {
-    const delivered = (): Record<string, unknown> | undefined =>
-      reactions.filter((r) => r.message_id === 41).find((r) => (r.reaction as Array<{ emoji?: string }>)[0]?.emoji === '👀');
-    const t0 = Date.now();
-    while (Date.now() - t0 < 4000 && !delivered()) await Bun.sleep(50);
-    expect(delivered()).toBeTruthy();
-  }
-  expect(reactions.filter((r) => r.message_id === 41).at(-1)).toMatchObject({
-    message_id: 41,
-    reaction: [{ type: 'emoji', emoji: '👀' }],
-  });
+  await waitForTelegramReaction(reactions, 41, '👀', 4000);
+  expectReactionSequence(reactions, 41, ['✍️', '👀']);
 
   // Pane is free again: a fresh inbound on %1 injects directly (no ghost defer).
   updateQueue.push([
@@ -1091,6 +1119,58 @@ test('a SCOPED question socket close keeps the Telegram card answerable and flus
     while (Date.now() - t0 < 8000 && !injected(cfgDir).some((l) => l.includes('after the death'))) await Bun.sleep(100);
   }
   expect(injected(cfgDir).some((l) => l.includes('after the death'))).toBe(true);
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('a SCOPED question send failure releases and flushes its deferred backlog', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const plainMessages: string[] = [];
+  let questionSendStarted = false;
+  let failQuestionSend!: () => void;
+  const failGate = new Promise<void>((resolve) => {
+    failQuestionSend = resolve;
+  });
+
+  const server = recordingServer(updateQueue, reactions, edits, plainMessages, async (_body, hasQuestionKeyboard) => {
+    if (!hasQuestionKeyboard) return null;
+    questionSendStarted = true;
+    await failGate;
+    return Response.json({ ok: false, description: 'send failed' }, { status: 500 });
+  });
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
+
+  const ask = startAsk(cfgDir, server.port, {
+    requestId: 'q_scoped_send_fails',
+    agent: 'claude',
+    kind: 'question',
+    question: 'Proceed?',
+    options: [{ label: 'Yes' }],
+  });
+  trackProc(reg, ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && !questionSendStarted) await Bun.sleep(50);
+    expect(questionSendStarted).toBe(true);
+  }
+
+  updateQueue.push([
+    { update_id: 80, message: { message_id: 81, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'send failure backlog' } },
+  ]);
+  await waitForTelegramReaction(reactions, 81, '✍️', 4000);
+  expect(injected(cfgDir)).toEqual([]);
+
+  failQuestionSend();
+  await ask.exited;
+  await waitForInjected(cfgDir, 'send failure backlog');
+  expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(false);
+  await waitForTelegramReaction(reactions, 81, '👀', 4000);
+  expectReactionSequence(reactions, 81, ['✍️', '👀']);
 
   daemon.kill('SIGTERM');
   await daemon.exited;
@@ -1107,7 +1187,7 @@ test('NO-WEDGE guard: an UNSCOPED question never answered still self-clears at t
   const updateQueue: unknown[][] = [];
   const reactions: Array<Record<string, unknown>> = [];
   const edits: string[] = [];
-  const plainMessages: string[] = []; // plain sendMessage bodies (the dead-letter notice)
+  const plainMessages: string[] = []; // collector so the test can assert no resend notice is emitted
   const server = recordingServer(updateQueue, reactions, edits, plainMessages);
   servers.push(server);
   const daemon = await startDaemon(cfgDir, server.port, { TG_CTL_UNSCOPED_TIMEOUT_MS: SHORT_UNSCOPED_MS });
@@ -1147,46 +1227,34 @@ test('NO-WEDGE guard: an UNSCOPED question never answered still self-clears at t
   expect(edits).toContain('expired — answer in terminal');
   await ask.exited; // the blocked hook is released (null) when its question expires
 
-  // Routing un-wedged: a NEW inbound now injects directly (no ghost defer).
+  // Routing un-wedged: a NEW inbound now also reaches the pane. It may queue
+  // behind the release flush for a moment, but it must not get stuck.
   updateQueue.push([
     { update_id: 51, message: { message_id: 52, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: Math.floor(Date.now() / 1000), text: 'routing alive' } },
   ]);
-  {
-    const t0 = Date.now();
-    while (Date.now() - t0 < 8000 && injected(cfgDir).length < 1) await Bun.sleep(100);
-  }
-  expect(injected(cfgDir).some((l) => l.includes('routing alive'))).toBe(true);
+  await waitForInjected(cfgDir, 'unwedge me', 12000);
+  await waitForInjected(cfgDir, 'routing alive', 12000);
 
   // Fate of the message deferred behind the EXPIRED unscoped question ('unwedge
-  // me'): the agent has moved on (its prompt was rewritten to "expired"), so the
-  // stale text is NEVER pasted into the now-free pane — that would be the very
-  // hanging-question resurface this module exists to kill. But the user is no
-  // longer silently robbed of it: on the unscoped expiry the daemon sweeps every
-  // pane that still holds a backlog and dead-letters the idle ones (tg-cli#58),
-  // emitting the same '⚠️ … were NOT delivered' notice the scoped socket-close
-  // path already gives. Before #58 this was a silent DATA-LOSS gap (the unscoped
-  // expiry had no paneId to dead-letter). The no-wedge guarantee still holds
-  // ('routing alive' got through) and the stale text still never lands on a pane.
-  expect(injected(cfgDir).some((l) => l.includes('unwedge me'))).toBe(false);
-  {
-    const t0 = Date.now();
-    while (Date.now() - t0 < 8000 && !plainMessages.some((m) => m.includes('were NOT delivered')))
-      await Bun.sleep(50);
-  }
-  expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(true);
+  // me'): once the blocking question is gone, the daemon must flush the queued
+  // message instead of asking the user to resend it. The no-wedge guarantee still
+  // holds because later inbound ('routing alive') also gets through.
+  expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(false);
+  await waitForTelegramReaction(reactions, 51, '👀', 4000);
+  expectReactionSequence(reactions, 51, ['✍️', '👀']);
 
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 40_000);
 
 // The dangerous failure mode of the #58 sweep: an unscoped question's expiry must
-// NOT dead-letter a backlog that belongs to a DIFFERENT, still-live question on
+// NOT flush/drop a backlog that belongs to a DIFFERENT, still-live question on
 // the same pane. The deferred queue is keyed by PANE, not question, so a naive
-// "drop every pane's backlog on the unscoped expiry" would destroy the scoped
+// "flush every pane's backlog on the unscoped expiry" would disturb the scoped
 // question's legitimately-queued messages. The per-pane guard
-// (onQuestionAbandoned skips a pane that still has a pending question) is what
+// (onQuestionReleased skips a pane that still has a pending question) is what
 // prevents this; this test pins that guard so a regression in it is caught.
-test('an UNSCOPED expiry does NOT dead-letter a backlog held behind a still-live SCOPED question on the same pane (tg-cli#58 guard)', async () => {
+test('an UNSCOPED expiry does NOT flush a backlog held behind a still-live SCOPED question on the same pane (tg-cli#58 guard)', async () => {
   const cfgDir = makeCfgDir();
   const updateQueue: unknown[][] = [];
   const reactions: Array<Record<string, unknown>> = [];
@@ -1273,8 +1341,8 @@ test('an UNSCOPED expiry does NOT dead-letter a backlog held behind a still-live
   await askUnscoped.exited; // the unscoped hook is released (null) when it expires
 
   // 4. The sweep ran, but PANE_ID still has a pending (scoped) question, so the
-  //    guard SKIPPED it — no dead-letter of the scoped backlog. The negative window
-  //    below is sound because the sweep (onUnscopedAbandon) runs SYNCHRONOUSLY in
+  //    guard SKIPPED it — no flush of the scoped backlog. The negative window
+  //    below is sound because the sweep (onUnscopedRelease) runs SYNCHRONOUSLY in
   //    the expiry timer BEFORE the hook's `socket.end("null\n")` that unblocks the
   //    ask subprocess — so by the time `askUnscoped.exited` above resolves, the
   //    sweep has already happened; a (wrongly) sent notice would already be in
@@ -1284,7 +1352,6 @@ test('an UNSCOPED expiry does NOT dead-letter a backlog held behind a still-live
     while (Date.now() - t0 < 3000 && !plainMessages.some((m) => m.includes('were NOT delivered'))) await Bun.sleep(50);
   }
   expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(false);
-  expect(daemonLogText(cfgDir)).not.toMatch(/dead-lettered \d+ queued message/);
   expect(injected(cfgDir)).toEqual([]); // 'keep me safe' is still queued, not lost, not pasted
 
   // 5. Answer the SCOPED question → its backlog flushes intact (the proof the
@@ -1306,10 +1373,8 @@ test('an UNSCOPED expiry does NOT dead-letter a backlog held behind a still-live
 // The unscoped sweep is wired into THREE removal paths (timeout / socket close /
 // send failure); the tests above exercise the timeout path. This one covers the
 // SOCKET-CLOSE path: an unscoped question whose hook process dies (fd closed)
-// BEFORE its bound elapses must still dead-letter its idle-pane backlog. Without
-// the `else onUnscopedAbandon()` in the close handler this regresses to the
-// silent loss #58 fixes — and no timeout-based test would catch it.
-test('an UNSCOPED question abandoned by SOCKET CLOSE (process dies) dead-letters its idle backlog (tg-cli#58, close path)', async () => {
+// BEFORE its bound elapses must still release and flush its idle-pane backlog.
+test('an UNSCOPED question abandoned by SOCKET CLOSE (process dies) flushes its idle backlog', async () => {
   const cfgDir = makeCfgDir();
   const updateQueue: unknown[][] = [];
   const reactions: Array<Record<string, unknown>> = [];
@@ -1345,15 +1410,13 @@ test('an UNSCOPED question abandoned by SOCKET CLOSE (process dies) dead-letters
   expect(injected(cfgDir)).toEqual([]); // deferred
 
   // The agent process dies (socket close) with NO answer, WELL before the 60s
-  // bound. The close handler must run the unscoped sweep and dead-letter the pane.
+  // bound. The close handler must run the unscoped sweep and flush the pane.
   ask.kill(9);
   await ask.exited;
-  {
-    const t0 = Date.now();
-    while (Date.now() - t0 < 8000 && !plainMessages.some((m) => m.includes('were NOT delivered'))) await Bun.sleep(50);
-  }
-  expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(true);
-  expect(injected(cfgDir)).toEqual([]); // 'die with me' never pasted into the dead prompt
+  await waitForInjected(cfgDir, 'die with me');
+  expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(false);
+  await waitForTelegramReaction(reactions, 71, '👀', 4000);
+  expectReactionSequence(reactions, 71, ['✍️', '👀']);
 
   daemon.kill('SIGTERM');
   await daemon.exited;

@@ -91,8 +91,9 @@ the button picker / ambiguous-target reply fires (the unscoped fail-closed). The
 auto-bind REDUCES how often the picker fires; it never replaces it.
 
 Both paths honor defer-while-waiting: a reply to a pane with an open question is
-queued (✍️) and flushed when the question is answered (see
-`docs/q-buttons-prerequisites.md`).
+queued (✍️) and flushed when the question is answered or released with no other
+live question owning that pane. Successful deferred delivery flips the source
+reaction to 👀 (see `docs/q-buttons-prerequisites.md`).
 
 ## Non-goals
 

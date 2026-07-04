@@ -138,9 +138,9 @@ tests can pass fakes.
   (PURE (de)serialization for the durable forwarded-question state — the on-disk envelope +
   age/count pruning; the entrypoint owns the atomic file I/O and the authoritative req
   normalization), `defer.ts` (defer-while-waiting queue model: inbound text is
-  QUEUED per-pane while that pane has an open question and flushed on answer, so it is never pasted
-  into the prompt — `driveFlush` re-checks the pane before EACH paste so a follow-up question
-  re-defers the untouched tail), and `voice.ts` (inbound VOICE→text: `voice:` config block
+  QUEUED per-pane while that pane has an open question and flushed on answer or release, so it is
+  never pasted into the prompt — `driveFlush` re-checks the pane before EACH paste so a follow-up
+  question re-defers the untouched tail), and `voice.ts` (inbound VOICE→text: `voice:` config block
   parse/resolve/upsert, ffmpeg + whisper argv builders, transcript cleaning, and the onboarding
   decision). `voice-probe.ts` is the ONE impure module here — it scans `~/xp` for an existing
   Whisper install (whisper.cpp binary + ggml model, or a faster-whisper venv) and checks for

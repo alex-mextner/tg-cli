@@ -3,6 +3,21 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.32.2
+
+**Fix: deferred Telegram replies now flush after question release instead of asking for a resend.**
+
+- Queued inbound messages behind an unscoped timeout, hook socket close, or
+  question-card send failure now drain into the target pane once the blocking
+  question is released, instead of sending the misleading `were NOT delivered.
+  Resend them.` notice.
+- Source message reactions keep the visible lifecycle: queued messages still get
+  **✍️** immediately and now flip to **👀** after the post-timeout/post-close/
+  send-failure flush succeeds.
+- The live-question guard remains: if another question is still pending on that
+  pane, the backlog stays queued for that question rather than being flushed over
+  its prompt.
+
 ## 1.32.1
 
 **Fix: `tg-ctl start` no longer inherits a soon-to-be-deleted worktree cwd.**
