@@ -131,9 +131,12 @@ When an agent has an outstanding button question (a `pendingButton` whose pane i
 known) and a NEW inbound message would inject into that pane, the daemon does NOT
 inject over the waiting prompt. It **queues** the message per-pane and reacts on
 the source Telegram message with **✍️** ("noted, queued") — Telegram's allowed
-reaction set has no ⏳, so ✍️ is the closest. When the question is answered, the
-queue is **flushed** into the pane (after a short settle delay). Control verbs
-(`/stop` = Escape) are never deferred — they go through to interrupt the prompt.
+reaction set has no ⏳, so ✍️ is the closest. When the question is answered, or
+released without an inline Telegram answer and no other live question owns that
+pane, the queue is **flushed** into the pane (after a short settle delay). After
+successful delivery the source reaction flips from **✍️** to **👀**. Control
+verbs (`/stop` = Escape) are never deferred — they go through to interrupt the
+prompt.
 
 ## Still open
 
