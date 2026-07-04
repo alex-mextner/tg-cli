@@ -59,8 +59,9 @@ import {
   continueCallbackData,
   extractAssistantText,
   extractFailure,
-  extractUsageLimitEvent,
+  extractUsageLimitEvents,
   formatClock,
+  formatDelta,
   parseContinueCallback,
   type HarnessFailureEvent,
   type UsageLimitEvent,
@@ -87,8 +88,10 @@ import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
 import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, readPidFile } from "./features/tg-ctl/lock"
 import {
+  buildAnsweredQuestionText,
   buildButtonMessage,
   buildClaudeQuestionAnswerOutput,
+  buildPostTimeoutQuestionMessage,
   callbackRequestId,
   collectQuestionAnswers,
   formatAgentHookOutput,
@@ -1480,6 +1483,7 @@ interface PendingButton {
   // whether or not the timer was armed.
   timer?: ReturnType<typeof setTimeout>
   finalText?: string
+  finalReplyMarkup?: ButtonMessagePayload["reply_markup"]
 }
 
 // A SCOPED question whose hook socket has CLOSED — the agent's 120s hook budget
@@ -1670,6 +1674,10 @@ interface QuestionRuntime {
   // (timeout / socket close / send failure) so the stale queue can't resurface, out
   // of order, on a LATER unrelated question's answer (review finding).
   onAbandon: (paneId: string) => void
+  // A scoped question's hook socket closed, so the harness may have fallen back to
+  // the terminal prompt. The Telegram card remains answerable by reply-text, and
+  // queued inbound is allowed to flush into the pane instead of being dead-lettered.
+  onTerminalFallback: (paneId: string) => void
   // Same, for an UNSCOPED question (no paneId): sweep every pane that still holds a
   // backlog and dead-letter the idle ones (tg-cli#58). Must run AFTER the entry is
   // deleted from `pending` so the per-pane guard sees the real post-removal state.
@@ -1679,10 +1687,6 @@ interface QuestionRuntime {
 // A genuinely dead card: an UNSCOPED question (no pane to late-deliver to) that
 // timed out, or a send-failed forward. Its keyboard is cleared so it can't be tapped.
 const EXPIRED_TERMINAL_TEXT = "expired — answer in terminal"
-// A SCOPED question whose hook socket closed: the agent fell back to the terminal,
-// but a LATE tap still injects the chosen option into its pane (late-delivery), so
-// the keyboard STAYS tappable and the card says so.
-const ABANDONED_TAP_TEXT = "window closed — tap still delivers your answer to the terminal"
 // A SCOPED permission whose hook socket closed (daemon restart mid-block): the
 // keyboard stays live so the user can tap once the agent reconnects and the
 // reconnect re-attach delivers the answer down the new socket.
@@ -1739,14 +1743,20 @@ function armPendingSocketClose(
     rt.pending.delete(pendingKey)
     rt.activeKeys.delete(pendingKey)
     if (retainAbandonedQuestion(rt, entry, pendingKey)) {
-      rt.onAbandon(entry.req.paneId as string)
-      const abandonedText = entry.req.kind === "permission"
-        ? ABANDONED_PERMISSION_TEXT
-        : entry.req.multiQuestion
-          ? ABANDONED_MULTI_TEXT
-          : ABANDONED_TAP_TEXT
-      if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText)
-      else entry.finalText = abandonedText
+      if (entry.req.kind === "question" && !entry.req.multiQuestion) {
+        rt.onTerminalFallback(entry.req.paneId as string)
+        const abandoned = buildPostTimeoutQuestionMessage(ctx.chatId, entry.req)
+        if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandoned.text, abandoned.reply_markup)
+        else {
+          entry.finalText = abandoned.text
+          entry.finalReplyMarkup = abandoned.reply_markup
+        }
+      } else {
+        rt.onAbandon(entry.req.paneId as string)
+        const abandonedText = entry.req.kind === "permission" ? ABANDONED_PERMISSION_TEXT : ABANDONED_MULTI_TEXT
+        if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText)
+        else entry.finalText = abandonedText
+      }
     } else {
       if (entry.req.paneId) rt.onAbandon(entry.req.paneId)
       else rt.onUnscopedAbandon()
@@ -1835,7 +1845,7 @@ async function forwardAndPostQuestion(
   if (rt.pending.get(pendingKey) !== entry || entry.finalText) {
     const finalText = entry.finalText ?? EXPIRED_TERMINAL_TEXT
     if (finalText === EXPIRED_TERMINAL_TEXT) void clearMessageKeyboard(ctx, messageId)
-    void editMessageText(ctx, messageId, finalText)
+    void editMessageText(ctx, messageId, finalText, entry.finalReplyMarkup)
   }
 }
 
@@ -2286,11 +2296,22 @@ function strField(obj: unknown, key: string): string {
 
 const USAGE_WARNING_COOLDOWN_MS = 60 * 60_000
 const USAGE_WARNING_STORE_MAX = 100
+const USAGE_LATEST_NO_RESET_MAX_AGE_MS = 24 * 60 * 60_000
 
 interface UsageWarningRecord {
   key: string
   lastSentAt: number
   resetAt: number | null
+}
+
+interface UsageLatestRecord {
+  agent: string
+  limitName: string | null
+  percent: number
+  resetAt: number | null
+  language: string
+  detail: string
+  sampledAt: number
 }
 
 function usageWarningKey(ev: UsageLimitEvent): string {
@@ -2299,6 +2320,121 @@ function usageWarningKey(ev: UsageLimitEvent): string {
 
 function usageWarningLockPath(path: string): string {
   return `${path}.lock`
+}
+
+function usageLatestKey(rec: Pick<UsageLatestRecord, "agent" | "limitName">): string {
+  return JSON.stringify([rec.agent, rec.limitName ?? ""])
+}
+
+function usageLatestLockPath(path: string): string {
+  return `${path}.lock`
+}
+
+function parseUsageLatestRecords(blob: string | null, now: number): UsageLatestRecord[] {
+  if (!blob) return []
+  try {
+    const parsed = JSON.parse(blob) as { samples?: unknown }
+    if (!Array.isArray(parsed.samples)) return []
+    return parsed.samples
+      .filter((item): item is UsageLatestRecord => {
+        if (!item || typeof item !== "object") return false
+        const rec = item as Record<string, unknown>
+        const resetAt = rec.resetAt
+        return (
+          typeof rec.agent === "string" &&
+          (rec.limitName === null || typeof rec.limitName === "string") &&
+          typeof rec.percent === "number" &&
+          Number.isFinite(rec.percent) &&
+          rec.percent >= 0 &&
+          rec.percent <= 100 &&
+          (resetAt === null || (typeof resetAt === "number" && Number.isFinite(resetAt) && resetAt > 0)) &&
+          typeof rec.language === "string" &&
+          typeof rec.detail === "string" &&
+          typeof rec.sampledAt === "number" &&
+          Number.isFinite(rec.sampledAt) &&
+          rec.sampledAt > 0
+        )
+      })
+      .filter((rec) => (rec.resetAt !== null ? rec.resetAt > now : rec.sampledAt > now - USAGE_LATEST_NO_RESET_MAX_AGE_MS))
+  } catch {
+    return []
+  }
+}
+
+function writeUsageLatestRecords(path: string, records: UsageLatestRecord[]): void {
+  atomicWrite(path, `${JSON.stringify({ version: 1, samples: records })}\n`)
+}
+
+function recordUsageLatest(path: string, events: UsageLimitEvent[], now: number): void {
+  if (events.length === 0) return
+  try {
+    withRoutesLock(
+      fsRoutesLockIo(usageLatestLockPath(path)),
+      () => {
+        const byKey = new Map<string, UsageLatestRecord>()
+        for (const rec of parseUsageLatestRecords(readFileOrNull(path), now)) byKey.set(usageLatestKey(rec), rec)
+        for (const ev of events) {
+          const rec: UsageLatestRecord = {
+            agent: ev.agent,
+            limitName: ev.limitName,
+            percent: ev.percent,
+            resetAt: ev.resetAt,
+            language: ev.language,
+            detail: ev.detail,
+            sampledAt: now,
+          }
+          byKey.set(usageLatestKey(rec), rec)
+        }
+        writeUsageLatestRecords(path, [...byKey.values()].sort(compareUsageLatestRecords))
+      },
+      { onContended: "skip" },
+    )
+  } catch (err) {
+    log(`harness-event: usage latest store failed: ${err}`)
+  }
+}
+
+function compareUsageLatestRecords(a: UsageLatestRecord, b: UsageLatestRecord): number {
+  const agent = a.agent.localeCompare(b.agent)
+  if (agent !== 0) return agent
+  return usageLimitRank(a.limitName) - usageLimitRank(b.limitName) || (a.limitName ?? "").localeCompare(b.limitName ?? "")
+}
+
+function usageLimitRank(limitName: string | null): number {
+  if (limitName === "5-hour") return 0
+  if (limitName === "weekly") return 1
+  if (limitName === "context window") return 2
+  if (limitName === "primary") return 3
+  if (limitName === "secondary") return 4
+  return 10
+}
+
+function formatUsagePercent(percent: number): string {
+  return Number.isInteger(percent) ? String(percent) : percent.toFixed(1).replace(/\.0$/, "")
+}
+
+function composeLimitStatus(ctx: Ctx, agentFilter: string | null, now = Date.now()): string {
+  const filter = agentFilter?.trim().toLowerCase() || null
+  const records = parseUsageLatestRecords(readFileOrNull(ctx.paths.usageLatest), now)
+    .filter((rec) => !filter || rec.agent.toLowerCase() === filter)
+    .sort(compareUsageLatestRecords)
+  const scope = filter ? ` for ${filter}` : ""
+  if (records.length === 0) {
+    return `No recent limit telemetry${scope}. Run tg-ctl install-hooks and wait for the agent statusLine/harness telemetry to report.`
+  }
+  const lines = [`Latest limits${scope}:`]
+  let currentAgent = ""
+  for (const rec of records) {
+    if (rec.agent !== currentAgent) {
+      currentAgent = rec.agent
+      lines.push(`${rec.agent}:`)
+    }
+    const limit = rec.limitName ?? "limit"
+    const reset = rec.resetAt !== null ? ` · resets ${formatClock(rec.resetAt)} (in ${formatDelta(rec.resetAt - now)})` : ""
+    const sampled = ` · updated ${formatDelta(now - rec.sampledAt)} ago`
+    lines.push(`- ${limit}: ${formatUsagePercent(rec.percent)}%${reset}${sampled}`)
+  }
+  return lines.join("\n")
 }
 
 function parseUsageWarningRecords(blob: string | null, now: number): UsageWarningRecord[] {
@@ -2468,9 +2604,11 @@ async function runHarnessEvent(ctx: Ctx, argv: string[], now: number): Promise<n
   const flags = parseHarnessEventFlags(argv)
   const payloadText = await readStdinText().catch(() => "")
   const agent = flags.agent ?? resolveAgentForPane(flags.paneId)
-  const hasSupportedUsageTelemetry = extractUsageLimitEvent(payloadText, { agent, language: flags.language, env: process.env, now: 0 }) !== null
+  const usageEvents = extractUsageLimitEvents(payloadText, { agent, language: flags.language, env: process.env, now })
+  const hasSupportedUsageTelemetry = extractUsageLimitEvents(payloadText, { agent, language: flags.language, env: process.env, now: 0 }).length > 0
+  if (!flags.dryRun) recordUsageLatest(ctx.paths.usageLatest, usageEvents, now)
   const sendUsageWarningIfPresent = async (): Promise<boolean> => {
-    const usage = extractUsageLimitEvent(payloadText, { agent, language: flags.language, env: process.env, now })
+    const usage = usageEvents.slice().sort((a, b) => b.percent - a.percent)[0] ?? null
     if (!usage) return false
     const notif = buildUsageLimitNotification(usage, now)
     if (!notif) {
@@ -2887,6 +3025,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       abandonedDuringFlush.delete(paneId)
     }
   }
+  // A scoped question's hook socket closed while the agent may still be waiting in
+  // its terminal fallback. Unlike a true abandon/dead card, the Telegram question
+  // remains visible and answerable by reply-text, so the pane backlog should not be
+  // reported as lost. Let the normal drain deliver queued messages in FIFO order.
+  const onQuestionTerminalFallback = (paneId: string): void => {
+    if (!deferred.has(paneId)) {
+      log(`question terminal-fallback on ${paneId} — no queued message(s)`)
+      return
+    }
+    log(`question terminal-fallback on ${paneId} — flushing queued message(s)`)
+    flushDeferred(paneId).catch((err) => log(`flushDeferred terminal-fallback error: ${err}`))
+  }
   // A forwarded question was removed WITHOUT a Telegram answer (timeout / hook
   // socket close / send failure). The agent's local prompt is still open, so we
   // must NOT flush — but we must also not leave the pane's backlog to resurface,
@@ -2949,6 +3099,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     answered: answeredButtons,
     persist: persistQuestions,
     onAbandon: onQuestionAbandoned,
+    onTerminalFallback: onQuestionTerminalFallback,
     onUnscopedAbandon,
   }
   let hookServer: Server | null = null
@@ -5111,8 +5262,86 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // (ABANDONED_RETAIN_MS, 30 min) finds neither entry and shows a misleading
       // "expired" on a card that WAS answered.
       void clearMessageKeyboard(ctx, cardId)
-      void editMessageText(ctx, cardId, `answered: ${answer.label}`)
+      void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label))
     }
+    return true
+  }
+
+  const retireExpiredAbandonedQuestion = (
+    requestId: string,
+    retained: AbandonedButton,
+    messageId: number | null,
+  ): void => {
+    abandonedButtons.delete(requestId)
+    persistQuestions()
+    const staleCardId = retained.messageId ?? messageId
+    if (staleCardId !== null) {
+      void clearMessageKeyboard(ctx, staleCardId)
+      void editMessageText(ctx, staleCardId, EXPIRED_TERMINAL_TEXT)
+    }
+  }
+
+  const handlePostTimeoutQuestionReply = async (
+    action: Extract<Action, { kind: "post-timeout-question-reply" }>,
+  ): Promise<boolean> => {
+    const retained = abandonedButtons.get(action.requestId)
+    if (
+      !retained ||
+      !retained.req.paneId ||
+      retained.req.kind !== "question" ||
+      retained.req.multiQuestion ||
+      retained.messageId !== action.questionMessageId
+    ) {
+      await sendMessage(ctx, "that question is no longer waiting — resend if needed")
+      return false
+    }
+    if (Date.now() - retained.at > ABANDONED_RETAIN_MS) {
+      retireExpiredAbandonedQuestion(action.requestId, retained, action.questionMessageId)
+      log(`ask-post-timeout-reply-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
+      await sendMessage(ctx, "that question expired — resend if needed")
+      return false
+    }
+    const paneId = retained.req.paneId
+    if (shouldDeferInbound(paneId)) {
+      log(`ask-post-timeout-reply-busy: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId}`)
+      await sendMessage(ctx, "agent is busy — reply to the question again shortly")
+      return false
+    }
+
+    const answer = action.text.trim()
+    const answeredAt = Date.now()
+    abandonedButtons.delete(action.requestId)
+    pruneAnsweredButtons(answeredButtons, answeredAt)
+    answeredButtons.set(action.requestId, { value: answer, label: answer, at: answeredAt, delivery: "pane" })
+    persistQuestions()
+
+    const res = await executeInjectSteps(buildTextInjectPlan(paneId, answer))
+    if (!res.ok) {
+      answeredButtons.delete(action.requestId)
+      abandonedButtons.set(action.requestId, { req: retained.req, messageId: retained.messageId, at: retained.at })
+      persistQuestions()
+      log(`ask-post-timeout-reply-failed: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId} err=${res.error}`)
+      await sendMessage(ctx, "could not reach the terminal — reply to the question again")
+      return false
+    }
+
+    log(`ask-post-timeout-reply-delivered: ${describeAskRequest(retained.req)} key=${action.requestId} answer=${answer} pane=${paneId}`)
+    void clearMessageKeyboard(ctx, action.questionMessageId)
+    void editMessageText(ctx, action.questionMessageId, buildAnsweredQuestionText(retained.req, answer))
+    flushDeferred(paneId).catch((err) => log(`flushDeferred post-timeout-reply error: ${err}`))
+    return true
+  }
+
+  const handleCloseQuestionCard = async (
+    action: Extract<Action, { kind: "close-question-card" }>,
+  ): Promise<boolean> => {
+    const retained = abandonedButtons.get(action.requestId)
+    if (retained && (action.messageId === null || retained.messageId === action.messageId)) {
+      abandonedButtons.delete(action.requestId)
+      persistQuestions()
+    }
+    if (action.messageId !== null) void clearMessageKeyboard(ctx, action.messageId)
+    await answerCallbackQuery(ctx, action.callbackQueryId, "closed")
     return true
   }
 
@@ -5128,6 +5357,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "answer-callback":
         await answerCallbackQuery(ctx, action.callbackQueryId, action.text)
         return true
+      case "close-question-card":
+        return handleCloseQuestionCard(action)
+      case "post-timeout-question-reply":
+        return handlePostTimeoutQuestionReply(action)
       case "answer-question": {
         const pending = pendingButtons.get(action.requestId)
         if (!pending) {
@@ -5199,7 +5432,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // (no duplicate card) instead of re-forwarding the now-answered question.
         persistQuestions()
         clearTimeout(pending.timer)
-        const finalText = `answered: ${answer.label}`
+        const finalText = buildAnsweredQuestionText(pending.req, answer.label)
         if (pending.messageId === null) pending.finalText = finalText
         const output = formatAgentHookOutput(pending.req, answer)
         pending.socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
@@ -5218,6 +5451,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       case "status":
         await sendMessage(ctx, composeStatus(ctx, null))
+        return true
+      case "limit-status":
+        await sendMessage(ctx, composeLimitStatus(ctx, action.agent))
         return true
       case "tasks":
         await runTasksCommand(ctx, action)
@@ -5396,6 +5632,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // /new awaits its dir is the typed path. When no /new is in flight this is false and the
         // plain-text path is byte-identical to before.
         newSessionAwaitingDir,
+        postTimeoutQuestionRequestIdForMessage: (messageId) => {
+          for (const [requestId, retained] of abandonedButtons) {
+            if (
+              retained.messageId === messageId &&
+              retained.req.kind === "question" &&
+              !retained.req.multiQuestion &&
+              retained.req.paneId
+            ) {
+              return requestId
+            }
+          }
+          return null
+        },
       })
 
       // At-most-once (spec §10): persist the offset BEFORE acting. A crash

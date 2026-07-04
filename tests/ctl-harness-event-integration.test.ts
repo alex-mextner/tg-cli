@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -56,6 +56,12 @@ function futureResetSeconds(minutes: number): number {
 
 function clearUsageWarningState(): void {
   const path = join(cfgDir, 'tg-ctl.123.usage-warnings.json');
+  rmSync(path, { force: true });
+  rmSync(`${path}.lock`, { force: true });
+}
+
+function clearUsageLatestState(): void {
+  const path = join(cfgDir, 'tg-ctl.123.usage-latest.json');
   rmSync(path, { force: true });
   rmSync(`${path}.lock`, { force: true });
 }
@@ -434,6 +440,43 @@ test('Claude statusLine usage with transcript_path is still treated as usage tel
   expect(msg.text).toContain('91%');
   expect(msg.reply_markup).toBeUndefined();
   expect(reactions).toHaveLength(0);
+});
+
+test('Claude statusLine usage records all latest buckets for /limit, including below-warning weekly usage', async () => {
+  clearUsageWarningState();
+  clearUsageLatestState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const fiveHourReset = futureResetSeconds(110);
+  const weeklyReset = futureResetSeconds(24 * 60);
+  const payload = JSON.stringify({
+    hook_event_name: 'Status',
+    session_id: 'abc123',
+    user_language: 'ru',
+    rate_limits: {
+      five_hour: {
+        used_percentage: 98,
+        resets_at: fiveHourReset,
+      },
+      seven_day: {
+        used_percentage: 64,
+        resets_at: weeklyReset,
+      },
+    },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'claude', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('98%');
+
+  const latest = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.usage-latest.json'), 'utf8')) as {
+    samples: Array<{ agent: string; limitName: string; percent: number; resetAt: number }>;
+  };
+  expect(latest.samples.map((s) => [s.agent, s.limitName, s.percent])).toEqual([
+    ['claude', '5-hour', 98],
+    ['claude', 'weekly', 64],
+  ]);
+  expect(latest.samples.map((s) => s.resetAt)).toEqual([fiveHourReset * 1000, weeklyReset * 1000]);
 });
 
 test('Claude statusLine usage without hook_event_name is not misrouted by transcript_path alone', async () => {

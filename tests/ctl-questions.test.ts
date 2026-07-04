@@ -1,11 +1,14 @@
 import { expect, test } from 'bun:test';
 import {
+  buildAnsweredQuestionText,
   buildButtonMessage,
   buildClaudeQuestionAnswerOutput,
+  buildPostTimeoutQuestionMessage,
   collectQuestionAnswers,
   extractAnswersFromHookReply,
   formatAgentHookOutput,
   parseButtonCallback,
+  parseQuestionCloseCallback,
   questionCapability,
   registrationAllowsHook,
   repairClaudeQuestionReply,
@@ -74,6 +77,30 @@ test('buildButtonMessage renders a question as Telegram inline keyboard payload'
   });
 });
 
+test('buildPostTimeoutQuestionMessage preserves the original question and accepts a text reply', () => {
+  const payload = buildPostTimeoutQuestionMessage(1000, QUESTION);
+  expect(payload.chat_id).toBe(1000);
+  expect(payload.text).toContain('Question from claude');
+  expect(payload.text).toContain('Pick deploy target');
+  expect(payload.text).toContain('Where should I deploy?');
+  expect(payload.text).toContain('Options:');
+  expect(payload.text).toContain('1. Staging - Safe validation environment');
+  expect(payload.text).toContain('2. Production - Customer-facing environment');
+  expect(payload.text).toContain('Time-out expired.');
+  expect(payload.text).toContain('Reply to this message with your answer');
+  expect(payload.reply_markup).toEqual({
+    inline_keyboard: [[{ text: 'Close', callback_data: 'tgqc:q_123' }]],
+  });
+});
+
+test('buildAnsweredQuestionText keeps the prompt context with the selected answer', () => {
+  const text = buildAnsweredQuestionText(QUESTION, 'Production');
+  expect(text).toContain('Question from claude');
+  expect(text).toContain('Pick deploy target');
+  expect(text).toContain('Where should I deploy?');
+  expect(text).toContain('Selected answer: Production');
+});
+
 test('buildButtonMessage uses short buttonId for callback data when requestId is long or opaque', () => {
   const payload = buildButtonMessage(1000, {
     requestId: 'oc:ses_12345678901234567890:que_12345678901234567890',
@@ -127,6 +154,12 @@ test('parseButtonCallback accepts only tg-cli callback data', () => {
   expect(parseButtonCallback('other:q_123:o1')).toBe(null);
   expect(parseButtonCallback('tgq:q_123')).toBe(null);
   expect(parseButtonCallback('tgq::o1')).toBe(null);
+});
+
+test('parseQuestionCloseCallback accepts only close-card callbacks', () => {
+  expect(parseQuestionCloseCallback('tgqc:q_123')).toEqual({ requestId: 'q_123' });
+  expect(parseQuestionCloseCallback('tgq:q_123:o1')).toBe(null);
+  expect(parseQuestionCloseCallback('tgqc:')).toBe(null);
 });
 
 test('resolveButtonCallback maps option callbacks to labels', () => {

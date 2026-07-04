@@ -24,6 +24,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     questions: join(configDir, `${base}.questions.json`),
     schedules: join(configDir, `${base}.schedules.json`),
     usageWarnings: join(configDir, `${base}.usage-warnings.json`),
+    usageLatest: join(configDir, `${base}.usage-latest.json`),
   };
 }
 

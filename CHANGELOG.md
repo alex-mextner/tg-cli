@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.32.0
+
+**Feature: timed-out Telegram questions stay answerable, and `/limit` reports latest agent quotas.**
+
+- Scoped question cards are no longer erased when the hook socket closes or the
+  harness falls back to the terminal prompt. Telegram now shows the original
+  question, marks the time-out as expired, replaces option buttons with **Close**,
+  and accepts a reply to that card as the post-factum answer.
+- Answered question cards keep the original prompt context and selected answer
+  instead of collapsing to `answered: ...`, so later readers can see what was
+  asked, what was chosen, and which agent asked.
+- Deferred inbound text behind a scoped terminal-fallback question is no longer
+  reported as "not delivered"; it drains through the pane contract instead of
+  leaving misleading stale ✍️ state.
+- Added `/limit [<agent>]` to the Telegram control daemon. Claude/Codex/Pi/custom
+  usage telemetry samples are saved as latest snapshots, including below-warning
+  buckets, so `/limit claude` can show both 5-hour and weekly usage.
+
 ## 1.31.1
 
 **Fix: `tg-ctl install-hooks` now wires Claude proactive usage telemetry.**

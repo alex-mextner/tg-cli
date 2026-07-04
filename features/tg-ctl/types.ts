@@ -144,6 +144,7 @@ export type Action =
   | { kind: 'inject-key'; key: 'Escape' } // /stop
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
   | { kind: 'status' } // /status — entrypoint composes the reply
+  | { kind: 'limit-status'; agent: string | null } // /limit [agent] — latest usage/rate-limit telemetry
   // /tasks [<agent>] [<status>] — entrypoint resolves the agent→project scope,
   // spawns task-cli + gh, composes a rich-HTML board table, sends it (#115).
   | { kind: 'tasks'; agent: string | null; status: string | null }
@@ -179,6 +180,20 @@ export type Action =
       requestId: string;
       value: string;
       messageId: number | null;
+    }
+  | {
+      kind: 'close-question-card';
+      callbackQueryId: string;
+      requestId: string;
+      messageId: number | null;
+    }
+  | {
+      kind: 'post-timeout-question-reply';
+      requestId: string;
+      questionMessageId: number;
+      text: string;
+      from: string;
+      messageId: number;
     }
   // Delivery receipt: set a 👀 reaction on the source message IF every action
   // emitted for it succeeded. Follows the message's delivery action(s); never
@@ -357,6 +372,7 @@ export interface CtlPaths {
   questions: string; // durable forwarded-question state (pending/abandoned + answered-replay)
   schedules: string; // durable auto-continue schedules (re-armed on restart, #113)
   usageWarnings: string; // recent proactive usage warnings, for duplicate suppression (#132)
+  usageLatest: string; // latest supported usage/rate-limit telemetry for /limit
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---
