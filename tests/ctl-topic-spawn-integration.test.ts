@@ -1091,6 +1091,7 @@ test('increment 4: re-spawn into a VANISHED dir restarts the /new flow (not stuc
   updateQueue.push([respawnTap(330, 130)]);
   await waitFor(() => topicsStore(cfgDir).some((t) => t.threadId === 130 && t.status === 'awaiting-path'));
   expect(topicsStore(cfgDir).find((t) => t.threadId === 130)?.status).toBe('awaiting-path'); // NOT stuck
+  await waitFor(() => sends.some((s) => s.message_thread_id === 130 && String(s.text).includes('not an absolute existing directory')));
   expect(sends.some((s) => s.message_thread_id === 130 && String(s.text).includes('not an absolute existing directory'))).toBe(true);
   expect(spawnArgvLog(paths.spawnLog)).toEqual([]); // never spawned into a gone dir
 
