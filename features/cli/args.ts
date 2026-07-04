@@ -44,6 +44,7 @@ export type ParseResult =
   | { action: 'version' }
   | { action: 'lsEmojiHelpers' }
   | { action: 'detectModel' }
+  | { action: 'detectAgent' }
   | { action: 'formatHelp' }
   | { action: 'error'; message: string }
   | {
@@ -57,6 +58,14 @@ export type ParseResult =
       // Explicit message tag (`--tag`). Rendered as a wordmark pill (custom-emoji
       // cells + readable word): `✳️ [window] 🔵 ANSWER`. Composes with `--title`.
       tag?: string;
+      // Explicit subagent/sender label (`--agent <name>`). Appears as its own
+      // `[agent]` bracket right after `[window]`: `✳️ [window] [agent] <title>`.
+      // Wins over the entrypoint's env-based auto-detection (see
+      // `features/agent-detect/detect.ts`) — an orchestrator dispatching many
+      // subagents should pass a descriptive name here (e.g. `--agent
+      // hyperide-fixer`) since auto-detection can only say "some subagent",
+      // never which one.
+      agent?: string;
       // code-as-pdf: also attach the raw original file alongside the rendered
       // PDF (`--with-original`). Default is PDF-only for code/config files.
       withOriginal?: boolean;
@@ -144,7 +153,7 @@ export function resolveExistingFile(token: string, cwd: string, home: string): s
  *
  * Precedence (the reconciliation point for "unknown dashed → error"):
  *   1. -h/--help and -v/--version win anywhere, before everything else.
- *   2. Info-only flags --ls-emoji-helpers / --detect-model win next.
+ *   2. Info-only flags --ls-emoji-helpers / --detect-model / --detect-agent win next.
  *   3. Real flags are matched: --format (with value validation), --photo,
  *      --file (each consuming a path value).
  *   4. ONLY a dashed token that matched none of the above is "unknown" → error.
@@ -197,6 +206,9 @@ export function parseArgs(
     if (a === '--detect-model') return { action: 'detectModel' };
   }
   for (const a of args) {
+    if (a === '--detect-agent') return { action: 'detectAgent' };
+  }
+  for (const a of args) {
     if (a === '--format-help') return { action: 'formatHelp' };
   }
 
@@ -205,6 +217,7 @@ export function parseArgs(
   let format: Format = 'plain';
   let title: string | undefined;
   let tag: string | undefined;
+  let agent: string | undefined;
   // Left undefined when the flag is absent so a no-flag parse result stays
   // byte-identical to before (the test suite asserts the send object with
   // toEqual and omits unset optional fields — same convention as title/tag).
@@ -282,6 +295,28 @@ export function parseArgs(
       // `tag === 'answer'` answer-gate below (and the value handed to send)
       // would carry the padding and the gate would miss a padded `answer`.
       tag = nextArg.trim();
+      i += 2;
+      continue;
+    }
+    // Explicit subagent/sender label: `--agent <name>`. Same "require a value,
+    // a `--`-prefixed next token is a missing value" contract as --title/--tag
+    // (a single-dash token like `-x` IS accepted as a literal value, same
+    // parity as those flags) — so `--agent --tag X` errors rather than
+    // swallowing `--tag` as the label. No content restriction (unlike --tag's
+    // lowercase-english set): the label is a free-form identifier an
+    // orchestrator picks per dispatch — it reaches Telegram HTML-escaped via
+    // styleWindowName (features/prefix-style/style.ts), same as `[window]`. A
+    // whitespace-only value (`--agent "   "`) is REJECTED the same as a
+    // missing one (review finding, tg#6254) — trimming it silently to '' would
+    // otherwise fall through to env/auto-detection below, breaking the
+    // documented "explicit flag always wins" invariant for what looks like an
+    // explicit choice.
+    if (arg === '--agent') {
+      const nextArg = args[i + 1];
+      if (!nextArg || nextArg.startsWith('--') || !nextArg.trim()) {
+        return { action: 'error', message: '--agent requires a value' };
+      }
+      agent = nextArg.trim();
       i += 2;
       continue;
     }
@@ -556,7 +591,7 @@ export function parseArgs(
   // A bare `--title`/`--tag`/`--table`/`--reply-to` still sends (a header-only
   // or table or reply message), so none of those is an empty invocation. The
   // `--table` body arrives on stdin, read by the entrypoint after parsing.
-  if (items.length === 0 && !caption && !title && !tag && !table && replyTo === undefined) {
+  if (items.length === 0 && !caption && !title && !tag && !agent && !table && replyTo === undefined) {
     return { action: 'help' };
   }
   return {
@@ -566,6 +601,7 @@ export function parseArgs(
     format,
     title,
     tag,
+    agent,
     withOriginal,
     noPdf,
     pdfDevice,

@@ -39,6 +39,12 @@ I/O, fetch, signals, `bun:ffi`):
   to a native **Rich Message** — `sendRichMessage` — when the body contains a rich-only tag
   like `<table>`/`<h1>`/`<ul>`/`<hr>`/`<details>`/`<tg-math>`, otherwise normal `sendMessage`;
   see "Rich messages" below), `--tag`/`--title` (header badge; compose with rich),
+  `--agent <label>` (subagent/sender identification — renders `[label]` right after
+  `[window]`; explicit flag wins over `TG_AGENT` env, which wins over auto-detection —
+  a Claude Code Task-tool subagent auto-labels as the generic `subagent` via
+  `CLAUDE_CODE_CHILD_SESSION`, no equivalent signal exists yet for Codex CLI/opencode;
+  `--detect-agent` prints what the current shell would auto-detect; NOT the same flag
+  as `tg-ctl`'s own `--agent` — see `features/agent-detect/detect.ts`),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
   on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
   `--topic <id>` (post INTO a forum topic — stamps `message_thread_id` on EVERY outbound
@@ -72,6 +78,10 @@ tests can pass fakes.
 
 ### Existing Features
 
+- `features/agent-detect/` — pure `detectAgentLabel(env)`: the auto-detection half of
+  `--agent`/`[agent]` subagent identification (tg#6254). Env-injected like `detectAiModel`
+  in the `tg` entrypoint. Investigated once (2026-07-04) against every harness on the dev
+  machine — see the module's doc comment for what IS/ISN'T auto-detectable per harness.
 - `features/auto-attach/` — path detection → attach files, R1-R4 text rules, line-spec quotes,
   worktree-aware + recursive path resolution, transmitter with Telegram message/caption limits.
 - `features/autolink-tasks/` — detects Linear ticket codes in messages, resolves titles via the
@@ -100,8 +110,8 @@ tests can pass fakes.
 - `features/render/` — pure outbound-render helpers used by `tg`: `html.ts` (escape, tag detection,
   parse-mode, emoji-entity → `<tg-emoji>`), `rich.ts` (Rich Message detection + limit validation —
   `isRichHtml` flags rich-only tags so a body routes to `sendRichMessage`, `validateRichHtml`
-  pre-flights the documented limits), `prefix.ts` (the `✳️ [window]` header + tag/title
-  badge), `tag.ts` (the lowercase-english tag set — answer/decision/problem/report — validated
+  pre-flights the documented limits), `prefix.ts` (the `✳️ [window]` header + optional
+  `[agent]` bracket + tag/title badge), `tag.ts` (the lowercase-english tag set — answer/decision/problem/report — validated
   at parse time via `validateTag`), `table.ts`
   (`--table`: delimited STDIN rows → an aligned, box-drawn, HTML-escaped monospace `<pre>` table —
   alignment is computed on raw cells so escaping never skews columns), and `format-help.ts`

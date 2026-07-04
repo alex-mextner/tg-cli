@@ -103,6 +103,23 @@ badge shows as \`<color>▫️▫️\` — ONE colored dot identifies the tag
 The tag word is not in the badge (any text after the dots is your \`--title\`/body).
 In-app, premium clients still see the full wordmark pill.
 
+## Subagent identification (\`--agent <label>\`) — REQUIRED when dispatching subagents
+If you are an orchestrator dispatching subagents (Claude Code Task tool or equivalent),
+and a subagent may call \`tg\` itself, ALWAYS pass \`--agent <descriptive-name>\` from that
+subagent so the recipient can tell WHICH subagent sent a message, not just that some AI
+did: \`tg --agent hyperide-fixer "done, PR #123 open"\` → \`✳️ [window] [hyperide-fixer] …\`.
+
+Auto-detection exists ONLY for Claude Code, and ONLY as the generic label \`subagent\`
+(env: \`CLAUDE_CODE_CHILD_SESSION\`) — it proves a message came from SOME subagent, never
+which one (no per-agent id/description reaches the child process). Codex CLI and opencode
+have no equivalent signal today. So: **don't rely on auto-detection** for anything beyond
+"some subagent" — pass \`--agent\` explicitly whenever the identity matters. \`TG_AGENT\` env
+is the same-precedence override as \`TG_AI_MODEL\` (flag wins, then env, then auto-detect).
+Check what the current shell would auto-detect: \`tg --detect-agent\`.
+
+(Not the same flag as \`tg-ctl\`'s own \`--agent <name>\` — that one selects a closed
+harness kind for inbound telemetry, on a different binary.)
+
 ## Threaded replies (\`--reply-to <message_id>\`)
 To answer a SPECIFIC inbound message and have your reply thread under it in
 Telegram, pass its message_id: \`tg --reply-to <id> "answer"\` (sets
@@ -193,7 +210,12 @@ const SKILL_BLURB =
   '`--title "..."` (the body is never pulled up). ' +
   'Reply UNDER a specific inbound message with `--reply-to <message_id>` (the id ' +
   'shows up in the injected `[TG from … #<id>]` wrap); the answer tag ' +
-  'requires it. `--format html` auto-sends a native Rich Message (tables, ' +
+  'requires it. ' +
+  'If you are an ORCHESTRATOR dispatching subagents that may call `tg` themselves, ' +
+  'ALWAYS pass `--agent <descriptive-name>` from each subagent so the recipient can ' +
+  'tell WHICH subagent sent a message — auto-detection (Claude Code only) can only ' +
+  'say "some subagent", never which one. ' +
+  '`--format html` auto-sends a native Rich Message (tables, ' +
   'headings, lists, LaTeX formulas) when the body has a rich tag like `<table>`/' +
   '`<h1>`/`<ul>` — same flag, tg routes by content. `tg --table` is the plain ' +
   'monospace `<pre>` fallback grid. `tg help format` lists every supported ' +

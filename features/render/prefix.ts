@@ -10,11 +10,14 @@
 //
 // The prefix ALWAYS ends with a newline: the message body sits BELOW the header
 // line, never joined onto it. The header line is `✳️ [window]`, optionally
-// followed by an explicit tag badge and/or an explicit `--title`:
-//   ✳️ [window]                          (no tag, no title)
+// followed by an `[agent]` bracket (subagent identification, tg#6254), an
+// explicit tag badge, and/or an explicit `--title`. `[agent]` reuses the SAME
+// styling as `[window]` (styleWindowName) — just another bracketed label:
+//   ✳️ [window]                          (no agent, no tag, no title)
+//   ✳️ [window] [agent]                  (--agent / auto-detected subagent)
 //   ✳️ [window] <title>                  (--title only)
 //   ✳️ [window] 🔵 ANSWER               (--tag only, unicode fallback)
-//   ✳️ [window] <ANSWER pill> — <title> (--tag + --title, real pill ids)
+//   ✳️ [window] [agent] 🔵 ANSWER — <title>  (agent + tag + title, all compose)
 // The message body NEVER rides this line — only an explicit tag/title appear.
 import { EMBEDDABLE_EMOJI_MAP, extractBaseModel, hasRealPillIds, TAG_PILL_IDS } from '../branding/emoji';
 import { styleTaskTitle, styleWindowName, toBoldItalic } from '../prefix-style/style';
@@ -32,6 +35,11 @@ export function buildPrefix(opts: {
   aiEmoji: string;
   model: string;
   tmuxWindow: string;
+  // Explicit or auto-detected subagent/sender label (`--agent`, or the
+  // env-based fallback in `features/agent-detect/detect.ts`). Rendered as its
+  // own `[agent]` bracket right after `[window]`, styled identically
+  // (styleWindowName) — see the header-shape table above.
+  agentLabel?: string;
   // Explicit message tag (`--tag`). The CLI validates this to a lowercase-english
   // word (answer/decision/problem/report) before it reaches here; resolveTag
   // uppercases + resolves it. The renderer itself stays total — an off-list value
@@ -41,7 +49,7 @@ export function buildPrefix(opts: {
   // here; only this explicit title ever appears on the header line.
   title?: string;
 }): PrefixParts {
-  const { aiEmoji, model, tmuxWindow, tag, title } = opts;
+  const { aiEmoji, model, tmuxWindow, agentLabel, tag, title } = opts;
   let html = '';
   let plain = '';
   let forceHtml = false;
@@ -73,6 +81,20 @@ export function buildPrefix(opts: {
       plain += ' ';
     }
     const styled = styleWindowName(tmuxWindow);
+    html += `[${styled.html}]`;
+    plain += `[${styled.plain}]`;
+    if (styled.tag) forceHtml = true; // the <b> Cyrillic fallback forces HTML
+  }
+
+  // --- Optional agent label (`--agent` / auto-detected) right after [window]. ---
+  // Same bracket styling as the window name — it is a sender-identity label,
+  // not a differently-branded element, so it gets no special color/emoji.
+  if (agentLabel) {
+    if (plain.length > 0) {
+      html += ' ';
+      plain += ' ';
+    }
+    const styled = styleWindowName(agentLabel);
     html += `[${styled.html}]`;
     plain += `[${styled.plain}]`;
     if (styled.tag) forceHtml = true; // the <b> Cyrillic fallback forces HTML
