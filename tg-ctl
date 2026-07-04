@@ -53,6 +53,7 @@ import {
   resolveByLastMessage,
 } from "./features/tg-ctl/discover"
 import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
+import { buildGitStateBanner, buildPaneGitState, type PaneGitState } from "./features/tg-ctl/git-state"
 import {
   autoContinueDelayMs,
   buildLimitNotification,
@@ -693,6 +694,35 @@ function discoverTarget(ctx: Ctx): DiscoverResult {
     }
   }
   return result
+}
+
+// Git-state-check banner support (git-state.ts): a best-effort, timeout-guarded read of the
+// destination pane's cwd, run right before a silent auto-bind delivery. A stuck `git` (lock
+// contention, a huge repo, a hung network filesystem) must never block the daemon's single-
+// threaded poll loop, so both spawns are killed after GIT_STATE_TIMEOUT_MS; ANY failure — not a
+// git repo, the git binary missing, a timeout, a non-zero exit — degrades to null (no banner),
+// the same "never breaks delivery" contract every other best-effort read in this file follows.
+const GIT_STATE_TIMEOUT_MS = 2000
+function gitStateForPath(cwd: string): PaneGitState | null {
+  try {
+    const branchProc = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: GIT_STATE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    })
+    if (branchProc.exitCode !== 0) return null // not a git repo, or git errored — undeterminable
+    const statusProc = Bun.spawnSync(["git", "-C", cwd, "status", "--porcelain"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: GIT_STATE_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    })
+    if (statusProc.exitCode !== 0) return null
+    return buildPaneGitState(branchProc.stdout.toString(), statusProc.stdout.toString())
+  } catch {
+    return null // git binary missing — never break the poll loop
+  }
 }
 
 // All tmux panes that host an agent, as /agent selection candidates (item 1).
@@ -3125,6 +3155,21 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return resolveByLastMessage(result, lastMessagePaneId())
   }
 
+  // Prepend the git-state-check banner (git-state.ts) to `text` when `control.git_state_banner`
+  // is on (default) AND the destination pane's cwd is mid-flight — uncommitted changes or a
+  // non-main/master branch. Scoped to the SILENT auto-bind deliveries only: a fresh, non-reply
+  // message that lands in the discovered pane with no human/reply anchor choosing it (plain
+  // inject-text, a photo/document notice, a standalone voice transcript). Deliberately NOT applied
+  // to reply-route (anchored to a specific prior message — on-topic by construction), topic-route
+  // (a per-topic pane, a different targeting model entirely), a /new spawn (a brand-new pane has no
+  // prior work to protect), a picker tap (the human explicitly chose that pane), or a message
+  // deferred behind an open question (flushed through a separate code path, out of scope here).
+  const withGitStateBanner = (panePath: string, text: string): string => {
+    if (!ctx.cfg.gitStateBanner) return text
+    const banner = buildGitStateBanner(gitStateForPath(panePath))
+    return banner ? `${banner}\n${text}` : text
+  }
+
   // Resolve a DiscoverResult's ambiguous `TargetPane[]` to the picker's
   // `AgentCandidate[]` (window names + cwd → distinct labels). The TargetPane
   // shape carries no window name, so re-derive over a fresh listAgentCandidates()
@@ -3168,8 +3213,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // to route through a tap, so it falls back to the picker WITHOUT a pending route
   // (select-only) — the buttons still tell the human which agents are live, not a
   // text dump.
+  // `buildPlan` receives the resolved TargetPane (not a bare paneId): the git-state-check banner
+  // (git-state.ts) needs the pane's `panePath` (cwd) to check, and that path only exists on the
+  // TargetPane `found` resolves to HERE — never re-`discover()`/re-`snapshot()` inside a caller to
+  // look it up by paneId alone, which would race against (and could disagree with) the pane this
+  // function actually delivers into.
   const injectViaTarget = async (
-    buildPlan: (paneId: string) => InjectStep[],
+    buildPlan: (target: TargetPane) => InjectStep[],
     deferText?: string,
     autoBind = false,
     sourceMessageId: number | null = null,
@@ -3206,7 +3256,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       markDeferredForAck(enqueueDeferred(paneId, deferText, sourceMessageId))
       return true
     }
-    const result = await executeInjectSteps(buildPlan(paneId))
+    const result = await executeInjectSteps(buildPlan(found.target))
     if (!result.ok) {
       log(`inject aborted: ${result.error}`)
       await sendMessage(ctx, result.error)
@@ -4705,7 +4755,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // dir error. An empty / non-slash answer (the stepUpdates gate only emits slash text, but be
       // defensive) also re-asks.
       if (path.startsWith("/") && isLikelySlashCommand(path)) {
-        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, path), path, true, action.messageId)
+        // A harness control-command passthrough (/compact, /clear), not new content — no
+        // git-state banner (see withGitStateBanner's scope note).
+        return injectViaTarget((target) => buildTextInjectPlan(target.pane.paneId, path), path, true, action.messageId)
       }
       await sendMessage(ctx, `\`${path || "(empty)"}\` is not an absolute path to an existing directory — send a full path like /Users/you/project.`)
       return false
@@ -4904,8 +4956,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const noun = action.mediaKind === "photo" ? "photo" : "file"
     const msg = `sent ${noun}: ${dest}` + (action.caption ? `\n${action.caption}` : "")
     const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, msg, action.messageId)
-    // A non-reply photo/file → auto-bind to the last-active agent like a text msg.
-    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped, true, action.messageId)
+    // A non-reply photo/file → auto-bind to the last-active agent like a text msg, with the
+    // git-state-check banner (withGitStateBanner) prepended when that pane is mid-flight.
+    return injectViaTarget(
+      (target) => buildTextInjectPlan(target.pane.paneId, withGitStateBanner(target.pane.panePath, wrapped)),
+      wrapped,
+      true,
+      action.messageId,
+    )
   }
 
   // Voice note → text (inbound STT). Unconfigured? Walk the user through setup
@@ -4989,8 +5047,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       })
     }
     const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, quoted, action.messageId)
-    // A non-reply voice note → auto-bind to the last-active agent like a text msg.
-    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped, true, action.messageId)
+    // A non-reply voice note → auto-bind to the last-active agent like a text msg, with the
+    // git-state-check banner (withGitStateBanner) prepended when that pane is mid-flight.
+    return injectViaTarget(
+      (target) => buildTextInjectPlan(target.pane.paneId, withGitStateBanner(target.pane.panePath, wrapped)),
+      wrapped,
+      true,
+      action.messageId,
+    )
   }
 
   // Best-effort delivery receipt (spec §10): 👀 on the source message. A
@@ -5424,12 +5488,21 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "agent-callback":
         return handleAgentCallback(action)
       case "inject-text":
-        // A plain non-reply message → opt into the no-reply auto-bind (fix B).
-        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text), action.text, true, action.messageId)
+        // A plain non-reply message → opt into the no-reply auto-bind (fix B). This is the exact
+        // HYP-915 shape (a fresh, unrelated message silently landing in an occupied pane), so the
+        // git-state-check banner (withGitStateBanner) is prepended here when that pane is
+        // mid-flight.
+        return injectViaTarget(
+          (target) => buildTextInjectPlan(target.pane.paneId, withGitStateBanner(target.pane.panePath, action.text)),
+          action.text,
+          true,
+          action.messageId,
+        )
       case "reply-route":
         return handleReplyRoute(action)
       case "inject-key":
-        return injectViaTarget((paneId) => buildKeyInjectPlan(paneId, action.key))
+        // A control verb (Escape/`/stop`) — no text to bank a banner into.
+        return injectViaTarget((target) => buildKeyInjectPlan(target.pane.paneId, action.key))
       case "kill-agent": {
         // /kill sends SIGINT — a DESTRUCTIVE verb. It must NOT auto-bind to a
         // guessed agent (killing the wrong one is unrecoverable); on an ambiguous
