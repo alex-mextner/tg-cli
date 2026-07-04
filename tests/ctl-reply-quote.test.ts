@@ -75,6 +75,7 @@ test('reply with prose → reply-route with the quote anchor + ack', () => {
     replyToMessageId: 0,
     injectText: '↩ «[2026-06-12 14:30] report text…»\n[TG from Alex] please fix — reply via tg',
     from: 'Alex',
+    messageId: 9,
   });
   expect(r.actions[1]).toEqual({ kind: 'ack', messageId: 9 });
 });

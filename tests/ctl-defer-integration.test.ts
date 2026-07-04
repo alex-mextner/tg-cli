@@ -35,6 +35,10 @@ function fakeTmux(cwd: string, injectLog: string): string {
 sub="$1"; shift
 case "$sub" in
   list-panes)
+    # Test hook: when the sentinel exists the pane is "gone" — verify-pane then
+    # fails, exercising the paste-failure path (tg#5855: outcome.failed clears
+    # the ✍️ mark and warns the user instead of silently dropping).
+    [ -f '${cwd}/pane-gone' ] && exit 0
     # Fields passed as %s args — the pane id is literally '%1', which must NOT
     # reach the printf FORMAT string (printf would read it as a directive).
     printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '${PANE_ID}' '${PANE_PID}' 'claude' 'main' '${cwd}'
@@ -288,6 +292,22 @@ test('inbound text deferred while a question is open, flushed (and not lost) aft
   expect(landed).toHaveLength(2);
   expect(landed[0]).toContain('first thing');
   expect(landed[1]).toContain('second thing');
+
+  // 5) Each flushed message flips its ✍️ "queued" mark to the normal 👀
+  //    delivery receipt (tg#5855 — the mark used to stay ✍️ forever).
+  {
+    const eyes = (id: number): boolean =>
+      reactions.some(
+        (r) =>
+          r.message_id === id &&
+          Array.isArray(r.reaction) &&
+          (r.reaction as Array<{ emoji?: string }>)[0]?.emoji === '👀',
+      );
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && !(eyes(11) && eyes(12))) await Bun.sleep(50);
+    expect(eyes(11)).toBe(true);
+    expect(eyes(12)).toBe(true);
+  }
 
   daemon.kill('SIGTERM');
   await daemon.exited;
@@ -764,6 +784,16 @@ test('a question removed WITHOUT an answer (hook socket closes) does not wedge l
   // The new message landed; the abandoned 'deferred one' was dropped (not wedged).
   expect(injected(cfgDir)).toContain('[TG from Alex tg#22] after expiry');
   expect(injected(cfgDir).some((l) => l.includes('deferred one'))).toBe(false);
+  // The dead-lettered message's ✍️ "queued" mark is CLEARED (empty reaction
+  // list): it will never reach the agent, and a surviving ✍️ would contradict
+  // the "resend them" notice (tg#5855).
+  {
+    const t0 = Date.now();
+    const cleared = (): boolean =>
+      reactions.some((r) => r.message_id === 21 && Array.isArray(r.reaction) && (r.reaction as unknown[]).length === 0);
+    while (Date.now() - t0 < 8000 && !cleared()) await Bun.sleep(50);
+    expect(cleared()).toBe(true);
+  }
   // It was DELIVERED (👀), not deferred (✍️).
   {
     const t0 = Date.now();
@@ -1341,6 +1371,346 @@ test('an UNSCOPED question abandoned by SOCKET CLOSE (process dies) dead-letters
   }
   expect(plainMessages.some((m) => m.includes('were NOT delivered'))).toBe(true);
   expect(injected(cfgDir)).toEqual([]); // 'die with me' never pasted into the dead prompt
+  // onUnscopedAbandon sweeps through the SAME onQuestionAbandoned path as the
+  // scoped dead-letter case, so message 71's ✍️ "queued" mark must be CLEARED
+  // here too — a surviving ✍️ would contradict the "were NOT delivered" notice
+  // above (review r3 #1: this path wasn't asserted, only inferred from sharing
+  // code with the scoped test).
+  {
+    const t0 = Date.now();
+    const cleared = (): boolean =>
+      reactions.some((r) => r.message_id === 71 && Array.isArray(r.reaction) && (r.reaction as unknown[]).length === 0);
+    while (Date.now() - t0 < 8000 && !cleared()) await Bun.sleep(50);
+    expect(cleared()).toBe(true);
+  }
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 40_000);
+
+// --- tg#5855: answered UNSCOPED blocker must flush the backlog + flip ✍️ → 👀 ---
+//
+// Alex's report (tg#5855): an agent hits a permission blocker, tg marks his next
+// message with ✍️ ("queued"), he taps allow — and the reaction never changes to
+// 👀 and the message never reaches the agent. Root cause: the answer-question
+// handler flushed only `pending.req.paneId`, but a permission forwarded by a hook
+// that ran WITHOUT TMUX_PANE (the COMMON Claude Code case) is UNSCOPED — paneId
+// undefined — so its answer flushed NOTHING, while the same unscoped entry had
+// deferred inbound for EVERY pane. Fixed: an unscoped answer sweeps every pane
+// with a backlog through flushDeferred, and each flushed item flips its source
+// message's reaction to the normal 👀 delivery receipt.
+test('tg#5855: answering an UNSCOPED permission flushes the deferred backlog and flips its ✍️ to 👀', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  // A permission blocker whose hook subprocess had NO TMUX_PANE → unscoped entry.
+  const ask = startAsk(
+    cfgDir,
+    server.port,
+    {
+      requestId: 'p_5855',
+      agent: 'claude',
+      kind: 'permission',
+      title: 'Bash',
+      question: 'Allow Bash? ls',
+      permissionEvent: 'PreToolUse',
+      toolInput: { command: 'ls' },
+    },
+    { unscoped: true },
+  );
+  trackProc(reg, ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  // Inbound text while the permission blocks → deferred (✍️), never pasted into
+  // the open prompt.
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([
+    { update_id: 80, message: { message_id: 81, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'do this next' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+  expect(injected(cfgDir)).toEqual([]);
+  expect(reactions.at(-1)).toMatchObject({ message_id: 81, reaction: [{ type: 'emoji', emoji: '✍️' }] });
+
+  // The human answers (taps the first button) → the hook unblocks.
+  updateQueue.push([
+    { update_id: 81, callback_query: { id: 'cb5855', from: { id: 1, first_name: 'Alex' }, message: { message_id: 1, chat: { id: 1 }, date: nowSec }, data: server.cb() } },
+  ]);
+  const askOut = await new Response(ask.stdout).text();
+  await ask.exited;
+  expect(askOut.length).toBeGreaterThan(0); // the hook received a decision
+
+  // 1) DELIVERY (the critical half): the deferred message reaches the pane.
+  //    With the bug it stayed queued forever (no pane to flush).
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 10_000 && !injected(cfgDir).some((l) => l.includes('do this next'))) await Bun.sleep(100);
+  }
+  expect(injected(cfgDir).some((l) => l.includes('do this next'))).toBe(true);
+
+  // 2) RECEIPT: the source message's ✍️ flips to the normal 👀 once it lands.
+  {
+    const t0 = Date.now();
+    const gotEyes = (): boolean =>
+      reactions.some(
+        (r) =>
+          r.message_id === 81 &&
+          Array.isArray(r.reaction) &&
+          (r.reaction as Array<{ emoji?: string }>)[0]?.emoji === '👀',
+      );
+    while (Date.now() - t0 < 8000 && !gotEyes()) await Bun.sleep(50);
+    expect(gotEyes()).toBe(true);
+  }
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 40_000);
+
+// Review #3 hardening proof: a flush whose PASTE itself fails (pane gone between
+// the question being answered and the flush actually running — a real race, not
+// hypothetical). Before tg#5855 this path silently dropped the message with no
+// trace: no reaction change, no notice. Now outcome.failed must (a) CLEAR the ✍️
+// mark rather than leave it claiming "still queued", and (b) warn the user so
+// they know to resend — mirroring the abandon/dead-letter notices, but for a
+// paste failure specifically.
+test('a flush whose paste FAILS clears the ✍️ mark and warns the user (does not silently drop)', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const plainMessages: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits, plainMessages);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const ask = startAsk(cfgDir, server.port, {
+    requestId: 'q_paste_fail',
+    agent: 'claude',
+    kind: 'question',
+    question: 'Proceed?',
+    options: [{ label: 'Yes' }],
+  });
+  trackProc(reg, ask);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+
+  // Inbound defers behind the open question.
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([
+    { update_id: 90, message: { message_id: 91, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'will not land' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+  expect(injected(cfgDir)).toEqual([]);
+  expect(reactions.at(-1)).toMatchObject({ message_id: 91, reaction: [{ type: 'emoji', emoji: '✍️' }] });
+
+  // The pane vanishes (e.g. the agent's tmux window closed) BEFORE the answer
+  // triggers the flush — verify-pane will now fail every inject in the plan.
+  writeFileSync(join(cfgDir, 'pane-gone'), '1');
+
+  // The human answers → flushDeferred runs, drives the paste, and it fails.
+  updateQueue.push([
+    { update_id: 91, callback_query: { id: 'cbfail', from: { id: 1, first_name: 'Alex' }, message: { message_id: 1, chat: { id: 1 }, date: nowSec }, data: server.cb() } },
+  ]);
+  const askOut = await new Response(ask.stdout).text();
+  await ask.exited;
+  expect(askOut.length).toBeGreaterThan(0);
+
+  // Never pasted (the failure is real, not a timing fluke).
+  expect(injected(cfgDir)).toEqual([]);
+
+  // The ✍️ mark is CLEARED, not left claiming the message is still queued.
+  {
+    const t0 = Date.now();
+    const cleared = (): boolean =>
+      reactions.some((r) => r.message_id === 91 && Array.isArray(r.reaction) && (r.reaction as unknown[]).length === 0);
+    while (Date.now() - t0 < 8000 && !cleared()) await Bun.sleep(50);
+    expect(cleared()).toBe(true);
+  }
+
+  // The user is warned to resend — the loss is visible, not silent.
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 4000 && !plainMessages.some((m) => m.includes('could not be pasted'))) await Bun.sleep(50);
+    expect(plainMessages.some((m) => m.includes('could not be pasted'))).toBe(true);
+  }
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 40_000);
+
+// Review #2 hardening proof: TWO simultaneous UNSCOPED blockers. Answering ONE
+// must NOT flush the backlog — the other unscoped entry still defers every pane
+// (paneHasPendingQuestion's `!paneId → true` arm), and pasting now would hit the
+// second agent's still-open prompt. Only when the LAST unscoped blocker is
+// answered does the backlog flush (and the ✍️ flips to 👀).
+test('two unscoped blockers: answering one does NOT flush; answering both flushes', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const askPayload = (id: string) => ({
+    requestId: id,
+    agent: 'claude',
+    kind: 'permission',
+    title: 'Bash',
+    question: `Allow Bash? ${id}`,
+    permissionEvent: 'PreToolUse',
+    toolInput: { command: 'ls' },
+  });
+  const ask1 = startAsk(cfgDir, server.port, askPayload('p_multi_1'), { unscoped: true });
+  trackProc(reg, ask1);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+  const cb1 = server.cb();
+
+  const ask2 = startAsk(cfgDir, server.port, askPayload('p_multi_2'), { unscoped: true });
+  trackProc(reg, ask2);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === cb1) await Bun.sleep(50);
+    expect(server.cb()).not.toBe(cb1);
+  }
+  const cb2 = server.cb();
+
+  // Inbound defers behind the blockers (✍️).
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([
+    { update_id: 90, message: { message_id: 91, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'multi backlog' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+  expect(reactions.at(-1)).toMatchObject({ message_id: 91, reaction: [{ type: 'emoji', emoji: '✍️' }] });
+
+  // Answer blocker 1 (its card is message_id 1). The second unscoped blocker
+  // still defers EVERY pane → the sweep must NOT paste into the open prompt.
+  updateQueue.push([
+    { update_id: 91, callback_query: { id: 'cbm1', from: { id: 1, first_name: 'Alex' }, message: { message_id: 1, chat: { id: 1 }, date: nowSec }, data: cb1 } },
+  ]);
+  await new Response(ask1.stdout).text();
+  await ask1.exited;
+  // Give a (wrong) flush ample time to fire — it must not.
+  await Bun.sleep(2500);
+  expect(injected(cfgDir)).toEqual([]);
+
+  // Answer blocker 2 (card message_id 2) → now the backlog flushes and 👀 lands.
+  updateQueue.push([
+    { update_id: 92, callback_query: { id: 'cbm2', from: { id: 1, first_name: 'Alex' }, message: { message_id: 2, chat: { id: 1 }, date: nowSec }, data: cb2 } },
+  ]);
+  await new Response(ask2.stdout).text();
+  await ask2.exited;
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 10_000 && !injected(cfgDir).some((l) => l.includes('multi backlog'))) await Bun.sleep(100);
+  }
+  expect(injected(cfgDir).some((l) => l.includes('multi backlog'))).toBe(true);
+  {
+    const t0 = Date.now();
+    const gotEyes = (): boolean =>
+      reactions.some(
+        (r) =>
+          r.message_id === 91 &&
+          Array.isArray(r.reaction) &&
+          (r.reaction as Array<{ emoji?: string }>)[0]?.emoji === '👀',
+      );
+    while (Date.now() - t0 < 8000 && !gotEyes()) await Bun.sleep(50);
+    expect(gotEyes()).toBe(true);
+  }
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 40_000);
+
+// Review r2 #1: BOTH unscoped blockers answered in ONE getUpdates batch. The two
+// sweeps race: the first starts flushDeferred (800ms settle), the second's sweep
+// can hit the re-entrancy guard while the first still owns the pane. The rerun
+// flag must guarantee the backlog still flushes — before it, the second sweep
+// could no-op in the TOCTOU window and strand the queue forever.
+test('two unscoped blockers answered in the SAME batch still flush the backlog', async () => {
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  const edits: string[] = [];
+  const server = recordingServer(updateQueue, reactions, edits);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const askPayload = (id: string) => ({
+    requestId: id,
+    agent: 'claude',
+    kind: 'permission',
+    title: 'Bash',
+    question: `Allow Bash? ${id}`,
+    permissionEvent: 'PreToolUse',
+    toolInput: { command: 'ls' },
+  });
+  const ask1 = startAsk(cfgDir, server.port, askPayload('p_batch_1'), { unscoped: true });
+  trackProc(reg, ask1);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === '') await Bun.sleep(50);
+    expect(server.cb()).not.toBe('');
+  }
+  const cb1 = server.cb();
+  const ask2 = startAsk(cfgDir, server.port, askPayload('p_batch_2'), { unscoped: true });
+  trackProc(reg, ask2);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && server.cb() === cb1) await Bun.sleep(50);
+    expect(server.cb()).not.toBe(cb1);
+  }
+  const cb2 = server.cb();
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([
+    { update_id: 95, message: { message_id: 96, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'same batch backlog' } },
+  ]);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000 && reactions.length === 0) await Bun.sleep(50);
+  }
+  expect(reactions.at(-1)).toMatchObject({ message_id: 96, reaction: [{ type: 'emoji', emoji: '✍️' }] });
+
+  // BOTH answers arrive in one batch → the two sweeps race on flushingPanes.
+  updateQueue.push([
+    { update_id: 96, callback_query: { id: 'cbb1', from: { id: 1, first_name: 'Alex' }, message: { message_id: 1, chat: { id: 1 }, date: nowSec }, data: cb1 } },
+    { update_id: 97, callback_query: { id: 'cbb2', from: { id: 1, first_name: 'Alex' }, message: { message_id: 2, chat: { id: 1 }, date: nowSec }, data: cb2 } },
+  ]);
+  await new Response(ask1.stdout).text();
+  await ask1.exited;
+  await new Response(ask2.stdout).text();
+  await ask2.exited;
+
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 12_000 && !injected(cfgDir).some((l) => l.includes('same batch backlog'))) await Bun.sleep(100);
+  }
+  expect(injected(cfgDir).some((l) => l.includes('same batch backlog'))).toBe(true);
 
   daemon.kill('SIGTERM');
   await daemon.exited;
