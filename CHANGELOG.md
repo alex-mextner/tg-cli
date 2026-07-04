@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.29.0
+
+**Feature (#138): `--title` refuses a `tg#<id>` reference.**
+
+- `--title` is a one-line header that is never linkified downstream (unlike the
+  body/caption, which the existing `autolink-msgrefs` feature handles). A `tg#<id>`
+  typed there is dead text, so `parseArgs` now refuses it at parse time with a
+  message pointing the reference at the body instead — the same rule task-cli/
+  gh-ship enforce on a PR/ticket title.
+- Gated on the same `autolink-msgrefs` feature flag the body-detection call uses:
+  with the feature disabled, `--title` is exactly as permissive as the body.
+
 ## 1.28.1
 
 **Fix (tg#6006): Telegram message references now link and carry compact excerpts.**
