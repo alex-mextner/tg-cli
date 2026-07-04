@@ -98,9 +98,201 @@ test('review visual hook calls canonical review visual argv from the caller cwd'
   const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'hi' }, process.env, home);
   expect(v.blocked).toBe(false);
   const args = readFileSync(argsFile, 'utf8').trim().split('\n');
-  expect(args).toEqual(['visual', pngPath, '--json', '--strict']);
+  // The caption is forwarded as --intent (tg#6188): without it, an intent-gated visual
+  // check (e.g. review-cli's selection-highlight module) can never activate for a
+  // tg-sent photo — the caption was simply dropped on the floor before this fix.
+  // `--intent=<value>` is ONE argv token (not two) so a caption starting with `-`
+  // can never be misparsed by argparse as the next option (review found).
+  expect(args).toEqual(['visual', pngPath, '--json', '--strict', '--intent=hi']);
   const cwd = readFileSync(cwdFile, 'utf8').trim();
   expect(cwd).toBe(REPO);
+});
+
+test('caption is forwarded as --intent, including non-English text', () => {
+  const argsFile = join(home, 'review-args.txt');
+  const review = join(binDir, 'review');
+  writeFileSync(
+    review,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > '${argsFile}'\ncat <<'JSON'\n{"decision":"keep"}\nJSON\nexit 0\n`,
+  );
+  chmodSync(review, 0o755);
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'элемент выбран' }, process.env, home);
+  expect(v.blocked).toBe(false);
+  const args = readFileSync(argsFile, 'utf8').trim().split('\n');
+  expect(args).toEqual(['visual', pngPath, '--json', '--strict', '--intent=элемент выбран']);
+});
+
+test('caption is TRIMMED (not forwarded byte-for-byte) — only outer whitespace is stripped', () => {
+  const argsFile = join(home, 'review-args.txt');
+  const review = join(binDir, 'review');
+  writeFileSync(
+    review,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > '${argsFile}'\ncat <<'JSON'\n{"decision":"keep"}\nJSON\nexit 0\n`,
+  );
+  chmodSync(review, 0o755);
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: '  fix applied  ' }, process.env, home);
+  expect(v.blocked).toBe(false);
+  const args = readFileSync(argsFile, 'utf8').trim().split('\n');
+  expect(args).toEqual(['visual', pngPath, '--json', '--strict', '--intent=fix applied']);
+});
+
+test('embedded NUL byte in caption is stripped, rest of the text still forwarded', () => {
+  // A NUL byte in argv raises ValueError at subprocess.run call time on the Python
+  // side — the hook strips it from the caption BEFORE building argv specifically to
+  // avoid that crash. Prove the strip happens and the surrounding text survives.
+  const argsFile = join(home, 'review-args.txt');
+  const review = join(binDir, 'review');
+  writeFileSync(
+    review,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > '${argsFile}'\ncat <<'JSON'\n{"decision":"keep"}\nJSON\nexit 0\n`,
+  );
+  chmodSync(review, 0o755);
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks(
+    { imagePath: pngPath, caption: 'sel' + String.fromCharCode(0) + 'ected' },
+    process.env,
+    home,
+  );
+  expect(v.blocked).toBe(false);
+  const args = readFileSync(argsFile, 'utf8').trim().split('\n');
+  expect(args).toEqual(['visual', pngPath, '--json', '--strict', '--intent=selected']);
+});
+
+test('NUL byte in imagePath (not caption) still fails open, via the new ValueError catch', () => {
+  // image_path is NOT stripped (unlike caption) — this proves the exact residual path
+  // the widened `except (OSError, ValueError)` guards: subprocess.run raises ValueError
+  // for an embedded NUL anywhere in argv, and it must resolve to allow (fail-open),
+  // matching the OSError branch right next to it and the descriptor's on_error:"open".
+  installDescriptorTrusted();
+  const badImagePath = pngPath + String.fromCharCode(0) + 'x';
+  const v = runPreSendPhotoHooks({ imagePath: badImagePath, caption: 'hi' }, process.env, home);
+  expect(v.blocked).toBe(false);
+});
+
+test('caption with a lone UTF-16 surrogate drops --intent but review visual STILL RUNS', () => {
+  // A lone surrogate (half of a broken UTF-16 pair) raises UnicodeEncodeError when
+  // Python's subprocess.run tries to encode it into argv — a ValueError subclass, same
+  // as the NUL case. Unlike NUL, this ISN'T stripped by .replace("\x00",""); if it
+  // reached subprocess.run unchecked, the exception would be caught by the widened
+  // except (OSError, ValueError) around the WHOLE call — meaning `review visual` never
+  // runs at all for that photo, not just that --intent is dropped. That would let a
+  // crafted caption disable visual verification outright (review found this in an
+  // earlier draft). The fix pre-validates encodability and drops ONLY --intent,
+  // proven here by asserting `review visual` still executes (argv captured) with no
+  // --intent flag, rather than merely asserting `v.blocked === false`.
+  const argsFile = join(home, 'review-args.txt');
+  const review = join(binDir, 'review');
+  writeFileSync(
+    review,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > '${argsFile}'\ncat <<'JSON'\n{"decision":"keep"}\nJSON\nexit 0\n`,
+  );
+  chmodSync(review, 0o755);
+  installDescriptorTrusted();
+  const loneSurrogate = String.fromCharCode(0xd800);
+  const v = runPreSendPhotoHooks(
+    { imagePath: pngPath, caption: `element ${loneSurrogate} selected` },
+    process.env,
+    home,
+  );
+  expect(v.blocked).toBe(false);
+  const args = readFileSync(argsFile, 'utf8').trim().split('\n');
+  expect(args).toEqual(['visual', pngPath, '--json', '--strict']);
+});
+
+test('an oversized caption is truncated, not forwarded whole (argv-size defense)', () => {
+  // Telegram captions cap at ~1024 chars, but this hook can't rely on that invisible
+  // upstream limit (its own comment says so) — a caption large enough to blow past the
+  // OS's exec() argv-size limit would raise OSError "Argument list too long" at
+  // subprocess.run call time, caught by the widened except, disabling verification for
+  // that photo entirely (the same class of bug the NUL/surrogate fixes above close).
+  // This doesn't reach the OS limit (that would make the test itself slow/flaky) — it
+  // proves the TRUNCATION behavior at the _MAX_INTENT_CHARS boundary instead.
+  const argsFile = join(home, 'review-args.txt');
+  const review = join(binDir, 'review');
+  writeFileSync(
+    review,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > '${argsFile}'\ncat <<'JSON'\n{"decision":"keep"}\nJSON\nexit 0\n`,
+  );
+  chmodSync(review, 0o755);
+  installDescriptorTrusted();
+  const overLong = 'x'.repeat(5000);
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: overLong }, process.env, home);
+  expect(v.blocked).toBe(false);
+  const args = readFileSync(argsFile, 'utf8').trim().split('\n');
+  expect(args[0]).toBe('visual');
+  expect(args[3]).toBe('--strict');
+  const intentArg = args[4];
+  expect(intentArg.startsWith('--intent=')).toBe(true);
+  expect(intentArg.length - '--intent='.length).toBeLessThanOrEqual(4096);
+});
+
+test('caption that is ONLY NUL bytes strips down to empty — no --intent flag added', () => {
+  const argsFile = join(home, 'review-args.txt');
+  const review = join(binDir, 'review');
+  writeFileSync(
+    review,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > '${argsFile}'\ncat <<'JSON'\n{"decision":"keep"}\nJSON\nexit 0\n`,
+  );
+  chmodSync(review, 0o755);
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks(
+    { imagePath: pngPath, caption: String.fromCharCode(0, 0) },
+    process.env,
+    home,
+  );
+  expect(v.blocked).toBe(false);
+  const args = readFileSync(argsFile, 'utf8').trim().split('\n');
+  expect(args).toEqual(['visual', pngPath, '--json', '--strict']);
+});
+
+test('caption starting with a dash is forwarded as ONE token, never split into a bare option', () => {
+  const argsFile = join(home, 'review-args.txt');
+  const review = join(binDir, 'review');
+  writeFileSync(
+    review,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > '${argsFile}'\ncat <<'JSON'\n{"decision":"keep"}\nJSON\nexit 0\n`,
+  );
+  chmodSync(review, 0o755);
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: '--fix applied' }, process.env, home);
+  expect(v.blocked).toBe(false);
+  const args = readFileSync(argsFile, 'utf8').trim().split('\n');
+  expect(args).toEqual(['visual', pngPath, '--json', '--strict', '--intent=--fix applied']);
+});
+
+test('caller omits caption entirely → run-photo-hooks defaults it to "", no --intent flag added', () => {
+  // buildEvent() in run-photo-hooks.ts defaults a missing caption to '' before it ever
+  // reaches the Python hook (args.caption is always a string, never absent) — this
+  // proves that default still resolves to "no --intent" end-to-end.
+  const argsFile = join(home, 'review-args.txt');
+  const review = join(binDir, 'review');
+  writeFileSync(
+    review,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > '${argsFile}'\ncat <<'JSON'\n{"decision":"keep"}\nJSON\nexit 0\n`,
+  );
+  chmodSync(review, 0o755);
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath }, process.env, home);
+  expect(v.blocked).toBe(false);
+  const args = readFileSync(argsFile, 'utf8').trim().split('\n');
+  expect(args).toEqual(['visual', pngPath, '--json', '--strict']);
+});
+
+test('no caption (or blank caption) → no --intent flag added, argv unchanged', () => {
+  const argsFile = join(home, 'review-args.txt');
+  const review = join(binDir, 'review');
+  writeFileSync(
+    review,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > '${argsFile}'\ncat <<'JSON'\n{"decision":"keep"}\nJSON\nexit 0\n`,
+  );
+  chmodSync(review, 0o755);
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: '   ' }, process.env, home);
+  expect(v.blocked).toBe(false);
+  const args = readFileSync(argsFile, 'utf8').trim().split('\n');
+  expect(args).toEqual(['visual', pngPath, '--json', '--strict']);
 });
 
 test('review verdict "rollback" (unstyled) → BLOCKED with reason', () => {
