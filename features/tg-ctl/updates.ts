@@ -321,6 +321,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
                 replyToMessageId: m.reply_to_message.message_id,
                 injectText: buildReplyInject(m, name, opts),
                 from: name,
+                messageId: m.message_id,
               }
             : textAction(m.text, name, opts, m.message_id);
       }
@@ -380,17 +381,17 @@ function textAction(text: string, name: string, opts: StepOpts, messageId: numbe
     }
     if (cmd === '/agent') {
       const p = parseAgentCommand(text);
-      return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name };
+      return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name, messageId };
     }
     if (cmd === '/new') {
       const p = parseNewCommand(text);
       return { kind: 'new-command', model: p.model, dir: p.dir, name: p.name, task: p.task, from: name };
     }
-    return { kind: 'inject-text', text };
+    return { kind: 'inject-text', text, messageId };
   }
   // A plain inbound message: surface its message_id in the wrap so the agent can
   // thread its answer with `tg --reply-to <id>` (threaded replies).
-  return { kind: 'inject-text', text: opts.wrap(name, text, messageId) };
+  return { kind: 'inject-text', text: opts.wrap(name, text, messageId), messageId };
 }
 
 // A harness/daemon slash-command (`/compact`, `/stop now`) vs a path-or-prose message that

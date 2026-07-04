@@ -2539,6 +2539,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       message: string
       candidates: AgentCandidate[]
       messageId: number | null
+      sourceMessageId: number | null
       timer: ReturnType<typeof setTimeout>
       prewrapped?: boolean
       // Bare `/agent` picker: there is no message yet. A tap must NOT inject an
@@ -2574,11 +2575,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     return false
   }
+  type DeferredInbound = {
+    text: string
+    sourceMessageId: number | null
+    delivered: boolean
+  }
   // Inbound queued behind an agent's outstanding question (defer-while-waiting):
-  // pane → already-wrapped texts, flushed when the question is answered. The
-  // flag tells the trailing `ack` to mark the source message with DEFER_REACTION
-  // (✍️ "noted, queued") instead of 👀.
-  const deferred = new DeferQueues()
+  // pane → already-wrapped texts plus their Telegram source message id, flushed
+  // when the question is answered. The flag tells the trailing `ack` to mark the
+  // source message with DEFER_REACTION (✍️ "noted, queued") instead of 👀.
+  const deferred = new DeferQueues<DeferredInbound>()
   // Panes with an in-flight flushDeferred. While a flush drains a pane, its queue
   // is momentarily empty (taken out per round), so deferred.has() alone would let
   // a live message inject AHEAD of items still being flushed. This flag keeps new
@@ -2591,7 +2597,22 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // records the pane and the drain loop dead-letters the residual queue instead of
   // pasting it into the still-open prompt (codex P2 — concurrent-flush resurface).
   const abandonedDuringFlush = new Set<string>()
-  let lastWasDeferred = false
+  type QueuedAckReaction = {
+    messageId: number
+    emoji: string
+    shouldSend?: () => boolean
+  }
+  const queuedAckReactions: QueuedAckReaction[] = []
+  const queueAckReaction = (messageId: number | null, emoji: string, shouldSend?: () => boolean): void => {
+    if (messageId === null) return
+    queuedAckReactions.push({ messageId, emoji, shouldSend })
+  }
+  const takeAckReaction = (messageId: number): QueuedAckReaction | null => {
+    const index = queuedAckReactions.findIndex((reaction) => reaction.messageId === messageId)
+    if (index < 0) return null
+    const [reaction] = queuedAckReactions.splice(index, 1)
+    return reaction ?? null
+  }
   const paneHasPendingQuestion = (paneId: string): boolean => {
     for (const pb of pendingButtons.values()) {
       // tg#30: an UNSCOPED question — paneId undefined because the hook subprocess ran WITHOUT
@@ -2621,26 +2642,44 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // paneHasPendingQuestion while the prompt is open.
   const shouldDeferInbound = (paneId: string): boolean =>
     paneHasPendingQuestion(paneId) || flushingPanes.has(paneId)
-  // Enqueue only — the caller sets lastWasDeferred when this came from a MESSAGE
-  // action (which earns a ⏳ ack); a button-callback defer edits its prompt
-  // instead and must NOT leak the flag onto the next message's ack.
-  const enqueueDeferred = (paneId: string, wrappedText: string): void => {
-    deferred.enqueue(paneId, wrappedText)
+  // Enqueue only — the caller queues the source-message ack reaction when this
+  // came from a MESSAGE action (which earns a ⏳ ack); a button-callback defer
+  // edits its prompt instead and must NOT leak onto the next message's ack.
+  const enqueueDeferred = (
+    paneId: string,
+    wrappedText: string,
+    sourceMessageId: number | null,
+  ): DeferredInbound => {
+    const item = { text: wrappedText, sourceMessageId, delivered: false }
+    deferred.enqueue(paneId, item)
+    return item
   }
-  const injectDeferredOne = async (paneId: string, text: string): Promise<boolean> => {
+  const markDeferredForAck = (item: DeferredInbound): void => {
+    queueAckReaction(item.sourceMessageId, DEFER_REACTION, () => !item.delivered)
+  }
+  const injectDeferredOne = async (paneId: string, item: DeferredInbound): Promise<boolean> => {
     // Must NEVER throw: a throw here rejects driveFlush, which (a) loses the
     // already-taken batch and (b) becomes an unhandled rejection in the
     // fire-and-forget flushDeferred call. executeInjectSteps normally returns
     // {ok:false} on tmux errors, but a spawn/exception could still escape — treat
     // any throw as a failed paste (drop + log), exactly like {ok:false}.
     try {
-      const res = await executeInjectSteps(buildTextInjectPlan(paneId, text))
+      const res = await executeInjectSteps(buildTextInjectPlan(paneId, item.text))
       if (!res.ok) log(`deferred flush into ${paneId} failed: ${res.error}`)
-      return res.ok
+      if (!res.ok) return false
     } catch (err) {
       log(`deferred flush into ${paneId} threw: ${err}`)
       return false
     }
+    item.delivered = true
+    if (item.sourceMessageId !== null) {
+      try {
+        await setSeenReaction(item.sourceMessageId)
+      } catch (err) {
+        log(`deferred flush reaction for message ${item.sourceMessageId} failed: ${err}`)
+      }
+    }
+    return true
   }
   // Tell the user a pane's deferred backlog was dropped without reaching the agent
   // (its question was abandoned before an answer). Declared above flushDeferred so
@@ -2679,7 +2718,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // still queued. They are disjoint — take() emptied the pane entry at the start
     // of the round, so anything drop() returns was enqueued after it — so the sum
     // is the exact count of messages that never reached the agent.
-    const deadLetterAbandoned = (tail: readonly string[]): void => {
+    const deadLetterAbandoned = (tail: readonly DeferredInbound[]): void => {
       const dropped = deferred.drop(paneId)
       const count = tail.length + dropped.length
       // Always log the resolution (even a zero-count one) so daemon.log records
@@ -2714,7 +2753,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // `tail` is driveFlush's untouched slice (already removed from the queue). The
       // pending read and the redefer/drop that follows run in ONE synchronous tick
       // (no await between), so no inbound can interleave and be misrouted.
-      const resolveAbandonment = (tail: readonly string[]): void => {
+      const resolveAbandonment = (tail: readonly DeferredInbound[]): void => {
         if (paneHasPendingQuestion(paneId)) {
           deferred.redefer(paneId, [...tail])
           log(`deferred flush into ${paneId} paused — ${tail.length} item(s) re-queued (abandon raced a new question)`)
@@ -2736,7 +2775,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         const outcome = await driveFlush(
           queue,
           () => paneHasPendingQuestion(paneId),
-          (text) => injectDeferredOne(paneId, text),
+          (item) => injectDeferredOne(paneId, item),
           () => abandonedDuringFlush.has(paneId),
         )
         if (outcome.abandoned.length > 0 || abandonedDuringFlush.has(paneId)) {
@@ -2932,6 +2971,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     buildPlan: (paneId: string) => InjectStep[],
     deferText?: string,
     autoBind = false,
+    sourceMessageId: number | null = null,
   ): Promise<boolean> => {
     const found = autoBind ? discoverForInject() : discover()
     if (!found.ok) {
@@ -2940,7 +2980,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // postAgentPicker's selectOnly), so it never arms a pending route that would
       // inject nothing on tap.
       if (found.reason === "ambiguous" && deferText !== undefined && deferText.trim() !== "") {
-        return postRoutePicker(candidatesForPicker(found.candidates), deferText)
+        return postRoutePicker(candidatesForPicker(found.candidates), deferText, undefined, sourceMessageId)
       }
       if (found.reason === "ambiguous") {
         // No routable text (a /stop with several agents): show the live agents as
@@ -2962,8 +3002,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // backlog (⏳); control verbs (Escape, no deferText) always go through to
     // interrupt it.
     if (deferText !== undefined && shouldDeferInbound(paneId)) {
-      enqueueDeferred(paneId, deferText)
-      lastWasDeferred = true
+      markDeferredForAck(enqueueDeferred(paneId, deferText, sourceMessageId))
       return true
     }
     const result = await executeInjectSteps(buildPlan(paneId))
@@ -2981,11 +3020,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     paneId: string,
     from: string,
     msg: string,
-  ): Promise<{ ok: boolean; error?: string; deferred?: boolean }> => {
+    sourceMessageId: number | null,
+    deferReactionViaAck = false,
+  ): Promise<{ ok: boolean; error?: string; deferred?: boolean; deferredItem?: DeferredInbound }> => {
     const wrapped = wrapInbound(ctx.cfg.injectWrap, from, msg)
     if (shouldDeferInbound(paneId)) {
-      enqueueDeferred(paneId, wrapped)
-      return { ok: true, deferred: true }
+      const item = enqueueDeferred(paneId, wrapped, sourceMessageId)
+      if (deferReactionViaAck) markDeferredForAck(item)
+      return { ok: true, deferred: true, deferredItem: item }
     }
     const res = await executeInjectSteps(buildTextInjectPlan(paneId, wrapped))
     return res.ok ? { ok: true } : { ok: false, error: res.error }
@@ -3009,7 +3051,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // selection. `message` empty ⇒ a bare-`/agent` select-only picker (a tap
   // confirms the choice, no inject); non-empty ⇒ the route picker (a tap injects
   // the message). Returns false only when the picker send itself failed.
-  const postAgentPicker = async (subset: AgentCandidate[], message: string): Promise<boolean> => {
+  const postAgentPicker = async (
+    subset: AgentCandidate[],
+    message: string,
+    sourceMessageId: number | null,
+  ): Promise<boolean> => {
     const token = `a${++agentTokenSeq}`
     const payload = buildAgentSelectMessage(ctx.chatId, subset, token, message)
     const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
@@ -3020,7 +3066,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
-    pendingAgent.set(token, { message, candidates: subset, messageId, timer, selectOnly: message.trim() === "" })
+    pendingAgent.set(token, {
+      message,
+      candidates: subset,
+      messageId,
+      sourceMessageId,
+      timer,
+      selectOnly: message.trim() === "",
+    })
+    if (message.trim() !== "") queueAckReaction(sourceMessageId, DEFER_REACTION)
     return true
   }
 
@@ -3036,7 +3090,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await replyNoAgent()
       return false
     }
-    return postAgentPicker(subset, "")
+    return postAgentPicker(subset, "", null)
   }
 
   // Route picker for ALREADY-WRAPPED text (a tap injects it VERBATIM, prewrapped:
@@ -3048,6 +3102,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     subset: AgentCandidate[],
     prewrappedText: string,
     notice?: string,
+    sourceMessageId: number | null = null,
   ): Promise<boolean> => {
     if (subset.length === 0) {
       await replyNoAgent()
@@ -3061,7 +3116,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
-    pendingAgent.set(token, { message: prewrappedText, candidates: subset, messageId, timer, prewrapped: true })
+    pendingAgent.set(token, {
+      message: prewrappedText,
+      candidates: subset,
+      messageId,
+      sourceMessageId,
+      timer,
+      prewrapped: true,
+    })
+    queueAckReaction(sourceMessageId, DEFER_REACTION)
     return true
   }
 
@@ -3081,7 +3144,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // Bare `/agent`: show the tappable picker so the CTO can SELECT an agent
       // (the buttons he asked for — "где кнопки?"), with distinct labels.
       log(`agent-route: bare /agent → picker over ${candidates.length} candidates`)
-      return postAgentPicker(candidates, "")
+      return postAgentPicker(candidates, "", null)
     }
 
     if (action.selector) {
@@ -3095,19 +3158,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         if (m.confident) {
           const target = m.matches[0]
           log(`agent-route: selector="${action.selector}" → ${target.paneId}/${target.windowName} confident=true msg="${msgPreview}"`)
-          const res = await injectToPane(target.paneId, action.from, action.rest)
+          const res = await injectToPane(target.paneId, action.from, action.rest, action.messageId, true)
           if (!res.ok) {
             log(`agent-route: inject failed → ${target.paneId}: ${res.error}`)
             await sendMessage(ctx, res.error ?? "inject failed")
             return false
           }
-          if (res.deferred) lastWasDeferred = true
           return true
         }
         // Ambiguous: multiple matches — show picker over matched subset
         const names = m.matches.map((c) => c.windowName).join(", ")
         log(`agent-route: selector="${action.selector}" → ambiguous (${m.matches.length} matches: ${names}) → picker`)
-        return postAgentPicker(m.matches, action.rest)
+        return postAgentPicker(m.matches, action.rest, action.messageId)
       }
       // Named selector matched NOTHING — never silently fall back to a random agent.
       // Report the miss clearly so the user knows their intent was not routed.
@@ -3122,18 +3184,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (candidates.length === 1) {
       const target = candidates[0]
       log(`agent-route: no selector, single candidate → ${target.paneId}/${target.windowName} msg="${msgPreview}"`)
-      const res = await injectToPane(target.paneId, action.from, action.all)
+      const res = await injectToPane(target.paneId, action.from, action.all, action.messageId, true)
       if (!res.ok) {
         await sendMessage(ctx, res.error ?? "inject failed")
         return false
       }
-      if (res.deferred) lastWasDeferred = true
       await sendMessage(ctx, routedReply(labelFor(target, candidates), res.deferred))
       return true
     }
 
     log(`agent-route: no selector, ${candidates.length} candidates → picker msg="${msgPreview}"`)
-    return postAgentPicker(candidates, action.all)
+    return postAgentPicker(candidates, action.all, action.messageId)
   }
 
   const handleAgentCallback = async (action: Extract<Action, { kind: "agent-callback" }>): Promise<boolean> => {
@@ -3183,19 +3244,32 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return true
     }
     // A reply's pending text already carries its wrap/anchor → inject verbatim;
-    // a /agent message is raw → wrap it. Both defer behind an open question. A
-    // callback edits its own prompt, so it must NOT set lastWasDeferred.
-    let res: { ok: boolean; error?: string; deferred?: boolean }
+    // a /agent message is raw → wrap it. Both defer behind an open question. The
+    // callback has no trailing ack, so it updates the source reaction directly.
+    let res: { ok: boolean; error?: string; deferred?: boolean; deferredItem?: DeferredInbound }
     if (pending.prewrapped) {
       if (shouldDeferInbound(target.paneId)) {
-        enqueueDeferred(target.paneId, pending.message)
-        res = { ok: true, deferred: true }
+        const item = enqueueDeferred(target.paneId, pending.message, pending.sourceMessageId)
+        res = { ok: true, deferred: true, deferredItem: item }
       } else {
         const r = await executeInjectSteps(buildTextInjectPlan(target.paneId, pending.message))
         res = r.ok ? { ok: true } : { ok: false, error: r.error }
       }
     } else {
-      res = await injectToPane(target.paneId, action.from, pending.message)
+      res = await injectToPane(target.paneId, action.from, pending.message, pending.sourceMessageId)
+    }
+    if (res.deferred && pending.sourceMessageId !== null && !res.deferredItem?.delivered) {
+      try {
+        await setReaction(pending.sourceMessageId, DEFER_REACTION)
+      } catch (err) {
+        log(`deferred picker reaction for message ${pending.sourceMessageId} failed: ${err}`)
+      }
+    } else if (res.ok && pending.sourceMessageId !== null) {
+      try {
+        await setSeenReaction(pending.sourceMessageId)
+      } catch (err) {
+        log(`picker delivery reaction for message ${pending.sourceMessageId} failed: ${err}`)
+      }
     }
     await answerCallbackQuery(ctx, action.callbackQueryId, res.ok ? (res.deferred ? "queued" : "sent") : "failed")
     if (pending.messageId !== null) {
@@ -3216,8 +3290,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const recognized = recognizeRoute(routes, action.replyToMessageId)
     const injectVerbatim = async (paneId: string): Promise<boolean> => {
       if (shouldDeferInbound(paneId)) {
-        enqueueDeferred(paneId, action.injectText)
-        lastWasDeferred = true
+        markDeferredForAck(enqueueDeferred(paneId, action.injectText, action.messageId))
         return true
       }
       const res = await executeInjectSteps(buildTextInjectPlan(paneId, action.injectText))
@@ -3248,7 +3321,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return false
       }
       const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
-      pendingAgent.set(token, { message: action.injectText, candidates: sorted, messageId, timer, prewrapped: true })
+      pendingAgent.set(token, {
+        message: action.injectText,
+        candidates: sorted,
+        messageId,
+        sourceMessageId: action.messageId,
+        timer,
+        prewrapped: true,
+      })
+      queueAckReaction(action.messageId, DEFER_REACTION)
       return true
     }
 
@@ -3435,8 +3516,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // reuse in the narrow enqueue→flush window could still flush into a stranger's pane. This
       // is a property of the shared flush mechanism (flat 1:1 shares it); tightening it means
       // teaching the flush drain about per-route project identity, deferred to the spawn increment.
-      enqueueDeferred(binding.paneId, action.injectText)
-      lastWasDeferred = true
+      markDeferredForAck(enqueueDeferred(binding.paneId, action.injectText, action.messageId))
       return true
     }
     const res = await executeInjectSteps(buildTextInjectPlan(binding.paneId, action.injectText))
@@ -4406,7 +4486,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // dir error. An empty / non-slash answer (the stepUpdates gate only emits slash text, but be
       // defensive) also re-asks.
       if (path.startsWith("/") && isLikelySlashCommand(path)) {
-        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, path), path, true)
+        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, path), path, true, action.messageId)
       }
       await sendMessage(ctx, `\`${path || "(empty)"}\` is not an absolute path to an existing directory — send a full path like /Users/you/project.`)
       return false
@@ -4577,7 +4657,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const msg = `sent ${noun}: ${dest}` + (action.caption ? `\n${action.caption}` : "")
     const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, msg, action.messageId)
     // A non-reply photo/file → auto-bind to the last-active agent like a text msg.
-    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped, true)
+    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped, true, action.messageId)
   }
 
   // Voice note → text (inbound STT). Unconfigured? Walk the user through setup
@@ -4657,11 +4737,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         replyToMessageId: action.replyToMessageId,
         injectText,
         from: action.from,
+        messageId: action.messageId,
       })
     }
     const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, quoted, action.messageId)
     // A non-reply voice note → auto-bind to the last-active agent like a text msg.
-    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped, true)
+    return injectViaTarget((paneId) => buildTextInjectPlan(paneId, wrapped), wrapped, true, action.messageId)
   }
 
   // Best-effort delivery receipt (spec §10): 👀 on the source message. A
@@ -5011,7 +5092,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return handleAgentCallback(action)
       case "inject-text":
         // A plain non-reply message → opt into the no-reply auto-bind (fix B).
-        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text), action.text, true)
+        return injectViaTarget((paneId) => buildTextInjectPlan(paneId, action.text), action.text, true, action.messageId)
       case "reply-route":
         return handleReplyRoute(action)
       case "inject-key":
@@ -5082,13 +5163,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "new-model":
         return handleNewModel(action)
       case "ack":
-        if (lastWasDeferred) {
-          lastWasDeferred = false
-          await setReaction(action.messageId, DEFER_REACTION)
+      {
+        const queuedReaction = takeAckReaction(action.messageId)
+        if (queuedReaction) {
+          if (!queuedReaction.shouldSend || queuedReaction.shouldSend()) {
+            await setReaction(action.messageId, queuedReaction.emoji)
+          }
         } else if (lastActionOk) {
           await setSeenReaction(action.messageId)
         }
         return true
+      }
     }
   }
 

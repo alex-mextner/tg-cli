@@ -3,6 +3,13 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.29.1
+
+**Fix:** deferred `tg-ctl` messages now complete their Telegram reaction lifecycle.
+
+- Messages queued behind an agent question still get the `✍️` queued reaction first,
+  then flip to `👀` after the deferred text is successfully flushed into the agent pane.
+
 ## 1.29.0
 
 **Feature (#138): `--title` refuses a `tg#<id>` reference.**

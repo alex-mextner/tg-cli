@@ -288,6 +288,25 @@ test('inbound text deferred while a question is open, flushed (and not lost) aft
   expect(landed).toHaveLength(2);
   expect(landed[0]).toContain('first thing');
   expect(landed[1]).toContain('second thing');
+  {
+    const t0 = Date.now();
+    while (
+      Date.now() - t0 < 8000 &&
+      !(
+        reactions.some((r) => r.message_id === 11 && (r.reaction as Array<{ emoji?: string }>)[0]?.emoji === '👀') &&
+        reactions.some((r) => r.message_id === 12 && (r.reaction as Array<{ emoji?: string }>)[0]?.emoji === '👀')
+      )
+    ) {
+      await Bun.sleep(50);
+    }
+  }
+  const reactionEmojis = (messageId: number): string[] =>
+    reactions
+      .filter((r) => r.message_id === messageId)
+      .map((r) => (r.reaction as Array<{ emoji?: string }>)[0]?.emoji)
+      .filter((emoji): emoji is string => typeof emoji === 'string');
+  expect(reactionEmojis(11)).toEqual(['✍️', '👀']);
+  expect(reactionEmojis(12)).toEqual(['✍️', '👀']);
 
   daemon.kill('SIGTERM');
   await daemon.exited;

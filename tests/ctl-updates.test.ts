@@ -170,7 +170,7 @@ test('a plain text message forwards its message_id to the wrap (for tg --reply-t
     `[TG from ${name}${messageId !== undefined ? ` #${messageId}` : ''}] ${msg}`;
   const opts = { ...makeOpts(), wrap: wrapWithId };
   const r = stepUpdates([upd(4321, { text: 'do the thing' })], opts);
-  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #4321] do the thing' });
+  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #4321] do the thing', messageId: 4321 });
 });
 
 test('the default injectWrap template renders the inbound id as #<id>', () => {
@@ -183,7 +183,7 @@ test('the default injectWrap template renders the inbound id as #<id>', () => {
       .replace('{msg}', msg)
       .replace('{id}', messageId !== undefined ? `#${messageId}` : '');
   const r2 = stepUpdates([upd(77, { text: 'hi' })], { ...makeOpts(), wrap: realWrap });
-  expect(r2.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #77] hi' });
+  expect(r2.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex #77] hi', messageId: 77 });
   // r is just exercising the default path doesn't throw.
   expect(r.actions.length).toBeGreaterThan(0);
 });
@@ -193,7 +193,7 @@ test('the default injectWrap template renders the inbound id as #<id>', () => {
 test('sender matching chatId is allowed', () => {
   const r = stepUpdates([upd(1, { text: 'hi' })], makeOpts());
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex] hi' },
+    { kind: 'inject-text', text: '[TG from Alex] hi', messageId: 1 },
     { kind: 'ack', messageId: 1 },
   ]);
 });
@@ -209,7 +209,7 @@ test('extra sender in allowedSenders is allowed', () => {
   const opts = makeOpts({ cfg: { ...DEFAULT_CONTROL, allowedSenders: [666] } });
   const r = stepUpdates([upd(1, { text: 'hi', from: { id: 666, username: 'eve' } })], opts);
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from eve] hi' },
+    { kind: 'inject-text', text: '[TG from eve] hi', messageId: 1 },
     { kind: 'ack', messageId: 1 },
   ]);
 });
@@ -285,7 +285,7 @@ test('/status → status', () => {
 test('unknown /cmd passes through VERBATIM — full text, no wrap', () => {
   const r = stepUpdates([upd(1, { text: '/compact keep the notes' })], makeOpts());
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '/compact keep the notes' },
+    { kind: 'inject-text', text: '/compact keep the notes', messageId: 1 },
     { kind: 'ack', messageId: 1 },
   ]);
 });
@@ -295,17 +295,17 @@ test('unknown /cmd passes through VERBATIM — full text, no wrap', () => {
 test('plain text is wrapped with first_name', () => {
   const r = stepUpdates([upd(1, { text: 'do the thing' })], makeOpts());
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex] do the thing' },
+    { kind: 'inject-text', text: '[TG from Alex] do the thing', messageId: 1 },
     { kind: 'ack', messageId: 1 },
   ]);
 });
 
 test('name falls back to username, then "tg"', () => {
   const byUsername = stepUpdates([upd(1, { text: 'a', from: { id: CHAT_ID, username: 'ult' } })], makeOpts());
-  expect(byUsername.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from ult] a' });
+  expect(byUsername.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from ult] a', messageId: 1 });
 
   const anonymous = stepUpdates([upd(1, { text: 'b', from: { id: CHAT_ID } })], makeOpts());
-  expect(anonymous.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from tg] b' });
+  expect(anonymous.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from tg] b', messageId: 1 });
 });
 
 // --- photo inbound (spec §5.2: daemon-chosen filename, largest rendition) ---
@@ -478,11 +478,11 @@ test('batch: ordered actions, stale counted, intruder dropped, offset correct', 
   ];
   const r = stepUpdates(updates, makeOpts());
   expect(r.actions).toEqual([
-    { kind: 'inject-text', text: '[TG from Alex] hello' },
+    { kind: 'inject-text', text: '[TG from Alex] hello', messageId: 10 },
     { kind: 'ack', messageId: 10 },
     { kind: 'status' },
     { kind: 'ack', messageId: 11 },
-    { kind: 'inject-text', text: '[TG from Alex] world' },
+    { kind: 'inject-text', text: '[TG from Alex] world', messageId: 15 },
     { kind: 'ack', messageId: 15 },
   ]);
   expect(r.skippedStale).toBe(1);
