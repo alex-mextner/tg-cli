@@ -70,6 +70,7 @@ export function buildOutboundHistoryRecords(
   ts: number,
   pane: string,
   groupToken: string,
+  chatId?: number,
 ): HistoryRecord[] {
   const uniqueIds = [...new Set(outboundIds)];
   const ids: (number | null)[] = uniqueIds.length > 0 ? uniqueIds : [null];
@@ -85,6 +86,7 @@ export function buildOutboundHistoryRecords(
   return ids.map((message_id) => ({
     ts,
     message_id,
+    ...(chatId !== undefined ? { chat_id: chatId } : {}),
     direction: 'agent',
     from: 'agent',
     text,

@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.28.1
+
+**Fix (tg#6006): Telegram message references now link and carry compact excerpts.**
+
+- `tg#<id>` and the already-rendered `𝒕𝒈#<id>` form are both detected in outbound
+  `tg` messages. Supergroup/channel refs become `t.me/c/...` links; private-DM refs
+  stay visibly styled but unlinked.
+- When the referenced id exists in `tg replies` history, the outbound message adds a
+  collapsed reference block with only the start of the original message plus `…` on
+  truncation, rather than copying the whole referenced Telegram message. Excerpts use
+  the same tag-safe walk as linking and are scoped by `chat_id` on new history rows.
+
 ## 1.28.0
 
 **Feature (tg-cli#132): proactive harness usage warnings at 90%.**

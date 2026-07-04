@@ -47,6 +47,16 @@ test('parseHistory: accepts null message_id (outbound with no id)', () => {
   expect(out[0].message_id).toBeNull();
 });
 
+test('parseHistory: optional chat_id round-trips when present', () => {
+  const raw = JSON.stringify(rec({ chat_id: -1001234567890 }));
+  expect(parseHistory(raw)[0].chat_id).toBe(-1001234567890);
+});
+
+test('serializeHistoryRecord preserves chat_id for the parser', () => {
+  const r = rec({ chat_id: -1001234567890 });
+  expect(parseHistory(serializeHistoryRecord(r))).toEqual([r]);
+});
+
 test('parseHistory: rejects records with a bad direction', () => {
   const raw = JSON.stringify({ ts: 1, message_id: 1, direction: 'sideways', from: 'x', text: 'y', pane: '%1' });
   expect(parseHistory(raw)).toEqual([]);

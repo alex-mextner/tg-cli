@@ -56,6 +56,11 @@ test('buildOutboundHistoryRecords: a single outbound id → one record, NO group
   expect(recs[0].groupId).toBeUndefined(); // nothing to group a solo send with — token unused
 });
 
+test('buildOutboundHistoryRecords: optional chatId is stamped on every record', () => {
+  const recs = buildOutboundHistoryRecords([501, 502], 'deployed', 1700000000, '%1', GROUP_TOKEN, -1001234567890);
+  expect(recs.map((r) => r.chat_id)).toEqual([-1001234567890, -1001234567890]);
+});
+
 test('buildOutboundHistoryRecords: a >4096 split emits one record per chunk id, same text, SAME groupId', () => {
   const recs = buildOutboundHistoryRecords([201, 202, 203], 'long report', 1700000000, '%1', GROUP_TOKEN);
   expect(recs.map((r) => r.message_id)).toEqual([201, 202, 203]);

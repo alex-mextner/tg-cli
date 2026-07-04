@@ -15,6 +15,7 @@ export type Direction = 'user' | 'agent';
 export interface HistoryRecord {
   ts: number; // unix SECONDS (send/receive time) — matches routes.ts convention
   message_id: number | null; // Telegram message_id; null when unknown (some outbound paths)
+  chat_id?: number; // Telegram chat id; absent on legacy history rows
   direction: Direction; // 'user' = inbound from the CTO, 'agent' = outbound from the agent
   from: string; // display name ('Alex', 'agent', …)
   text: string; // the message body, verbatim (UNWRAPPED — no `[TG from …]` envelope)
@@ -70,6 +71,7 @@ function parseLine(line: string): HistoryRecord | null {
   return {
     ts: r.ts,
     message_id: r.message_id,
+    ...(typeof r.chat_id === 'number' ? { chat_id: r.chat_id } : {}),
     direction: r.direction,
     from: r.from,
     text: r.text,

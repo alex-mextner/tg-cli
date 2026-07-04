@@ -20,7 +20,15 @@ const opts = { chatId: ALLOWED, allowedSenders: [] as number[], pane: '%3' as st
 test('inboundHistoryRecords: one user record per text message, UNWRAPPED text + pane', () => {
   const recs = inboundHistoryRecords([msg({ text: 'do the thing' })], opts);
   expect(recs).toEqual([
-    { ts: 1700000000, message_id: 100, direction: 'user', from: 'Alex', text: 'do the thing', pane: '%3' },
+    {
+      ts: 1700000000,
+      message_id: 100,
+      chat_id: ALLOWED,
+      direction: 'user',
+      from: 'Alex',
+      text: 'do the thing',
+      pane: '%3',
+    },
   ]);
 });
 

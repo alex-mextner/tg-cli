@@ -31,7 +31,7 @@ import { detectRefsExpanded } from "./features/autolink-prs/detect"
 import { probeRefsInRepo, probeRepo, type GhRef } from "./features/autolink-prs/resolve"
 import { buildEntries, linkifyRefsCompound } from "./features/autolink-prs/render"
 import { detectMsgRefs } from "./features/autolink-msgrefs/detect"
-import { linkifyMsgRefs, msgRefUrl } from "./features/autolink-msgrefs/render"
+import { buildMsgRefEntries, detectLinkableMsgRefs, linkifyMsgRefs, msgRefUrl } from "./features/autolink-msgrefs/render"
 import {
   markHint,
   parseHintState,
@@ -48,7 +48,7 @@ import {
   serializeRoutes,
   withRoutesLock,
 } from "./features/tg-ctl/routes"
-import { appendRecordsToBlob } from "./features/replies/history"
+import { appendRecordsToBlob, parseHistory } from "./features/replies/history"
 import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/replies/outbound"
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
@@ -644,6 +644,8 @@ if (import.meta.main) {
 
   const BOT_TOKEN = env.TG_BOT_TOKEN
   const CHAT_ID = env.TG_CHAT_ID
+  const CHAT_ID_NUMBER = Number(CHAT_ID)
+  const currentChatId = Number.isFinite(CHAT_ID_NUMBER) ? CHAT_ID_NUMBER : undefined
 
   if (!BOT_TOKEN || !CHAT_ID) {
     console.error("Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ~/.config/tg-cli/.env")
@@ -944,9 +946,25 @@ if (import.meta.main) {
   // recognized as a message ref and never mis-resolved as issue/PR #3715. The
   // deep link only materializes for a supergroup chat; in a private DM the ref
   // is marked but unlinked (no public per-message URL exists there).
-  const msgRefIds =
+  const rawMsgRefIds =
     features["autolink-msgrefs"] !== false && caption ? detectMsgRefs(caption) : []
-  const hasMsgRefs = msgRefIds.length > 0
+  const buildMsgRefEntriesFor = (ids: number[]) => {
+    if (ids.length === 0) return []
+    const historyPath = ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).history
+    let historyRaw: string
+    try {
+      historyRaw = readFileSync(historyPath, "utf8")
+    } catch {
+      return []
+    }
+    return buildMsgRefEntries(
+      parseHistory(historyRaw),
+      ids,
+      (id) => msgRefUrl(currentChatId, id),
+      currentChatId,
+    )
+  }
+  const hasMsgRefs = rawMsgRefIds.length > 0
   const hasAutolink = hasTickets || hasRefs || hasMsgRefs
 
   // Record an outbound message_id → this pane so the daemon can route a REPLY to
@@ -1052,6 +1070,7 @@ if (import.meta.main) {
         Math.floor(Date.now() / 1000),
         TMUX_PANE,
         randomUUID(),
+        currentChatId,
       )
       // 0o600: the log is a conversation transcript — owner-only, like the daemon socket.
       writeFileSync(
@@ -1209,7 +1228,9 @@ if (import.meta.main) {
     // and a `tg#3715` is never even offered to the PR resolver. Deep link only
     // when the chat is a supergroup; otherwise the ref is marked but unlinked.
     let body = plan.textMessages[0].text
-    if (hasMsgRefs) body = linkifyMsgRefs(body, (id) => msgRefUrl(CHAT_ID, id))
+    const linkableMsgRefIds = hasMsgRefs ? detectLinkableMsgRefs(body) : []
+    const msgRefEntries = buildMsgRefEntriesFor(linkableMsgRefIds)
+    if (hasMsgRefs) body = linkifyMsgRefs(body, (id) => msgRefUrl(currentChatId, id))
     plan.textMessages[0] = {
       text: applyAutolink(body, autolinkTickets, prefix.present, {
         linkifyTickets: hasTickets
@@ -1217,7 +1238,7 @@ if (import.meta.main) {
               linkifyTicketsCompound(html, new Map(autolinkTickets.map((t) => [t.code, t])))
           : undefined,
         linkify: hasRefs ? (html: string): string => linkifyRefsCompound(html, autolinkRefs) : undefined,
-        issues,
+        issues: [...msgRefEntries, ...issues],
         prs,
         styleTitle: styleTaskTitle,
       }),

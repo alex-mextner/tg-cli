@@ -24,6 +24,9 @@ ON by default, toggled like any feature: `--no-feature autolink-msgrefs` or
 
 - A reference is `tg#` (case-insensitive on `tg`) immediately followed by a positive id:
   `tg#[1-9][0-9]*`. `tg#0` is not a thing — the leading digit must be `1-9`.
+- The already-rendered bold-italic form `𝒕𝒈#<id>` / `𝑻𝑮#<id>` is also accepted. This
+  matters in private DMs, where message refs render as styled-but-unlinked text and users
+  often copy that visible token back verbatim.
 - Boundaries: the char before `tg` and the char after the number must not be alphanumeric.
   `xtg#1`, `tg#1a` are NOT references; `(tg#10)`, `tg#10,`, `tg#10.` are.
 - Whitespace tokens containing `://` are skipped (a pasted URL with `tg#` in its path is not
@@ -42,6 +45,19 @@ ON by default, toggled like any feature: `--no-feature autolink-msgrefs` or
     the null case.
 - Same tag-safe walk as the sibling features: never rewrites inside `<a>…</a>` (Telegram
   rejects nested links), `<pre>`/`<code>`, or a token containing `://`.
+- When a mentioned message id exists in the local `tg replies` history, `buildMsgRefEntries`
+  contributes a bottom `<blockquote expandable>` entry. The label is the same link/styled
+  `tg#<id>` marker; the title is `from: head`, where `head` is a one-line collapsed excerpt
+  truncated to a short prefix with `…`. The outbound message never quotes the whole referenced
+  Telegram message.
+- Excerpt entries are keyed from the same tag-safe walk as linkification, not from raw text:
+  `tg#<id>` inside `<a>`, `<pre>`, `<code>`, or a URL token does not link and does not add an
+  excerpt block.
+- New history rows carry `chat_id`, and excerpt lookup filters by the current chat so the same
+  bot used in two chats cannot show another chat's message text for a colliding `message_id`.
+  Legacy rows without `chat_id` remain eligible for backward compatibility.
+- Missing/corrupt history is best-effort: link/styled body refs still render, but the excerpt
+  block entry is skipped.
 
 ## Ordering — runs BEFORE the #N PR pass
 
@@ -55,10 +71,16 @@ explicit and robust to any future loosening of the PR boundary rule.
 ## Tests (TDD, red-first)
 
 - detect: bare `tg#<id>`; case-insensitive prefix; dedup + first-appearance order;
-  punctuation boundaries; leading/trailing alnum rejection; `tg#0` rejection; bare `#N`
-  is NOT a msgref; URL tokens skipped; multiline; empty.
+  already-styled `𝒕𝒈#<id>`; punctuation boundaries; leading/trailing alnum rejection;
+  `tg#0` rejection; bare `#N` is NOT a msgref; URL tokens skipped; multiline; empty.
 - `msgRefUrl`: supergroup → `t.me/c` link; DM/basic-group/empty → null.
 - linkify: url → anchor; null url → styled bold-italic ref; tag-safety inside
   `<a>`/`<pre>`/`<code>`/URL tokens; no-ref body unchanged.
+- excerpt entries: compact one-line history excerpt, ellipsis on truncation, missing ids
+  skipped, duplicate ids deduped in mention order, code-point-safe emoji truncation, escaped
+  excerpt text, and current-chat filtering when `chat_id` is available.
+- entrypoint subprocess: real `tg` send against a fake Bot API reads
+  `tg-ctl.<bot>.history.jsonl` and sends the excerpt block for both `tg#<id>` and
+  `𝒕𝒈#<id>`; skipped tags do not create excerpt-only blocks.
 - coexistence: `detectRefs` ignores `tg#<id>`; the PR linkify never rewrites a `tg#<id>`
   even when that number is a verified PR, while a standalone `#N` still links.

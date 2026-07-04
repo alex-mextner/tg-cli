@@ -59,6 +59,7 @@ export function inboundHistoryRecords(updates: TgUpdate[], opts: InboundOpts): H
     out.push({
       ts: m.date,
       message_id: m.message_id,
+      chat_id: m.chat.id,
       direction: 'user',
       from,
       text: historyText(m),
