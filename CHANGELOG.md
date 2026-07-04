@@ -3,6 +3,30 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.30.1
+
+**Feature (tg#6254): subagent identification — `--agent <label>` + auto-detection.**
+
+- An orchestrator that fans work out to several subagents (Claude Code's Task tool)
+  loses the sender's identity once a subagent calls `tg` directly — the recipient could
+  see a message with no way to tell "the orchestrator" from "subagent #3" apart, only that
+  some AI sent it. `--agent <label>` renders its own `[label]` bracket right after
+  `[window]`, styled identically (Sans-Serif Bold, `<b>` Cyrillic fallback).
+- `TG_AGENT` env is the same-precedence fallback as `TG_AI_MODEL`: explicit `--agent` flag
+  wins, then `TG_AGENT`, then auto-detection.
+- Auto-detection (`features/agent-detect/detect.ts`): investigated against every harness on
+  the dev machine. Claude Code sets `CLAUDE_CODE_CHILD_SESSION=1` ONLY in a Task-tool
+  subagent's own process — the one reliable automatic "is this a subagent" signal found —
+  so `tg` auto-labels it the generic `subagent`. It cannot say WHICH subagent (no per-agent
+  id/description reaches the child env); an orchestrator wanting a specific name must still
+  pass `--agent` itself. No equivalent signal exists today for Codex CLI (0.142.4) or
+  opencode (1.17.10) — `--agent`/`TG_AGENT` is the only path there.
+- `--detect-agent` prints what the current shell would auto-detect (mirrors
+  `--detect-model`).
+- Not to be confused with `tg-ctl`'s own `--agent <name>` (a closed harness-kind selector
+  for `tg-ctl ask`/`harness-event` telemetry) — same word, different binary, different
+  parser, no collision.
+
 ## 1.30.0
 
 **Feature (HYP-891 follow-up): empty-editor watermark WARN heuristic in `pre-send-photo`.**

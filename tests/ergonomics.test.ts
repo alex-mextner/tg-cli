@@ -80,12 +80,15 @@ test('--bogus unknown flag → error (not sent as text)', () => {
 // --- Regression: every real flag main supports is still recognized, NOT
 // treated as an unknown-dashed error (the core reconciliation requirement). ---
 test("main's real flags are all recognized (no unknown-flag regression)", () => {
-  // --ls-emoji-helpers and --detect-model win anywhere as dedicated actions.
+  // --ls-emoji-helpers / --detect-model / --detect-agent win anywhere as dedicated actions.
   expect(parseArgs(['--ls-emoji-helpers'], dir, HOME)).toEqual({
     action: 'lsEmojiHelpers',
   });
   expect(parseArgs(['--detect-model'], dir, HOME)).toEqual({
     action: 'detectModel',
+  });
+  expect(parseArgs(['--detect-agent'], dir, HOME)).toEqual({
+    action: 'detectAgent',
   });
   // --format is matched and validated, not errored as unknown.
   expect(parseArgs(['--format', 'html', 'hi'], dir, HOME)).toEqual({
@@ -112,6 +115,14 @@ test("main's real flags are all recognized (no unknown-flag regression)", () => 
     items: [{ type: 'document', path: pdfAbs }],
     caption: '',
     format: 'plain',
+  });
+  // --agent is matched and consumes a value, same as --title/--tag.
+  expect(parseArgs(['--agent', 'sub-1', 'hi'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'hi',
+    format: 'plain',
+    agent: 'sub-1',
   });
 });
 

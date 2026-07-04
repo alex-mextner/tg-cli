@@ -53,6 +53,7 @@ import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/rep
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
+import { detectAgentLabel } from "./features/agent-detect/detect"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
@@ -102,8 +103,8 @@ export const USAGE = `Usage:
   tg voice setup                # configure inbound voice→text (local Whisper STT)
   tg --ls-emoji-helpers
 
-The global options (--format, --tag, --title, --reply-to, --topic, the feature toggles)
-apply to ANY of the above forms — see Options below.
+The global options (--format, --tag, --title, --agent, --reply-to, --topic, the feature
+toggles) apply to ANY of the above forms — see Options below.
 
 Help topics (\`tg help <topic>\`):
   format   what Telegram message formatting supports (HTML tags / entities)
@@ -131,6 +132,20 @@ Options:
                          decision  🟠 DECISION  a decision to confirm
                          problem   🔴 PROBLEM   a blocker / problem
                          report    🟢 REPORT    a status / result report
+  --agent <name>        label the sender: "✳️ [window] [name] <title>". An
+                       orchestrator dispatching several subagents should pass a
+                       descriptive name here so the recipient can tell WHICH
+                       subagent sent a message (not just that some subagent
+                       did). Auto-detected as a generic "subagent" when running
+                       as a Claude Code Task-tool subagent and no --agent is
+                       given (env: CLAUDE_CODE_CHILD_SESSION) — that signal
+                       can't identify WHICH subagent, only that it is one, so
+                       an explicit --agent is still the recommended path for
+                       fan-out dispatches. No equivalent auto-detection exists
+                       for Codex CLI / opencode today. Also: TG_AGENT env
+                       (same precedence as TG_AI_MODEL: explicit flag wins,
+                       then env, then auto-detection). Check what would be
+                       auto-detected in the current shell: --detect-agent.
   --reply-to <id>      thread the outbound message UNDER an inbound Telegram
                        message (sets reply_to_message_id). The id is the inbound
                        message's Telegram message_id — the tg-ctl daemon surfaces
@@ -616,6 +631,12 @@ if (import.meta.main) {
 
   const AI_EMOJI = detectAiEmoji()
 
+  // --- Subagent/sender label (`[agent]` bracket, tg#6254) ---
+  // `--agent` (parsed below, in `parsed.agent`) wins when given; otherwise
+  // fall back to env-based auto-detection. See features/agent-detect/detect.ts
+  // for what IS and ISN'T auto-detectable per harness today.
+  const AGENT_LABEL_AUTO = detectAgentLabel(env)
+
   // --- Emoji helpers listing ---
   const listEmojiHelpers = (): string => {
     const lines = [
@@ -645,6 +666,10 @@ if (import.meta.main) {
   }
   if (parsed.action === "detectModel") {
     console.log(`${MODEL || "(none)"}\t${AI_EMOJI || "(none)"}`)
+    process.exit(0)
+  }
+  if (parsed.action === "detectAgent") {
+    console.log(AGENT_LABEL_AUTO || "(none)")
     process.exit(0)
   }
 
@@ -687,7 +712,11 @@ if (import.meta.main) {
 
   const tmuxWindow = getTmuxWindow()
 
-  const { items, caption: rawCaption, format, title, tag, withOriginal, noPdf, pdfDevice, replyTo, topic, table } = parsed
+  const { items, caption: rawCaption, format, title, tag, agent, withOriginal, noPdf, pdfDevice, replyTo, topic, table } = parsed
+
+  // `--agent` wins over the env-based auto-detection computed above; an empty
+  // result from both means no `[agent]` bracket at all (unchanged default).
+  const AGENT_LABEL = agent || AGENT_LABEL_AUTO || undefined
 
   // Forum-topic thread id (docs/specs/tg-forum-topics.md §8): the explicit
   // `--topic <id>` flag wins; otherwise fall back to the TG_TOPIC env (merged
@@ -1128,7 +1157,7 @@ if (import.meta.main) {
   // substituting :helper: markers inside text we're about to remove. Line-spec
   // quotes are inserted AFTER this hook (anchored on the token) so the injected
   // <pre> can't flip the userHtml/escape decision below.
-  const prefix = buildPrefix({ aiEmoji: AI_EMOJI, model: MODEL, tmuxWindow, tag, title })
+  const prefix = buildPrefix({ aiEmoji: AI_EMOJI, model: MODEL, tmuxWindow, agentLabel: AGENT_LABEL, tag, title })
   const renderText = (stripped: string, fmt: Format): { text: string; format: Format } => {
     const parsedCaption = parseEmojiHelpers(stripped)
     // buildPrefix already rendered the prefix to finished html/plain (its emoji

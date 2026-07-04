@@ -340,6 +340,44 @@ See [docs/custom-emoji-system.md](docs/custom-emoji-system.md) for the full spec
 
 ---
 
+## Subagent identification (`--agent`)
+
+Agent branding (above) identifies which MODEL is talking. It cannot tell apart an
+orchestrator from the several subagents it fans work out to (Claude Code's Task tool
+and equivalents) — a recipient sees a message with no way to know WHICH subagent sent
+it, only that some AI did.
+
+```bash
+tg --agent hyperide-fixer "fixed the layout bug, PR #123 open"
+# → ✳️ [window] [hyperide-fixer]
+#   fixed the layout bug, PR #123 open
+```
+
+`--agent <label>` renders its own `[label]` bracket right after `[window]`, styled the
+same way (Sans-Serif Bold, `<b>` fallback for Cyrillic). `TG_AGENT` is the env
+equivalent — same precedence as `TG_AI_MODEL`: an explicit `--agent` flag wins, then
+`TG_AGENT`, then auto-detection.
+
+**Auto-detection today (investigated 2026-07-04): Claude Code only, and only
+generic.** A Claude Code Task-tool subagent's own process carries
+`CLAUDE_CODE_CHILD_SESSION=1` — present ONLY in a subagent, never in the top-level
+session — so `tg` auto-labels it `[subagent]` when no `--agent`/`TG_AGENT` is given.
+This flag can say "some subagent sent this," never WHICH one: no per-agent id, type, or
+task description reaches the child process env, and the shared `CLAUDE_CODE_SESSION_ID`
+is identical across every sibling subagent. **An orchestrator dispatching several
+subagents should pass a descriptive `--agent <name>` itself** — auto-detection is a
+floor, not a substitute. Codex CLI (checked: 0.142.4) and opencode (checked: 1.17.10)
+expose no equivalent child/parent signal today; `--agent` is the only path there. Check
+what the current shell would auto-detect: `tg --detect-agent`.
+
+Note: `tg-ctl`'s OWN `--agent <name>` (used by `tg-ctl ask --agent codex` / `tg-ctl
+harness-event`) is a DIFFERENT flag on a DIFFERENT binary — a closed harness-kind
+selector (`claude`/`codex`/`opencode`/`pi`/`aider`) for classifying inbound hook/telemetry
+payloads, not a free-form outbound sender label. The two never collide (separate argv
+parsers), but don't confuse them.
+
+---
+
 ## Screenshots
 
 <table align="center" width="100%">
