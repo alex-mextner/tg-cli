@@ -63,31 +63,6 @@ def block(message: str) -> int:
     return BLOCK_EXIT_CODE
 
 
-def looks_like_vscode_window(image_path: str) -> bool:
-    """Heuristic: a FULL VS Code WINDOW screenshot has a dark, UNIFORM vertical
-    activity bar on the far-left edge and is window-wide. Preview proofs must be
-    CROPPED to the iframe/pane — a full-window shot dilutes a broken/unstyled/
-    overlapping preview behind the styled editor chrome, so both the human eye and
-    `review visual` (which judges the whole image) miss it. We BLOCK these to force
-    a crop. Calibrated: full window left-strip ~[25,26,27]; cropped pane ~[243,237,231].
-    Best-effort: any error / no PIL -> treat as NOT a window (fail-open)."""
-    try:
-        from PIL import Image
-
-        im = Image.open(image_path).convert("RGB")
-        w, h = im.size
-        if w < 1000:  # a cropped preview pane is narrow; a real editor window is wide
-            return False
-        xs, ys = (4, 8, 12), tuple(int(h * f) for f in (0.15, 0.3, 0.5, 0.7, 0.85))
-        px = [im.getpixel((x, y)) for x in xs for y in ys]
-        means = [sum(p[i] for p in px) / len(px) for i in range(3)]
-        spread = max(max(p[i] for p in px) - min(p[i] for p in px) for i in range(3))
-        # dark (each channel < 60) AND flat (uniform strip = a chrome bar, not content)
-        return all(m < 60 for m in means) and spread < 40
-    except Exception:  # noqa: BLE001 - any failure must fail OPEN, never brick a send
-        return False
-
-
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -102,17 +77,23 @@ def main() -> int:
         warn("no image_path in event args — allowing")
         return allow()
 
-    # Enforce CROPPED preview proofs: a full VS Code window screenshot is blocked so a
-    # broken/unstyled/overlapping preview pane can't hide behind the styled editor chrome
-    # (the review visual gate below judges the WHOLE image and would pass it). This is the
-    # durable mechanism behind "always send cropped proofs" — a hook, not a verbal promise.
-    if looks_like_vscode_window(image_path):
-        return block(
-            "Full VS Code WINDOW screenshot detected (dark left activity bar). Crop the proof "
-            "to the PREVIEW PANE / iframe and resend — a full-window shot hides a broken or "
-            "unstyled preview behind the styled editor chrome (the visual gate and the eye both "
-            "miss it). Re-capture cropped, e.g. `iframeElement.screenshot({path})`."
-        )
+    # NOTE: this hook previously ran a `looks_like_vscode_window()` pixel heuristic
+    # that BLOCKED every full VS Code window screenshot (dark left activity-bar
+    # strip = block), forcing callers to crop to the preview pane/iframe. Removed
+    # 2026-07-03 (HYP-891) at Alex's explicit direction: his tg#6041 standard made
+    # full-window screenshots (Explorer/Inspector/Logs panels visible) the DEFAULT
+    # desired HyperIDE diagnostic proof format, and the heuristic — which only
+    # detected "is this a full window", not "is the preview inside it broken" —
+    # hard-blocked that default, legitimate case at least twice in one day.
+    #
+    # KNOWN TRADEOFF (accepted, not solved): the `review visual --strict` call
+    # below is the only remaining gate on a full-window shot, and it judges the
+    # WHOLE image — the same limitation the original heuristic's author cited as
+    # the reason a broken/unstyled preview pane could get visually diluted behind
+    # busy editor chrome. That risk is real and UNVERIFIED either way (no
+    # regression test proves `review visual` does or doesn't catch it on a full
+    # window). Alex explicitly weighed this and chose to accept it rather than
+    # keep gating the now-default proof format — see tg#6063/6064.
 
     review_bin = shutil.which("review")
     if not review_bin:
