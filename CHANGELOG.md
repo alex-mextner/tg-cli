@@ -3,6 +3,27 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.32.1
+
+**Fix: `tg-ctl start` no longer inherits a soon-to-be-deleted worktree cwd.**
+
+- Root cause for the false "Claude Code not in tmux" replies after deploying
+  1.32.0: the detached `tg-ctl run` daemon inherited the caller's current
+  directory. When deploy was run from a feature worktree and that worktree was
+  removed after merge, the live daemon kept a deleted cwd; later `tmux`/`ps`
+  discovery calls failed and the daemon reported no agent even though Claude was
+  still alive.
+- `tg-ctl start` now launches the detached daemon through the deployed
+  `~/.files/bin/tg-ctl` path when available and pins `PWD` to that stable bin
+  directory, so cleanup of the caller's worktree cannot break inbound routing.
+- Telegram question/permission cards now show their source (`agent`,
+  `subagent`, tmux window/pane/session, and cwd), and the answered card keeps
+  that context with the selected answer.
+- `/tasks` without an explicit agent now scopes to the replied-to or routed
+  project, not to the daemon's own stable cwd. Ambiguous multi-agent cases now
+  ask for an explicit `/tasks <agent>` instead of guessing the newest
+  registration.
+
 ## 1.32.0
 
 **Feature: timed-out Telegram questions stay answerable, and `/limit` reports latest agent quotas.**

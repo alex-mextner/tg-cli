@@ -25,6 +25,8 @@ export interface HookEnv {
   paneId?: string; // process.env.TMUX_PANE of the hook process
   cwd?: string; // hook process cwd (payload.cwd wins when present)
   sessionName?: string; // tmux session of the pane
+  windowName?: string; // tmux window name of the hook process
+  subagent?: string; // TG_AGENT / harness subagent signal when available
 }
 
 // djb2 — a short stable id so a repeated identical prompt reuses its callback key.
@@ -81,6 +83,8 @@ function build(
     paneId: env.paneId,
     cwd: cwd ?? env.cwd,
     sessionName: env.sessionName,
+    windowName: env.windowName,
+    subagent: env.subagent,
   };
 }
 
@@ -109,6 +113,8 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       paneId: typeof p.paneId === 'string' ? p.paneId : env.paneId,
       cwd: typeof p.cwd === 'string' ? p.cwd : env.cwd,
       sessionName: typeof p.sessionName === 'string' ? p.sessionName : env.sessionName,
+      windowName: typeof p.windowName === 'string' ? p.windowName : env.windowName,
+      subagent: typeof p.subagent === 'string' ? p.subagent : env.subagent,
     };
   }
 
@@ -150,6 +156,8 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       paneId: env.paneId,
       cwd: cwd ?? env.cwd,
       sessionName: env.sessionName,
+      windowName: env.windowName,
+      subagent: env.subagent,
     };
   }
 

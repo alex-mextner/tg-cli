@@ -6,7 +6,7 @@
 // loaded by the test run. (A real `launchctl load` would register a RunAtLoad agent into the
 // tester's session and actually start the daemon — exactly the side effect this avoids.)
 import { expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -41,6 +41,19 @@ function reapDaemon(cfg: string, botId: string): void {
 
 function run(args: string[], env: Record<string, string>, cwd?: string) {
   return Bun.spawnSync(['bun', TG_CTL, ...args], { cwd, env: { PATH: process.env.PATH ?? '', ...env } });
+}
+
+function processCwd(pid: number): string | null {
+  if (process.platform === 'linux') {
+    try {
+      return readlinkSync(`/proc/${pid}/cwd`);
+    } catch {
+      return null;
+    }
+  }
+  const out = Bun.spawnSync(['lsof', '-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { stdout: 'pipe', stderr: 'pipe' });
+  if (out.exitCode !== 0) return null;
+  return out.stdout.toString().split('\n').find((line) => line.startsWith('n'))?.slice(1) ?? null;
 }
 
 // A throwaway HOME + config dir with fake creds so the bot-token gate passes.
@@ -399,3 +412,101 @@ test('env-pin: grandchild uses ctx.configDir when TG_CTL_CONFIG_DIR absent from 
   // not appear here (reapDaemon times out → test would hang but cleanup kills it).
   reapDaemon(cfgDir, '123456');
 });
+
+test('start launches the daemon from a stable cwd, not the caller cwd', async () => {
+  const { home, cfg, env } = fakeEnv();
+  writeFileSync(join(cfg, 'config.yaml'), 'control:\n  enabled: true\n');
+  const deployedDir = join(home, '.files', 'bin');
+  mkdirSync(deployedDir, { recursive: true });
+  symlinkSync(TG_CTL, join(deployedDir, 'tg-ctl'));
+  const launchDir = mkdtempSync(join(tmpdir(), 'tgctl-launch-cwd-'));
+  const shimDir = mkdtempSync(join(tmpdir(), 'tgctl-snapshot-shim-'));
+  writeFileSync(
+    join(shimDir, 'tmux'),
+    "#!/bin/sh\nprintf 's\\t1\\t%%9\\t111\\t2.1.199\\text\\t\\t/project\\n'\n",
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(shimDir, 'ps'),
+    "#!/bin/sh\nprintf ' 111 1 /bin/zsh\\n 222 111 /Users/ultra/.claude/local/claude --resume\\n'\n",
+    { mode: 0o755 },
+  );
+
+  let releaseUpdates = false;
+  let served = false;
+  const sent: string[] = [];
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/setMyCommands')) {
+        return Response.json({ ok: true, result: true });
+      }
+      if (url.pathname.endsWith('/getUpdates')) {
+        const deadline = Date.now() + 5000;
+        while (!releaseUpdates && Date.now() < deadline) await Bun.sleep(20);
+        if (!served) {
+          served = true;
+          return Response.json({
+            ok: true,
+            result: [
+              {
+                update_id: 1,
+                message: {
+                  message_id: 10,
+                  from: { id: 42, first_name: 'Alex' },
+                  chat: { id: 42 },
+                  date: Math.floor(Date.now() / 1000),
+                  text: '/status',
+                },
+              },
+            ],
+          });
+        }
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as { text?: string };
+        sent.push(body.text ?? '');
+        return Response.json({ ok: true, result: { message_id: sent.length } });
+      }
+      if (url.pathname.endsWith('/setMessageReaction')) {
+        return Response.json({ ok: true, result: true });
+      }
+      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+    },
+  });
+
+  try {
+    const started = run(
+      ['start'],
+      {
+        ...env,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+        PATH: `${shimDir}:${process.env.PATH ?? ''}`,
+      },
+      launchDir,
+    );
+    expect(started.exitCode).toBe(0);
+
+    const pidFile = join(cfg, 'tg-ctl.123456.pid');
+    const deadline = Date.now() + 5000;
+    while (!existsSync(pidFile) && Date.now() < deadline) await Bun.sleep(20);
+    expect(existsSync(pidFile)).toBe(true);
+    const daemonPid = Number(readFileSync(pidFile, 'utf8').trim());
+
+    rmSync(launchDir, { recursive: true, force: true });
+    expect(processCwd(daemonPid)).toBe(realpathSync(deployedDir));
+    releaseUpdates = true;
+
+    const statusDeadline = Date.now() + 5000;
+    while (!sent.some((text) => text.includes('target: claude in s:1 %9 (pid 222)')) && Date.now() < statusDeadline) {
+      await Bun.sleep(20);
+    }
+    expect(sent.join('\n')).toContain('target: claude in s:1 %9 (pid 222)');
+  } finally {
+    releaseUpdates = true;
+    reapDaemon(cfg, '123456');
+    server.stop(true);
+  }
+}, 12_000);

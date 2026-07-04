@@ -67,6 +67,7 @@ test('buildButtonMessage renders a question as Telegram inline keyboard payload'
   const payload = buildButtonMessage(1000, QUESTION);
   expect(payload.chat_id).toBe(1000);
   expect(payload.text).toContain('Question from claude');
+  expect(payload.text).toContain('Source: agent=claude');
   expect(payload.text).toContain('Pick deploy target');
   expect(payload.text).toContain('Where should I deploy?');
   expect(payload.reply_markup).toEqual({
@@ -75,6 +76,24 @@ test('buildButtonMessage renders a question as Telegram inline keyboard payload'
       [{ text: 'Production', callback_data: 'tgq:q_123:o1' }],
     ],
   });
+});
+
+test('buildButtonMessage includes source agent, subagent, window, pane, session, and cwd', () => {
+  const payload = buildButtonMessage(1000, {
+    requestId: 'p_src',
+    agent: 'claude',
+    subagent: 'review-worker',
+    windowName: 'ext',
+    paneId: '%7',
+    sessionName: 'work',
+    cwd: '/Users/ultra/work/hyperide',
+    kind: 'permission',
+    title: 'Bash',
+    question: 'Allow Bash? pkill -9 hvsc',
+  });
+  expect(payload.text).toContain('Permission request from claude');
+  expect(payload.text).toContain('Source: agent=claude · subagent=review-worker · window=ext · pane=%7 · session=work');
+  expect(payload.text).toContain('Cwd: /Users/ultra/work/hyperide');
 });
 
 test('buildPostTimeoutQuestionMessage preserves the original question and accepts a text reply', () => {
@@ -96,6 +115,7 @@ test('buildPostTimeoutQuestionMessage preserves the original question and accept
 test('buildAnsweredQuestionText keeps the prompt context with the selected answer', () => {
   const text = buildAnsweredQuestionText(QUESTION, 'Production');
   expect(text).toContain('Question from claude');
+  expect(text).toContain('Source: agent=claude');
   expect(text).toContain('Pick deploy target');
   expect(text).toContain('Where should I deploy?');
   expect(text).toContain('Selected answer: Production');

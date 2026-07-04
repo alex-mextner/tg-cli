@@ -181,6 +181,75 @@ test('tg-ctl ask fast-passes when the hook cwd does not match the active registr
   expect(sentMessages).toEqual([]);
 }, 10_000);
 
+test('tg-ctl ask carries tmux session/window from the hook pane environment', async () => {
+  const cfgDir = makeCfgDir();
+  writeFileSync(
+    join(cfgDir, 'bin', 'tmux'),
+    `#!/bin/sh
+[ "$TMUX" = "tmux-sock,1,0" ] || exit 2
+[ "$TMUX_PANE" = "%77" ] || exit 3
+case "$3" in
+  '#{session_name}') printf 'tmux-session\\n' ;;
+  '#{window_name}') printf 'tmux-window\\n' ;;
+  *) exit 4 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  const sentMessages: Array<{ text?: string }> = [];
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) return Response.json({ ok: true, result: [] });
+      if (url.pathname.endsWith('/sendMessage')) {
+        sentMessages.push((await req.json()) as { text?: string });
+        return Response.json({ ok: true, result: { message_id: 93 } });
+      }
+      if (url.pathname.endsWith('/editMessageText') || url.pathname.endsWith('/editMessageReplyMarkup')) {
+        return Response.json({ ok: true, result: true });
+      }
+      return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+    },
+  });
+  servers.push(server);
+  await startDaemon(cfgDir, server.port);
+
+  const ask = startAsk(
+    cfgDir,
+    server.port,
+    {
+      session_id: 'sid',
+      hook_event_name: 'PreToolUse',
+      tool_name: 'AskUserQuestion',
+      tool_input: {
+        questions: [
+          {
+            header: 'Decision',
+            question: 'Continue?',
+            options: [{ label: 'A' }],
+          },
+        ],
+      },
+    },
+    {
+      PATH: `${join(cfgDir, 'bin')}:${process.env.PATH ?? ''}`,
+      TMUX: 'tmux-sock,1,0',
+      TMUX_PANE: '%77',
+    },
+  );
+
+  const t0 = Date.now();
+  while (Date.now() - t0 < 5000 && sentMessages.length === 0) await Bun.sleep(50);
+  if (ask.exitCode === null) {
+    ask.kill(9);
+    await ask.exited;
+  }
+
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('Source: agent=claude · window=tmux-window · pane=%77 · session=tmux-session');
+}, 10_000);
+
 test('tg-ctl ask rejects duplicate active callback ids without replacing the first pending hook', async () => {
   const cfgDir = makeCfgDir();
   let sendCount = 0;
@@ -335,7 +404,7 @@ test('daemon resolves a callback that arrives before sendMessage returns', async
   const t0 = Date.now();
   while (Date.now() - t0 < 5000 && edited.length === 0) await Bun.sleep(50);
   expect(edited).toEqual([
-    { chat_id: 1, message_id: 101, text: 'Question from claude\n\nContinue?\n\nSelected answer: A' },
+    { chat_id: 1, message_id: 101, text: `Question from claude\n\nSource: agent=claude\nCwd: ${cfgDir}\n\nContinue?\n\nSelected answer: A` },
   ]);
 }, 10_000);
 
@@ -618,7 +687,7 @@ async function startDaemon(cfgDir: string, apiPort: number): Promise<Subprocess>
   return daemon;
 }
 
-function startAsk(cfgDir: string, apiPort: number, request: unknown): Subprocess {
+function startAsk(cfgDir: string, apiPort: number, request: unknown, extraEnv: Record<string, string> = {}): Subprocess {
   const body = request && typeof request === 'object' && !Array.isArray(request)
     ? { cwd: cfgDir, ...(request as Record<string, unknown>) }
     : request;
@@ -627,6 +696,7 @@ function startAsk(cfgDir: string, apiPort: number, request: unknown): Subprocess
       HOME: cfgDir,
       TG_CTL_CONFIG_DIR: cfgDir,
       TG_API_BASE: `http://127.0.0.1:${apiPort}`,
+      ...extraEnv,
     },
     stdin: 'pipe',
     stdout: 'pipe',

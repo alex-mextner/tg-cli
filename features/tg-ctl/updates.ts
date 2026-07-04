@@ -359,7 +359,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
                 from: name,
                 messageId: m.message_id,
               }
-            : textAction(m.text, name, opts, m.message_id);
+            : textAction(m.text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null);
       }
     } else if (m.voice ?? m.audio) action = voiceAction(u.update_id, m, name, opts);
     else if (m.photo?.length) action = photoAction(u.update_id, m, name);
@@ -404,7 +404,7 @@ function isDaemonSlashCommand(text: string): boolean {
 // Command-vs-prompt split (spec §13). Verbs match on the first whitespace
 // token; unknown slash commands pass through VERBATIM so the harness
 // interprets its own (/compact, /clear, …) — no wrap on those.
-function textAction(text: string, name: string, opts: StepOpts, messageId: number): Action {
+function textAction(text: string, name: string, opts: StepOpts, messageId: number, replyToMessageId: number | null): Action {
   if (text.startsWith('/')) {
     const verb = text.split(/\s+/, 1)[0];
     const cmd = verb.replace(/@\w+$/, ''); // tolerate /cmd@botname in groups
@@ -417,7 +417,7 @@ function textAction(text: string, name: string, opts: StepOpts, messageId: numbe
     }
     if (cmd === '/tasks') {
       const p = parseTasksCommand(text);
-      return { kind: 'tasks', agent: p.agent, status: p.status };
+      return { kind: 'tasks', agent: p.agent, status: p.status, replyToMessageId };
     }
     if (cmd === '/agent') {
       const p = parseAgentCommand(text);
