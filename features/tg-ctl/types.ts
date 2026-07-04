@@ -334,6 +334,7 @@ export interface CtlPaths {
   topics: string; // threadId→agent binding map for forum-topics mode (always allocated)
   questions: string; // durable forwarded-question state (pending/abandoned + answered-replay)
   schedules: string; // durable auto-continue schedules (re-armed on restart, #113)
+  usageWarnings: string; // recent proactive usage warnings, for duplicate suppression (#132)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---

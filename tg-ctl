@@ -55,12 +55,15 @@ import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features
 import {
   autoContinueDelayMs,
   buildLimitNotification,
+  buildUsageLimitNotification,
   continueCallbackData,
   extractAssistantText,
   extractFailure,
+  extractUsageLimitEvent,
   formatClock,
   parseContinueCallback,
   type HarnessFailureEvent,
+  type UsageLimitEvent,
 } from "./features/tg-ctl/limits"
 import { isAllowedReaction, reactionForStage } from "./features/tg-ctl/reactions"
 import {
@@ -109,7 +112,7 @@ import {
   serializeRegistrations,
   upsertRegistration,
 } from "./features/tg-ctl/registration-store"
-import { claudeHooksInstalled, withClaudeHooks, withHarnessHooks } from "./features/tg-ctl/hook-install"
+import { claudeHooksInstalled, harnessHooksInstalled, withClaudeHooks, withHarnessHooks } from "./features/tg-ctl/hook-install"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
@@ -204,10 +207,15 @@ export const USAGE = `Usage:
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
   tg-ctl install-hooks   # wire q→buttons + StopFailure (limit/error) hooks
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
-  tg-ctl harness-event [--dry-run] [--pane %N] [--agent NAME] [--reason MATCHER]
+  tg-ctl harness-event [--dry-run] [--pane %N] [--agent NAME] [--language LANG]
+                        [--reason MATCHER]
                         [--reset-at ISO] [--source-message-id ID] [--transcript PATH]
-                         # StopFailure hook: notify the chat a harness stopped on a
-                         # limit/error; offer an auto-continue button at reset time.
+                         # StopFailure/usage hook: notify the chat when a harness
+                         # stopped on a limit/error, or supported usage telemetry reaches >=90%.
+                         # --agent labels reports and selects harness-specific usage contracts.
+                         # Claude context_window and Pi stats require --agent claude/pi.
+                         # --transcript or transcript_path alone is treated as failure input.
+                         # Limit warnings localize from payload/locale hints; else English.
                          # --dry-run renders WITHOUT sending (safe smoke, #113).
 
 The run/start/status/stop/enable/disable lifecycle follows the shared agent-tools
@@ -922,16 +930,24 @@ function composeStatus(ctx: Ctx): string {
   // Guide the user when q→buttons isn't wired (the hook is what forwards an
   // agent's question to Telegram — without it the feature is silently dead).
   const hooksRaw = readFileOrNull(join(ctx.home, ".claude", "settings.json"))
-  let hooksOk = false
+  let questionHooksOk = false
+  let harnessHooksOk = false
   if (hooksRaw) {
     try {
-      hooksOk = claudeHooksInstalled(JSON.parse(hooksRaw), "tg-ctl ask")
+      const hooksSettings = JSON.parse(hooksRaw)
+      questionHooksOk = claudeHooksInstalled(hooksSettings, "tg-ctl ask")
+      harnessHooksOk = harnessHooksInstalled(hooksSettings, "tg-ctl harness-event")
     } catch {}
   }
   lines.push(
-    hooksOk
+    questionHooksOk
       ? "q→buttons hooks: installed (Claude Code)"
       : "q→buttons hooks: NOT installed — run `tg-ctl install-hooks`",
+  )
+  lines.push(
+    harnessHooksOk
+      ? "limit/error hooks: installed (Claude Code StopFailure)"
+      : "limit/error hooks: NOT installed — run `tg-ctl install-hooks`",
   )
   // Autostart (the shared service-management lifecycle): an installed unit means the daemon
   // comes back at login. Mirrors the q→buttons line — installed reports the kind/label, absent
@@ -2143,6 +2159,7 @@ interface HarnessEventFlags {
   resetAtIso: string | null
   sourceMessageId: number | null
   transcriptPath: string | null
+  language: string | null
 }
 
 function parseHarnessEventFlags(argv: string[]): HarnessEventFlags {
@@ -2154,6 +2171,7 @@ function parseHarnessEventFlags(argv: string[]): HarnessEventFlags {
     resetAtIso: null,
     sourceMessageId: null,
     transcriptPath: null,
+    language: null,
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -2165,6 +2183,7 @@ function parseHarnessEventFlags(argv: string[]): HarnessEventFlags {
     else if (a === "--reset-at") flags.resetAtIso = next()
     else if (a === "--source-message-id") flags.sourceMessageId = Number(next()) || null
     else if (a === "--transcript") flags.transcriptPath = next()
+    else if (a === "--language" || a === "--lang" || a === "--locale") flags.language = next()
   }
   return flags
 }
@@ -2172,6 +2191,119 @@ function parseHarnessEventFlags(argv: string[]): HarnessEventFlags {
 function strField(obj: unknown, key: string): string {
   const v = obj && typeof obj === "object" ? (obj as Record<string, unknown>)[key] : undefined
   return typeof v === "string" ? v : ""
+}
+
+const USAGE_WARNING_COOLDOWN_MS = 60 * 60_000
+const USAGE_WARNING_STORE_MAX = 100
+
+interface UsageWarningRecord {
+  key: string
+  lastSentAt: number
+  resetAt: number | null
+}
+
+function usageWarningKey(ev: UsageLimitEvent): string {
+  return JSON.stringify([ev.agent, ev.limitName ?? ""])
+}
+
+function usageWarningLockPath(path: string): string {
+  return `${path}.lock`
+}
+
+function parseUsageWarningRecords(blob: string | null, now: number): UsageWarningRecord[] {
+  if (!blob) return []
+  try {
+    const parsed = JSON.parse(blob) as { warnings?: unknown }
+    if (!Array.isArray(parsed.warnings)) return []
+    return parsed.warnings
+      .filter((item): item is UsageWarningRecord => {
+        if (!item || typeof item !== "object") return false
+        const rec = item as Record<string, unknown>
+        const resetAt = rec.resetAt
+        return (
+          typeof rec.key === "string" &&
+          typeof rec.lastSentAt === "number" &&
+          Number.isFinite(rec.lastSentAt) &&
+          rec.lastSentAt > 0 &&
+          (resetAt === null || (typeof resetAt === "number" && Number.isFinite(resetAt) && resetAt > 0))
+        )
+      })
+      .filter((rec) => (rec.resetAt !== null ? rec.resetAt > now : rec.lastSentAt > now - 24 * USAGE_WARNING_COOLDOWN_MS))
+      .slice(-USAGE_WARNING_STORE_MAX)
+  } catch {
+    return []
+  }
+}
+
+function usageWarningAlreadyRecorded(records: UsageWarningRecord[], ev: UsageLimitEvent, now: number): boolean {
+  const key = usageWarningKey(ev)
+  const rec = records.find((item) => item.key === key)
+  if (!rec) return false
+  return rec.resetAt !== null || now - rec.lastSentAt < USAGE_WARNING_COOLDOWN_MS
+}
+
+function writeUsageWarningRecords(path: string, records: UsageWarningRecord[]): void {
+  atomicWrite(path, `${JSON.stringify({ version: 1, warnings: records.slice(-USAGE_WARNING_STORE_MAX) })}\n`)
+}
+
+function claimUsageWarning(path: string, ev: UsageLimitEvent, now: number): boolean {
+  try {
+    const claimed = withRoutesLock(
+      fsRoutesLockIo(usageWarningLockPath(path)),
+      () => {
+        const key = usageWarningKey(ev)
+        const records = parseUsageWarningRecords(readFileOrNull(path), now)
+        if (usageWarningAlreadyRecorded(records, ev, now)) return false
+        const next = records.filter((item) => item.key !== key)
+        next.push({ key, lastSentAt: now, resetAt: ev.resetAt })
+        writeUsageWarningRecords(path, next)
+        return true
+      },
+      { onContended: "skip" },
+    )
+    return claimed === true
+  } catch (err) {
+    log(`harness-event: usage warning dedupe claim failed: ${err}`)
+    return false
+  }
+}
+
+function clearUsageWarningClaim(path: string, ev: UsageLimitEvent, now: number): void {
+  try {
+    withRoutesLock(
+      fsRoutesLockIo(usageWarningLockPath(path)),
+      () => {
+        const key = usageWarningKey(ev)
+        writeUsageWarningRecords(
+          path,
+          parseUsageWarningRecords(readFileOrNull(path), now).filter((item) => item.key !== key),
+        )
+      },
+      { onContended: "skip" },
+    )
+  } catch (err) {
+    log(`harness-event: usage warning dedupe cleanup failed: ${err}`)
+  }
+}
+
+function hasHarnessFailureSignal(payloadText: string, flags: HarnessEventFlags, hasUsageTelemetry = false): boolean {
+  if (flags.reason || flags.resetAtIso || flags.transcriptPath) return true
+  let payload: unknown = null
+  try {
+    payload = JSON.parse(payloadText)
+  } catch {
+    return payloadText.trim().length > 0
+  }
+  if (!payload || typeof payload !== "object") return false
+  const hookEventName = strField(payload, "hook_event_name")
+  return Boolean(
+    hookEventName === "StopFailure" ||
+      strField(payload, "reason") ||
+      strField(payload, "matcher") ||
+      strField(payload, "error") ||
+      strField(payload, "error_type") ||
+      (!hookEventName && !hasUsageTelemetry && strField(payload, "transcript_path")),
+  )
 }
 
 // The failure prose from a Claude transcript (JSONL): the LAST assistant message
@@ -2245,26 +2377,57 @@ async function runHarnessEvent(ctx: Ctx, argv: string[], now: number): Promise<n
   const flags = parseHarnessEventFlags(argv)
   const payloadText = await readStdinText().catch(() => "")
   const agent = flags.agent ?? resolveAgentForPane(flags.paneId)
-  const ev = buildHarnessEvent(payloadText, flags, agent, now)
-  const notif = buildLimitNotification(ev, now)
-  if (!notif) {
-    // Staleness guard (#113): a reset already in the past, or nothing to report.
-    if (!flags.dryRun) log(`harness-event: suppressed (stale/none) agent=${ev.agent} reset=${ev.resetAt}`)
-    else console.log("harness-event: SUPPRESSED (reset already past or nothing to report)")
+  const hasSupportedUsageTelemetry = extractUsageLimitEvent(payloadText, { agent, language: flags.language, env: process.env, now: 0 }) !== null
+  const sendUsageWarningIfPresent = async (): Promise<boolean> => {
+    const usage = extractUsageLimitEvent(payloadText, { agent, language: flags.language, env: process.env, now })
+    if (!usage) return false
+    const notif = buildUsageLimitNotification(usage, now)
+    if (!notif) {
+      if (!flags.dryRun) log(`harness-event: suppressed (usage below threshold) agent=${usage.agent} percent=${usage.percent}`)
+      else console.log("harness-event: SUPPRESSED (usage below 90%)")
+      return true
+    }
+    if (flags.dryRun) {
+      console.log("=== harness-event DRY-RUN (no send) ===")
+      console.log(notif.text)
+      return true
+    }
+    if (!claimUsageWarning(ctx.paths.usageWarnings, usage, now)) {
+      log(`harness-event: suppressed (duplicate usage warning) agent=${usage.agent} limit=${usage.limitName ?? "-"} reset=${usage.resetAt ?? "-"}`)
+      return true
+    }
+    const messageId = await sendMessage(ctx, notif.text, { parse_mode: "HTML" })
+    if (messageId === null) clearUsageWarningClaim(ctx.paths.usageWarnings, usage, now)
+    return true
+  }
+  const failurePayload = hasHarnessFailureSignal(payloadText, flags, hasSupportedUsageTelemetry)
+  if (failurePayload) {
+    const ev = buildHarnessEvent(payloadText, flags, agent, now)
+    const notif = buildLimitNotification(ev, now)
+    if (!notif) {
+      if (await sendUsageWarningIfPresent()) return 0
+      // Staleness guard (#113): a reset already in the past, or nothing to report.
+      if (!flags.dryRun) log(`harness-event: suppressed (stale/none) agent=${ev.agent} reset=${ev.resetAt}`)
+      else console.log("harness-event: SUPPRESSED (reset already past or nothing to report)")
+      return 0
+    }
+    if (flags.dryRun) {
+      console.log("=== harness-event DRY-RUN (no send) ===")
+      console.log(notif.text)
+      if (notif.button) console.log(`[button] ${notif.button.label} → ${notif.button.data}`)
+      if (ev.sourceMessageId !== null) console.log(`[reaction] ${reactionForStage("stalled")} on message ${ev.sourceMessageId}`)
+      return 0
+    }
+    const keyboard = notif.button ? { inline_keyboard: [[{ text: notif.button.label, callback_data: notif.button.data }]] } : undefined
+    const extra: Record<string, unknown> = { parse_mode: "HTML" }
+    if (keyboard) extra.reply_markup = keyboard
+    await sendMessage(ctx, notif.text, extra)
+    if (ev.sourceMessageId !== null) await setMessageReaction(ctx, ev.sourceMessageId, reactionForStage("stalled"))
     return 0
   }
-  if (flags.dryRun) {
-    console.log("=== harness-event DRY-RUN (no send) ===")
-    console.log(notif.text)
-    if (notif.button) console.log(`[button] ${notif.button.label} → ${notif.button.data}`)
-    if (ev.sourceMessageId !== null) console.log(`[reaction] ${reactionForStage("stalled")} on message ${ev.sourceMessageId}`)
-    return 0
-  }
-  const keyboard = notif.button ? { inline_keyboard: [[{ text: notif.button.label, callback_data: notif.button.data }]] } : undefined
-  const extra: Record<string, unknown> = { parse_mode: "HTML" }
-  if (keyboard) extra.reply_markup = keyboard
-  await sendMessage(ctx, notif.text, extra)
-  if (ev.sourceMessageId !== null) await setMessageReaction(ctx, ev.sourceMessageId, reactionForStage("stalled"))
+  if (await sendUsageWarningIfPresent()) return 0
+  if (!flags.dryRun) log(`harness-event: suppressed (no supported event) agent=${agent}`)
+  else console.log("harness-event: SUPPRESSED (no supported event)")
   return 0
 }
 

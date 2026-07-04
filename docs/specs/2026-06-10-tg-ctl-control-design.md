@@ -30,7 +30,10 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
 
 ## 2. Non-goals (explicit)
 
-- **No completion / Stop-hook detection** — CC Stop hooks false-fire; rejected by design.
+- **No normal completion detection** — do not infer "done" from turn-complete hooks or
+  terminal output. `StopFailure` is the only Stop-family hook used: it reports explicit
+  harness failures/limits and optional proactive usage telemetry, not successful
+  completion.
 - **No full-session streaming / terminal mirror** — that is `/rc` and every competitor.
 - **No screen-scraping** (`capture-pane`) for the round-trip.
 - **No arbitrary remote shell** — the only injection target is the agent session.
@@ -207,7 +210,7 @@ full-session mirror, no scraped firehose, no completion-detection heuristics.
     stays as a fallback; both are idempotent via `flock`.
 - Auto-start is fire-and-forget and idempotent (`flock` guarantees a single instance).
 
-## 8. Question / permission forwarding (the only hooks)
+## 8. Question / permission forwarding and harness status hooks
 
 Core handoff shipped in `tg-ctl`: a hook process runs `tg-ctl ask`, writes a
 normalized question/permission JSON request on stdin, and waits on the running
@@ -297,9 +300,25 @@ the documented Codex shape:
 `{hookSpecificOutput:{hookEventName:"PermissionRequest",decision:{behavior:"allow"|"deny"}}}`.
 Codex hooks still require manual trust via `/hooks` on first run.
 
-These work **without** channels (pure hook return-value path). **No completion/Stop
-hook.** The hook process awaits the button answer over the UDS request/response
-path with a hard client-side timeout.
+These work **without** channels (pure hook return-value path). There is still **no
+completion hook** for successful turns. A separate, quick `StopFailure` hook shells
+`tg-ctl harness-event`: it notifies Telegram when the harness reports an explicit
+limit/error and, when a reset time is known, includes the auto-continue button.
+The same subcommand also accepts confirmed proactive usage telemetry contracts
+piped by a harness hook or collector (Claude Code statusLine `rate_limits`, Codex
+`token_count.rate_limits` / `account/rateLimits/*`, Pi
+`get_session_stats.data.contextUsage.percent`, and tg-cli's explicit
+`schema: "tg-cli.usageLimit.v1"` envelope). Generic token/cost events remain
+ignored because they do not carry a quota percent/reset contract, and repeated
+warnings for the same agent/limit are deduped for the current reset window (or a
+one-hour cooldown when no reset is known).
+`--agent` is a contract selector as well as a report label: Claude
+`context_window` telemetry is accepted only with `--agent claude`, and Pi session
+stats only with `--agent pi`. For StopFailure compatibility, `--transcript` or a
+payload `transcript_path` with no supported usage telemetry is treated as failure
+input; the last assistant transcript message is scanned for the limit/error text.
+The question/permission hook process awaits the button answer over the UDS
+request/response path with a hard client-side timeout.
 
 **Verification status (review F5/F7 — live spike PASSED on CC 2.1.170):** a
 PreToolUse hook on `AskUserQuestion` returning

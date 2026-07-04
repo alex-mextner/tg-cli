@@ -166,7 +166,28 @@ buttons grouped by tmux session; tap one to route. Bare `/agent` lists the agent
 ### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
 
-**Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hook into `~/.claude/settings.json` (backup first, existing hooks preserved), then restart the agent session. `tg-ctl status` tells you whether the hook is installed. (Codex/opencode: see the command's printed guidance.)
+**Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hooks into `~/.claude/settings.json` (backup first, existing hooks preserved), then restart the agent session. `tg-ctl status` reports q→buttons and StopFailure hook installation separately. (Codex/opencode: see the command's printed guidance.)
+
+`tg-ctl harness-event` also accepts externally-piped proactive limit telemetry
+from confirmed contracts: Claude Code statusLine `rate_limits` (and
+`context_window` when called with `--agent claude`), Codex `token_count.rate_limits` / app-server
+`account/rateLimits/*`, Pi RPC `get_session_stats.data.contextUsage.percent`
+(with `--agent pi`), and an explicit `schema: "tg-cli.usageLimit.v1"` envelope
+for custom collectors such as an OpenCode plugin. Native OpenCode token/cost
+events are not treated as quota telemetry because they do not carry a
+percentage/reset contract. `--agent` is a selector for agent-specific telemetry,
+not just a display label: Claude `context_window` requires `--agent claude`, and
+Pi session stats require `--agent pi`. When supported usage is **90% or higher**, tg-cli
+sends a deduped Telegram warning in the detected user language (`--language`,
+then `language`/`locale`/`user_language` payload fields, then `LANG`/`LC_*`);
+if the language cannot be determined, the warning falls back to English.
+Duplicate warnings for the same agent/limit are suppressed for the current reset
+window, or for one hour when no reset is known.
+For StopFailure compatibility, `--transcript` or a `transcript_path` payload with
+no supported usage telemetry is treated as failure input and the last assistant
+message in that transcript is scanned for the limit/error text.
+`install-hooks` wires the Claude StopFailure hook; proactive telemetry collectors
+must pipe their payloads to `tg-ctl harness-event`.
 
 While an agent is **waiting on a question**, new messages you send it are **deferred** (queued, marked ✍️ on the message) and delivered once the question is answered — they don't interrupt the prompt.
 

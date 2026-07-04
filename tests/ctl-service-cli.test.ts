@@ -9,6 +9,7 @@ import { expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { withClaudeHooks } from '../features/tg-ctl/hook-install';
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -115,6 +116,18 @@ test('status reports an autostart line (the lifecycle state)', () => {
   const proc = run(['status'], env);
   expect(proc.exitCode).toBe(0);
   expect(proc.stdout.toString()).toContain('autostart:');
+});
+
+test('status reports StopFailure hook separately from q→buttons hook', () => {
+  const { home, env } = fakeEnv();
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  writeFileSync(join(home, '.claude', 'settings.json'), `${JSON.stringify(withClaudeHooks({}, 'tg-ctl ask').settings)}\n`);
+
+  const proc = run(['status'], env);
+  expect(proc.exitCode).toBe(0);
+  const out = proc.stdout.toString();
+  expect(out).toContain('q→buttons hooks: installed');
+  expect(out).toContain('limit/error hooks: NOT installed');
 });
 
 // On a host where the OS control command (launchctl/systemctl) fails, `enable` writes the unit

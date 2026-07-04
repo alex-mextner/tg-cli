@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -48,6 +48,16 @@ async function runHarnessEvent(args: string[], stdin: string): Promise<{ code: n
   const stdout = await new Response(proc.stdout).text();
   await proc.exited;
   return { code: proc.exitCode ?? 1, stdout };
+}
+
+function futureResetSeconds(minutes: number): number {
+  return Math.floor((Date.now() + minutes * 60_000) / 1000);
+}
+
+function clearUsageWarningState(): void {
+  const path = join(cfgDir, 'tg-ctl.123.usage-warnings.json');
+  rmSync(path, { force: true });
+  rmSync(`${path}.lock`, { force: true });
 }
 
 test('a session-limit with a parseable reset → notification + auto-continue button + stalled reaction', async () => {
@@ -131,6 +141,26 @@ test('production path: a JSONL transcript_path (not flags) yields the reset + cl
   expect(msg.reply_markup.inline_keyboard[0][0].callback_data).toMatch(/^lc:%3:\d+$/);
 });
 
+test('transcript_path-only JSON payload is still treated as an explicit failure', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const transcript = join(cfgDir, 'transcript-only.jsonl');
+  writeFileSync(
+    transcript,
+    JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'You have hit your session limit · resets 4:10am (Europe/Belgrade)' }] },
+    }),
+  );
+  const { code } = await runHarnessEvent(['--agent', 'hyperide', '--pane', '%3'], JSON.stringify({ transcript_path: transcript }));
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  const msg = sentMessages[0];
+  expect(msg.text).toContain('session limit');
+  expect(msg.reply_markup.inline_keyboard[0][0].callback_data).toMatch(/^lc:%3:\d+$/);
+  expect(reactions).toHaveLength(0);
+});
+
 test('an API error with no reset → alert, no button', async () => {
   sentMessages.length = 0;
   const { code } = await runHarnessEvent(['--agent', 'hyperide'], JSON.stringify({ reason: 'overloaded', message: 'overloaded_error (529)' }));
@@ -138,6 +168,18 @@ test('an API error with no reset → alert, no button', async () => {
   expect(sentMessages).toHaveLength(1);
   expect(sentMessages[0].text).toContain('API error');
   expect(sentMessages[0].reply_markup).toBeUndefined();
+});
+
+test('JSON error field alone is treated as an explicit failure, not ignored telemetry', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const { code } = await runHarnessEvent(['--agent', 'hyperide'], JSON.stringify({ error: 'server_error (500)' }));
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('API error');
+  expect(sentMessages[0].text).toContain('server_error');
+  expect(sentMessages[0].reply_markup).toBeUndefined();
+  expect(reactions).toHaveLength(0);
 });
 
 // PR #120 review: the REAL bare-hook payload uses `error_type`/`error`, not our
@@ -197,4 +239,299 @@ test('production StopFailure shape for an ACTUAL limit: button + button data + r
   const button = msg.reply_markup.inline_keyboard[0][0];
   expect(button.callback_data).toMatch(/^lc:%3:\d+:55$/);
   expect(button.text).toContain('Auto-continue');
+});
+
+test('StopFailure payload wins over embedded usage telemetry and keeps auto-continue', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'rate_limit',
+    error: 'You have hit your rate limit · resets 4:10am (Europe/Belgrade)',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: { used_percent: 91, window_minutes: 300, resets_at: futureResetSeconds(80) },
+      },
+    },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3', '--source-message-id', '55'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  const msg = sentMessages[0];
+  expect(msg.text).toContain('hit its session limit');
+  expect(msg.text).not.toContain('использовано');
+  expect(msg.reply_markup).toBeDefined();
+  expect(msg.reply_markup.inline_keyboard[0][0].callback_data).toMatch(/^lc:%3:\d+:55$/);
+  expect(reactions[0]).toMatchObject({ chat_id: 1, message_id: 55, reaction: [{ type: 'emoji', emoji: '😴' }] });
+});
+
+test('stale StopFailure falls through to supported usage telemetry', async () => {
+  clearUsageWarningState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const staleReset = new Date(Date.now() - 60 * 60_000).toISOString();
+  const payload = JSON.stringify({
+    hook_event_name: 'StopFailure',
+    error_type: 'rate_limit',
+    error: 'You have hit your rate limit.',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: { used_percent: 91, window_minutes: 300 },
+      },
+    },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3', '--reset-at', staleReset], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('is at');
+  expect(sentMessages[0].text).toContain('91%');
+  expect(sentMessages[0].reply_markup).toBeUndefined();
+  expect(reactions).toHaveLength(0);
+});
+
+test('high usage payload at 90 percent sends a localized warning without auto-continue', async () => {
+  clearUsageWarningState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    agent: 'codex',
+    user_language: 'ru',
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: {
+          used_percent: 91,
+          window_minutes: 300,
+          resets_at: futureResetSeconds(60),
+        },
+      },
+    },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  const msg = sentMessages[0];
+  expect(msg.text).toContain('codex');
+  expect(msg.text).toContain('использовано');
+  expect(msg.text).toContain('91%');
+  expect(msg.text).toContain('5-часового лимита');
+  expect(msg.reply_markup).toBeUndefined();
+  expect(reactions).toHaveLength(0);
+});
+
+test('repeated identical high usage payload is deduped', async () => {
+  clearUsageWarningState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const reset = futureResetSeconds(90);
+  const payload = JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: { used_percent: 91, window_minutes: 300, resets_at: reset },
+      },
+    },
+  });
+  expect((await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload)).code).toBe(0);
+  expect((await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload)).code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('91%');
+  expect(reactions).toHaveLength(0);
+});
+
+test('repeated Codex relative-reset usage payload is deduped despite Date.now drift', async () => {
+  clearUsageWarningState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: { used_percent: 91, window_minutes: 300, resets_in_seconds: 3600 },
+      },
+    },
+  });
+  expect((await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload)).code).toBe(0);
+  expect((await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload)).code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('91%');
+  expect(reactions).toHaveLength(0);
+});
+
+test('concurrent identical high usage payloads claim the warning once', async () => {
+  clearUsageWarningState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: { used_percent: 91, window_minutes: 300, resets_in_seconds: 3600 },
+      },
+    },
+  });
+  const results = await Promise.all([
+    runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload),
+    runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload),
+  ]);
+  expect(results.map((r) => r.code)).toEqual([0, 0]);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('91%');
+  expect(reactions).toHaveLength(0);
+});
+
+test('usage --language flag overrides payload language hints', async () => {
+  clearUsageWarningState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    user_language: 'en',
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: { used_percent: 91, window_minutes: 300, resets_at: futureResetSeconds(100) },
+      },
+    },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3', '--language', 'ru'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('использовано');
+  expect(sentMessages[0].text).toContain('91%');
+  expect(sentMessages[0].reply_markup).toBeUndefined();
+  expect(reactions).toHaveLength(0);
+});
+
+test('Claude statusLine usage with transcript_path is still treated as usage telemetry', async () => {
+  clearUsageWarningState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    hook_event_name: 'Status',
+    session_id: 'abc123',
+    transcript_path: '/tmp/nonexistent-claude-transcript.jsonl',
+    user_language: 'ru',
+    rate_limits: {
+      five_hour: {
+        used_percentage: 91,
+        resets_at: futureResetSeconds(110),
+      },
+    },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'claude', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  const msg = sentMessages[0];
+  expect(msg.text).toContain('использовано');
+  expect(msg.text).toContain('91%');
+  expect(msg.reply_markup).toBeUndefined();
+  expect(reactions).toHaveLength(0);
+});
+
+test('Claude statusLine usage without hook_event_name is not misrouted by transcript_path alone', async () => {
+  clearUsageWarningState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    transcript_path: '/tmp/nonexistent-claude-transcript.jsonl',
+    user_language: 'ru',
+    rate_limits: {
+      five_hour: {
+        used_percentage: 91,
+        resets_at: futureResetSeconds(115),
+      },
+    },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'claude', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('использовано');
+  expect(sentMessages[0].text).toContain('91%');
+  expect(sentMessages[0].text).not.toContain('API error');
+  expect(sentMessages[0].reply_markup).toBeUndefined();
+  expect(reactions).toHaveLength(0);
+});
+
+test('usage payload with harmless top-level message remains usage, not unknown API error', async () => {
+  clearUsageWarningState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    message: 'token telemetry sample',
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: { used_percent: 91, window_minutes: 300, resets_at: futureResetSeconds(120) },
+      },
+    },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('is at');
+  expect(sentMessages[0].text).not.toContain('API error');
+});
+
+test('unsupported telemetry with top-level message is ignored, not reported as unknown API error', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    message: 'token telemetry sample',
+    type: 'message.updated',
+    properties: { info: { providerID: 'opencode', tokens: { input: 120000, output: 10 } } },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'opencode', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(0);
+  expect(reactions).toHaveLength(0);
+});
+
+test('usage payload below threshold is suppressed without falling back to unknown StopFailure', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: { used_percent: 89, window_minutes: 300 },
+      },
+    },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(0);
+  expect(reactions).toHaveLength(0);
+});
+
+test('usage payload with stale reset is suppressed', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: {
+          used_percent: 91,
+          window_minutes: 300,
+          resets_at: Math.floor((Date.now() - 60 * 60_000) / 1000),
+        },
+      },
+    },
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(0);
+  expect(reactions).toHaveLength(0);
 });

@@ -19,6 +19,9 @@ test('ctlPaths builds lock/pid/offset/registration/socket/log under configDir', 
   expect(p.routes).toBe('/home/u/.config/tg-cli/tg-ctl.123456.routes.json');
   expect(p.history).toBe('/home/u/.config/tg-cli/tg-ctl.123456.history.jsonl');
   expect(p.topics).toBe('/home/u/.config/tg-cli/tg-ctl.123456.topics.json');
+  expect(p.questions).toBe('/home/u/.config/tg-cli/tg-ctl.123456.questions.json');
+  expect(p.schedules).toBe('/home/u/.config/tg-cli/tg-ctl.123456.schedules.json');
+  expect(p.usageWarnings).toBe('/home/u/.config/tg-cli/tg-ctl.123456.usage-warnings.json');
 });
 
 test('ctlPaths tolerates a trailing slash in configDir', () => {

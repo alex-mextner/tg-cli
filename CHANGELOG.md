@@ -3,6 +3,20 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.28.0
+
+**Feature (tg-cli#132): proactive harness usage warnings at 90%.**
+
+- `tg-ctl harness-event` accepts externally-piped proactive usage telemetry when a
+  confirmed limit contract reaches `>=90%`: Claude Code statusLine
+  rate-limits/context, Codex `rate_limits`, Pi RPC `contextUsage`, or tg-cli's
+  explicit `schema: "tg-cli.usageLimit.v1"` envelope for custom collectors such
+  as an OpenCode plugin.
+- Generic token/cost payloads are ignored rather than guessed. Warnings are
+  deduped per agent/limit for the current reset window (or a one-hour cooldown
+  when no reset is known), localize from payload/locale hints when possible, and
+  otherwise render in English.
+
 ## 1.27.0
 
 **Feature (tg-cli#130): reply quote-anchor carries the original message's
