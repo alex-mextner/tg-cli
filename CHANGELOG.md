@@ -3,6 +3,41 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.33.1
+
+**Fix (tg#6651/tg#6672): calibrate the empty-editor watermark heuristic against real VS Code screenshots.**
+
+- `looks_like_empty_vscode_watermark()` (`features/hooks/review-descriptor/pre_send_photo.py`)
+  never actually fired on a real empty-VS-Code-window screenshot, despite being
+  designed exactly to catch that case — every prior test fixture was synthetic and
+  ~15x higher contrast than reality. Two real reference screenshots (Dark Modern
+  theme, Explorer + a docked Chat panel, zero editor tabs) both returned `False`
+  under the old constants.
+- Two compounding bugs found by direct pixel analysis: (1) the old sample box
+  (20-90% of window width) physically overlapped the docked right panel, so panel
+  divider lines and foreground content — not the watermark — were the actual
+  "non-bg" signal detected, blowing the compactness span up to ~0.8-0.93; (2) even
+  past that, the real watermark logo's own contrast against the editor background
+  is only ~6-7 RGB levels, invisible under the old `WATERMARK_BG_TOL=20`.
+- Recalibrated four constants together against the real screenshots: narrowed
+  `WATERMARK_BOX` to 25-72% of width (clear of the docked panel), lowered
+  `WATERMARK_BG_TOL` 20 -> 6, raised `WATERMARK_NONBG_RATIO_RANGE`'s ceiling
+  0.10 -> 0.15, raised `WATERMARK_MAX_SPAN_RATIO`'s y-cap 0.40 -> 0.50. Verified
+  against 7 real BUSY full-window screenshots (code editor + preview + error/table
+  panes) pulled from other HyperIDE e2e runs — none false-positive under the new
+  constants.
+- New tests: `tests/hooks-watermark-detector.test.ts` gained real-screenshot
+  fixture tests — two positive (`tests/fixtures/vscode-empty-watermark-{1,2}.png`)
+  and one real-busy negative (`vscode-busy-content-1.png`, a code editor + Hyper
+  Canvas preview pane) — alongside the existing synthetic ones, so the
+  false-positive direction is locked in against a real capture too, not only
+  synthetic noise (review finding). Three synthetic negative fixtures that
+  hardcoded the OLD box fractions now read `WATERMARK_BOX` live from the module
+  instead, so they can't silently drift out of sync with the box again. Still
+  WARN-only, not a block — see the CALIBRATION comment in `pre_send_photo.py`
+  for the honest limits of this pass (both real positive fixtures are the same
+  panel layout; the tol margin is narrow, not comfortable).
+
 ## 1.33.0
 
 **Feature: git-state-check banner — warn before a message lands in an occupied pane.**

@@ -10,10 +10,12 @@ import { createHash } from 'crypto';
 // features/hooks/review-descriptor/pre_send_photo.py — the WARN-only
 // heuristic that detects VS Code's "no tabs open" watermark (a small,
 // compact glyph cluster on an overwhelmingly flat background, dead center
-// of the editor pane). No real VS Code screenshot exists to calibrate
-// against, so fixtures are SYNTHETIC images built with the same shape
-// characteristics the detector's docstring describes, generated via a tiny
-// Python/PIL helper (Pillow is already a soft dependency of this hook).
+// of the editor pane). Most fixtures here are SYNTHETIC images built with
+// assumed shape characteristics (generated via a tiny Python/PIL helper —
+// Pillow is already a soft dependency of this hook); tg#6651/tg#6672 added
+// the first REAL reference screenshots (tests/fixtures/vscode-empty-
+// watermark-*.png, see the dedicated tests below) after the synthetic-only
+// calibration turned out to miss the real watermark entirely.
 
 const REPO = join(import.meta.dir, '..');
 const PY_HOOK = join(REPO, 'features', 'hooks', 'review-descriptor', 'pre_send_photo.py');
@@ -43,6 +45,35 @@ const pilAvailable = checkAvailable('import PIL');
 // realistic for a HyperIDE full-window proof screenshot.
 const W = 1600;
 const H = 900;
+
+// Read WATERMARK_BOX from the module itself rather than hardcoding its
+// fraction values a second time here (review finding, tg#6651/tg#6672
+// follow-up): several fixtures below need to know exactly which region of
+// the image the detector will sample, to place/space content meaningfully
+// relative to that box (e.g. "two clusters half the BOX width apart"). A
+// copy-pasted literal silently drifts out of sync the next time the box is
+// recalibrated -- exactly what happened here, when WATERMARK_BOX narrowed
+// from (0.20, 0.90, ...) to (0.25, 0.72, ...) and a fixture computed from
+// the old literal kept "passing" for a geometry it no longer actually
+// tested. Falls back to the pre-fix literal if python/PIL aren't available
+// (this read itself only needs python3, not PIL) so the pilAvailable-gated
+// skip below still works without this value.
+function readWatermarkBox(): [number, number, number, number] {
+  if (!pythonAvailable) return [0.2, 0.9, 0.15, 0.65];
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(join(import.meta.dir, '..', 'features', 'hooks', 'review-descriptor'))})
+from pre_send_photo import WATERMARK_BOX
+print(",".join(str(v) for v in WATERMARK_BOX))
+`;
+  const proc = Bun.spawnSync(['python3', '-c', script], { stdout: 'pipe', stderr: 'pipe' });
+  if (proc.exitCode !== 0) {
+    throw new Error(`reading WATERMARK_BOX failed: ${proc.stderr.toString()}`);
+  }
+  const [x0, x1, y0, y1] = proc.stdout.toString().trim().split(',').map(Number);
+  return [x0, x1, y0, y1];
+}
+const [BOX_X0, BOX_X1, BOX_Y0, BOX_Y1] = readWatermarkBox();
 
 let home: string;
 
@@ -78,8 +109,9 @@ print(looks_like_empty_vscode_watermark(${JSON.stringify(pngPath)}))
 }
 
 // A compact rectangle of glyph-colored pixels near the geometric center of
-// the image — inside the detector's central box (WATERMARK_BOX: 20-90% W,
-// 15-65% H) — on the flat (30,30,30) background, sized to land the sampled
+// the image — inside the detector's central box (WATERMARK_BOX, read live
+// from the module above, not hardcoded here) — on the flat (30,30,30)
+// background, sized to land the sampled
 // non-bg ratio inside WATERMARK_NONBG_RATIO_RANGE and the span well under
 // the compactness caps.
 const CENTER_GLYPH_CLUSTER = `
@@ -212,6 +244,63 @@ for row in range(n_rows):
   expect(detect(draw)).toBe(true);
 });
 
+test.skipIf(!pilAvailable)('REAL empty VS Code window screenshot (tg#6651/tg#6672) -> detected', () => {
+  // Every fixture above this point is SYNTHETIC (high-contrast, ~120-level
+  // glyph-on-background) and was blind to the actual bug this locks in: a
+  // real captured VS Code Dark Modern "no tabs open" watermark is a single
+  // flat translucent LOGO mark with only ~6-7 RGB levels of contrast against
+  // the editor background -- an order of magnitude subtler than every
+  // synthetic fixture in this file, and invisible under the OLD
+  // WATERMARK_BG_TOL=20. Two independently captured real screenshots (same
+  // window layout -- Explorer + a docked Chat panel, zero editor tabs --
+  // differing only in Explorer tree state) both returned False under the
+  // pre-fix constants; investigating why found the OLD WATERMARK_BOX also
+  // physically overlapped the docked Chat panel, polluting the signal with
+  // panel content/divider lines instead of the watermark itself. See the
+  // CALIBRATION comment above WATERMARK_BOX in pre_send_photo.py for the
+  // full pixel-level analysis.
+  const fixture1 = join(REPO, 'tests', 'fixtures', 'vscode-empty-watermark-1.png');
+  const fixture2 = join(REPO, 'tests', 'fixtures', 'vscode-empty-watermark-2.png');
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(join(REPO, 'features', 'hooks', 'review-descriptor'))})
+from pre_send_photo import looks_like_empty_vscode_watermark
+print(looks_like_empty_vscode_watermark(${JSON.stringify(fixture1)}))
+print(looks_like_empty_vscode_watermark(${JSON.stringify(fixture2)}))
+`;
+  const proc = Bun.spawnSync(['python3', '-c', script], { stdout: 'pipe', stderr: 'pipe' });
+  expect(proc.exitCode).toBe(0);
+  const lines = proc.stdout.toString().trim().split('\n');
+  expect(lines[0]).toBe('True');
+  expect(lines[1]).toBe('True');
+});
+
+test.skipIf(!pilAvailable)('REAL busy full-window screenshot (code editor + preview pane) -> NOT detected (review finding)', () => {
+  // review finding: recalibrating for the real-watermark positive case above
+  // (lowering WATERMARK_BG_TOL, widening WATERMARK_NONBG_RATIO_RANGE and
+  // WATERMARK_MAX_SPAN_RATIO) is a sensitivity INCREASE, and this file's own
+  // history (HYP-891) is entirely about a prior heuristic that false-
+  // positived on legitimate busy screenshots. The "dense random content" /
+  // "12000 scattered points" negative fixtures above are SYNTHETIC noise,
+  // not a real HyperIDE layout -- they don't prove the recalibrated
+  // constants stay quiet on an actual busy window. This fixture is a real
+  // capture (Explorer + a real code file open in the editor + the Hyper
+  // Canvas preview pane showing a readonly-mode notice with an icon and a
+  // table -- a shape not unlike a watermark at a glance) pulled from an
+  // unrelated HyperIDE e2e run. Locks in the false-positive direction the
+  // two real positive fixtures above don't cover.
+  const fixture = join(REPO, 'tests', 'fixtures', 'vscode-busy-content-1.png');
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(join(REPO, 'features', 'hooks', 'review-descriptor'))})
+from pre_send_photo import looks_like_empty_vscode_watermark
+print(looks_like_empty_vscode_watermark(${JSON.stringify(fixture)}))
+`;
+  const proc = Bun.spawnSync(['python3', '-c', script], { stdout: 'pipe', stderr: 'pipe' });
+  expect(proc.exitCode).toBe(0);
+  expect(proc.stdout.toString().trim()).toBe('False');
+});
+
 test.skipIf(!pythonAvailable)('_trimmed_span_ratio: a single far outlier does not blow up the span at small n (review finding)', () => {
   // Unit-tests _trimmed_span_ratio directly (bypassing the full detector's
   // density-floor gate) because the realistic small-n regime this guards --
@@ -289,8 +378,8 @@ test.skipIf(!pilAvailable)('compact glyph cluster on a NOISY near-flat backgroun
   const draw = `
 import random
 random.seed(11)
-bx0, bx1 = int(${W} * 0.20), int(${W} * 0.90)
-by0, by1 = int(${H} * 0.15), int(${H} * 0.65)
+bx0, bx1 = int(${W} * ${BOX_X0}), int(${W} * ${BOX_X1})
+by0, by1 = int(${H} * ${BOX_Y0}), int(${H} * ${BOX_Y1})
 for y in range(by0, by1, 2):
     for x in range(bx0, bx1, 2):
         n = random.randint(-4, 4)
@@ -313,8 +402,8 @@ test.skipIf(!pilAvailable)('dense random content filling the central pane -> NOT
   const draw = `
 import random
 random.seed(7)
-bx0, bx1 = int(${W} * 0.20), int(${W} * 0.90)
-by0, by1 = int(${H} * 0.15), int(${H} * 0.65)
+bx0, bx1 = int(${W} * ${BOX_X0}), int(${W} * ${BOX_X1})
+by0, by1 = int(${H} * ${BOX_Y0}), int(${H} * ${BOX_Y1})
 for y in range(by0, by1):
     for x in range(bx0, bx1):
         px[x, y] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
@@ -334,9 +423,9 @@ test.skipIf(!pilAvailable)('two compact clusters ~54% of the box apart (moderate
   // WATERMARK_MAX_SPAN_RATIO (0.35, 0.40) actually rejects this, not just
   // the two extremes.
   const draw = `
-bx0 = int(${W} * 0.20)
-by0 = int(${H} * 0.15)
-box_w = int(${W} * 0.90) - bx0
+bx0 = int(${W} * ${BOX_X0})
+by0 = int(${H} * ${BOX_Y0})
+box_w = int(${W} * ${BOX_X1}) - bx0
 c1x, c1y = bx0 + 40, by0 + 150
 c2x, c2y = bx0 + 40 + int(box_w * 0.5), by0 + 150
 for gx, gy in [(c1x, c1y), (c2x, c2y)]:
@@ -362,8 +451,8 @@ test.skipIf(!pilAvailable)('glyph pixels scattered across the whole pane (not co
   // False verdict here can only come from the compactness (span) check, the
   // thing this test means to isolate -- not from the density check as well.
   const draw = `
-bx0, bx1 = int(${W} * 0.20), int(${W} * 0.90)
-by0, by1 = int(${H} * 0.15), int(${H} * 0.65)
+bx0, bx1 = int(${W} * ${BOX_X0}), int(${W} * ${BOX_X1})
+by0, by1 = int(${H} * ${BOX_Y0}), int(${H} * ${BOX_Y1})
 import random
 random.seed(3)
 for _ in range(12000):
