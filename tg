@@ -443,6 +443,10 @@ if (import.meta.main) {
     return worktreeRootsCache
   }
   const recursiveAttachOn = features["recursive-attach"] !== false
+  // Same flag the body-detection call below gates on (`features["autolink-msgrefs"] !== false`)
+  // — threaded into parseArgs so the --title guard honours a disabled feature identically
+  // (tg-cli#138 review finding on PR #139: --title must not ban a literal the body allows).
+  const msgrefAutolinkOn = features["autolink-msgrefs"] !== false
   const parsed = parseArgs(
     args,
     process.cwd(),
@@ -451,6 +455,8 @@ if (import.meta.main) {
     getWorktreeRoots,
     attachDenylistOn,
     recursiveAttachOn,
+    undefined,
+    msgrefAutolinkOn,
   )
 
   // No-send actions resolve BEFORE the credential gate so help/version/info

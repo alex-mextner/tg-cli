@@ -173,6 +173,13 @@ export function parseArgs(
   // the default builds one lazy real-fs index per parseArgs call.
   recursiveAttach = true,
   getFileIndex?: () => string[],
+  // Message-reference autolinking (feature `autolink-msgrefs`, ON by default): gates the
+  // `--title` tg#<id> guard below, mirroring the SAME flag the body-detection call in the `tg`
+  // entrypoint already gates on. With the feature off, a `tg#<id>` is inert plain text (no
+  // linkify, no gate) in BOTH the title and the body — consistent, rather than banning it from
+  // the title while the identical literal is freely allowed in the body (task-cli#45 / tg-cli
+  // review finding on PR #139).
+  msgrefAutolink = true,
 ): ParseResult {
   // 1. Help / version win anywhere, before the empty check.
   for (const a of args) {
@@ -242,8 +249,12 @@ export function parseArgs(
       // place a reader can follow a reference from — and unlike the message
       // body, nothing here ever gets linkified. Refuse instrumentally (the
       // same rule task-cli/gh-ship enforce on a ticket/PR title) rather than
-      // silently sending an inert `tg#1234` in the header.
-      if (detectMsgRefs(nextArg).length > 0) {
+      // silently sending an inert `tg#1234` in the header. Gated on the SAME
+      // `autolink-msgrefs` feature flag the body detection uses (`tg`'s main
+      // entrypoint) — with the feature off, `tg#<id>` is inert plain text
+      // everywhere, in the title exactly like the body, not banned in one and
+      // freely allowed in the other.
+      if (msgrefAutolink && detectMsgRefs(nextArg).length > 0) {
         return {
           action: 'error',
           message: 'Refusing: --title contains a tg#<id> reference — move it into the message body.',
