@@ -2,16 +2,19 @@ import { expect, test } from 'bun:test';
 import {
   autoContinueDelayMs,
   buildLimitNotification,
+  buildUsageLimitNotification,
   classifyFailure,
   continueCallbackData,
   extractAssistantText,
   extractFailure,
+  extractUsageLimitEvent,
   formatClock,
   formatDelta,
   MAX_TIMER_MS,
   parseContinueCallback,
   parseResetTime,
   type HarnessFailureEvent,
+  type UsageLimitEvent,
 } from '../features/tg-ctl/limits';
 
 // A fixed local reference so wall-clock resolution is deterministic regardless of
@@ -26,6 +29,17 @@ const ev = (over: Partial<HarnessFailureEvent> = {}): HarnessFailureEvent => ({
   detail: '',
   resetAt: null,
   sourceMessageId: null,
+  ...over,
+});
+
+const usageEv = (over: Partial<UsageLimitEvent> = {}): UsageLimitEvent => ({
+  kind: 'usage-warning',
+  agent: 'codex',
+  percent: 91,
+  limitName: 'primary',
+  resetAt: NOW + 60 * 60_000,
+  language: 'en',
+  detail: '',
   ...over,
 });
 
@@ -166,6 +180,12 @@ test('notification: agent name is HTML-escaped', () => {
   expect(n.text).not.toContain('a<b>&c');
 });
 
+test('notification: short reset delta is HTML-escaped', () => {
+  const n = buildLimitNotification(ev({ resetAt: NOW + 30_000 }), NOW)!;
+  expect(n.text).toContain('&lt;1m');
+  expect(n.text).not.toContain('(<1m)');
+});
+
 test('autoContinueDelayMs: future = remaining, past = 0, far future clamped', () => {
   expect(autoContinueDelayMs(NOW + 5000, NOW)).toBe(5000);
   expect(autoContinueDelayMs(NOW - 5000, NOW)).toBe(0);
@@ -214,4 +234,319 @@ test('formatClock / formatDelta', () => {
   expect(formatDelta(45 * 60_000)).toBe('45m');
   expect(formatDelta(125 * 60_000)).toBe('2h 5m');
   expect(formatDelta(30_000)).toBe('<1m');
+});
+
+test('usage parser: Codex token_count rate_limits extracts the highest percentage + reset', () => {
+  const primaryReset = Math.floor((NOW + 60 * 60_000) / 1000);
+  const secondaryReset = Math.floor((NOW + 7 * 24 * 60 * 60_000) / 1000);
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        rate_limits: {
+          primary: { used_percent: 91, window_minutes: 300, resets_at: primaryReset },
+          secondary: { used_percent: 63, window_minutes: 10080, resets_at: secondaryReset },
+        },
+      },
+    }),
+    { agent: 'codex', language: 'ru', now: NOW },
+  );
+  expect(ev).toMatchObject({
+    kind: 'usage-warning',
+    agent: 'codex',
+    percent: 91,
+    limitName: '5-hour',
+    language: 'ru',
+  });
+  expect(ev?.resetAt).toBe(primaryReset * 1000);
+});
+
+test('usage parser: stale high bucket does not hide a lower active bucket', () => {
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        rate_limits: {
+          primary: { used_percent: 99, window_minutes: 300, resets_at: Math.floor((NOW - 60_000) / 1000) },
+          secondary: { used_percent: 95, window_minutes: 10080, resets_at: Math.floor((NOW + 60_000) / 1000) },
+        },
+      },
+    }),
+    { agent: 'codex', now: NOW },
+  );
+  expect(ev).toMatchObject({ agent: 'codex', percent: 95, limitName: 'weekly' });
+});
+
+test('usage parser: percent fields are literal 0-100 values, not guessed ratios', () => {
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      type: 'token_count',
+      rate_limits: {
+        limit_id: 'codex',
+        primary: { used_percent: 1, window_minutes: 300 },
+        secondary: { used_percent: 0.9, window_minutes: 10080 },
+      },
+    }),
+  );
+  expect(ev).toMatchObject({ agent: 'codex', percent: 1 });
+  expect(buildUsageLimitNotification(ev!, NOW)).toBeNull();
+});
+
+test('usage parser: percent fields outside 0-100 are ignored', () => {
+  expect(
+    extractUsageLimitEvent(
+      JSON.stringify({
+        type: 'token_count',
+        rate_limits: {
+          limit_id: 'codex',
+          primary: { used_percent: 9100, window_minutes: 300 },
+        },
+      }),
+    ),
+  ).toBeNull();
+  expect(
+    extractUsageLimitEvent(
+      JSON.stringify({
+        type: 'token_count',
+        rate_limits: {
+          limit_id: 'codex',
+          primary: { used_percent: 120, window_minutes: 300 },
+          secondary: { used_percent: 91, window_minutes: 10080 },
+        },
+      }),
+    ),
+  ).toMatchObject({ agent: 'codex', percent: 91, limitName: 'weekly' });
+});
+
+test('usage parser: Codex app-server account rateLimits shape prefers the Codex weekly bucket', () => {
+  const primaryReset = Math.floor((NOW + 60 * 60_000) / 1000);
+  const secondaryReset = Math.floor((NOW + 7 * 24 * 60 * 60_000) / 1000);
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      method: 'account/rateLimits/updated',
+      params: {
+        rateLimitsByLimitId: {
+          codex: {
+            limitId: 'codex',
+            primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: primaryReset },
+            secondary: { usedPercent: 94, windowDurationMins: 10080, resetsAt: secondaryReset },
+          },
+        },
+      },
+    }),
+    { now: NOW },
+  );
+  expect(ev).toMatchObject({ agent: 'codex', percent: 94, limitName: 'weekly' });
+  expect(ev?.resetAt).toBe(secondaryReset * 1000);
+});
+
+test('usage parser: Codex app-server accepts the documented account/rateLimits/* method family', () => {
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      method: 'account/rateLimits/snapshot',
+      params: {
+        rateLimitsByLimitId: {
+          codex: {
+            limitId: 'codex',
+            primary: { usedPercent: 92, windowDurationMins: 300, resetsAt: Math.floor((NOW + 60_000) / 1000) },
+          },
+        },
+      },
+    }),
+    { now: NOW },
+  );
+  expect(ev).toMatchObject({ agent: 'codex', percent: 92, limitName: '5-hour' });
+});
+
+test('usage parser: Codex rollout relative reset seconds resolve against now', () => {
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      msg: {
+        type: 'token_count',
+        rate_limits: {
+          limit_id: 'codex',
+          primary: { used_percent: 90, window_minutes: 300, resets_in_seconds: 120 },
+        },
+      },
+    }),
+    { now: NOW },
+  );
+  expect(ev).toMatchObject({ agent: 'codex', percent: 90, limitName: '5-hour' });
+  expect(ev?.resetAt).toBe(NOW + 120_000);
+});
+
+test('usage parser: Claude statusLine rate_limits shape is recognized', () => {
+  const primaryReset = Math.floor((NOW + 60 * 60_000) / 1000);
+  const secondaryReset = Math.floor((NOW + 7 * 24 * 60 * 60_000) / 1000);
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      version: '2.1.199',
+      model: { display_name: 'Opus' },
+      rate_limits: {
+        five_hour: { used_percentage: 91.5, resets_at: primaryReset },
+        seven_day: { used_percentage: 64, resets_at: secondaryReset },
+      },
+    }),
+    { language: 'ru', now: NOW },
+  );
+  expect(ev).toMatchObject({ agent: 'claude', percent: 91.5, limitName: '5-hour', language: 'ru' });
+  expect(ev?.resetAt).toBe(primaryReset * 1000);
+});
+
+test('usage parser: Claude context_window is accepted only when the caller identifies Claude', () => {
+  const payload = JSON.stringify({
+    context_window: { used_percentage: 92, context_window_size: 200000 },
+  });
+  expect(extractUsageLimitEvent(payload)).toBeNull();
+  expect(extractUsageLimitEvent(payload, { agent: 'claude' })).toMatchObject({
+    agent: 'claude',
+    percent: 92,
+    limitName: 'context window',
+  });
+});
+
+test('usage parser: Claude context_window competes with low rate_limits when agent is Claude', () => {
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      rate_limits: {
+        five_hour: { used_percentage: 20, resets_at: Math.floor((NOW + 60_000) / 1000) },
+        seven_day: { used_percentage: 30, resets_at: Math.floor((NOW + 60_000) / 1000) },
+      },
+      context_window: { used_percentage: 95, context_window_size: 200000 },
+    }),
+    { agent: 'claude', now: NOW },
+  );
+  expect(ev).toMatchObject({ agent: 'claude', percent: 95, limitName: 'context window' });
+});
+
+test('usage parser: Claude rate_limits are not attributed when caller identifies another agent', () => {
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      rate_limits: {
+        five_hour: { used_percentage: 91, resets_at: Math.floor((NOW + 60_000) / 1000) },
+      },
+    }),
+    { agent: 'codex', now: NOW },
+  );
+  expect(ev).toBeNull();
+});
+
+test('usage parser: Pi get_session_stats RPC context usage is recognized for the pi harness', () => {
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      type: 'response',
+      command: 'get_session_stats',
+      success: true,
+      data: {
+        sessionId: 'abc123',
+        tokens: { input: 50000, output: 10000, total: 105000 },
+        contextUsage: { tokens: 184000, contextWindow: 200000, percent: 92 },
+      },
+    }),
+    { agent: 'pi' },
+  );
+  expect(ev).toMatchObject({ agent: 'pi', percent: 92, limitName: 'context window' });
+});
+
+test('usage parser: OpenCode requires the explicit tg-cli usage envelope', () => {
+  const reset = new Date(NOW + 60 * 60_000).toISOString();
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      schema: 'tg-cli.usageLimit.v1',
+      agent: 'opencode',
+      usedPercent: 90,
+      limitName: 'Go 5-hour',
+      resetsAt: reset,
+      locale: 'en-US',
+    }),
+    { now: NOW },
+  );
+  expect(ev).toMatchObject({ agent: 'opencode', percent: 90, limitName: 'Go 5-hour', language: 'en' });
+  expect(ev?.resetAt).toBe(Date.parse(reset));
+});
+
+test('usage parser: generic percent/prose/token-only payloads are ignored', () => {
+  const payloads = [
+    JSON.stringify({ agent: 'claude', usage: { percent: 91, limit_name: 'daily' } }),
+    JSON.stringify({ agent: 'opencode', usage: { percent: 91, limit_name: 'daily' } }),
+    JSON.stringify({ name: 'claude_code.token.usage', value: 1234, attributes: { type: 'input' } }),
+    JSON.stringify({ type: 'message.updated', properties: { info: { providerID: 'opencode', tokens: { input: 120000, output: 10 } } } }),
+    'codex limit 91% resets 4pm',
+  ];
+  for (const payload of payloads) {
+    expect(extractUsageLimitEvent(payload, { agent: 'opencode' })).toBeNull();
+  }
+});
+
+test('usage notification: below 90% suppresses; 90% and above reports', () => {
+  expect(buildUsageLimitNotification(usageEv({ percent: 89.9 }), NOW)).toBeNull();
+  expect(buildUsageLimitNotification(usageEv({ percent: 90 }), NOW)).not.toBeNull();
+});
+
+test('usage notification: stale reset suppresses like the StopFailure path', () => {
+  expect(buildUsageLimitNotification(usageEv({ percent: 95, resetAt: NOW - 1 }), NOW)).toBeNull();
+});
+
+test('usage notification: Russian and English copy', () => {
+  const ru = buildUsageLimitNotification(usageEv({ agent: 'claude', language: 'ru', percent: 92 }), NOW)!;
+  expect(ru.text).toContain('использовано');
+  expect(ru.text).toContain('92%');
+  expect(ru.text).toContain('основного лимита');
+  expect(ru.text).toContain('Сброс');
+
+  const en = buildUsageLimitNotification(usageEv({ language: 'en', percent: 93 }), NOW)!;
+  expect(en.text).toContain('is at');
+  expect(en.text).toContain('93%');
+  expect(en.text).toContain('Resets');
+});
+
+test('usage notification: short Russian reset delta is HTML-escaped', () => {
+  const ru = buildUsageLimitNotification(usageEv({ language: 'ru', resetAt: NOW + 30_000 }), NOW)!;
+  expect(ru.text).toContain('&lt;1 мин');
+  expect(ru.text).not.toContain('(<1 мин)');
+});
+
+test('usage parser: language falls back to process locale hints when payload lacks one', () => {
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      type: 'token_count',
+      rate_limits: {
+        limit_id: 'codex',
+        primary: { used_percent: 90, window_minutes: 300 },
+      },
+    }),
+    { env: { LANG: 'ru_RU.UTF-8' } },
+  );
+  expect(ev?.language).toBe('ru');
+});
+
+test('usage parser: language detection ignores nested unrelated language fields', () => {
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      model: { language_code: 'ru' },
+      type: 'token_count',
+      rate_limits: {
+        limit_id: 'codex',
+        primary: { used_percent: 90, window_minutes: 300 },
+      },
+    }),
+  );
+  expect(ev?.language).toBe('en');
+});
+
+test('usage parser: language detection ignores top-level language_code and keeps env fallback', () => {
+  const ev = extractUsageLimitEvent(
+    JSON.stringify({
+      language_code: 'ru',
+      type: 'token_count',
+      rate_limits: {
+        limit_id: 'codex',
+        primary: { used_percent: 90, window_minutes: 300 },
+      },
+    }),
+    { env: { LANG: 'en_US.UTF-8' } },
+  );
+  expect(ev?.language).toBe('en');
 });

@@ -35,6 +35,7 @@ test('/agent <win> <msg> → agent-route with selector + rest + ack', () => {
     rest: 'deploy now',
     all: 'feat-bot deploy now',
     from: 'Alex',
+    messageId: 1,
   });
   // a non-reply action earns the 👀 receipt
   expect(r.actions[1]).toEqual({ kind: 'ack', messageId: 1 });
@@ -69,5 +70,5 @@ test('tgq: callback still routes to answer-question (no regression)', () => {
 
 test('other slash commands still pass through verbatim', () => {
   const r = stepUpdates([textUpd(6, '/compact')], opts);
-  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '/compact' });
+  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '/compact', messageId: 6 });
 });

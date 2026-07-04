@@ -2,6 +2,9 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join, resolve } from "path"
+// Explicit import (not the global `crypto`) so the multi-part groupId token
+// doesn't depend on a runtime global being present — review: tg-cli#131 f/u.
+import { randomUUID } from "node:crypto"
 import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
 import {
   applyFeatureFlags,
@@ -28,7 +31,7 @@ import { detectRefsExpanded } from "./features/autolink-prs/detect"
 import { probeRefsInRepo, probeRepo, type GhRef } from "./features/autolink-prs/resolve"
 import { buildEntries, linkifyRefsCompound } from "./features/autolink-prs/render"
 import { detectMsgRefs } from "./features/autolink-msgrefs/detect"
-import { linkifyMsgRefs, msgRefUrl } from "./features/autolink-msgrefs/render"
+import { buildMsgRefEntries, detectLinkableMsgRefs, linkifyMsgRefs, msgRefUrl } from "./features/autolink-msgrefs/render"
 import {
   markHint,
   parseHintState,
@@ -45,8 +48,8 @@ import {
   serializeRoutes,
   withRoutesLock,
 } from "./features/tg-ctl/routes"
-import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
-import { outboundHistoryText } from "./features/replies/outbound"
+import { appendRecordsToBlob, parseHistory } from "./features/replies/history"
+import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/replies/outbound"
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
@@ -440,6 +443,10 @@ if (import.meta.main) {
     return worktreeRootsCache
   }
   const recursiveAttachOn = features["recursive-attach"] !== false
+  // Same flag the body-detection call below gates on (`features["autolink-msgrefs"] !== false`)
+  // — threaded into parseArgs so the --title guard honours a disabled feature identically
+  // (tg-cli#138 review finding on PR #139: --title must not ban a literal the body allows).
+  const msgrefAutolinkOn = features["autolink-msgrefs"] !== false
   const parsed = parseArgs(
     args,
     process.cwd(),
@@ -448,6 +455,8 @@ if (import.meta.main) {
     getWorktreeRoots,
     attachDenylistOn,
     recursiveAttachOn,
+    undefined,
+    msgrefAutolinkOn,
   )
 
   // No-send actions resolve BEFORE the credential gate so help/version/info
@@ -641,6 +650,8 @@ if (import.meta.main) {
 
   const BOT_TOKEN = env.TG_BOT_TOKEN
   const CHAT_ID = env.TG_CHAT_ID
+  const CHAT_ID_NUMBER = Number(CHAT_ID)
+  const currentChatId = Number.isFinite(CHAT_ID_NUMBER) ? CHAT_ID_NUMBER : undefined
 
   if (!BOT_TOKEN || !CHAT_ID) {
     console.error("Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ~/.config/tg-cli/.env")
@@ -941,9 +952,25 @@ if (import.meta.main) {
   // recognized as a message ref and never mis-resolved as issue/PR #3715. The
   // deep link only materializes for a supergroup chat; in a private DM the ref
   // is marked but unlinked (no public per-message URL exists there).
-  const msgRefIds =
+  const rawMsgRefIds =
     features["autolink-msgrefs"] !== false && caption ? detectMsgRefs(caption) : []
-  const hasMsgRefs = msgRefIds.length > 0
+  const buildMsgRefEntriesFor = (ids: number[]) => {
+    if (ids.length === 0) return []
+    const historyPath = ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).history
+    let historyRaw: string
+    try {
+      historyRaw = readFileSync(historyPath, "utf8")
+    } catch {
+      return []
+    }
+    return buildMsgRefEntries(
+      parseHistory(historyRaw),
+      ids,
+      (id) => msgRefUrl(currentChatId, id),
+      currentChatId,
+    )
+  }
+  const hasMsgRefs = rawMsgRefIds.length > 0
   const hasAutolink = hasTickets || hasRefs || hasMsgRefs
 
   // Record an outbound message_id → this pane so the daemon can route a REPLY to
@@ -975,11 +1002,13 @@ if (import.meta.main) {
     }
     return null
   }
-  // The FIRST outbound message id of THIS send (a multi-chunk / media send is
-  // ONE logical message for recall — see recordOutboundHistory below).
-  let firstOutboundId: number | null = null
+  // EVERY outbound message id of THIS send (a multi-chunk >4096 split or a
+  // media-group send emits several Telegram message_ids for one logical
+  // agent message — see recordOutboundHistory below, which now logs a
+  // recall-able history record for each one, not just the first).
+  const outboundIds: number[] = []
   const recordRoute = (messageId: number): void => {
-    if (firstOutboundId === null) firstOutboundId = messageId
+    outboundIds.push(messageId)
     if (!ROUTES_PATH || !TMUX_PANE) return
     try {
       // Resolve the route cwd (a tmux display-message lookup) BEFORE taking the
@@ -1022,12 +1051,13 @@ if (import.meta.main) {
     }
   }
 
-  // Append ONE `agent` history record for this send so `tg replies` can recall
+  // Append `agent` history record(s) for this send so `tg replies` can recall
   // what the agent sent (mirror of the daemon's inbound writer). Best-effort:
   // tmux-only, swallow-all — history bookkeeping must never break a send. The
-  // text is the message body (or a [photo]/[document] placeholder for a media-
-  // only send); `firstOutboundId` is the FIRST sent message id (null if no send
-  // reported one). Called AFTER transmit so the id is known.
+  // text is the message body (or a [photo]/[document] placeholder for a
+  // media-only send). One record is written per outbound message_id — see
+  // `buildOutboundHistoryRecords` (features/replies/outbound.ts) for why.
+  // Called AFTER transmit so the ids are known.
   const HISTORY_PATH = TMUX_PANE
     ? ctlPaths(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"), botIdFromToken(BOT_TOKEN)).history
     : null
@@ -1036,18 +1066,22 @@ if (import.meta.main) {
     const text = outboundHistoryText(body, { photos: plan.photos.length, documents: plan.documents.length })
     if (text === null) return
     try {
-      const rec: HistoryRecord = {
-        ts: Math.floor(Date.now() / 1000),
-        message_id: firstOutboundId,
-        direction: "agent",
-        from: "agent",
+      // randomUUID() only actually lands in a record when the send is truly
+      // multi-part (buildOutboundHistoryRecords ignores it otherwise) — a
+      // random token, not the group's first id, so it can't collide across
+      // two different chats sharing this bot's history file (tg-cli#131 f/u).
+      const recs = buildOutboundHistoryRecords(
+        outboundIds,
         text,
-        pane: TMUX_PANE,
-      }
+        Math.floor(Date.now() / 1000),
+        TMUX_PANE,
+        randomUUID(),
+        currentChatId,
+      )
       // 0o600: the log is a conversation transcript — owner-only, like the daemon socket.
       writeFileSync(
         HISTORY_PATH,
-        appendRecordsToBlob(existsSync(HISTORY_PATH) ? readFileSync(HISTORY_PATH, "utf8") : null, [rec]),
+        appendRecordsToBlob(existsSync(HISTORY_PATH) ? readFileSync(HISTORY_PATH, "utf8") : null, recs),
         { mode: 0o600 },
       )
       chmodSync(HISTORY_PATH, 0o600) // enforce on a pre-existing, looser-perm file too
@@ -1200,7 +1234,9 @@ if (import.meta.main) {
     // and a `tg#3715` is never even offered to the PR resolver. Deep link only
     // when the chat is a supergroup; otherwise the ref is marked but unlinked.
     let body = plan.textMessages[0].text
-    if (hasMsgRefs) body = linkifyMsgRefs(body, (id) => msgRefUrl(CHAT_ID, id))
+    const linkableMsgRefIds = hasMsgRefs ? detectLinkableMsgRefs(body) : []
+    const msgRefEntries = buildMsgRefEntriesFor(linkableMsgRefIds)
+    if (hasMsgRefs) body = linkifyMsgRefs(body, (id) => msgRefUrl(currentChatId, id))
     plan.textMessages[0] = {
       text: applyAutolink(body, autolinkTickets, prefix.present, {
         linkifyTickets: hasTickets
@@ -1208,7 +1244,7 @@ if (import.meta.main) {
               linkifyTicketsCompound(html, new Map(autolinkTickets.map((t) => [t.code, t])))
           : undefined,
         linkify: hasRefs ? (html: string): string => linkifyRefsCompound(html, autolinkRefs) : undefined,
-        issues,
+        issues: [...msgRefEntries, ...issues],
         prs,
         styleTitle: styleTaskTitle,
       }),
@@ -1390,10 +1426,11 @@ if (import.meta.main) {
     }
   }
 
-  // Outbound history for `tg replies` recall — one `agent` record per send,
-  // stamped with the first sent message id (now known). The body is the raw
-  // user-typed message (caption), so recall shows what the agent meant to say,
-  // not the branded envelope. Best-effort; never blocks the (already-sent) send.
+  // Outbound history for `tg replies` recall — one `agent` record per
+  // outbound message_id (now known; see buildOutboundHistoryRecords). The
+  // body is the raw user-typed message (caption), so recall shows what the
+  // agent meant to say, not the branded envelope. Best-effort; never blocks
+  // the (already-sent) send.
   recordOutboundHistory(caption)
 
   // Generated code→pdf / md→pdf artifacts are uploaded by now — drop their temp

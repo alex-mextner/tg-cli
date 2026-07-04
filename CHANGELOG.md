@@ -3,7 +3,7 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.26.2
+## 1.30.0
 
 **Feature (HYP-891 follow-up): empty-editor watermark WARN heuristic in `pre-send-photo`.**
 
@@ -207,7 +207,38 @@ semantic versioning.
   that specific, arguably most-likely-in-practice failure mode is caught by
   the same blanket fail-open as every other error path, not a missed case.
 
-## 1.26.1
+## 1.29.2
+
+**Fix (#141, closes #140): forward the outgoing photo caption as `--intent` to
+`review visual`.** (Retroactive entry — #141 merged to main without a
+CHANGELOG update; added here while reconciling it with the #133/HYP-891 branch
+above, so the version ladder has no undocumented gap.)
+
+- The pre-send-photo hook receives the outgoing caption in the event args
+  (`args.caption`) but never forwarded it — `review visual` was always invoked
+  as `[visual, image_path, --json, --strict]`, no `--intent`. review-cli's
+  intent-gated contributed modules (e.g. `selection-highlight`'s hard CV veto)
+  only activate when `--intent`/`--check` mentions their tag, so that whole
+  activation path was inert for every tg-sent photo, in any language
+  (tg#6188).
+- `--intent=<value>` is forwarded as ONE argv token (not two) so a caption
+  starting with `-`/`--` doesn't get misparsed by argparse as the next option.
+- `_safe_intent()` sanitizes the caption before it reaches `--intent`: strips
+  NUL bytes, trims to `_MAX_INTENT_CHARS` (4096), and pre-validates
+  encodability — an unencodable caption (e.g. a lone UTF-16 surrogate) drops
+  `--intent` rather than letting `subprocess.run`'s own `UnicodeEncodeError`
+  (a `ValueError` subclass) crash the entire `review visual` call and
+  silently disable verification for that photo. The `except` around
+  `subprocess.run` is widened to `(OSError, ValueError)` to still fail open
+  on `image_path`-side NUL bytes without that widening ever being reachable
+  via a crafted `--intent` value.
+- 18 tests in `tests/hooks-review-descriptor.test.ts`: canonical argv,
+  non-English forwarding, leading-dash forwarding, whitespace trimming,
+  embedded-NUL stripping, oversized-caption truncation, lone-surrogate
+  handling (proves `review visual` still runs), and no-caption/blank-caption
+  cases.
+
+## 1.29.3
 
 **Fix (HYP-891): remove the `pre-send-photo` full-window-screenshot block.**
 
@@ -227,6 +258,96 @@ semantic versioning.
   comment in `pre_send_photo.py` and HYP-891 for the follow-up if this needs
   strengthening later (e.g. a targeted vision check module scoped to the preview
   region instead of the whole window).
+
+## 1.29.1
+
+**Fix:** deferred `tg-ctl` messages now complete their Telegram reaction lifecycle.
+
+- Messages queued behind an agent question still get the `✍️` queued reaction first,
+  then flip to `👀` after the deferred text is successfully flushed into the agent pane.
+
+## 1.29.0
+
+**Feature (#138): `--title` refuses a `tg#<id>` reference.**
+
+- `--title` is a one-line header that is never linkified downstream (unlike the
+  body/caption, which the existing `autolink-msgrefs` feature handles). A `tg#<id>`
+  typed there is dead text, so `parseArgs` now refuses it at parse time with a
+  message pointing the reference at the body instead — the same rule task-cli/
+  gh-ship enforce on a PR/ticket title.
+- Gated on the same `autolink-msgrefs` feature flag the body-detection call uses:
+  with the feature disabled, `--title` is exactly as permissive as the body.
+
+## 1.28.1
+
+**Fix (tg#6006): Telegram message references now link and carry compact excerpts.**
+
+- `tg#<id>` and the already-rendered `𝒕𝒈#<id>` form are both detected in outbound
+  `tg` messages. Supergroup/channel refs become `t.me/c/...` links; private-DM refs
+  stay visibly styled but unlinked.
+- When the referenced id exists in `tg replies` history, the outbound message adds a
+  collapsed reference block with only the start of the original message plus `…` on
+  truncation, rather than copying the whole referenced Telegram message. Excerpts use
+  the same tag-safe walk as linking and are scoped by `chat_id` on new history rows.
+
+## 1.28.0
+
+**Feature (tg-cli#132): proactive harness usage warnings at 90%.**
+
+- `tg-ctl harness-event` accepts externally-piped proactive usage telemetry when a
+  confirmed limit contract reaches `>=90%`: Claude Code statusLine
+  rate-limits/context, Codex `rate_limits`, Pi RPC `contextUsage`, or tg-cli's
+  explicit `schema: "tg-cli.usageLimit.v1"` envelope for custom collectors such
+  as an OpenCode plugin.
+- Generic token/cost payloads are ignored rather than guessed. Warnings are
+  deduped per agent/limit for the current reset window (or a one-hour cooldown
+  when no reset is known), localize from payload/locale hints when possible, and
+  otherwise render in English.
+
+## 1.27.0
+
+**Feature (tg-cli#130): reply quote-anchor carries the original message's
+`tg#<id>`.** From Alex (tg#5978).
+
+- `buildReplyAnchor`/`buildReplyInject` (`features/tg-ctl/updates.ts`) now
+  render `↩ tg#<id> «[date time] head…»` — `tg#<id>` is
+  `reply_to_message.message_id`, the Telegram id of the message being
+  answered (almost always the agent's own prior report), rendered with the
+  same `tg#` convention as the inbound wrap's own-message `{id}`. Previously
+  only the reply's OWN id was surfaced (via the `[TG from {name} {id}]` wrap);
+  the id of the message being REPLIED TO was invisible, so an agent whose
+  context had compacted had no way to recover the original beyond the ~60-char
+  truncated preview. Now it can pull the full text back with `tg replies` (or
+  `tg replies --json` filtered by id) instead of guessing.
+- Applies uniformly to text replies, voice-note replies, and prose replies
+  inside a bound forum topic (all three route through the same
+  `buildReplyAnchor`).
+- Docs: `docs/specs/reply-quotes.md` and the README inbound-reply section
+  updated to the new anchor format.
+- **Fix (review: tg-cli#131):** a reply anchored to a non-first chunk of a
+  >4096 split, or a non-first item of a media-group album, was NOT
+  recall-able via `tg replies --json | select(.id == <tg#>)` — `tg` only
+  wrote ONE history record, keyed to the first outbound message id, even
+  though the route map (used to route an inbound reply back to its origin
+  pane) already tracked every id. `buildOutboundHistoryRecords`
+  (`features/replies/outbound.ts`) now writes one `agent` history record per
+  outbound message_id, so every anchored id stays recall-able.
+  `outboundHistoryText` also now combines a mixed photo+document send into
+  one placeholder (`[2 photos, 3 files]`) instead of silently dropping the
+  document count.
+- **Fix (tg-cli#134, review: tg-cli#131 follow-up):** writing multiple
+  records per send meant the plain (non-`--json`) `tg replies agent` listing
+  printed one logical send as N duplicate-looking lines, and `-n`/`--limit`
+  counted raw records instead of sends. Every true multi-part send is now
+  tagged with a shared `groupId` (a caller-supplied random token, not the
+  group's first id — Telegram message_id is per-chat-sequential, so reusing
+  it as the key could collide across two chats sharing one bot's history
+  file) and `select.ts` groups by that authoritative marker; `-n`/`--limit`
+  now counts logical sends (not raw records) for BOTH the plain listing and
+  `--json` — a kept multi-part send is never truncated mid-group, so a
+  `--json -n N` result can carry more than N rows when the tail includes a
+  multi-part send. The plain listing additionally collapses each group to
+  one line; `--json` always returns every id of the kept sends, uncollapsed.
 
 ## 1.26.0
 

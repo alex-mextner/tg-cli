@@ -152,7 +152,10 @@ The agent reads it and responds by calling `tg`.
 
 **Reply with a quote (v1.6.0)** — reply to a message (optionally highlighting a
 part of it) and the agent receives a quote anchor identifying what you answered:
-`↩ «[date time] the quoted text…»` above your message.
+`↩ tg#5975 «[date time] the quoted text…»` above your message. `tg#5975` is the
+replied-to message's own Telegram id (tg-cli#130) — if the preview isn't enough
+to place it (e.g. after the agent's context compacted), it can pull the full
+original back with `tg replies`.
 
 ### Addressing a specific agent (v1.6.0)
 With several agents running, `/agent <window> <message>` routes to one of them.
@@ -163,7 +166,28 @@ buttons grouped by tmux session; tap one to route. Bare `/agent` lists the agent
 ### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
 
-**Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hook into `~/.claude/settings.json` (backup first, existing hooks preserved), then restart the agent session. `tg-ctl status` tells you whether the hook is installed. (Codex/opencode: see the command's printed guidance.)
+**Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hooks into `~/.claude/settings.json` (backup first, existing hooks preserved), then restart the agent session. `tg-ctl status` reports q→buttons and StopFailure hook installation separately. (Codex/opencode: see the command's printed guidance.)
+
+`tg-ctl harness-event` also accepts externally-piped proactive limit telemetry
+from confirmed contracts: Claude Code statusLine `rate_limits` (and
+`context_window` when called with `--agent claude`), Codex `token_count.rate_limits` / app-server
+`account/rateLimits/*`, Pi RPC `get_session_stats.data.contextUsage.percent`
+(with `--agent pi`), and an explicit `schema: "tg-cli.usageLimit.v1"` envelope
+for custom collectors such as an OpenCode plugin. Native OpenCode token/cost
+events are not treated as quota telemetry because they do not carry a
+percentage/reset contract. `--agent` is a selector for agent-specific telemetry,
+not just a display label: Claude `context_window` requires `--agent claude`, and
+Pi session stats require `--agent pi`. When supported usage is **90% or higher**, tg-cli
+sends a deduped Telegram warning in the detected user language (`--language`,
+then `language`/`locale`/`user_language` payload fields, then `LANG`/`LC_*`);
+if the language cannot be determined, the warning falls back to English.
+Duplicate warnings for the same agent/limit are suppressed for the current reset
+window, or for one hour when no reset is known.
+For StopFailure compatibility, `--transcript` or a `transcript_path` payload with
+no supported usage telemetry is treated as failure input and the last assistant
+message in that transcript is scanned for the limit/error text.
+`install-hooks` wires the Claude StopFailure hook; proactive telemetry collectors
+must pipe their payloads to `tg-ctl harness-event`.
 
 While an agent is **waiting on a question**, new messages you send it are **deferred** (queued, marked ✍️ on the message) and delivered once the question is answered — they don't interrupt the prompt.
 
@@ -256,9 +280,12 @@ $ tg replies
   after / at or before the date (both inclusive). A date is an ISO date
   (`2026-06-28`, midnight UTC), an ISO datetime (`2026-06-28T10:00`, UTC), or
   relative (`3d` / `24h` — N days or hours ago from now).
-- `-n/--limit N` (default 20), `--full` (no truncation), `--json` (a
-  machine-readable array: `ts` ms, `id`, `direction`, `from`, `text`, `pane`),
-  `--help`.
+- `-n/--limit N` (default 20, counts SENDS not raw rows — a >4096-char split
+  or a media-group album is one send, never truncated mid-send), `--full`
+  (no truncation), `--json` (a machine-readable array: `ts` ms, `id`,
+  `direction`, `from`, `text`, `pane` — one row per Telegram message_id, so
+  a multi-part send is several rows and `--json -n N` can return more than N
+  rows), `--help`.
 
 ```
 tg replies all                  # the full back-and-forth in this session
@@ -267,7 +294,7 @@ tg replies user find deploy     # your messages mentioning "deploy"
 tg replies agent --all-sessions # everything the agent has sent, anywhere
 tg replies user --since 3d      # your messages in the last 3 days
 tg replies all --since 2026-06-28 --until 2026-06-30  # a date range
-tg replies --json -n 5          # the last 5, as JSON
+tg replies --json -n 5          # the last 5 sends, as JSON
 ```
 
 History is an append-only `~/.config/tg-cli/tg-ctl.<botid>.history.jsonl` (one

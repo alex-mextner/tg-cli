@@ -54,12 +54,300 @@ export interface LimitNotification {
   resetAt: number | null;
 }
 
+export type UsageReportLanguage = 'en' | 'ru';
+
+const USAGE_AGENTS = ['claude', 'codex', 'pi', 'opencode'] as const;
+export type UsageAgent = (typeof USAGE_AGENTS)[number];
+
+export interface UsageLimitEvent {
+  kind: 'usage-warning';
+  agent: UsageAgent;
+  percent: number;
+  limitName: string | null;
+  resetAt: number | null;
+  language: UsageReportLanguage;
+  detail: string;
+}
+
+export interface UsageLimitOptions {
+  agent?: string | null;
+  language?: string | null;
+  env?: Record<string, string | undefined>;
+  now?: number;
+}
+
+interface UsageSample {
+  agent: 'claude' | 'codex' | 'pi' | 'opencode';
+  percent: number;
+  limitName: string | null;
+  resetAt: number | null;
+}
+
+const USAGE_REPORT_THRESHOLD_PERCENT = 90;
+interface CodexRateLimitRoot {
+  value: Record<string, unknown>;
+  trustedDirect: boolean;
+}
+const LANGUAGE_KEYS = ['language', 'locale', 'user_language', 'userLanguage'];
+
 // Map a StopFailure matcher to a notification kind. A matcher naming a limit
 // (session/usage/rate) is a schedulable stop; anything else (overloaded,
 // billing_error, api_error, …) is a plain error alert. The presence of a reset
 // time — not this label — is what actually decides whether a button is offered.
 export function classifyFailure(reason: string): HarnessFailureKind {
   return /limit/i.test(reason) ? 'session-limit' : 'api-error';
+}
+
+/**
+ * Normalize proactive usage/rate-limit telemetry into one high-usage candidate.
+ * Deliberately not generic: accepted shapes are Claude Code statusLine limits,
+ * Codex rate-limit telemetry, Pi `get_session_stats`, or tg-cli's explicit
+ * `tg-cli.usageLimit.v1` envelope. Generic token/cost payloads are ignored
+ * because they do not carry a quota percentage/reset contract. `opts.agent` is
+ * only a hint: it must normalize to a supported usage agent before agent-specific
+ * payloads such as Claude context or Pi stats are accepted. Extracted details are
+ * truncated before rendering.
+ */
+export function extractUsageLimitEvent(payloadText: string, opts: UsageLimitOptions = {}): UsageLimitEvent | null {
+  const parsed = parseJsonOrNull(payloadText);
+  if (parsed === null) return null;
+  const now = opts.now ?? Date.now();
+  const samples = collectContractUsageSamples(parsed, { ...opts, now }).filter((sample) => sample.resetAt === null || sample.resetAt > now);
+  if (samples.length === 0) return null;
+  samples.sort((a, b) => b.percent - a.percent);
+  const sample = samples[0];
+  const language =
+    normalizeReportLanguage(opts.language) ??
+    findLanguage(parsed) ??
+    languageFromEnv(opts.env) ??
+    'en';
+  return {
+    kind: 'usage-warning',
+    agent: sample.agent,
+    percent: sample.percent,
+    limitName: sample.limitName,
+    resetAt: sample.resetAt,
+    language,
+    detail: truncateDetail(detailFromUsagePayload(parsed)),
+  };
+}
+
+function parseJsonOrNull(text: string): unknown | null {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function collectContractUsageSamples(value: unknown, opts: UsageLimitOptions): UsageSample[] {
+  return [
+    ...usageSamplesFromNormalizedEnvelope(value),
+    ...usageSamplesFromClaudeStatusLine(value, opts),
+    ...usageSamplesFromCodex(value, opts.now ?? Date.now()),
+    ...usageSamplesFromPiStats(value, opts),
+  ];
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function recordField(rec: Record<string, unknown> | null, key: string): Record<string, unknown> | null {
+  return asRecord(rec?.[key]);
+}
+
+function stringField(rec: Record<string, unknown> | null, key: string): string | null {
+  const v = rec?.[key];
+  return typeof v === 'string' && v.trim() ? v.trim() : null;
+}
+
+function usageSamplesFromNormalizedEnvelope(value: unknown): UsageSample[] {
+  const rec = asRecord(value);
+  if (!rec || rec.schema !== 'tg-cli.usageLimit.v1') return [];
+  const agent = normalizeUsageAgent(rec.agent);
+  const percent = percentFromUnknown(rec.usedPercent);
+  if (!agent || percent === null) return [];
+  return [{ agent, percent, limitName: stringField(rec, 'limitName'), resetAt: timeFromUnknown(rec.resetsAt) }];
+}
+
+function usageSamplesFromClaudeStatusLine(value: unknown, opts: UsageLimitOptions): UsageSample[] {
+  const rec = asRecord(value);
+  if (!rec) return [];
+  const agent = normalizeUsageAgent(opts.agent);
+  if (agent && agent !== 'claude') return [];
+  const samples: UsageSample[] = [];
+  const rateLimits = recordField(rec, 'rate_limits');
+  for (const [key, label] of [
+    ['five_hour', '5-hour'],
+    ['seven_day', 'weekly'],
+  ] as const) {
+    const win = recordField(rateLimits, key);
+    const percent = percentFromUnknown(win?.used_percentage);
+    if (percent !== null) {
+      samples.push({ agent: 'claude', percent, limitName: label, resetAt: timeFromUnknown(win?.resets_at) });
+    }
+  }
+
+  if (agent === 'claude') {
+    const contextWindow = recordField(rec, 'context_window');
+    const percent = percentFromUnknown(contextWindow?.used_percentage);
+    if (percent !== null) {
+      samples.push({ agent: 'claude', percent, limitName: 'context window', resetAt: null });
+    }
+  }
+  return samples;
+}
+
+function usageSamplesFromCodex(value: unknown, now: number): UsageSample[] {
+  const roots = codexRateLimitRoots(value);
+  const samples: UsageSample[] = [];
+  for (const root of roots) {
+    const normalizedRoot = normalizeCodexRateLimitRoot(root);
+    if (!normalizedRoot) continue;
+    for (const [key, rec] of normalizedRoot) {
+      const percent = percentFromUnknown(rec.usedPercent ?? rec.used_percent);
+      if (percent === null) continue;
+      const windowMins = numberFromUnknown(rec.windowDurationMins ?? rec.window_minutes);
+      samples.push({
+        agent: 'codex',
+        percent,
+        limitName: codexLimitLabel(key, windowMins),
+        resetAt: codexResetAt(rec, now),
+      });
+    }
+  }
+  return samples;
+}
+
+function codexRateLimitRoots(value: unknown): CodexRateLimitRoot[] {
+  const rec = asRecord(value);
+  if (!rec) return [];
+  const roots: CodexRateLimitRoot[] = [];
+  const payload = recordField(rec, 'payload');
+  const msg = recordField(rec, 'msg');
+  const params = recordField(rec, 'params');
+  const result = recordField(rec, 'result');
+
+  if (payload?.type === 'token_count') pushCodexRoot(roots, payload.rate_limits, true);
+  if (msg?.type === 'token_count') pushCodexRoot(roots, msg.rate_limits, true);
+  if (rec.type === 'token_count') pushCodexRoot(roots, rec.rate_limits, true);
+  if (typeof rec.method === 'string' && rec.method.startsWith('account/rateLimits/')) pushCodexRoot(roots, params, false);
+  pushCodexRoot(roots, result, false);
+  pushCodexRoot(roots, rec, false);
+  return roots;
+}
+
+function normalizeCodexRateLimitRoot(root: CodexRateLimitRoot): [string, Record<string, unknown>][] | null {
+  const { value, trustedDirect } = root;
+  const byId = recordField(value, 'rateLimitsByLimitId');
+  const codexById = recordField(byId, 'codex');
+  const directCamel = recordField(value, 'rateLimits');
+  const directSnake = trustedDirect || value.limit_id === 'codex' || value.limitId === 'codex' ? value : null;
+  const candidate =
+    codexById ??
+    (directCamel && (directCamel.limitId === 'codex' || directCamel.limit_id === 'codex') ? directCamel : null) ??
+    directSnake;
+  if (!candidate) return null;
+  const out: [string, Record<string, unknown>][] = [];
+  for (const key of ['primary', 'secondary'] as const) {
+    const rec = recordField(candidate, key);
+    if (rec) out.push([key, rec]);
+  }
+  return out;
+}
+
+function pushCodexRoot(out: CodexRateLimitRoot[], value: unknown, trustedDirect: boolean): void {
+  const rec = asRecord(value);
+  if (rec) out.push({ value: rec, trustedDirect });
+}
+
+function codexLimitLabel(key: string, windowMins: number | null): string {
+  if (windowMins === 300) return '5-hour';
+  if (windowMins === 10080) return 'weekly';
+  return key;
+}
+
+function codexResetAt(rec: Record<string, unknown>, now: number): number | null {
+  const absolute = timeFromUnknown(rec.resetsAt ?? rec.resets_at);
+  if (absolute !== null) return absolute;
+  const rel = numberFromUnknown(rec.resetsInSeconds ?? rec.resets_in_seconds);
+  return rel !== null && rel >= 0 ? now + rel * 1000 : null;
+}
+
+function usageSamplesFromPiStats(value: unknown, opts: UsageLimitOptions): UsageSample[] {
+  const rec = asRecord(value);
+  if (!rec) return [];
+  const agent = normalizeUsageAgent(opts.agent) ?? normalizeUsageAgent(rec.agent) ?? normalizeUsageAgent(rec.harness);
+  if (agent !== 'pi') return [];
+  if (rec.type !== 'response' || rec.command !== 'get_session_stats' || rec.success !== true) return [];
+  const data = recordField(rec, 'data');
+  const contextUsage = recordField(data, 'contextUsage');
+  const percent = percentFromUnknown(contextUsage?.percent);
+  if (percent === null) return [];
+  return [{ agent: 'pi', percent, limitName: 'context window', resetAt: null }];
+}
+
+function normalizeUsageAgent(raw: unknown): UsageAgent | null {
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim().toLowerCase();
+  return (USAGE_AGENTS as readonly string[]).includes(s) ? (s as UsageAgent) : null;
+}
+
+function numberFromUnknown(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v !== 'string') return null;
+  const trimmed = v.trim().replace(/%$/, '');
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : null;
+}
+
+function percentFromUnknown(v: unknown): number | null {
+  const n = numberFromUnknown(v);
+  return n !== null && n >= 0 && n <= 100 ? n : null;
+}
+
+function timeFromUnknown(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v < 1_000_000_000_000 ? v * 1000 : v;
+  if (typeof v !== 'string' || !v.trim()) return null;
+  const n = numberFromUnknown(v);
+  if (n !== null && n > 0) return n < 1_000_000_000_000 ? n * 1000 : n;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : null;
+}
+
+function findLanguage(value: unknown): UsageReportLanguage | null {
+  return normalizeReportLanguage(findStringByKeys(value, LANGUAGE_KEYS));
+}
+
+function languageFromEnv(env: Record<string, string | undefined> | undefined): UsageReportLanguage | null {
+  if (!env) return null;
+  return normalizeReportLanguage(env.LC_ALL) ?? normalizeReportLanguage(env.LC_MESSAGES) ?? normalizeReportLanguage(env.LANG);
+}
+
+function normalizeReportLanguage(raw: unknown): UsageReportLanguage | null {
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim().toLowerCase();
+  if (!s) return null;
+  if (s.startsWith('ru') || s.includes('russian') || s.includes('рус')) return 'ru';
+  if (s.startsWith('en') || s.includes('english')) return 'en';
+  return null;
+}
+
+function findStringByKeys(value: unknown, keys: string[]): string | null {
+  const rec = asRecord(value);
+  if (!rec) return null;
+  for (const key of keys) {
+    const v = rec[key];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+function detailFromUsagePayload(value: unknown): string {
+  const rec = asRecord(value);
+  return stringField(rec, 'detail') ?? '';
 }
 
 // Parse a reset time out of failure text → next future ms epoch, or null.
@@ -206,8 +494,32 @@ export function buildLimitNotification(ev: HarnessFailureEvent, now: number): Li
   return { text: `${head}${when}${detail}`, button, resetAt: ev.resetAt };
 }
 
+export function buildUsageLimitNotification(ev: UsageLimitEvent, now: number): LimitNotification | null {
+  if (ev.percent < USAGE_REPORT_THRESHOLD_PERCENT) return null;
+  if (ev.resetAt !== null && ev.resetAt <= now) return null;
+  const agent = escapeHtml(ev.agent || 'agent');
+  const pct = formatPercent(ev.percent);
+  const limit = usageLimitPhrase(ev.limitName, ev.language);
+  const detail = ev.detail ? `\n<blockquote>${escapeHtml(ev.detail)}</blockquote>` : '';
+  const when =
+    ev.resetAt !== null
+      ? ev.language === 'ru'
+        ? `\nСброс: <b>${formatClock(ev.resetAt)}</b> (через ${escapeHtml(formatDeltaLocalized(ev.resetAt - now, ev.language))}).`
+        : `\nResets at <b>${formatClock(ev.resetAt)}</b> (in ${escapeHtml(formatDeltaLocalized(ev.resetAt - now, ev.language))}).`
+      : '';
+  const head =
+    ev.language === 'ru'
+      ? `⚠️ <b>${agent}</b>: использовано <b>${pct}%</b> ${limit}.`
+      : `⚠️ <b>${agent}</b> is at <b>${pct}%</b> of ${limit}.`;
+  const advice =
+    ev.language === 'ru'
+      ? '\nЗапланируй паузу или переключи агента до жёсткой остановки.'
+      : '\nPlan around it or switch agents before the hard stop.';
+  return { text: `${head}${when}${advice}${detail}`, button: null, resetAt: ev.resetAt };
+}
+
 function resetLine(ev: HarnessFailureEvent, now: number): string {
-  if (ev.resetAt !== null) return `\nResets at <b>${formatClock(ev.resetAt)}</b> (in ${formatDelta(ev.resetAt - now)}).`;
+  if (ev.resetAt !== null) return `\nResets at <b>${formatClock(ev.resetAt)}</b> (in ${escapeHtml(formatDelta(ev.resetAt - now))}).`;
   return ev.kind === 'session-limit' ? `\nReset time unknown — continue manually.` : '';
 }
 
@@ -248,4 +560,30 @@ export function formatDelta(ms: number): string {
   const h = Math.floor(totalMin / 60);
   const m = totalMin % 60;
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+function formatDeltaLocalized(ms: number, language: UsageReportLanguage): string {
+  if (language !== 'ru') return formatDelta(ms);
+  const totalMin = Math.floor(ms / 60_000);
+  if (totalMin < 1) return '<1 мин';
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h > 0 ? `${h} ч ${m} мин` : `${m} мин`;
+}
+
+function formatPercent(n: number): string {
+  return Number.isInteger(n) ? String(n) : n.toFixed(1).replace(/\.0$/, '');
+}
+
+function usageLimitPhrase(limitName: string | null, language: UsageReportLanguage): string {
+  if (language === 'ru') {
+    if (limitName === '5-hour') return '5-часового лимита';
+    if (limitName === 'weekly') return 'недельного лимита';
+    if (limitName === 'context window') return 'контекстного окна';
+    if (limitName === 'primary') return 'основного лимита';
+    if (limitName === 'secondary') return 'дополнительного лимита';
+    return limitName ? `${escapeHtml(limitName)} лимита` : 'лимита';
+  }
+  if (limitName === 'context window') return 'its context window';
+  return limitName ? `its ${escapeHtml(limitName)} limit` : 'its limit';
 }

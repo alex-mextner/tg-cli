@@ -24,6 +24,16 @@ describe('DeferQueues', () => {
     expect(q.peek('%2')).toEqual(['c']);
   });
 
+  test('generic queues preserve structured items', () => {
+    const q = new DeferQueues<{ text: string; sourceMessageId: number }>();
+    q.enqueue('%1', { text: 'a', sourceMessageId: 11 });
+    q.enqueue('%1', { text: 'b', sourceMessageId: 12 });
+    expect(q.take('%1')).toEqual([
+      { text: 'a', sourceMessageId: 11 },
+      { text: 'b', sourceMessageId: 12 },
+    ]);
+  });
+
   test('has reflects whether a pane has queued text', () => {
     const q = new DeferQueues();
     expect(q.has('%1')).toBe(false);

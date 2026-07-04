@@ -171,6 +171,57 @@ test('--title / --tag require a value (a dashed next token is a missing value)',
   });
 });
 
+test('--title refuses a tg#<id> reference (must move into the body)', () => {
+  expect(parseArgs(['--title', 'see tg#5900', 'body'], dir, HOME)).toEqual({
+    action: 'error',
+    message: 'Refusing: --title contains a tg#<id> reference — move it into the message body.',
+  });
+  // Case-insensitive prefix, still refused — asserted on the MESSAGE (not just the error
+  // action), and WITH a body token present, so this genuinely exercises the tg#-detection guard
+  // rather than passing vacuously on the "missing body" error a bare --title would hit anyway.
+  expect(parseArgs(['--title', 'TG#42 done', 'body'], dir, HOME)).toEqual({
+    action: 'error',
+    message: 'Refusing: --title contains a tg#<id> reference — move it into the message body.',
+  });
+  // A bare GitHub-style #42 (no `tg` prefix) is unaffected — only tg#<id> is banned.
+  expect(parseArgs(['--title', 'closes #42', 'body'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'body',
+    format: 'plain',
+    title: 'closes #42',
+  });
+  // The reference must still land in the BODY without complaint.
+  expect(parseArgs(['--title', 'Ship it', 'per tg#5900 do X'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'per tg#5900 do X',
+    format: 'plain',
+    title: 'Ship it',
+  });
+});
+
+test('--title guard is gated on the SAME autolink-msgrefs feature flag as the body (tg-cli#138)', () => {
+  // With the feature OFF, a tg#<id> in --title is inert plain text, exactly like the body
+  // (`tg` gates the body's detectMsgRefs call on the identical flag) — not banned in one place
+  // while freely allowed in the other.
+  const msgrefAutolinkOff = false;
+  expect(
+    parseArgs(['--title', 'see tg#5900', 'body'], dir, HOME, true, () => [], true, true, undefined, msgrefAutolinkOff),
+  ).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'body',
+    format: 'plain',
+    title: 'see tg#5900',
+  });
+  // Default (flag omitted / on) still refuses — the guard is ON unless explicitly disabled.
+  expect(parseArgs(['--title', 'see tg#5900', 'body'], dir, HOME)).toEqual({
+    action: 'error',
+    message: 'Refusing: --title contains a tg#<id> reference — move it into the message body.',
+  });
+});
+
 test('--tag rejects uppercase / Cyrillic / unknown with a 3-part error (lowercase-english only)', () => {
   for (const bad of ['ANSWER', 'Decision', 'ОТВЕТ', 'ПРОБЛЕМА', 'fixme']) {
     const r = parseArgs(['--tag', bad, 'body'], dir, HOME);

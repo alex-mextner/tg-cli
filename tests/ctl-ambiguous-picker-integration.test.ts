@@ -265,6 +265,8 @@ async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
 }
 
 const pickerOf = (sends: SentMessage[]): SentMessage | undefined => sends.find((s) => s.hasMarkup);
+const reactionEmojis = (reactions: FakeReaction[], messageId: number): string[] =>
+  reactions.filter((r) => r.messageId === messageId).map((r) => r.emoji);
 
 test('AMBIGUOUS plain message, NO last message → inline-keyboard picker (buttons, NO "candidates:" text dump)', async () => {
   // Two registered agents, both live, and routes.json is EMPTY (no last message in
@@ -297,6 +299,8 @@ test('AMBIGUOUS plain message, NO last message → inline-keyboard picker (butto
   expect(picker!.buttons.every((b) => b.callback_data.startsWith('tga:'))).toBe(true);
   // No silent inject while the human picks.
   expect(injectedLines(h.injectLog).length).toBe(0);
+  await waitFor(() => tg.reactions.some((r) => r.messageId === 20));
+  expect(reactionEmojis(tg.reactions, 20)).toEqual(['✍️']);
 }, 15_000);
 
 test('NO-REPLY plain message → binds DIRECTLY to the last-message agent, NO picker (tg-cli#78)', async () => {
@@ -427,6 +431,8 @@ test('TAP a button → routes the pending message to the chosen pane', async () 
   // or wrong payload. The wrapped inject embeds the raw '{msg}' so 'route me' is
   // present in what reached the pane (guards a wrapping/content regression).
   expect(toolsLines.join('\n')).toContain('route me');
+  await waitFor(() => tg.reactions.some((r) => r.messageId === 20 && r.emoji === '👀'));
+  expect(reactionEmojis(tg.reactions, 20)).toEqual(['✍️', '👀']);
 }, 15_000);
 
 test('REPLY to a now-GONE agent → picker WITH "no longer running" notice naming the gone agent', async () => {
@@ -462,6 +468,16 @@ test('REPLY to a now-GONE agent → picker WITH "no longer running" notice namin
   expect(picker!.buttons.some((b) => b.text.includes('agent-tools'))).toBe(true);
   // No silent inject into the surviving agent.
   expect(injectedLines(h.injectLog).length).toBe(0);
+
+  await waitFor(() => tg.reactions.some((r) => r.messageId === 22));
+  expect(reactionEmojis(tg.reactions, 22)).toEqual(['✍️']);
+
+  const toolsBtn = picker!.buttons.find((b) => b.text.includes('agent-tools'))!;
+  tg.pushCallback(703, toolsBtn.callback_data, 9000 + tg.sends.indexOf(picker!) + 1);
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0);
+  await waitFor(() => tg.reactions.some((r) => r.messageId === 22 && r.emoji === '👀'));
+  expect(reactionEmojis(tg.reactions, 22)).toEqual(['✍️', '👀']);
 }, 15_000);
 
 test('HAPPY PATH: a single registered live agent → direct inject, NO picker', async () => {

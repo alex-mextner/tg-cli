@@ -17,13 +17,32 @@
 //
 // PURE text analysis: no I/O. Mirrors features/autolink-prs/detect.ts in shape.
 
-// `tg#` (case-insensitive on the `tg`) immediately followed by a positive id.
-// The leading digit is 1-9 — message ids are positive, and a `tg#0` is not a
-// thing. Captured as one token; the global flag walks every occurrence.
-const MSGREF_RE = /tg#[1-9][0-9]*/gi;
+// `tg#` (case-insensitive on the ASCII `tg`) or the already-rendered
+// Mathematical Bold Italic form (`𝒕𝒈#` / `𝑻𝑮#`) immediately followed by a
+// positive id. The styled form exists because private-DM msgrefs render as
+// marked-but-unlinked text; users often copy that back verbatim.
+const MSGREF_RE = /(?:[tT][gG]|[𝑻𝒕][𝑮𝒈])#([1-9][0-9]*)/gu;
+
+const ALNUM_RE = /[\p{L}\p{N}]/u;
+
+function codePointBefore(segment: string, idx: number): string | undefined {
+  if (idx <= 0) return undefined;
+  const lo = segment.charCodeAt(idx - 1);
+  if (lo >= 0xdc00 && lo <= 0xdfff && idx >= 2) {
+    const hi = segment.charCodeAt(idx - 2);
+    if (hi >= 0xd800 && hi <= 0xdbff) return segment.slice(idx - 2, idx);
+  }
+  return segment[idx - 1];
+}
+
+function codePointAt(segment: string, idx: number): string | undefined {
+  if (idx >= segment.length) return undefined;
+  const cp = segment.codePointAt(idx);
+  return cp === undefined ? undefined : String.fromCodePoint(cp);
+}
 
 function isAlnum(ch: string | undefined): boolean {
-  return ch !== undefined && /[A-Za-z0-9]/.test(ch);
+  return ch !== undefined && ALNUM_RE.test(ch);
 }
 
 /**
@@ -40,10 +59,8 @@ export function findMsgRefMatches(segment: string): Array<{ start: number; end: 
   while ((m = MSGREF_RE.exec(segment)) !== null) {
     const start = m.index;
     const end = start + m[0].length;
-    if (isAlnum(segment[start - 1]) || isAlnum(segment[end])) continue;
-    // The id is everything after `tg#` (3 chars). parseInt copes with the
-    // case-insensitive prefix since it only reads the trailing digits.
-    out.push({ start, end, id: parseInt(m[0].slice(3), 10) });
+    if (isAlnum(codePointBefore(segment, start)) || isAlnum(codePointAt(segment, end))) continue;
+    out.push({ start, end, id: parseInt(m[1], 10) });
   }
   return out;
 }

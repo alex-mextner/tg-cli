@@ -15,10 +15,23 @@ export type Direction = 'user' | 'agent';
 export interface HistoryRecord {
   ts: number; // unix SECONDS (send/receive time) — matches routes.ts convention
   message_id: number | null; // Telegram message_id; null when unknown (some outbound paths)
+  chat_id?: number; // Telegram chat id; absent on legacy history rows
   direction: Direction; // 'user' = inbound from the CTO, 'agent' = outbound from the agent
   from: string; // display name ('Alex', 'agent', …)
   text: string; // the message body, verbatim (UNWRAPPED — no `[TG from …]` envelope)
   pane: string | null; // tmux pane id this message was routed to / sent from; null outside tmux
+  // Set ONLY on a true multi-part send (a >4096 split or a media-group album —
+  // buildOutboundHistoryRecords, review: tg-cli#131) to a random per-send
+  // token; every sibling record of that ONE send carries the same value.
+  // Absent on a normal single-record send/receive. This is an authoritative
+  // WRITE-TIME marker, not a read-time heuristic: grouping by coincidental
+  // field equality (same ts/text/pane) would wrongly merge two genuinely
+  // different messages sent in the same second with the same text. A random
+  // token (not the group's first message_id) also avoids a theoretical
+  // collision across two different chats sharing one bot's history file —
+  // Telegram's message_id is sequential PER CHAT, so two chats' multi-part
+  // sends could otherwise start at the same id (review: tg-cli#131 follow-up).
+  groupId?: string;
 }
 
 // Keep the tail only — recency is what `replies` shows, and the file must not
@@ -47,13 +60,23 @@ function parseLine(line: string): HistoryRecord | null {
   if (typeof r.from !== 'string') return null;
   if (typeof r.text !== 'string') return null;
   if (!(typeof r.pane === 'string' || r.pane === null)) return null;
+  // groupId is optional/informational — an absent or malformed value just
+  // means "not part of a known multi-part group", never an invalid record.
+  // An empty string is treated the same as absent: groupMultiPartSends'
+  // adjacency check is `r.groupId !== undefined && prev?.groupId === r.groupId`,
+  // and two DIFFERENT records both carrying `groupId: ''` (a hand-edited or
+  // corrupted line — the write path only ever emits crypto.randomUUID(),
+  // never '') would otherwise satisfy that check and wrongly merge.
+  const groupId = typeof r.groupId === 'string' && r.groupId !== '' ? r.groupId : undefined;
   return {
     ts: r.ts,
     message_id: r.message_id,
+    ...(typeof r.chat_id === 'number' ? { chat_id: r.chat_id } : {}),
     direction: r.direction,
     from: r.from,
     text: r.text,
     pane: r.pane,
+    ...(groupId !== undefined ? { groupId } : {}),
   };
 }
 
