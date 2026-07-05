@@ -96,10 +96,10 @@ exit 0
   });
 }
 
-// Runs one full daemon round-trip: a single plain-text update, delivered to the ONE live
-// pane rooted at `fixtureDir`. Returns the exact text the daemon injected (the multi-line
-// `load-buffer` payload when a banner was prepended, else the plain wrap).
-async function injectedTextFor(fixtureDir: string): Promise<string> {
+// Runs one full daemon round-trip: a single inbound update carrying `text`, delivered to the
+// ONE live pane rooted at `fixtureDir`. Returns the exact text the daemon injected (the
+// multi-line `load-buffer` payload when a banner was prepended, else the plain wrap/passthrough).
+async function injectedTextFor(fixtureDir: string, text = 'fix the other thing'): Promise<string> {
   const nowSec = Math.floor(Date.now() / 1000);
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-gitstate-cfg-'));
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
@@ -129,7 +129,7 @@ async function injectedTextFor(fixtureDir: string): Promise<string> {
             result: [
               {
                 update_id: 500,
-                message: { message_id: 1, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'fix the other thing' },
+                message: { message_id: 1, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text },
               },
             ],
           });
@@ -205,4 +205,31 @@ test('git-state banner: pane cwd is not a git repo → no banner', async () => {
   const text = await injectedTextFor(fixture);
   expect(text).not.toContain('⚠');
   expect(text.trim().startsWith('[TG from Alex')).toBe(true);
+}, 15_000);
+
+// Regression (review catch on PR #153): an unrecognized `/command` (e.g. `/compact`) is emitted
+// as inject-text VERBATIM — no wrap — so the harness TUI can execute it as a slash command.
+// Prepending the banner ahead of it would push the leading `/` off the first character, so the
+// harness would read it as plain prompt text instead of a real command. Even on a DIRTY pane, a
+// slash-command passthrough must reach the pane untouched, banner-free.
+test('git-state banner: never prepended to a slash-command passthrough, even on a dirty pane', async () => {
+  const fixture = gitFixture('dirty-feature-branch');
+  const text = await injectedTextFor(fixture, '/compact keep the notes');
+  expect(text).toBe('/compact keep the notes');
+  expect(text).not.toContain('⚠');
+  expect(text.startsWith('/')).toBe(true);
+}, 15_000);
+
+// Locks in the invariant withGitStateBanner's slash-guard depends on (review follow-up): at the
+// FLAT (non-topic) level, updates.ts's textAction gates on a bare `startsWith('/')` — a path-like
+// message that merely LOOKS like a command (`/etc/hosts is broken`, no recognized verb) is
+// ALSO passed through verbatim, same as a real `/compact`. It is never wrapped, so it never gets
+// banered — same behavior with or without this PR (updates.ts is unmodified). This is the ONLY
+// way the slash-guard could ever eat a legitimate banner (if wrapping ever changed to cover this
+// case), so it's pinned here rather than left as a documented-but-unverified assumption.
+test('git-state banner: a path-like message (not a real command) also passes through unbannered', async () => {
+  const fixture = gitFixture('dirty-feature-branch');
+  const text = await injectedTextFor(fixture, '/etc/hosts is broken');
+  expect(text).toBe('/etc/hosts is broken');
+  expect(text).not.toContain('⚠');
 }, 15_000);

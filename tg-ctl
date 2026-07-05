@@ -3164,8 +3164,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // (a per-topic pane, a different targeting model entirely), a /new spawn (a brand-new pane has no
   // prior work to protect), a picker tap (the human explicitly chose that pane), or a message
   // deferred behind an open question (flushed through a separate code path, out of scope here).
+  //
+  // Never banner a SLASH-COMMAND passthrough (review catch, PR #153): the flat inject-text action
+  // also carries an unrecognized `/command` (e.g. `/compact`, `/clear`) VERBATIM so the harness TUI
+  // can execute it — updates.ts's textAction only wraps ordinary prose, never a passthrough command.
+  // Prepending a banner line ahead of it would push the `/` off the first character, so the harness
+  // reads it as plain prompt text instead of a command. A wrapped inject (the normal case) always
+  // starts with the injectWrap template, never `/`, so this guard only ever skips a real passthrough.
   const withGitStateBanner = (panePath: string, text: string): string => {
-    if (!ctx.cfg.gitStateBanner) return text
+    if (!ctx.cfg.gitStateBanner || text.startsWith("/")) return text
     const banner = buildGitStateBanner(gitStateForPath(panePath))
     return banner ? `${banner}\n${text}` : text
   }

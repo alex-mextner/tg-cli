@@ -66,6 +66,15 @@ message lands on a discovered pane with nothing else choosing it for it:
 - a non-reply photo/document notice (`download-media`),
 - a standalone (non-reply) voice transcript (`transcribe-voice`).
 
+**Slash-command passthrough guard (review catch on PR #153):** the flat `inject-text` action also
+carries an unrecognized `/command` (e.g. `/compact`, `/clear`) **verbatim, unwrapped** — not the
+normal wrapped-prose case — so the harness TUI can execute it as a real slash command. Prepending
+the banner ahead of it would push the leading `/` off the first character, so the harness would
+read the whole thing as plain prompt text instead of a command. `withGitStateBanner` therefore
+skips the banner whenever `text` already starts with `/` — the wrapped-prose case never does (the
+`injectWrap` template always renders first), so this only ever catches a real passthrough. Covered
+by `tests/ctl-git-state-banner-integration.test.ts`'s dirty-pane passthrough test.
+
 Deliberately **excluded**, with the reasoning at each call site:
 - **reply-route** — anchored to a specific prior message; on-topic by construction.
 - **topic-route** (forum-topics mode) — a per-topic pane, a different targeting model entirely;
