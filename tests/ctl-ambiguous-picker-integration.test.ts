@@ -37,6 +37,7 @@ afterEach(async () => {
 // Every `send-keys -t <pane> -l <text>` and multi-line `paste-buffer -t <pane>`
 // is logged as "<pane>\t…" so the test can assert WHICH pane received the inject.
 function fakeTmux(cfgDir: string, dirHyper: string, dirTools: string, injectLog: string): string {
+  const tmuxBuffer = join(cfgDir, 'tmux-buffer.txt');
   return `#!/bin/sh
 sub="$1"; shift
 mode=$(cat '${join(cfgDir, 'tmux-mode')}' 2>/dev/null || echo both)
@@ -72,12 +73,16 @@ case "$sub" in
     if [ "$is_enter" = "0" ] && [ -n "$pane" ]; then printf '%s\\t%s\\n' "$pane" "$text" >> '${injectLog}'; fi
     ;;
   load-buffer)
-    cat >/dev/null
+    cat > '${tmuxBuffer}'
     ;;
   paste-buffer)
     pane=""
     while [ $# -gt 0 ]; do if [ "$1" = "-t" ]; then pane="$2"; fi; shift; done
-    if [ -n "$pane" ]; then printf '%s\\tPASTE\\n' "$pane" >> '${injectLog}'; fi
+    if [ -n "$pane" ]; then
+      printf '%s\\t' "$pane" >> '${injectLog}'
+      cat '${tmuxBuffer}' >> '${injectLog}' 2>/dev/null || true
+      printf '\\n' >> '${injectLog}'
+    fi
     ;;
 esac
 exit 0
@@ -160,6 +165,7 @@ interface FakeTg {
   port: number;
   pushText: (updateId: number, messageId: number, text: string) => void;
   pushReply: (updateId: number, messageId: number, replyToId: number, text: string) => void;
+  pushPhoto: (updateId: number, messageId: number, caption?: string, replyToId?: number) => void;
   pushCallback: (updateId: number, data: string, onMessageId: number) => void;
   sends: SentMessage[];
   reactions: FakeReaction[];
@@ -208,6 +214,12 @@ function startFakeTg(): FakeTg {
         }
         return Response.json({ ok: true, result: true });
       }
+      if (url.pathname.endsWith('/getFile')) {
+        return Response.json({ ok: true, result: { file_path: 'photos/shot.jpg' } });
+      }
+      if (url.pathname.includes('/file/bot')) {
+        return new Response('JPEGDATA');
+      }
       // answerCallbackQuery / editMessageText — all OK.
       return Response.json({ ok: true, result: true });
     },
@@ -235,6 +247,27 @@ function startFakeTg(): FakeTg {
             date: nowSec(),
             text,
             reply_to_message: { message_id: replyToId, date: nowSec(), chat: { id: 1 }, text: 'orig' },
+          },
+        },
+      ]);
+    },
+    pushPhoto: (updateId, messageId, caption, replyToId) => {
+      queue.push([
+        {
+          update_id: updateId,
+          message: {
+            message_id: messageId,
+            from: { id: 1, first_name: 'Alex' },
+            chat: { id: 1 },
+            date: nowSec(),
+            ...(caption !== undefined ? { caption } : {}),
+            ...(replyToId !== undefined
+              ? { reply_to_message: { message_id: replyToId, date: nowSec(), chat: { id: 1 }, text: 'orig' } }
+              : {}),
+            photo: [
+              { file_id: 'photo-small', file_size: 100 },
+              { file_id: 'photo-large', file_size: 1024 },
+            ],
           },
         },
       ]);
@@ -364,6 +397,155 @@ test('NO-REPLY bind FLIPS to whoever posted last (a newer post from the other ag
   expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(true);
   expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`))).toBe(false);
   expect(lines.join('\n')).toContain('ship it');
+}, 15_000);
+
+test('PHOTO reply routes to the replied-to origin pane after download, not the last-message agent', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const h = makeHarness([
+    { paneId: PANE_HYPER, cwd: '' },
+    { paneId: PANE_TOOLS, cwd: '' },
+  ]);
+  writeFileSync(
+    join(h.cfgDir, 'tg-ctl.123.routes.json'),
+    JSON.stringify([
+      { id: 900, paneId: PANE_HYPER, cwd: h.dirHyper, ts: now - 60 },
+      { id: 901, paneId: PANE_TOOLS, cwd: h.dirTools, ts: now },
+    ]),
+  );
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushPhoto(710, 40, 'screenshot says route error', 900);
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.length > 0);
+  await waitFor(() => tg.reactions.some((r) => r.messageId === 40 && r.emoji === '👀'));
+  await Bun.sleep(200);
+
+  expect(pickerOf(tg.sends)).toBeUndefined();
+  const lines = injectedLines(h.injectLog);
+  const joined = lines.join('\n');
+  expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`))).toBe(false);
+  expect(joined).toContain('↩ tg#900');
+  expect(joined).toContain('sent photo:');
+  expect(joined).toContain('screenshot says route error');
+  expect(readFileSync(join(h.cfgDir, '.cache', 'tg-cli', 'inbound', '710.jpg'), 'utf8')).toBe('JPEGDATA');
+  expect(reactionEmojis(tg.reactions, 40)).toEqual(['👀']);
+}, 15_000);
+
+test('PHOTO caption /agent routes media to the selected agent instead of the last-message agent', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const h = makeHarness(
+    [
+      { paneId: PANE_HYPER, cwd: '' },
+      { paneId: PANE_TOOLS, cwd: '' },
+    ],
+    [{ id: 910, paneId: PANE_TOOLS, cwd: '', ts: now }],
+  );
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushPhoto(711, 41, '/agent hyperide\nlook at this route error');
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.length > 0);
+  await waitFor(() => tg.reactions.some((r) => r.messageId === 41 && r.emoji === '👀'));
+  await Bun.sleep(200);
+
+  expect(pickerOf(tg.sends)).toBeUndefined();
+  const lines = injectedLines(h.injectLog);
+  const joined = lines.join('\n');
+  expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`))).toBe(false);
+  expect(joined).toContain('sent photo:');
+  expect(joined).toContain('look at this route error');
+  expect(joined).not.toContain('/agent hyperide');
+  expect(reactionEmojis(tg.reactions, 41)).toEqual(['👀']);
+}, 15_000);
+
+test('PHOTO reply with /agent caption follows the selected agent, not the replied-to origin', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const h = makeHarness([
+    { paneId: PANE_HYPER, cwd: '' },
+    { paneId: PANE_TOOLS, cwd: '' },
+  ]);
+  writeFileSync(
+    join(h.cfgDir, 'tg-ctl.123.routes.json'),
+    JSON.stringify([{ id: 920, paneId: PANE_TOOLS, cwd: h.dirTools, ts: now }]),
+  );
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushPhoto(712, 42, '/agent hyperide\nlook at this route error', 920);
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.length > 0);
+  await waitFor(() => tg.reactions.some((r) => r.messageId === 42 && r.emoji === '👀'));
+  await Bun.sleep(200);
+
+  const lines = injectedLines(h.injectLog);
+  const joined = lines.join('\n');
+  expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`))).toBe(false);
+  expect(joined).toContain('look at this route error');
+  expect(joined).not.toContain('↩ tg#920');
+  expect(joined).not.toContain('/agent hyperide');
+  expect(reactionEmojis(tg.reactions, 42)).toEqual(['👀']);
+}, 15_000);
+
+test('PHOTO caption bare /agent opens a picker and the tap injects the prewrapped receipt once', async () => {
+  const h = makeHarness([
+    { paneId: PANE_HYPER, cwd: '' },
+    { paneId: PANE_TOOLS, cwd: '' },
+  ]);
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushPhoto(713, 43, '/agent');
+
+  await waitFor(() => pickerOf(tg.sends) !== undefined);
+  const picker = pickerOf(tg.sends)!;
+  const toolsBtn = picker.buttons.find((b) => b.text.includes('agent-tools'))!;
+  expect(toolsBtn).toBeDefined();
+  expect(injectedLines(h.injectLog).length).toBe(0);
+  await waitFor(() => reactionEmojis(tg.reactions, 43).includes('✍️'));
+  expect(reactionEmojis(tg.reactions, 43)).toEqual(['✍️']);
+
+  tg.pushCallback(714, toolsBtn.callback_data, 9000 + tg.sends.indexOf(picker) + 1);
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0);
+  await waitFor(() => tg.reactions.some((r) => r.messageId === 43 && r.emoji === '👀'));
+  await Bun.sleep(200);
+
+  const lines = injectedLines(h.injectLog);
+  const joined = lines.join('\n');
+  expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(false);
+  expect(joined).toContain('sent photo:');
+  expect(joined).not.toContain('/agent');
+  expect(joined.match(/\[TG from Alex tg#43\]/g) ?? []).toHaveLength(1);
+  expect(reactionEmojis(tg.reactions, 43)).toEqual(['✍️', '👀']);
+}, 15_000);
+
+test('PHOTO caption /agent with no matching selector reports the miss and never falls back to another agent', async () => {
+  const h = makeHarness([
+    { paneId: PANE_HYPER, cwd: '' },
+    { paneId: PANE_TOOLS, cwd: '' },
+  ]);
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushPhoto(715, 44, '/agent missing-agent\nthis should not auto-bind');
+
+  await waitFor(() => tg.sends.some((s) => s.text.includes("no agent matching 'missing-agent'")));
+  await Bun.sleep(200);
+
+  expect(injectedLines(h.injectLog).length).toBe(0);
+  expect(pickerOf(tg.sends)).toBeUndefined();
+  expect(reactionEmojis(tg.reactions, 44)).not.toContain('👀');
 }, 15_000);
 
 test('NO-REPLY bind: last-message agent GONE → never guesses into the gone pane (no fabricated button)', async () => {

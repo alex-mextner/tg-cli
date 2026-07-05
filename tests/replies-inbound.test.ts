@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { inboundHistoryRecords } from '../features/replies/inbound';
-import type { TgUpdate } from '../features/tg-ctl/types';
+import { isAgentCommand } from '../features/tg-ctl/agent-match';
+import type { TgMessage, TgUpdate } from '../features/tg-ctl/types';
 
 const ALLOWED = 555;
 
@@ -140,9 +141,7 @@ test('inboundHistoryRecords: resolvePane returning null falls back to opts.pane'
   expect(recs[0].pane).toBe('%fallback');
 });
 
-test('inboundHistoryRecords: a media reply stays on the default pane (only text/voice reply-route)', () => {
-  // Mirrors the daemon guard: a photo reply becomes download-media (default
-  // target), so resolvePane returns null for it and history uses the default.
+test('inboundHistoryRecords: a media reply is stamped under the routed origin pane', () => {
   const photoReply = msg({
     photo: [{ file_id: 'p' }],
     caption: 'see this',
@@ -153,16 +152,34 @@ test('inboundHistoryRecords: a media reply stays on the default pane (only text/
     text: 'this one',
     reply_to_message: { message_id: 50, chat: { id: ALLOWED }, date: 1, text: 'which one?' },
   });
-  const resolvePane = (m: {
-    text?: string;
-    voice?: unknown;
-    audio?: unknown;
-    reply_to_message?: unknown;
-  }): string | null =>
+  const resolvePane = (m: TgMessage): string | null =>
     m.reply_to_message &&
-    ((m.text !== undefined && !m.text.startsWith('/')) || m.voice !== undefined || m.audio !== undefined)
+    ((m.text !== undefined && !m.text.startsWith('/')) ||
+      (m.photo !== undefined && !isAgentCommand(m.caption ?? '')) ||
+      (m.document !== undefined && !isAgentCommand(m.caption ?? '')) ||
+      m.voice !== undefined ||
+      m.audio !== undefined)
       ? '%origin'
       : null;
   const recs = inboundHistoryRecords([photoReply, textReply], { ...opts, pane: '%default', resolvePane });
-  expect(recs.map((r) => r.pane)).toEqual(['%default', '%origin']); // photo default, text origin
+  expect(recs.map((r) => r.pane)).toEqual(['%origin', '%origin']);
+});
+
+test('inboundHistoryRecords: a media reply with /agent caption is not stamped under the replied-to origin', () => {
+  const explicitAgentPhotoReply = msg({
+    photo: [{ file_id: 'p' }],
+    caption: '/agent ext\nlook at this route error',
+    reply_to_message: { message_id: 50, chat: { id: ALLOWED }, date: 1, text: 'origin pane report' },
+  });
+  const resolvePane = (m: TgMessage): string | null =>
+    m.reply_to_message &&
+    ((m.text !== undefined && !m.text.startsWith('/')) ||
+      (m.photo !== undefined && !isAgentCommand(m.caption ?? '')) ||
+      (m.document !== undefined && !isAgentCommand(m.caption ?? '')) ||
+      m.voice !== undefined ||
+      m.audio !== undefined)
+      ? '%origin'
+      : null;
+  const recs = inboundHistoryRecords([explicitAgentPhotoReply], { ...opts, pane: '%default', resolvePane });
+  expect(recs.map((r) => r.pane)).toEqual(['%default']);
 });

@@ -151,7 +151,7 @@ tests can pass fakes.
   discover.ts's raw-stdout-in/structured-data-out shape. The entrypoint's `gitStateForPath`
   (timeout-guarded git spawns) and `withGitStateBanner` compose it at the ONE seam that matches the
   failure mode: `injectViaTarget`'s silent auto-bind deliveries (plain inject-text, a
-  download-media notice, a standalone voice transcript) — NOT reply-route (anchored to a specific
+  non-reply download-media notice, a standalone voice transcript) — NOT reply-route (anchored to a specific
   prior message), NOT topic-route (a different, per-topic targeting model), NOT a `/new` spawn (a
   fresh pane has no prior work to protect), and NOT a picker tap (the human already chose the
   pane). Default ON; opt out per machine with `control.git_state_banner: false` — an agent that
@@ -194,10 +194,13 @@ tests can pass fakes.
   (`tg replies user --since 3d`, `tg replies all --since 2026-06-28 --until 2026-06-30`);
   `--json` is machine-readable, `find`/`--regex` search. Exact-match leading token
   in `tg` dispatch (like `hooks`/`voice`), so `tg "replies ..."` as a plain message still sends.
-  - **Reply pane accuracy:** a text/voice reply is stamped with its recognized ORIGIN pane (the
-    same pane reply-route delivers it to); a photo/document reply or a `/agent <window> …` routing
-    command is stamped with the DEFAULT discovered pane (those route elsewhere, but they are media
-    receipts / routing directives, not conversational content — acceptable for recall).
+  - **Reply pane accuracy:** text, voice, photo, and document replies are stamped with their
+    recognized ORIGIN pane (the same pane reply-route delivers them to). Exception: a
+    photo/document reply whose caption starts with `/agent <window> …` is stamped like an
+    explicit `/agent` routing command, not under the replied-to origin, because the selector
+    deliberately overrides reply-route. Plain `/agent <window> …` routing commands are stamped
+    with the DEFAULT discovered pane because they route elsewhere by explicit selector rather
+    than by the replied-to message.
   - **Known limitation (matches `routes`):** both writers do read-modify-write rather than a true
     `O_APPEND`, so a daemon-inbound write racing a concurrent agent-outbound write could lose a
     record. The daemon is the single inbound writer and outbound writes are short; a file lock is

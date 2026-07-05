@@ -43,7 +43,7 @@ export const DEFAULT_CONTROL: ControlConfig = {
   transport: 'auto',
   // `{id}` renders the inbound Telegram message_id as `#<id>` — the agent passes
   // it to `tg --reply-to <id>` to thread its answer under this exact message.
-  // When no id is available (a /agent route, a media item) `{id}` collapses with
+  // When no id is available (for example a /agent route) `{id}` collapses with
   // its leading space (see wrapInbound), so the wrap stays `[TG from {name}] …`.
   injectWrap: '[TG from {name} {id}] {msg}',
   stalenessSec: 300,
@@ -218,6 +218,16 @@ export type Action =
       caption?: string;
       from: string; // display name for the wrap
       messageId: number; // inbound Telegram message_id → surfaced as `#<id>` for tg --reply-to
+      // Set when the photo/document itself is a reply: after download, route the
+      // media receipt through reply-route with this quote anchor prepended (same
+      // origin-pane semantics as typed and voice replies).
+      replyToMessageId?: number;
+      replyAnchor?: string;
+      // Set when the media caption itself is `/agent ...`: after download the
+      // local-path receipt is routed by that selector instead of auto-binding to
+      // the last active pane. Mirrors text `/agent` routing but keeps the media
+      // receipt pre-wrapped so the path and message id survive.
+      agentRoute?: { selector: string | null; rest: string; all: string };
     }
   // A voice/audio note: download the OGG, ffmpeg→WAV, run local Whisper, then
   // route the transcript EXACTLY like a typed message — wrapped + acked. When

@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.33.2
+
+**Fix: Telegram photo/document routing now honors replies and `/agent` captions.**
+
+- Photo/document replies now carry the replied-to message id and quote anchor
+  through the `download-media` action. After the file is downloaded, the daemon
+  routes the `sent photo:` / `sent file:` receipt through the same origin-pane
+  reply handler as typed replies, so a screenshot reply to an `ext` report lands
+  in `ext`, not in the last active agent.
+- Photo/document captions that start with `/agent ...` are parsed before
+  download and routed to the selected agent after the local file path is known.
+  The injected receipt keeps the caption body and source message id, but does not
+  inject the `/agent <selector>` command line itself.
+- Added parser and daemon integration coverage for media reply routing,
+  `/agent` media captions, and history pane stamping for media replies.
+
 ## 1.33.1
 
 **Fix (tg#6651/tg#6672): calibrate the empty-editor watermark heuristic against real VS Code screenshots.**

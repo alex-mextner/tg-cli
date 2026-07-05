@@ -428,6 +428,77 @@ test('photo over 20MB → reply instead of download', () => {
   expect((r.actions[0] as { kind: 'reply'; text: string }).text).toContain('file too large');
 });
 
+test('a photo reply carries the quote anchor for reply-routing after download', () => {
+  const r = stepUpdates(
+    [
+      upd(77, {
+        photo: [{ file_id: 'shot', file_size: 123 }],
+        caption: 'this screenshot',
+        reply_to_message: {
+          message_id: 42,
+          chat: { id: CHAT_ID },
+          date: NOW,
+          text: 'agent report from ext',
+        },
+      }),
+    ],
+    makeOpts(),
+  );
+  const a = r.actions[0] as Extract<(typeof r.actions)[number], { kind: 'download-media' }>;
+  expect(a.kind).toBe('download-media');
+  expect(a.replyToMessageId).toBe(42);
+  expect(a.replyAnchor).toContain('↩');
+  expect(a.replyAnchor).toContain('tg#42 ');
+  expect(a.replyAnchor).toContain('agent report from ext');
+});
+
+test('a photo caption starting with /agent carries an agent route instead of default auto-bind', () => {
+  const r = stepUpdates(
+    [
+      upd(78, {
+        photo: [{ file_id: 'shot', file_size: 123 }],
+        caption: '/agent ext\nlook at this route error',
+      }),
+    ],
+    makeOpts(),
+  );
+  const a = r.actions[0] as Extract<(typeof r.actions)[number], { kind: 'download-media' }>;
+  expect(a.kind).toBe('download-media');
+  expect(a.agentRoute).toEqual({
+    selector: 'ext',
+    rest: 'look at this route error',
+    all: 'ext\nlook at this route error',
+  });
+  expect(a.replyToMessageId).toBeUndefined();
+});
+
+test('a photo reply with /agent caption follows the explicit agent route, not the replied-to origin', () => {
+  const r = stepUpdates(
+    [
+      upd(79, {
+        photo: [{ file_id: 'shot', file_size: 123 }],
+        caption: '/agent ext\nlook at this route error',
+        reply_to_message: {
+          message_id: 42,
+          chat: { id: CHAT_ID },
+          date: NOW,
+          text: 'agent report from another pane',
+        },
+      }),
+    ],
+    makeOpts(),
+  );
+  const a = r.actions[0] as Extract<(typeof r.actions)[number], { kind: 'download-media' }>;
+  expect(a.kind).toBe('download-media');
+  expect(a.agentRoute).toEqual({
+    selector: 'ext',
+    rest: 'look at this route error',
+    all: 'ext\nlook at this route error',
+  });
+  expect(a.replyToMessageId).toBeUndefined();
+  expect(a.replyAnchor).toBeUndefined();
+});
+
 // --- document inbound ---
 
 test('document name = <update_id>.<sanitized ext>, NEVER the Telegram basename', () => {
@@ -477,6 +548,48 @@ test('document over 20MB → reply; exactly 20MB still downloads (strict >)', ()
 
   const at = stepUpdates([upd(1, { document: { file_id: 'x', file_size: limit } })], makeOpts());
   expect(at.actions[0].kind).toBe('download-media');
+});
+
+test('a document reply carries the quote anchor for reply-routing after download', () => {
+  const r = stepUpdates(
+    [
+      upd(88, {
+        document: { file_id: 'doc1', file_name: 'trace.txt', file_size: 321 },
+        caption: 'see attached trace',
+        reply_to_message: {
+          message_id: 43,
+          chat: { id: CHAT_ID },
+          date: NOW,
+          text: 'agent report with logs',
+        },
+      }),
+    ],
+    makeOpts(),
+  );
+  const a = r.actions[0] as Extract<(typeof r.actions)[number], { kind: 'download-media' }>;
+  expect(a.kind).toBe('download-media');
+  expect(a.replyToMessageId).toBe(43);
+  expect(a.replyAnchor).toContain('tg#43 ');
+  expect(a.replyAnchor).toContain('agent report with logs');
+});
+
+test('a document caption starting with /agent carries an agent route instead of default auto-bind', () => {
+  const r = stepUpdates(
+    [
+      upd(89, {
+        document: { file_id: 'doc1', file_name: 'trace.txt', file_size: 321 },
+        caption: '/agent rig attached trace',
+      }),
+    ],
+    makeOpts(),
+  );
+  const a = r.actions[0] as Extract<(typeof r.actions)[number], { kind: 'download-media' }>;
+  expect(a.kind).toBe('download-media');
+  expect(a.agentRoute).toEqual({
+    selector: 'rig',
+    rest: 'attached trace',
+    all: 'rig attached trace',
+  });
 });
 
 // --- voice inbound (inbound STT: transcribe-voice action) ---

@@ -42,6 +42,15 @@ explicit override when the auto-picked target is not who you mean.
 The daemon decides which interpretation holds *after* matching, because only it
 knows the live window names. Tolerates `/agent@botname` (group chats).
 
+The same command grammar applies when `/agent ...` is the **caption** of an
+inbound photo/document. Telegram delivers that as media, not as text, so
+`stepUpdates` keeps the parsed agent route on the `download-media` action. After
+the daemon downloads the file, it injects the pre-wrapped
+`sent photo: <local-path>` / `sent file: <local-path>` receipt plus the caption
+body into the selected agent. The `/agent <selector>` command line itself is not
+injected. Explicit caption routing wins over default last-active auto-bind and
+over reply-route metadata.
+
 ## Phonetic normalization
 
 `phoneticKey(s)`:

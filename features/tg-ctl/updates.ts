@@ -12,7 +12,7 @@
 
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
 import { parseButtonCallback, parseQuestionCloseCallback } from './questions';
-import { parseAgentCallback, parseAgentCommand } from './agent-match';
+import { isAgentCommand, parseAgentCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback } from './new-command';
 import { parseTasksCommand } from './tasks-command';
@@ -362,8 +362,8 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
             : textAction(m.text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null);
       }
     } else if (m.voice ?? m.audio) action = voiceAction(u.update_id, m, name, opts);
-    else if (m.photo?.length) action = photoAction(u.update_id, m, name);
-    else if (m.document) action = documentAction(u.update_id, m, name);
+    else if (m.photo?.length) action = photoAction(u.update_id, m, name, opts);
+    else if (m.document) action = documentAction(u.update_id, m, name, opts);
     // Anything else (sticker, …) → advance silently.
     if (action) {
       actions.push(action);
@@ -531,7 +531,25 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
   return [{ kind: 'topic-answer', threadId, text: m.text ?? '', from: name, messageId: m.message_id }];
 }
 
-function photoAction(updateId: number, m: TgMessage, name: string): Action {
+function attachMediaReplyRoute(
+  action: Extract<Action, { kind: 'download-media' }>,
+  m: TgMessage,
+  opts: StepOpts,
+): Extract<Action, { kind: 'download-media' }> {
+  if (m.caption && isAgentCommand(m.caption)) {
+    return { ...action, agentRoute: parseAgentCommand(m.caption) };
+  }
+  if (m.reply_to_message) {
+    return {
+      ...action,
+      replyToMessageId: m.reply_to_message.message_id,
+      replyAnchor: buildReplyAnchor(m, opts),
+    };
+  }
+  return action;
+}
+
+function photoAction(updateId: number, m: TgMessage, name: string, opts: StepOpts): Action {
   // Telegram sends several renditions; take the largest by file_size. Ties and
   // missing sizes resolve to the LATER entry — the array is size-ascending.
   let best = m.photo![0];
@@ -539,16 +557,20 @@ function photoAction(updateId: number, m: TgMessage, name: string): Action {
     if ((p.file_size ?? 0) >= (best.file_size ?? 0)) best = p;
   }
   if ((best.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: 'reply', text: TOO_LARGE_REPLY };
-  return {
-    kind: 'download-media',
-    fileId: best.file_id,
-    suggestedName: `${updateId}.jpg`,
-    mediaKind: 'photo',
-    fileSize: best.file_size,
-    caption: m.caption,
-    from: name,
-    messageId: m.message_id,
-  };
+  return attachMediaReplyRoute(
+    {
+      kind: 'download-media',
+      fileId: best.file_id,
+      suggestedName: `${updateId}.jpg`,
+      mediaKind: 'photo',
+      fileSize: best.file_size,
+      caption: m.caption,
+      from: name,
+      messageId: m.message_id,
+    },
+    m,
+    opts,
+  );
 }
 
 // A voice/audio note → transcribe-voice. The OGG is downloaded under a
@@ -575,19 +597,23 @@ function voiceAction(updateId: number, m: TgMessage, name: string, opts: StepOpt
   return action;
 }
 
-function documentAction(updateId: number, m: TgMessage, name: string): Action {
+function documentAction(updateId: number, m: TgMessage, name: string, opts: StepOpts): Action {
   const doc = m.document!;
   if ((doc.file_size ?? 0) > MAX_DOWNLOAD_BYTES) return { kind: 'reply', text: TOO_LARGE_REPLY };
-  return {
-    kind: 'download-media',
-    fileId: doc.file_id,
-    suggestedName: `${updateId}.${sanitizedExt(doc.file_name)}`,
-    mediaKind: 'document',
-    fileSize: doc.file_size,
-    caption: m.caption,
-    from: name,
-    messageId: m.message_id,
-  };
+  return attachMediaReplyRoute(
+    {
+      kind: 'download-media',
+      fileId: doc.file_id,
+      suggestedName: `${updateId}.${sanitizedExt(doc.file_name)}`,
+      mediaKind: 'document',
+      fileSize: doc.file_size,
+      caption: m.caption,
+      from: name,
+      messageId: m.message_id,
+    },
+    m,
+    opts,
+  );
 }
 
 // The saved filename is ALWAYS daemon-chosen — <update_id>.<ext> — and only
