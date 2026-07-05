@@ -33,6 +33,10 @@ export interface ParsedAgentCommand {
 
 // `/agent feat-bot deploy now` → selector "feat-bot", rest "deploy now",
 // all "feat-bot deploy now". `/agent` alone → selector null, rest/all "".
+export function isAgentCommand(text: string): boolean {
+  return /^\/agent(@\w+)?(?:\s|$)/i.test(text);
+}
+
 export function parseAgentCommand(text: string): ParsedAgentCommand {
   const body = text.replace(/^\/agent(@\w+)?\s*/i, '');
   if (!body.trim()) return { selector: null, rest: '', all: '' };

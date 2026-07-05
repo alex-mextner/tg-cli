@@ -54,6 +54,16 @@ In `stepUpdates`, a text message that **is a reply** and whose text is **not a
 the `buildReplyInject` text; a reply whose text starts with `/` still runs the
 command verbatim (so you can reply `/stop` to a message).
 
+Photo/document replies first become `download-media` actions because the daemon
+must fetch the file before it knows the local path to inject. The action still
+carries the same `replyToMessageId` + `replyAnchor`; after download the executor
+wraps `sent photo: <path>` / `sent file: <path>` plus the caption, prepends the
+anchor, and hands it to the same `reply-route` handler. A screenshot reply to an
+`ext` report therefore reaches `ext`, not the last active/default pane.
+Exception: when the media caption itself starts with `/agent ...`, the explicit
+agent selector wins over the replied-to origin. In that case the daemon routes
+the media receipt as a `/agent` command and does not prepend the reply anchor.
+
 ## Reply routing: recognized origin vs LRU/MRU picker (v1.6.0)
 
 `tg` records every outbound message id → `{paneId, cwd, ts}` into a bounded

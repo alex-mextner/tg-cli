@@ -18,8 +18,8 @@ import type { InjectStep } from './types';
 // this is the message-ref convention (tg#28). The `tg#` — not a bare `#` — is
 // what lets the outbound autolink layer recognize a reply-to-a-message reference
 // and keep it distinct from a GitHub issue/PR `#<id>` (which would otherwise be
-// resolved against the cwd repo and mis-linked). When no id is available (a
-// /agent route, a media item, …) the `{id}` placeholder is removed from the
+// resolved against the cwd repo and mis-linked). When no id is available (for
+// example a /agent route) the `{id}` placeholder is removed from the
 // TEMPLATE along with one adjacent space BEFORE substitution, so the wrap reads
 // naturally (`[TG from {name} {id}]` → `[TG from {name}]`). Doing the cleanup on
 // the template — never on the substituted output — is what keeps the user's

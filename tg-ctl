@@ -21,9 +21,11 @@ import {
   dedupeCandidates,
   distinctLabels,
   isBareWindowName,
+  isAgentCommand,
   matchWindows,
   suggestSelector,
   type AgentCandidate,
+  type ParsedAgentCommand,
 } from "./features/tg-ctl/agent-match"
 import {
   LAUNCHD_LABEL,
@@ -3386,6 +3388,60 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
+  const injectPrewrappedToPane = async (paneId: string, prewrappedText: string, sourceMessageId: number | null): Promise<boolean> => {
+    if (shouldDeferInbound(paneId)) {
+      markDeferredForAck(enqueueDeferred(paneId, prewrappedText, sourceMessageId))
+      return true
+    }
+    const res = await executeInjectSteps(buildTextInjectPlan(paneId, prewrappedText))
+    if (!res.ok) {
+      await sendMessage(ctx, res.error)
+      return false
+    }
+    return true
+  }
+
+  const routePrewrappedAgentMessage = async (
+    route: ParsedAgentCommand,
+    prewrappedText: string,
+    sourceMessageId: number,
+  ): Promise<boolean> => {
+    const candidates = listAgentCandidates()
+    const msgPreview = prewrappedText.slice(0, 60).replace(/\n/g, " ")
+    if (candidates.length === 0) {
+      log(`media-agent-route: no candidates — selector=${route.selector || "(none)"} msg="${msgPreview}"`)
+      await sendMessage(ctx, NO_AGENT_REPLY)
+      return false
+    }
+
+    if (route.selector) {
+      const m = matchWindows(route.selector, candidates)
+      if (m.matches.length > 0) {
+        if (m.confident) {
+          const target = m.matches[0]
+          log(`media-agent-route: selector="${route.selector}" → ${target.paneId}/${target.windowName} confident=true msg="${msgPreview}"`)
+          return injectPrewrappedToPane(target.paneId, prewrappedText, sourceMessageId)
+        }
+        const names = m.matches.map((c) => c.windowName).join(", ")
+        log(`media-agent-route: selector="${route.selector}" → ambiguous (${m.matches.length} matches: ${names}) → picker`)
+        return postRoutePicker(m.matches, prewrappedText, undefined, sourceMessageId)
+      }
+      const names = candidates.map((c) => c.windowName).join(", ")
+      log(`media-agent-route: selector="${route.selector}" → NO match among [${names}] — reporting error`)
+      await sendMessage(ctx, `no agent matching '${route.selector}' (running: ${names}) — try /agent to pick`)
+      return false
+    }
+
+    if (candidates.length === 1) {
+      const target = candidates[0]
+      log(`media-agent-route: no selector, single candidate → ${target.paneId}/${target.windowName} msg="${msgPreview}"`)
+      return injectPrewrappedToPane(target.paneId, prewrappedText, sourceMessageId)
+    }
+
+    log(`media-agent-route: no selector, ${candidates.length} candidates → picker msg="${msgPreview}"`)
+    return postRoutePicker(candidates, prewrappedText, undefined, sourceMessageId)
+  }
+
   // /agent routing (item 1): bare `/agent` → an inline-keyboard PICKER (tappable
   // buttons, one distinct-labelled button per agent); confident phonetic match →
   // direct inject; ambiguous → the same session-grouped picker carrying the pending
@@ -4961,8 +5017,22 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const dest = await downloadFileToCache(action.fileId, action.suggestedName)
     if (dest === null) return false
     const noun = action.mediaKind === "photo" ? "photo" : "file"
-    const msg = `sent ${noun}: ${dest}` + (action.caption ? `\n${action.caption}` : "")
+    const routedCaption = action.agentRoute ? action.agentRoute.rest : action.caption
+    const msg = `sent ${noun}: ${dest}` + (routedCaption ? `\n${routedCaption}` : "")
     const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, msg, action.messageId)
+    if (action.agentRoute) {
+      return routePrewrappedAgentMessage(action.agentRoute, wrapped, action.messageId)
+    }
+    if (action.replyToMessageId !== undefined) {
+      const injectText = `${action.replyAnchor ?? ""}\n${wrapped}`.replace(/^\n/, "")
+      return handleReplyRoute({
+        kind: "reply-route",
+        replyToMessageId: action.replyToMessageId,
+        injectText,
+        from: action.from,
+        messageId: action.messageId,
+      })
+    }
     // A non-reply photo/file → auto-bind to the last-active agent like a text msg, with the
     // git-state-check banner (withGitStateBanner) prepended when that pane is mid-flight.
     return injectViaTarget(
@@ -5718,11 +5788,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           const replyId = m.reply_to_message?.message_id
           if (replyId === undefined) return null
           // ONLY the kinds that actually reply-route (updates.ts): a text reply
-          // whose body is NOT a /command, or a voice/audio reply. A photo/document
-          // reply becomes download-media and injects into the DEFAULT target, so
-          // origin-stamping it would disagree with delivery — leave it default.
+          // whose body is NOT a /command, a photo/document reply after download,
+          // or a voice/audio reply after transcription.
           const isRoutedReply =
-            (m.text !== undefined && !m.text.startsWith("/")) || m.voice !== undefined || m.audio !== undefined
+            (m.text !== undefined && !m.text.startsWith("/")) ||
+            (m.photo !== undefined && !isAgentCommand(m.caption ?? "")) ||
+            (m.document !== undefined && !isAgentCommand(m.caption ?? "")) ||
+            m.voice !== undefined ||
+            m.audio !== undefined
           if (!isRoutedReply) return null
           const recognized = recognizeRoute(histRoutes, replyId)
           if (!recognized) return null

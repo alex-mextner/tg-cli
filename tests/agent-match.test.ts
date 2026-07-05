@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import {
   parseAgentCommand,
+  isAgentCommand,
   phoneticKey,
   matchWindows,
   groupBySession,
@@ -46,6 +47,18 @@ test('parse: tolerates /agent@botname and multiline', () => {
     rest: 'line two',
     all: 'api\nline two',
   });
+});
+
+test('isAgentCommand: matches only a real /agent command token', () => {
+  expect(isAgentCommand('/agent')).toBe(true);
+  expect(isAgentCommand('/agent ext')).toBe(true);
+  expect(isAgentCommand('/agent@mybot ext')).toBe(true);
+  expect(isAgentCommand('/agent\tfoo')).toBe(true);
+  expect(isAgentCommand('/agent\nfoo')).toBe(true);
+  expect(isAgentCommand('/agents')).toBe(false);
+  expect(isAgentCommand('/agent_x')).toBe(false);
+  expect(isAgentCommand(' /agent ext')).toBe(false);
+  expect(isAgentCommand('hello /agent ext')).toBe(false);
 });
 
 // --- phoneticKey ---
