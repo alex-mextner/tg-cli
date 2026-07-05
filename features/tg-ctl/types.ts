@@ -175,6 +175,8 @@ export type Action =
       from: string;
       messageId: number | null;
     }
+  // A tap on the Cancel button shown after a bare `/agent` selection.
+  | { kind: 'agent-cancel'; callbackQueryId: string; token: string; messageId: number | null }
   // A reply: route by the recognized origin pane (routes map) when known, else
   // a session-grouped picker ordered LRU/MRU. injectText is already wrapped +
   // carries the quote anchor (items 2,3); it is injected verbatim.

@@ -11,7 +11,8 @@ import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon
 //   1. assert a bare `/agent` posts an inline keyboard (not plain text) whose
 //      buttons carry DISTINCT labels from the WINDOW NAMES (tg-cli#75 fix C) — not
 //      the cwd basenames the daemon used to fall back to ("hyperide");
-//   2. tap one button and assert the select-only confirmation (no inject).
+//   2. tap one button and assert the select-only confirmation arms the NEXT
+//      ordinary message to that pane (with a Cancel button), not just a hint.
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 
@@ -62,10 +63,11 @@ writeFileSync(join(binDir, 'ps'), psScript, { mode: 0o755 });
 
 let callbackData: string | null = null;
 let callbackServed = false;
-let routeMsgServed = false;
+let plainMsgServed = false;
 const sentMessages: Array<Record<string, unknown>> = [];
 const editedMessages: Array<Record<string, unknown>> = [];
 const answeredCallbacks: unknown[] = [];
+const reactions: Array<Record<string, unknown>> = [];
 
 const server = Bun.serve({
   port: 0,
@@ -112,11 +114,10 @@ const server = Bun.serve({
           ],
         });
       }
-      // After the select-only tap is answered, deliver the SUGGESTED command
-      // (`/agent rig hello there`) to prove the handed-back selector actually
-      // routes — the finding-#1 round-trip the unit test asserts in isolation.
-      if (offset <= 300 && callbackServed && answeredCallbacks.length > 0 && !routeMsgServed) {
-        routeMsgServed = true;
+      // After the select-only tap is answered, deliver an ORDINARY message. The
+      // selected agent must consume it; a visual "selected" hint is not enough.
+      if (offset <= 300 && callbackServed && answeredCallbacks.length > 0 && !plainMsgServed) {
+        plainMsgServed = true;
         return Response.json({
           ok: true,
           result: [
@@ -127,7 +128,7 @@ const server = Bun.serve({
                 from: { id: 1, first_name: 'Alex' },
                 chat: { id: 1 },
                 date: Math.floor(Date.now() / 1000),
-                text: '/agent rig hello there',
+                text: 'hello there',
               },
             },
           ],
@@ -155,6 +156,7 @@ const server = Bun.serve({
       return Response.json({ ok: true, result: true });
     }
     if (url.pathname.endsWith('/setMessageReaction')) {
+      reactions.push((await req.json()) as Record<string, unknown>);
       return Response.json({ ok: true, result: true });
     }
     return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
@@ -168,7 +170,7 @@ afterAll(async () => {
   server.stop(true);
 });
 
-test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and a tap selects (no inject)', async () => {
+test('bare /agent button selection routes the next ordinary message and offers cancel', async () => {
   const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
   const daemon = await spawnDaemon(reg, {
     tgCtlPath: TG_CTL,
@@ -185,7 +187,7 @@ test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and 
   closeSync(logFd);
   expect(existsSync(join(cfgDir, 'tg-ctl.123.sock'))).toBe(true);
 
-  // Wait for the picker, the tap answer, AND the follow-up route's inject.
+  // Wait for the picker, the tap answer, AND the follow-up ordinary-message inject.
   const tEnd = Date.now() + 10000;
   const injected = (): boolean => {
     const log = existsSync(tmuxLog) ? readFileSync(tmuxLog, 'utf8') : '';
@@ -195,7 +197,12 @@ test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and 
   };
   while (
     Date.now() < tEnd &&
-    (sentMessages.length === 0 || answeredCallbacks.length === 0 || !routeMsgServed || !injected())
+    (sentMessages.length === 0 ||
+      answeredCallbacks.length === 0 ||
+      !plainMsgServed ||
+      !injected() ||
+      editedMessages.length < 2 ||
+      !reactions.some((r) => r.message_id === 30))
   ) {
     await Bun.sleep(80);
   }
@@ -231,17 +238,21 @@ test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and 
   for (const label of labels) expect(String(picker.text)).not.toContain(label);
 
   // 2. The tap was acknowledged as a selection and the prompt was edited to the
-  //    select-only confirmation — nothing was injected (no tmux send-keys).
+  //    next-message confirmation with a Cancel button. It must not tell the
+  //    user to type `/agent rig <message>`; the selection itself is live state.
   expect(answeredCallbacks).toEqual([{ callback_query_id: 'cb1', text: 'selected' }]);
-  expect(editedMessages.length).toBeGreaterThanOrEqual(1);
+  expect(editedMessages.length).toBeGreaterThanOrEqual(2);
   const edited = String(editedMessages[0].text);
   expect(edited).toContain('selected rig · claude');
-  expect(edited).toContain('/agent rig');
+  expect(edited).toContain('next message');
+  expect(edited).not.toContain('/agent rig');
+  const cancelMarkup = editedMessages[0].reply_markup as
+    | { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> }
+    | undefined;
+  expect(cancelMarkup?.inline_keyboard).toEqual([[{ text: 'Cancel', callback_data: expect.stringMatching(/^tgac:/) }]]);
 
-  // 3. Round-trip (finding #1): the suggested `/agent rig hello there` confidently
-  //    routed to the cwd-`rig` pane %5001 and injected — the cwd-derived selector
-  //    really addresses the picked agent (matchWindows scores the cwd, not just
-  //    the bare window name "4").
+  // 3. The ordinary follow-up message routed to the selected cwd-`rig` pane
+  //    %5001, proving the tap armed daemon state rather than only changing text.
   const log = existsSync(tmuxLog) ? readFileSync(tmuxLog, 'utf8') : '';
   // send-keys / paste-buffer targeting `-t %5001` on the SAME line (per-line, not
   // merely both-present-somewhere) — proves the inject hit the chosen pane.
@@ -249,4 +260,11 @@ test('bare /agent posts an inline-keyboard picker with distinct cwd labels, and 
   // and NOT into a sibling pane
   expect(log).not.toContain('%5002');
   expect(log).not.toContain('%5003');
+  expect(String(editedMessages.at(-1)?.text)).toBe('→ rig · claude');
+  expect(editedMessages.at(-1)?.reply_markup).toBeUndefined();
+  expect(reactions).toContainEqual({
+    chat_id: 1,
+    message_id: 30,
+    reaction: [{ type: 'emoji', emoji: '👀' }],
+  });
 }, 25_000);

@@ -12,7 +12,7 @@
 
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
 import { parseButtonCallback, parseQuestionCloseCallback } from './questions';
-import { isAgentCommand, parseAgentCallback, parseAgentCommand } from './agent-match';
+import { isAgentCommand, parseAgentCallback, parseAgentCancelCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback } from './new-command';
 import { parseTasksCommand } from './tasks-command';
@@ -223,10 +223,23 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         });
         continue;
       }
-      // /agent selection taps (tga:…) route first; q→buttons taps (tgq:…) next.
+      // /agent selection taps (tgac:/tga:…) are appended to the normal action
+      // stream, not callbackActions: a same-batch earlier message must not be
+      // consumed by a later picker tap. Question callbacks still stay
+      // callback-first below so they can unblock slower same-batch message work.
+      const agentCancelCb = parseAgentCancelCallback(cb.data);
+      if (agentCancelCb) {
+        actions.push({
+          kind: 'agent-cancel',
+          callbackQueryId: cb.id,
+          token: agentCancelCb.token,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
+      }
       const agentCb = parseAgentCallback(cb.data);
       if (agentCb) {
-        callbackActions.push({
+        actions.push({
           kind: 'agent-callback',
           callbackQueryId: cb.id,
           token: agentCb.token,

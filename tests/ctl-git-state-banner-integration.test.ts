@@ -96,10 +96,12 @@ exit 0
   });
 }
 
-// Runs one full daemon round-trip: a single inbound update carrying `text`, delivered to the
-// ONE live pane rooted at `fixtureDir`. Returns the exact text the daemon injected (the
-// multi-line `load-buffer` payload when a banner was prepended, else the plain wrap/passthrough).
-async function injectedTextFor(fixtureDir: string, text = 'fix the other thing'): Promise<string> {
+// Runs one full daemon round-trip delivered to the ONE live pane rooted at `fixtureDir`.
+// In `auto` mode it sends `text` directly; in `selected` mode it first sends bare
+// `/agent`, taps the picker, then sends `text`. Returns the exact text the daemon
+// injected (the multi-line `load-buffer` payload when a banner was prepended, else
+// the plain wrap/passthrough).
+async function injectedTextFor(fixtureDir: string, text = 'fix the other thing', mode: 'auto' | 'selected' = 'auto'): Promise<string> {
   const nowSec = Math.floor(Date.now() / 1000);
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-gitstate-cfg-'));
   writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
@@ -112,7 +114,11 @@ async function injectedTextFor(fixtureDir: string, text = 'fix the other thing')
   writeFileSync(bufferLog, '');
   writeShim(shimDir, injectLog, bufferLog, fixtureDir);
 
-  const sent: { chat_id: number; text: string }[] = [];
+  const sent: Array<{ chat_id: number; text: string; reply_markup?: { inline_keyboard?: Array<Array<{ callback_data?: string }>> } }> = [];
+  let pickerCallbackData: string | null = null;
+  let pickerMessageId: number | null = null;
+  let callbackServed = false;
+  let selectedTextServed = false;
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -123,7 +129,7 @@ async function injectedTextFor(fixtureDir: string, text = 'fix the other thing')
       }
       if (url.pathname.endsWith('/getUpdates')) {
         const offset = Number(url.searchParams.get('offset') ?? '0');
-        if (offset === 0) {
+        if (mode === 'auto' && offset === 0) {
           return Response.json({
             ok: true,
             result: [
@@ -134,12 +140,62 @@ async function injectedTextFor(fixtureDir: string, text = 'fix the other thing')
             ],
           });
         }
+        if (mode === 'selected' && offset <= 500 && sent.length === 0) {
+          return Response.json({
+            ok: true,
+            result: [
+              {
+                update_id: 500,
+                message: { message_id: 1, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: '/agent' },
+              },
+            ],
+          });
+        }
+        if (mode === 'selected' && offset <= 501 && pickerCallbackData && pickerMessageId !== null && !callbackServed) {
+          callbackServed = true;
+          return Response.json({
+            ok: true,
+            result: [
+              {
+                update_id: 501,
+                callback_query: {
+                  id: 'cb-selected',
+                  from: { id: 1, first_name: 'Alex' },
+                  message: { message_id: pickerMessageId, chat: { id: 1 }, date: nowSec },
+                  data: pickerCallbackData,
+                },
+              },
+            ],
+          });
+        }
+        if (mode === 'selected' && offset <= 502 && callbackServed && !selectedTextServed) {
+          selectedTextServed = true;
+          return Response.json({
+            ok: true,
+            result: [
+              {
+                update_id: 502,
+                message: { message_id: 2, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text },
+              },
+            ],
+          });
+        }
         await Bun.sleep(1500);
         return Response.json({ ok: true, result: [] });
       }
       if (url.pathname.endsWith('/sendMessage')) {
-        sent.push((await req.json()) as { chat_id: number; text: string });
-        return Response.json({ ok: true, result: { message_id: 1 } });
+        const body = (await req.json()) as { chat_id: number; text: string; reply_markup?: { inline_keyboard?: Array<Array<{ callback_data?: string }>> } };
+        sent.push(body);
+        const firstButton = body.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data;
+        if (firstButton) {
+          pickerCallbackData = firstButton;
+          pickerMessageId = 100 + sent.length;
+        }
+        return Response.json({ ok: true, result: { message_id: 100 + sent.length } });
+      }
+      if (url.pathname.endsWith('/answerCallbackQuery') || url.pathname.endsWith('/editMessageText')) {
+        await req.json();
+        return Response.json({ ok: true, result: true });
       }
       if (url.pathname.endsWith('/setMessageReaction')) {
         await req.json();
@@ -173,7 +229,11 @@ async function injectedTextFor(fixtureDir: string, text = 'fix the other thing')
   daemon.kill('SIGTERM');
   await Promise.race([daemon.exited, Bun.sleep(4000)]);
 
-  expect(sent).toEqual([]); // no guard/error reply — the inject was attempted, not rejected
+  if (mode === 'auto') {
+    expect(sent).toEqual([]); // no guard/error reply — the inject was attempted, not rejected
+  } else {
+    expect(sent[0]?.text).toBe('Pick an agent:');
+  }
   // A banner adds a newline, forcing inject.ts's multi-line load-buffer/paste-buffer path; the
   // plain single-line wrap (no banner) goes through send-keys -l instead — read back whichever
   // path actually fired.
@@ -191,6 +251,16 @@ test('git-state banner: uncommitted changes on a feature branch → banner prepe
   expect(text).toContain('DIFFERENT task');
   expect(text).toContain('[TG from Alex'); // the original wrap still follows, verbatim
   expect(text).toContain('fix the other thing');
+}, 15_000);
+
+test('git-state banner: selected /agent route also prepends banner on a dirty pane', async () => {
+  const fixture = gitFixture('dirty-feature-branch');
+  const text = await injectedTextFor(fixture, 'fix the selected thing', 'selected');
+  expect(text).toContain('⚠');
+  expect(text).toContain('feat/uncommitted-fixture');
+  expect(text).toContain('DIFFERENT task');
+  expect(text).toContain('[TG from Alex');
+  expect(text).toContain('fix the selected thing');
 }, 15_000);
 
 test('git-state banner: clean checkout on main → no banner, plain wrap only', async () => {

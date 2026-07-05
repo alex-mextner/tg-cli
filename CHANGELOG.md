@@ -3,6 +3,18 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.33.3
+
+**Fix: bare `/agent` button selection now routes the next message.**
+
+- Tapping an agent after a bare `/agent` now arms a one-shot route for the next
+  ordinary inbound message, instead of only editing the prompt to suggest
+  `/agent <selector> <message>`.
+- The selected prompt keeps a `Cancel` button. Tapping it removes the pending
+  one-shot route, so a later message falls back to the normal router/picker.
+- Added daemon integration coverage for both the next-message route and Cancel
+  clearing the selection.
+
 ## 1.33.2
 
 **Fix: Telegram photo/document routing now honors replies and `/agent` captions.**
