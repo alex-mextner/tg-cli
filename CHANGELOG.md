@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.33.0
+
+**Feature: git-state-check banner — warn before a message lands in an occupied pane.**
+
+- Root cause fix for a real incident: tg-ctl routes an inbound message to a tmux
+  PANE, not to "the agent's current task". A fresh, unrelated message can land
+  in a pane that is mid-flight on unrelated feature work, and the pane — human
+  or AI — has no signal that this is a NEW thread, not a continuation of what
+  it was just doing.
+- `tg-ctl` now checks the destination pane's cwd (uncommitted changes, or a
+  branch other than main/master) right before a SILENT auto-bind delivery
+  (plain inbound text, a photo/document notice, a standalone voice transcript)
+  and, when the pane is mid-flight, prepends a warning banner naming the branch
+  and file count, so neither a human nor an AI agent silently treats the new
+  message as more of the same task.
+- Deliberately scoped to the un-anchored auto-bind path only: a reply (already
+  anchored to a specific prior message), a forum-topic route, a fresh `/new`
+  spawn, and a picker-tap delivery (the human already chose the pane) are
+  unaffected.
+- New `control.git_state_banner` config flag (default `true`) opts out per
+  machine. Honest tradeoff: an agent that always works on a feature branch sees
+  this banner on every delivery to that pane — the check detects "this pane
+  has work in flight", not "this message is off-topic", and those are not the
+  same thing.
+
 ## 1.32.2
 
 **Fix: deferred Telegram replies now flush after question release instead of asking for a resend.**

@@ -144,7 +144,20 @@ tests can pass fakes.
   parse/resolve/upsert, ffmpeg + whisper argv builders, transcript cleaning, and the onboarding
   decision). `voice-probe.ts` is the ONE impure module here — it scans `~/xp` for an existing
   Whisper install (whisper.cpp binary + ggml model, or a faster-whisper venv) and checks for
-  `ffmpeg`, handing a pure `WhisperProbe` to `decideOnboarding`. Shared shapes in `types.ts`.
+  `ffmpeg`, handing a pure `WhisperProbe` to `decideOnboarding`. `git-state.ts` (git-state-check
+  banner, root-cause fix for a fresh unrelated message silently reading as "more of the same task"
+  in an occupied pane): PURE parse of raw `git rev-parse --abbrev-ref HEAD` / `git status
+  --porcelain` stdout into a `PaneGitState` + `buildGitStateBanner`'s warning text, mirroring
+  discover.ts's raw-stdout-in/structured-data-out shape. The entrypoint's `gitStateForPath`
+  (timeout-guarded git spawns) and `withGitStateBanner` compose it at the ONE seam that matches the
+  failure mode: `injectViaTarget`'s silent auto-bind deliveries (plain inject-text, a
+  download-media notice, a standalone voice transcript) — NOT reply-route (anchored to a specific
+  prior message), NOT topic-route (a different, per-topic targeting model), NOT a `/new` spawn (a
+  fresh pane has no prior work to protect), and NOT a picker tap (the human already chose the
+  pane). Default ON; opt out per machine with `control.git_state_banner: false` — an agent that
+  always works on a feature branch sees the banner on every delivery to that pane, which is
+  expected noise from the check's design (it detects "pane busy", not "message off-topic"), not a
+  bug. Shared shapes in `types.ts`.
 - `features/replies/` — the `tg replies` subcommand (message recall). All PURE except `cli.ts`,
   which is effectful-via-DI like `features/hooks/cli.ts` (the I/O — history read, `$TMUX_PANE`
   detection, stdout — is injected as `RepliesCliDeps`, so the orchestration is unit-tested without

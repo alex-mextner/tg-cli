@@ -60,6 +60,16 @@ test('parseControlConfig parses the topics flag with the same token sets', () =>
   expect(parseControlConfig('control:\n  topics: maybe\n')).toEqual({}); // unrecognized → ignore
 });
 
+test('parseControlConfig parses the git_state_banner flag with the same token sets', () => {
+  for (const v of ['true', 'yes', 'on', '1']) {
+    expect(parseControlConfig(`control:\n  git_state_banner: ${v}\n`)).toEqual({ gitStateBanner: true });
+  }
+  for (const v of ['false', 'no', 'off', '0']) {
+    expect(parseControlConfig(`control:\n  git_state_banner: ${v}\n`)).toEqual({ gitStateBanner: false });
+  }
+  expect(parseControlConfig('control:\n  git_state_banner: maybe\n')).toEqual({}); // unrecognized → ignore
+});
+
 test('parseControlConfig strips surrounding quotes from string values', () => {
   const yaml = "control:\n  session: 'my session'\n  inject_wrap: \"{name}: {msg}\"\n";
   expect(parseControlConfig(yaml)).toEqual({
@@ -114,6 +124,11 @@ test('resolveControlConfig: partial fields override defaults, the rest stay', ()
 test('resolveControlConfig: topics defaults OFF and an explicit true flows through', () => {
   expect(resolveControlConfig({}).topics).toBe(false);
   expect(resolveControlConfig({ topics: true }).topics).toBe(true);
+});
+
+test('resolveControlConfig: git_state_banner defaults ON and an explicit false flows through', () => {
+  expect(resolveControlConfig({}).gitStateBanner).toBe(true);
+  expect(resolveControlConfig({ gitStateBanner: false }).gitStateBanner).toBe(false);
 });
 
 test('resolveControlConfig: transport outside the union falls back to auto', () => {
