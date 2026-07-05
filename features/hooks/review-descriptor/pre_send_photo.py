@@ -92,42 +92,99 @@ def _safe_intent(caption: object) -> str:
 
 # --- empty-editor watermark heuristic (WARN-only, see main()) --------------
 #
-# VS Code renders a small, muted "watermark" of keybinding-hint rows dead
-# center of the editor PART only when the active editor group has ZERO open
-# tabs — a genuinely empty editor/preview pane. This is a much NARROWER
-# signal than the removed looks_like_vscode_window() (HYP-891): that one
-# matched ANY full window via a dark, uniform left activity-bar strip and
-# false-positived on legitimate content-full screenshots at least twice in
-# one day. A watermark only ever renders over a perfectly flat editor
-# background with a tiny, compact cluster of hint-row glyphs — a real code
-# file, canvas render, or webview fills the same region with dense, varied
-# content and cannot produce this pattern, regardless of whether the
-# surrounding Explorer/Inspector/Logs panels are busy (they usually are, per
-# Alex's tg#6041 full-window proof standard, so the check is scoped to a
-# central box rather than the whole image).
+# VS Code renders a small, muted "watermark" dead center of the editor PART
+# only when the active editor group has ZERO open tabs — a genuinely empty
+# editor/preview pane. This is a much NARROWER signal than the removed
+# looks_like_vscode_window() (HYP-891): that one matched ANY full window via
+# a dark, uniform left activity-bar strip and false-positived on legitimate
+# content-full screenshots at least twice in one day. A watermark only ever
+# renders over a perfectly flat editor background with a compact glyph
+# cluster — a real code file, canvas render, or webview fills the same
+# region with dense, varied content and cannot produce this pattern,
+# regardless of whether the surrounding Explorer/Inspector/Logs panels are
+# busy (they usually are, per Alex's tg#6041 full-window proof standard, so
+# the check is scoped to a central box rather than the whole image).
 #
-# CALIBRATION: reasoned from VS Code's known watermark layout (a short list
-# of hint rows, centered in the editor part), NOT verified against a
-# captured reference screenshot of an actual empty editor group. The exact
-# thresholds below are best-effort. That is exactly the gap that made the
-# original heuristic's overly broad "dark left strip" match legitimate
-# content — see main() for why this stays WARN-only, not a block, until
-# field-calibrated.
+# CALIBRATION (tg#6651/tg#6672 follow-up — first REAL reference data this
+# heuristic has ever had): every threshold below used to be reasoned from
+# VS Code's assumed watermark layout (a short list of keybinding-hint TEXT
+# rows), never verified against an actual empty-editor-group screenshot —
+# and that assumption was wrong. Two real screenshots of a genuinely empty
+# VS Code Dark Modern window (Explorer docked left, a Chat panel docked
+# right, zero editor tabs — see tests/fixtures/vscode-empty-watermark-*.png)
+# show the CURRENT VS Code watermark is a single big flat translucent LOGO
+# mark, not hint-text rows, and `looks_like_empty_vscode_watermark()`
+# returned False on BOTH real screenshots under the old constants. Direct
+# pixel analysis of both (identical results on both, since they differ only
+# in Explorer tree state, irrelevant to this box) found two compounding
+# bugs, not one:
 #
-# BOX PLACEMENT (review finding): the watermark centers on the EDITOR PART,
-# not the WINDOW -- on a real full-window screenshot the editor part is
-# offset right by the Activity Bar + Explorer sidebar (~15-20% of width) and
-# only re-centered if a same-width panel is docked on the right too. A box
-# symmetric around the window's horizontal center can miss the cluster
-# entirely on the common "Explorer open, nothing docked right" layout. The
-# box below is deliberately WIDE and asymmetric (biased right) to cover both
-# a truly centered watermark and one shifted right by a typical sidebar,
-# rather than a value calibrated from a real screenshot (none was available).
+#   1. The OLD box (0.20-0.90 x) physically overlaps a docked right panel on
+#      this common layout. That panel's own background is a DIFFERENT
+#      near-black shade ((25,26,27) vs the editor's (18,19,20), diff ~7) —
+#      itself invisible at the old tol=20 — but real panel foreground pixels
+#      (text/icons) and the thin Explorer|Editor / Editor|panel divider
+#      border lines (~(42,43,44), diff ~22-24, sitting right at the box's own
+#      edges by construction) DID cross tol=20 and were the actual "non-bg"
+#      signal detected — not the watermark. Because those artifacts sit at
+#      the box's extreme edges, the measured span blew up to ~0.93 (x) /
+#      ~0.80-0.86 (y), correctly rejected by WATERMARK_MAX_SPAN_RATIO but for
+#      the WRONG reason (panel bleed, not "real content is spread out").
+#   2. Once the box is narrowed clear of both docked panels, the real logo's
+#      own fill color — (13,13,14) against the editor's (18,19,20) bg — is a
+#      contrast of only ~6-7 RGB levels: still invisible at tol=20. At that
+#      point _sample_box detects ZERO non-bg pixels at all (ratio 0), a
+#      different false negative ("no signal") than bug #1's ("signal spans
+#      too much").
+#
+# Fixing both (narrower box + lower tol) reproduces the SAME numbers on both
+# real screenshots: non_bg_ratio ≈ 0.116, span_x ≈ 0.315, span_y ≈ 0.448 —
+# the values the constants below are now calibrated against, with margin.
+# Verified NOT to false-positive against 7 real BUSY full-window screenshots
+# pulled from other HyperIDE e2e runs (code editor + Hyper Canvas preview +
+# error/warning panes, some with a centered icon+table not unlike a
+# watermark shape) — all still return False under the new constants, mostly
+# rejected on span (0.55-0.9, comfortably over the new 0.35/0.50 caps).
+#
+# HONEST LIMITS (not solved by this pass): both real reference screenshots
+# are the SAME window layout (Explorer + Chat panel, same widths) — one data
+# point on panel geometry, not two. A materially different sidebar/panel
+# width could still bleed into the box the same way bug #1 did; the box
+# below is a measured-safe value for this one layout, not a proven-general
+# one. Separately, the real logo's contrast (~7) sits only 2-3 RGB levels
+# above the noise floor the "noisy near-flat background" synthetic test
+# already exercises (±4) — WATERMARK_BG_TOL rides a narrow, real window
+# between those two numbers, not a comfortable margin. Both are exactly why
+# this stays WARN-only, not a block: an unvalidated pixel heuristic
+# hard-blocking a legitimate send is the HYP-891 failure mode this file
+# already exists to avoid repeating.
+#
+# BOX PLACEMENT (review finding, still true): the watermark centers on the
+# EDITOR PART, not the WINDOW -- on a real full-window screenshot the editor
+# part is offset right by the Activity Bar + Explorer sidebar (~15-20% of
+# width). The box below stays asymmetric (biased right of window-center) for
+# that reason, just narrower than before on both ends to also clear a
+# docked right panel (see calibration note above).
 
-WATERMARK_BOX = (0.20, 0.90, 0.15, 0.65)  # (x0, x1, y0, y1) fractions of W,H
+WATERMARK_BOX = (0.25, 0.72, 0.15, 0.65)  # (x0, x1, y0, y1) fractions of W,H
 WATERMARK_SAMPLE_STEP = 3
 WATERMARK_QUANT = 8  # bucket size for the background-color estimate, see _mode_color
-WATERMARK_BG_TOL = 20
+# Lowered from 20 (review finding, see CALIBRATION above): tol=20 made the
+# real VS Code watermark logo (~6-7 level contrast against editor bg)
+# completely invisible to this detector -- it never fired on either real
+# reference screenshot. 6 sits just under the measured 7-level logo contrast
+# and just above the ±4 perturbation the "noisy near-flat background" test
+# already covers -- a narrow but real, measured window, not a comfortable
+# margin (see HONEST LIMITS above).
+WATERMARK_BG_TOL = 6
+# Upper bound raised from 0.10 (review finding, see CALIBRATION above): the
+# real watermark logo measures ~0.116 non-bg density in a properly-scoped
+# box -- already over the old 0.10 ceiling on its own, independent of the
+# tol fix. 0.15 admits that with margin. Verified this does not re-admit
+# genuinely busy content: 7 real full-window screenshots with dense code /
+# preview / table content measure 0.045-0.49 here -- the ones under 0.15
+# still get rejected by the span cap below, not this range.
+#
 # Lower bound (review finding): VS Code's real hint rows are THIN text/icon
 # strokes, not a filled block. A synthetic icon block + 5 thin (3px) text
 # rows -- deliberately sized so every stroke is guaranteed at least one
@@ -138,17 +195,16 @@ WATERMARK_BG_TOL = 20
 # is lowered with a safety margin below it rather than exactly at the
 # measured value. Still > 0 so a perfectly solid/blank pane (zero glyphs, a
 # different bug signature) stays rejected.
-WATERMARK_NONBG_RATIO_RANGE = (0.001, 0.10)
-# Compactness caps (review finding): (0.70, 0.80) let a cluster cover up to
-# 70-80% of the box and still count as "compact" -- effectively disabling
-# the check the docstring/CHANGELOG claim distinguishes a watermark from
-# real content. The measured positive fixtures (a solid glyph block, a
-# right-shifted block, an icon+thin-text-row cluster) all span <=0.26 on
-# either axis; a two-cluster fixture spanning ~54% of the box width is
-# exactly the kind of spread-out pattern real content could produce and is
-# NOT "small, compact". Tightened with real margin above the measured
-# positive cases, well below where that moderate-spread case lands.
-WATERMARK_MAX_SPAN_RATIO = (0.35, 0.40)  # (x span, y span) vs box size
+WATERMARK_NONBG_RATIO_RANGE = (0.001, 0.15)
+# y-cap raised from 0.40 to 0.50 (review finding, see CALIBRATION above): the
+# real watermark logo's own shape -- a chunky mark, not thin rows -- measures
+# span_y ≈ 0.448 in a properly-scoped box, over the old 0.40 cap on its own.
+# 0.50 admits that with margin. x-cap stays at 0.35: the real logo measures
+# span_x ≈ 0.315 there already, no change needed. Re-verified against the
+# existing "two compact clusters ~54% apart" / "scattered glyph pixels"
+# negative fixtures (still span 0.5-1.0 -- still rejected) and 7 real busy
+# screenshots (span 0.55-0.9 -- still rejected).
+WATERMARK_MAX_SPAN_RATIO = (0.35, 0.50)  # (x span, y span) vs box size
 
 
 WATERMARK_BOX_MAX_DIM = 1200  # cap the CROPPED box before per-pixel sampling, see _sample_box
@@ -314,8 +370,11 @@ def _mode_color(samples: list) -> tuple:
 def looks_like_empty_vscode_watermark(image_path: str) -> bool:
     """True if the central editor-pane box looks like VS Code's empty-editor-
     group watermark: overwhelmingly flat background, plus a small, compact,
-    non-zero cluster of non-background pixels (the hint-row glyphs) — not
-    dense content, and not a perfectly solid/blank region either (a
+    non-zero cluster of non-background pixels (the watermark logo/glyphs —
+    see the CALIBRATION note above WATERMARK_BOX: current VS Code renders a
+    single flat logo mark here, not the hint-text rows this detector was
+    originally reasoned from) — not dense content, and not a perfectly
+    solid/blank region either (a
     blank/crashed webview is a DIFFERENT bug signature with zero glyphs, left
     to `review visual` to catch). Best-effort: any error / no PIL -> False
     (fail-open, never brick a send on this heuristic alone)."""
@@ -371,9 +430,9 @@ def warn_empty_watermark_if_detected(image_path: str) -> None:
         # centered dialog or a lone logo on a plain background.
         warn(
             "possible empty-editor watermark: a small compact element on an otherwise "
-            "flat central pane, consistent with VS Code's 'no tabs open' hint rows — this "
+            "flat central pane, consistent with VS Code's 'no tabs open' logo mark — this "
             "screenshot may not actually show what the caption claims; not blocking "
-            "(unvalidated heuristic, see HYP-891 follow-up)"
+            "(WARN-only pending field validation on live traffic, see HYP-891 follow-up)"
         )
 
 
