@@ -2855,13 +2855,42 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       sourceMessageId: number | null
       timer: ReturnType<typeof setTimeout>
       prewrapped?: boolean
-      // Bare `/agent` picker: there is no message yet. A tap must NOT inject an
-      // empty message — it confirms the choice and tells the user the selector
-      // to address it with (`/agent <selector> <message>`).
+      // Select-only picker: there is no message on the button itself. Bare
+      // `/agent` uses this to arm a one-shot route for the next ordinary inbound
+      // message; control pickers (/stop, /kill) only hand back the selector.
       selectOnly?: boolean
+      armNextMessage?: boolean
     }
   >()
   let agentTokenSeq = 0
+  const SELECTED_AGENT_TTL_MS = 10 * 60_000
+  type SelectedAgentRoute = {
+    token: string
+    paneId: string
+    label: string
+    messageId: number | null
+    timer: ReturnType<typeof setTimeout>
+  }
+  let selectedAgentRoute: SelectedAgentRoute | null = null
+  let selectedAgentTokenSeq = 0
+  // Must match features/tg-ctl/agent-match.ts's parser prefix.
+  const AGENT_CANCEL_CALLBACK_PREFIX = "tgac"
+  const cancelSelectedAgentRoute = (): SelectedAgentRoute | null => {
+    const selected = selectedAgentRoute
+    if (!selected) return null
+    selectedAgentRoute = null
+    clearTimeout(selected.timer)
+    return selected
+  }
+  const cancelSelectedAgentRouteForAgentCommand = (): void => {
+    const previous = cancelSelectedAgentRoute()
+    if (previous && previous.messageId !== null) {
+      void editMessageText(ctx, previous.messageId, `cancelled ${previous.label} — another /agent command was used`)
+    }
+  }
+  const selectedAgentCancelMarkup = (token: string): ButtonMessagePayload["reply_markup"] => ({
+    inline_keyboard: [[{ text: "Cancel", callback_data: `${AGENT_CANCEL_CALLBACK_PREFIX}:${token}` }]],
+  })
   // Flat-chat `/new` sessions in flight (issue #27), keyed by an opaque token. IN-MEMORY only:
   // a `/new` interrupted by a daemon restart is simply abandoned (the user re-runs it) — far
   // simpler than the crash-recovery the PERSISTENT forum-topic bindings need, because a flat /new
@@ -3307,14 +3336,31 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return i >= 0 ? distinctLabels(fleet)[i] : `${target.windowName} · ${target.agent}`
   }
 
+  const armSelectedAgentRoute = (target: AgentCandidate, label: string, messageId: number | null): string => {
+    const previous = cancelSelectedAgentRoute()
+    if (previous && previous.messageId !== null && previous.messageId !== messageId) {
+      void editMessageText(ctx, previous.messageId, `cancelled ${previous.label} — replaced by another selection`)
+    }
+    const token = `s${++selectedAgentTokenSeq}`
+    const timer = setTimeout(() => {
+      if (selectedAgentRoute?.token !== token) return
+      selectedAgentRoute = null
+      if (messageId !== null) void editMessageText(ctx, messageId, `selected ${label} — expired`)
+    }, SELECTED_AGENT_TTL_MS)
+    selectedAgentRoute = { token, paneId: target.paneId, label, messageId, timer }
+    return token
+  }
+
   // Post the session-grouped inline-keyboard agent PICKER and arm its pending
-  // selection. `message` empty ⇒ a bare-`/agent` select-only picker (a tap
-  // confirms the choice, no inject); non-empty ⇒ the route picker (a tap injects
-  // the message). Returns false only when the picker send itself failed.
+  // selection. `message` empty ⇒ a select-only picker; bare `/agent` additionally
+  // sets `armNextMessage` so a tap routes the next ordinary inbound message.
+  // Non-empty ⇒ the route picker (a tap injects the message). Returns false only
+  // when the picker send itself failed.
   const postAgentPicker = async (
     subset: AgentCandidate[],
     message: string,
     sourceMessageId: number | null,
+    options: { armNextMessage?: boolean } = {},
   ): Promise<boolean> => {
     const token = `a${++agentTokenSeq}`
     const payload = buildAgentSelectMessage(ctx.chatId, subset, token, message)
@@ -3333,15 +3379,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       sourceMessageId,
       timer,
       selectOnly: message.trim() === "",
+      armNextMessage: message.trim() === "" && options.armNextMessage === true,
     })
     if (message.trim() !== "") queueAckReaction(sourceMessageId, DEFER_REACTION)
     return true
   }
 
-  // Select-only picker (buttons, no pending route): the bare-`/agent` flow, but
-  // also the fallback for an ambiguous control verb that carries no routable text
-  // (a /stop or /kill across several agents) — the buttons show the live agents
-  // instead of a plain-text dump, and a tap hands back the selector to address one.
+  // Select-only picker (buttons, no pending route): fallback for an ambiguous
+  // control verb that carries no routable text (a /stop or /kill across several
+  // agents) — the buttons show the live agents instead of a plain-text dump, and
+  // a tap hands back the selector to address one.
   // Guards an empty subset (a freak full race where candidatesForPicker filtered
   // every discovery pane out) → the no-agent reply, never a button-less picker
   // (mirrors postRoutePicker; matches the candidatesForPicker fallback comment).
@@ -3406,6 +3453,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     prewrappedText: string,
     sourceMessageId: number,
   ): Promise<boolean> => {
+    cancelSelectedAgentRouteForAgentCommand()
     const candidates = listAgentCandidates()
     const msgPreview = prewrappedText.slice(0, 60).replace(/\n/g, " ")
     if (candidates.length === 0) {
@@ -3442,11 +3490,40 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return postRoutePicker(candidates, prewrappedText, undefined, sourceMessageId)
   }
 
+  const injectIntoSelectedAgent = async (prewrappedText: string, sourceMessageId: number): Promise<boolean | null> => {
+    const selected = cancelSelectedAgentRoute()
+    if (!selected) return null
+    const liveFleet = listAgentCandidates()
+    const liveTarget = liveFleet.find((c) => c.paneId === selected.paneId)
+    if (!liveTarget) {
+      await sendMessage(ctx, `selected ${selected.label} is no longer running — routing this message normally`)
+      if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, `selected ${selected.label} — agent is no longer running`)
+      return null
+    }
+    const label = labelFor(liveTarget, liveFleet)
+    log(`agent-select: next message → ${liveTarget.paneId}/${liveTarget.windowName}`)
+    if (shouldDeferInbound(liveTarget.paneId)) {
+      markDeferredForAck(enqueueDeferred(liveTarget.paneId, prewrappedText, sourceMessageId))
+      if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, routedReply(label, true))
+      return true
+    }
+    const text = withGitStateBanner(liveTarget.panePath, prewrappedText)
+    const res = await executeInjectSteps(buildTextInjectPlan(liveTarget.paneId, text))
+    if (!res.ok) {
+      await sendMessage(ctx, res.error)
+      if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, `inject failed: ${res.error}`)
+      return false
+    }
+    if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, routedReply(label, false))
+    return true
+  }
+
   // /agent routing (item 1): bare `/agent` → an inline-keyboard PICKER (tappable
   // buttons, one distinct-labelled button per agent); confident phonetic match →
   // direct inject; ambiguous → the same session-grouped picker carrying the pending
   // message; named selector with NO match → error reply, never silent fallback.
   const handleAgentRoute = async (action: Extract<Action, { kind: "agent-route" }>): Promise<boolean> => {
+    cancelSelectedAgentRouteForAgentCommand()
     const candidates = listAgentCandidates()
     const msgPreview = action.all.slice(0, 60).replace(/\n/g, " ")
     if (candidates.length === 0) {
@@ -3458,7 +3535,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // Bare `/agent`: show the tappable picker so the CTO can SELECT an agent
       // (the buttons he asked for — "где кнопки?"), with distinct labels.
       log(`agent-route: bare /agent → picker over ${candidates.length} candidates`)
-      return postAgentPicker(candidates, "", null)
+      return postAgentPicker(candidates, "", null, { armNextMessage: true })
     }
 
     if (action.selector) {
@@ -3531,29 +3608,24 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
     pendingAgent.delete(action.token)
     clearTimeout(pending.timer)
-    // Bare-`/agent` select-only picker: there is no message to inject. Confirm
-    // the choice and hand back the exact selector to address this agent — the
-    // selector matchWindows keys on is the window name (its cwd basename when the
-    // window name is bare/numeric, which still phonetically matches that pane).
+    // Select-only picker: bare `/agent` arms a one-shot target for the next
+    // ordinary inbound message; control pickers only return the selector hint.
     if (pending.selectOnly) {
       await answerCallbackQuery(ctx, action.callbackQueryId, "selected")
       if (pending.messageId !== null) {
-        // Verify the suggested selector against the FULL live fleet, not the
-        // pending subset: an ambiguous `/agent <sel>` (no message) narrows
-        // `pending.candidates` to the matches, but the user's follow-up `/agent
-        // <selector> <message>` re-resolves against ALL agents — a pane OUTSIDE
-        // the subset whose window name matches the suggestion would otherwise be
-        // a silent misroute (review finding). A fresh snapshot that still
-        // contains the chosen pane is authoritative; if it raced away, fall back
-        // to the pending subset (the picker re-opens — safe).
+        // Build selector/label against the full live fleet, not only the button
+        // subset, so a suggested selector can never confidently route elsewhere.
         const live = listAgentCandidates()
         const fleet = live.some((c) => c.paneId === target.paneId) ? live : pending.candidates
         const liveTarget = fleet.find((c) => c.paneId === target.paneId) ?? target
-        const selector = suggestSelector(liveTarget, fleet)
-        // Show the DISTINCT label (not the ambiguous "4 · claude") so the user
-        // sees which agent they picked, then the exact command to address it.
         const label = labelFor(liveTarget, fleet)
-        void editMessageText(ctx, pending.messageId, `selected ${label} — send: /agent ${selector} <message>`)
+        if (pending.armNextMessage) {
+          const token = armSelectedAgentRoute(liveTarget, label, pending.messageId)
+          void editMessageText(ctx, pending.messageId, `selected ${label} — send the next message here`, selectedAgentCancelMarkup(token))
+        } else {
+          const selector = suggestSelector(liveTarget, fleet)
+          void editMessageText(ctx, pending.messageId, `selected ${label} — send: /agent ${selector} <message>`)
+        }
       }
       return true
     }
@@ -3594,6 +3666,22 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       )
     }
     return res.ok
+  }
+
+  const handleAgentCancelCallback = async (action: Extract<Action, { kind: "agent-cancel" }>): Promise<boolean> => {
+    const selected = selectedAgentRoute
+    if (
+      !selected ||
+      selected.token !== action.token ||
+      (selected.messageId !== null && action.messageId !== null && selected.messageId !== action.messageId)
+    ) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
+    cancelSelectedAgentRoute()
+    await answerCallbackQuery(ctx, action.callbackQueryId, "cancelled")
+    if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, `cancelled ${selected.label}`)
+    return true
   }
 
   // A reply: route to the recognized origin pane (routes map) or, when unknown,
@@ -5033,6 +5121,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         messageId: action.messageId,
       })
     }
+    if (selectedAgentRoute) {
+      const selectedResult = await injectIntoSelectedAgent(wrapped, action.messageId)
+      if (selectedResult !== null) return selectedResult
+    }
     // A non-reply photo/file → auto-bind to the last-active agent like a text msg, with the
     // git-state-check banner (withGitStateBanner) prepended when that pane is mid-flight.
     return injectViaTarget(
@@ -5124,6 +5216,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       })
     }
     const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, quoted, action.messageId)
+    if (selectedAgentRoute) {
+      const selectedResult = await injectIntoSelectedAgent(wrapped, action.messageId)
+      if (selectedResult !== null) return selectedResult
+    }
     // A non-reply voice note → auto-bind to the last-active agent like a text msg, with the
     // git-state-check banner (withGitStateBanner) prepended when that pane is mid-flight.
     return injectViaTarget(
@@ -5564,7 +5660,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return handleAgentRoute(action)
       case "agent-callback":
         return handleAgentCallback(action)
+      case "agent-cancel":
+        return handleAgentCancelCallback(action)
       case "inject-text":
+        if (selectedAgentRoute) {
+          const selectedResult = await injectIntoSelectedAgent(action.text, action.messageId)
+          if (selectedResult !== null) return selectedResult
+        }
         // A plain non-reply message → opt into the no-reply auto-bind (fix B). This is the exact
         // HYP-915 shape (a fresh, unrelated message silently landing in an occupied pane), so the
         // git-state-check banner (withGitStateBanner) is prepended here when that pane is

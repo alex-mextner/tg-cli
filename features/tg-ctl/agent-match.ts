@@ -344,6 +344,7 @@ export function dedupeCandidates(candidates: AgentCandidate[]): AgentCandidate[]
 // --- selection button payload ---
 
 const AGENT_CALLBACK_PREFIX = 'tga';
+const AGENT_CANCEL_CALLBACK_PREFIX = 'tgac';
 
 export interface AgentSelectPayload {
   text: string;
@@ -419,6 +420,13 @@ export function parseAgentCallback(data: string | undefined): ParsedAgentCallbac
   const index = Number(parts[2]);
   if (!Number.isInteger(index) || index < 0) return null;
   return { token: parts[1], index };
+}
+
+export function parseAgentCancelCallback(data: string | undefined): { token: string } | null {
+  if (!data) return null;
+  const parts = data.split(':');
+  if (parts.length !== 2 || parts[0] !== AGENT_CANCEL_CALLBACK_PREFIX || !parts[1]) return null;
+  return { token: parts[1] };
 }
 
 function truncate(s: string, max: number): string {

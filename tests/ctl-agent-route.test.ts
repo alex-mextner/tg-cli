@@ -63,6 +63,21 @@ test('tga: callback → agent-callback action', () => {
   });
 });
 
+test('tgac: callback → agent-cancel action', () => {
+  const r = stepUpdates([cbUpd(7, 'tgac:s1')], opts);
+  expect(r.actions[0]).toEqual({
+    kind: 'agent-cancel',
+    callbackQueryId: 'cb7',
+    token: 's1',
+    messageId: 77,
+  });
+});
+
+test('same-batch earlier message stays before a later /agent selection callback', () => {
+  const r = stepUpdates([textUpd(8, 'hello before tap'), cbUpd(9, 'tga:a1:0')], opts);
+  expect(r.actions.map((a) => a.kind)).toEqual(['inject-text', 'ack', 'agent-callback']);
+});
+
 test('tgq: callback still routes to answer-question (no regression)', () => {
   const r = stepUpdates([cbUpd(5, 'tgq:req1:o0')], opts);
   expect(r.actions[0]).toMatchObject({ kind: 'answer-question', requestId: 'req1', value: 'o0' });

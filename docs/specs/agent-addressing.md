@@ -22,9 +22,9 @@ several agents run side by side:
 - **No match** (selector given but nothing matched) → error reply naming the
   selector and the running agents; the message is **not** delivered.
 - Bare `/agent` → an inline-keyboard **picker** (tappable buttons), one
-  distinct-labelled button per addressable agent. A tap SELECTS that agent and
-  replies with the exact selector to address it (`/agent <selector> <message>`);
-  it injects nothing, since there is no message yet.
+  distinct-labelled button per addressable agent. A tap arms a one-shot route:
+  the next ordinary inbound message goes to that selected agent. The confirmation
+  card keeps a `Cancel` button to clear the pending route before anything is sent.
 
 This complements the existing default routing (the per-pane registration set —
 every live session that ran `tg` is registered; tg-cli#67): `/agent` is the
@@ -107,9 +107,10 @@ A tap (`tga:…`) is parsed by `parseAgentCallback` and emitted as an
 injects the pending message into `candidates[index]`'s pane (re-verifying the
 pane still hosts an agent), answers the callback, and edits the prompt to
 `→ <label>`. For a **bare-`/agent`** (`selectOnly`) picker there is no message to
-inject: it answers `selected`, and edits the prompt to
-`selected <label> — send: /agent <selector> <message>`, where `<selector>`
-(`suggestSelector`) is the unique non-bare window name, else the cwd project dir.
+inject yet: it answers `selected`, arms a one-shot route for the next ordinary
+inbound message, and edits the prompt to `selected <label> — send the next
+message here` with a `Cancel` button. A successful/queued/failed delivery edits
+that same prompt to its final state and removes the button.
 
 `tga:` callbacks are routed BEFORE `tgq:` (q→buttons) in `stepUpdates`, so the
 two button systems never collide.
@@ -143,12 +144,11 @@ treated as non-distinguishing and the label leans on the cwd project dir instead
 
 ## Non-goals / future
 
-- A bare `/agent` is a one-tap **selector** (pick → it hands back the
-  `/agent <selector> <message>` command), NOT a sticky target the daemon
-  remembers — the message still goes up front on the next `/agent`. (Earlier
-  this was "lists only, no buttons"; the picker replaced the text list because
-  three indistinguishable `4 · claude` rows were useless and there were no
-  buttons to tap — CTO bug report.)
+- The bare `/agent` selection is intentionally one-shot: it is remembered only
+  until the next ordinary inbound message, `Cancel`, TTL expiry, or another
+  explicit `/agent` command. (Earlier this was "lists only, no buttons"; the
+  picker replaced the text list because three indistinguishable `4 · claude`
+  rows were useless and there were no buttons to tap — CTO bug report.)
 - No persistence of `pendingAgent` across a daemon restart (10-min in-memory TTL).
 - When a bare-`/agent` button is tapped, the daemon re-runs `listAgentCandidates()`
   and verifies the handed-back selector against the FULL LIVE fleet at tap time

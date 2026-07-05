@@ -713,6 +713,37 @@ test('AMBIGUOUS control verb (/stop, no routable text) → select-only picker, N
   expect(tg.reactions.some((r) => r.messageId === stopMsgId && r.emoji === '👀')).toBe(false);
 }, 15_000);
 
+test('AMBIGUOUS control picker tap does not arm the next message', async () => {
+  const h = makeHarness([
+    { paneId: PANE_HYPER, cwd: '' },
+    { paneId: PANE_TOOLS, cwd: '' },
+  ]);
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushText(710, 37, '/stop');
+
+  await waitFor(() => pickerOf(tg.sends) !== undefined);
+  const picker = pickerOf(tg.sends)!;
+  const toolsBtn = picker.buttons.find((b) => b.text.includes('agent-tools')) ?? picker.buttons[0]!;
+
+  tg.pushCallback(711, toolsBtn.callback_data, 9000 + tg.sends.indexOf(picker) + 1);
+  await Bun.sleep(200);
+
+  const sendsBeforeFollowup = tg.sends.length;
+  tg.pushText(712, 38, 'after stop picker tap');
+
+  await waitFor(() => tg.sends.length > sendsBeforeFollowup);
+
+  expect(injectedLines(h.injectLog).length).toBe(0);
+  const followupPicker = tg.sends.slice(sendsBeforeFollowup).find((s) => s.hasMarkup);
+  expect(followupPicker).toBeDefined();
+  expect(followupPicker!.text).toContain('Route to which agent?');
+  expect(followupPicker!.text).toContain('after stop picker tap');
+  daemon.kill('SIGTERM');
+}, 15_000);
+
 test('DESTRUCTIVE /kill NEVER auto-binds to the last-message agent (asks even WITH a last message)', async () => {
   // Two registered live agents AND a populated routes.json (agent-tools %2 posted last).
   // A harmless content message WOULD bind to %2 — but /kill is destructive and must NOT
@@ -743,6 +774,33 @@ test('DESTRUCTIVE /kill NEVER auto-binds to the last-message agent (asks even WI
   // No inject of any kind, and the /kill earned no 👀 (it did not execute).
   expect(injectedLines(h.injectLog).length).toBe(0);
   expect(tg.reactions.some((r) => r.messageId === killMsgId && r.emoji === '👀')).toBe(false);
+}, 15_000);
+
+test('bare /agent selection routes the next standalone photo', async () => {
+  const h = makeHarness([
+    { paneId: PANE_HYPER, cwd: '' },
+    { paneId: PANE_TOOLS, cwd: '' },
+  ]);
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushText(713, 39, '/agent');
+
+  await waitFor(() => pickerOf(tg.sends) !== undefined);
+  const picker = pickerOf(tg.sends)!;
+  const toolsBtn = picker.buttons.find((b) => b.text.includes('agent-tools')) ?? picker.buttons[0]!;
+
+  tg.pushCallback(714, toolsBtn.callback_data, 9000 + tg.sends.indexOf(picker) + 1);
+  await Bun.sleep(200);
+  tg.pushPhoto(715, 40);
+
+  await waitFor(() => injectedLines(h.injectLog).some((l) => l.startsWith(`${PANE_TOOLS}\t`) && l.includes('sent photo:')));
+
+  const lines = injectedLines(h.injectLog);
+  expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`) && l.includes('sent photo:'))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(false);
+  daemon.kill('SIGTERM');
 }, 15_000);
 
 test('candidatesForPicker drops a discovery pane that is NOT a live agent (no synthetic dead button)', async () => {
