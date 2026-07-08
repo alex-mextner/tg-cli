@@ -875,6 +875,26 @@ async function runTranscription(ctx: Ctx, oggPath: string): Promise<string | nul
   return cleanTranscript(proc.stdout)
 }
 
+function formatVoiceConfirmation(text: string): string {
+  const prefix = "🎤 Расшифровка: "
+  const suffix = "\n… (здесь укорочено; полный текст не обрезается перед маршрутизацией)"
+  const maxTelegramText = 4096
+  const full = `${prefix}${text}`
+  if (full.length <= maxTelegramText) return full
+
+  const maxTextLength = Math.max(0, maxTelegramText - prefix.length - suffix.length)
+  const kept: string[] = []
+  let keptLength = 0
+  for (const char of text) {
+    if (keptLength + char.length > maxTextLength) break
+    kept.push(char)
+    keptLength += char.length
+  }
+  const out = `${prefix}${kept.join("")}${suffix}`
+  if (out.length <= maxTelegramText) return out
+  return `${prefix}${suffix}`.slice(0, maxTelegramText)
+}
+
 // The faster-whisper runner script: the configured project's own transcriber
 // when it ships one (my_faster_whisper.py / transcribe.py), else a generated
 // fallback written into the config dir. `main.py` is intentionally NOT trusted
@@ -2853,6 +2873,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       candidates: AgentCandidate[]
       messageId: number | null
       sourceMessageId: number | null
+      relatedReactionMessageId: number | null
       timer: ReturnType<typeof setTimeout>
       prewrapped?: boolean
       // Select-only picker: there is no message on the button itself. Bare
@@ -2920,6 +2941,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   type DeferredInbound = {
     text: string
     sourceMessageId: number | null
+    relatedReactionMessageId: number | null
     delivered: boolean
   }
   // Inbound queued behind an agent's outstanding question (defer-while-waiting):
@@ -2985,8 +3007,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     paneId: string,
     wrappedText: string,
     sourceMessageId: number | null,
+    relatedReactionMessageId: number | null = null,
   ): DeferredInbound => {
-    const item = { text: wrappedText, sourceMessageId, delivered: false }
+    const item = { text: wrappedText, sourceMessageId, relatedReactionMessageId, delivered: false }
     deferred.enqueue(paneId, item)
     return item
   }
@@ -3008,13 +3031,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     item.delivered = true
-    if (item.sourceMessageId !== null) {
-      try {
-        await setSeenReaction(item.sourceMessageId)
-      } catch (err) {
-        log(`deferred flush reaction for message ${item.sourceMessageId} failed: ${err}`)
-      }
-    }
+    await setSeenReactions(item.sourceMessageId, item.relatedReactionMessageId)
     return true
   }
   const flushDeferred = async (paneId: string): Promise<void> => {
@@ -3377,6 +3394,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       candidates: subset,
       messageId,
       sourceMessageId,
+      relatedReactionMessageId: null,
       timer,
       selectOnly: message.trim() === "",
       armNextMessage: message.trim() === "" && options.armNextMessage === true,
@@ -3410,6 +3428,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     prewrappedText: string,
     notice?: string,
     sourceMessageId: number | null = null,
+    relatedReactionMessageId: number | null = null,
   ): Promise<boolean> => {
     if (subset.length === 0) {
       await replyNoAgent()
@@ -3428,6 +3447,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       candidates: subset,
       messageId,
       sourceMessageId,
+      relatedReactionMessageId,
       timer,
       prewrapped: true,
     })
@@ -3635,7 +3655,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     let res: { ok: boolean; error?: string; deferred?: boolean; deferredItem?: DeferredInbound }
     if (pending.prewrapped) {
       if (shouldDeferInbound(target.paneId)) {
-        const item = enqueueDeferred(target.paneId, pending.message, pending.sourceMessageId)
+        const item = enqueueDeferred(target.paneId, pending.message, pending.sourceMessageId, pending.relatedReactionMessageId)
         res = { ok: true, deferred: true, deferredItem: item }
       } else {
         const r = await executeInjectSteps(buildTextInjectPlan(target.paneId, pending.message))
@@ -3645,17 +3665,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       res = await injectToPane(target.paneId, action.from, pending.message, pending.sourceMessageId)
     }
     if (res.deferred && pending.sourceMessageId !== null && !res.deferredItem?.delivered) {
-      try {
-        await setReaction(pending.sourceMessageId, DEFER_REACTION)
-      } catch (err) {
-        log(`deferred picker reaction for message ${pending.sourceMessageId} failed: ${err}`)
-      }
-    } else if (res.ok && pending.sourceMessageId !== null) {
-      try {
-        await setSeenReaction(pending.sourceMessageId)
-      } catch (err) {
-        log(`picker delivery reaction for message ${pending.sourceMessageId} failed: ${err}`)
-      }
+      await setReaction(pending.sourceMessageId, DEFER_REACTION)
+    } else if (res.ok) {
+      await setSeenReactions(pending.sourceMessageId, pending.relatedReactionMessageId)
     }
     await answerCallbackQuery(ctx, action.callbackQueryId, res.ok ? (res.deferred ? "queued" : "sent") : "failed")
     if (pending.messageId !== null) {
@@ -3687,12 +3699,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // A reply: route to the recognized origin pane (routes map) or, when unknown,
   // a session-grouped picker ordered LRU/MRU. injectText already carries the
   // wrap + quote anchor, so it is injected verbatim everywhere here.
-  const handleReplyRoute = async (action: Extract<Action, { kind: "reply-route" }>): Promise<boolean> => {
+  const handleReplyRoute = async (
+    action: Extract<Action, { kind: "reply-route" }>,
+    relatedReactionMessageId: number | null = null,
+  ): Promise<boolean> => {
     const routes = parseRoutes(readFileOrNull(ctx.paths.routes))
     const recognized = recognizeRoute(routes, action.replyToMessageId)
     const injectVerbatim = async (paneId: string): Promise<boolean> => {
       if (shouldDeferInbound(paneId)) {
-        markDeferredForAck(enqueueDeferred(paneId, action.injectText, action.messageId))
+        markDeferredForAck(enqueueDeferred(paneId, action.injectText, action.messageId, relatedReactionMessageId))
         return true
       }
       const res = await executeInjectSteps(buildTextInjectPlan(paneId, action.injectText))
@@ -3700,6 +3715,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         await sendMessage(ctx, res.error)
         return false
       }
+      // The source message's own receipt is still handled by the trailing ack
+      // action. This branch only adds the related replied-to message receipt.
+      await setSeenReactions(null, relatedReactionMessageId)
       return true
     }
 
@@ -3728,6 +3746,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         candidates: sorted,
         messageId,
         sourceMessageId: action.messageId,
+        relatedReactionMessageId,
         timer,
         prewrapped: true,
       })
@@ -5195,6 +5214,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
 
+    // This is an STT confirmation only, not a delivery receipt. Routing below may
+    // still produce a separate no-agent / picker / inject-failed signal.
+    await sendMessage(ctx, formatVoiceConfirmation(text), { reply_to_message_id: action.messageId })
+
     // Route exactly like a typed message, but present the transcript as a 🎤-marked
     // quote (formatVoiceTranscript) so the agent can tell it's transcribed speech, not
     // typed text: a reply note carries the quote anchor and goes through the SAME
@@ -5207,13 +5230,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         quoted,
         action.messageId,
       )}`.replace(/^\n/, "")
-      return handleReplyRoute({
-        kind: "reply-route",
-        replyToMessageId: action.replyToMessageId,
-        injectText,
-        from: action.from,
-        messageId: action.messageId,
-      })
+      return handleReplyRoute(
+        {
+          kind: "reply-route",
+          replyToMessageId: action.replyToMessageId,
+          injectText,
+          from: action.from,
+          messageId: action.messageId,
+        },
+        action.replyToMessageId,
+      )
     }
     const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, quoted, action.messageId)
     if (selectedAgentRoute) {
@@ -5251,6 +5277,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   }
   const setSeenReaction = (messageId: number): Promise<void> => setReaction(messageId, "👀")
+  const setSeenReactions = async (
+    primaryMessageId: number | null,
+    relatedMessageId: number | null | undefined,
+  ): Promise<void> => {
+    // setReaction is best-effort and already catches/logs Bot API failures.
+    const ids = Array.from(new Set([primaryMessageId, relatedMessageId].filter((id): id is number => typeof id === "number")))
+    for (const id of ids) await setSeenReaction(id)
+  }
   // ⏳ is NOT in Telegram's allowed reaction set; ✍️ ("noted, queued") is the
   // closest allowed emoji for "deferred behind the agent's open question".
   const DEFER_REACTION = "✍️"
