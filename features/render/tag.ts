@@ -11,7 +11,7 @@
 //
 // INPUT POLICY (CTO 2026-06-16, ROADMAP "tg --tag: lowercase-english only"):
 // `--tag` accepts ONLY the lowercase-english tag words — `answer` / `decision`
-// / `problem` / `report`. Uppercase (`ANSWER`), Cyrillic aliases (`ОТВЕТ`), and
+// / `problem` / `question` / `report`. Uppercase (`ANSWER`), Cyrillic aliases (`ОТВЕТ`), and
 // unknown words are REJECTED at parse time (`validateTag`) with a 3-part error
 // and a non-zero exit, instead of the old soft-render-and-warn behavior. The
 // internal pipeline still keys on the UPPERCASE canonical (the pill set, the
@@ -20,10 +20,23 @@
 
 import { TAG_PILL_DOT, TAG_PILL_FALLBACK, tagPillCellDots } from '../branding/emoji';
 
-// The four canonical (English) tag words. This is the canonical order the pill
+// The five canonical (English) tag words. This is the canonical order the pill
 // set, the fallback map, and the upload script all key on.
-export const CANONICAL_TAGS = ['ANSWER', 'DECISION', 'PROBLEM', 'REPORT'] as const;
+//
+// QUESTION renders IDENTICALLY to DECISION (same colored dot; no dedicated
+// pill asset of its own yet — see emoji.ts's comment on TAG_PILL_IDS.QUESTION
+// for why it deliberately does NOT borrow DECISION's real pill). The two only
+// differ in TRIAGE semantics downstream: ESCALATION_TAGS below.
+export const CANONICAL_TAGS = ['ANSWER', 'DECISION', 'PROBLEM', 'QUESTION', 'REPORT'] as const;
 export type CanonicalTag = (typeof CANONICAL_TAGS)[number];
+
+// The lowercase-english tags that mean "this is an escalation ask needing a
+// structured reply" — used by BOTH features/cli/args.ts's TAG_GATES (Tier 1,
+// parse-time, blocking) and the pre-send-text escalation-format-gate hook
+// (features/hooks/escalation-format-descriptor/pre_send_text_gate.ts, Tier 2,
+// advisory). A single shared list so adding a third escalation tag is one
+// edit instead of two lists that can silently drift apart.
+export const ESCALATION_TAGS = ['decision', 'question'] as const;
 
 // The accepted `--tag` values: the lowercase-english spelling of each canonical
 // tag. This is the ONLY accepted input form (see INPUT POLICY above). Derived
@@ -36,7 +49,7 @@ export const ACCEPTED_TAGS: readonly string[] = CANONICAL_TAGS.map((t) => t.toLo
 const CANONICAL_TAG_SET = new Set<string>(CANONICAL_TAGS);
 
 // A human-readable, comma-separated list of the accepted tags, for error/help
-// text ("use one of: answer, decision, problem, report").
+// text ("use one of: answer, decision, problem, question, report").
 export const ACCEPTED_TAGS_LIST = ACCEPTED_TAGS.join(', ');
 
 /**
@@ -45,7 +58,7 @@ export const ACCEPTED_TAGS_LIST = ACCEPTED_TAGS.join(', ');
  * Returns `null` when the tag is accepted (a lowercase-english canonical word,
  * after trimming surrounding whitespace). Otherwise returns a 3-part error
  * MESSAGE — WHAT (`invalid --tag 'X'`), WHY (`tags must be lowercase english`),
- * HOW (`use one of: answer, decision, problem, report`) — that the caller
+ * HOW (`use one of: answer, decision, problem, question, report`) — that the caller
  * surfaces verbatim before exiting non-zero. Never throws.
  *
  * Rejects everything that is not exactly one of ACCEPTED_TAGS: uppercase
@@ -75,8 +88,8 @@ export interface ResolvedTag {
   // cell's Telegram-side alt (emoji_list) or Telegram drops the entity.
   cellDots: string[];
   // The canonical (English) tag WORD. For a known tag this is one of
-  // ANSWER/DECISION/PROBLEM/REPORT; for an unknown tag it is the uppercased raw
-  // input (and `known` is false).
+  // ANSWER/DECISION/PROBLEM/QUESTION/REPORT; for an unknown tag it is the
+  // uppercased raw input (and `known` is false).
   word: string;
   // True when the input resolved to a canonical tag; false for an off-list tag.
   known: boolean;

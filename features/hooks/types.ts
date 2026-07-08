@@ -116,10 +116,36 @@ export interface HookEvent {
 export type Decision = 'allow' | 'block';
 
 // What a hook prints on stdout (protocol only — logs go to stderr).
+//
+// The gate_* / body_sha256 fields are an OPTIONAL, generic extension: any
+// hook may report structured "gate" context about what it checked, and the
+// runner copies it straight through into that hook's audit.jsonl line (see
+// AuditLine in runner.ts). They carry no meaning to the runner itself — only
+// the escalation-format gate
+// (features/hooks/escalation-format-descriptor/pre_send_text_gate.ts) uses
+// them today, but they are not named after it so any future gate can reuse
+// the same audit shape instead of inventing its own.
 export interface HookOutput {
   hook_api?: string;
   decision?: Decision;
   message?: string;
+  // The --tag value the gate evaluated (e.g. "decision", "question").
+  gate_tag?: string;
+  // Comma-separated list of what the gate found missing (e.g. "table"). Empty
+  // or absent when nothing was missing.
+  gate_missing?: string;
+  // What kind of literal table (if any) the gate found — see TableKind in
+  // features/render/table.ts ('html' | 'boxed' | 'pipe' | 'none').
+  gate_table_kind?: string;
+  // Non-empty when the send bypassed the gate (e.g. a future RIG_HATCH_REQUEST
+  // override) and, if so, by what mechanism. Empty/absent = no bypass used.
+  gate_bypass?: string;
+  // sha256 of the message body the gate evaluated, so an audit line can be
+  // correlated back to the exact content without storing the body itself.
+  body_sha256?: string;
+  // The gate's own logic/version tag, so a later behavior change (e.g. the
+  // flip from warn to block) is distinguishable in historical audit lines.
+  gate_version?: string;
 }
 
 // Why the trust gate let a hook run, or refused it.
@@ -144,6 +170,14 @@ export interface HookRunResult {
   trustState: TrustState;
   errored: boolean; // the hook crashed / timed out / bad protocol
   quarantined: boolean; // treated as absent (did not run)
+  // Optional gate_* passthrough from the hook's own stdout (see HookOutput).
+  // Undefined for a quarantined hook or one that never reported them.
+  gateTag?: string;
+  gateMissing?: string;
+  gateTableKind?: string;
+  gateBypass?: string;
+  bodySha256?: string;
+  gateVersion?: string;
 }
 
 // The aggregate verdict the host acts on.

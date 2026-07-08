@@ -3,6 +3,35 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.34.0
+
+**Feature: escalation-format gate — `question` tag + `pre-send-text` hook point.**
+
+Non-breaking: the escalation-format check is ADVISORY (warn-mode) by default —
+nothing that worked before hard-fails now.
+
+- New canonical `--tag question` (renders like `decision` — same orange dot —
+  but stays on the unicode fallback badge for every viewer, since it has no
+  dedicated pill asset yet).
+- `--tag decision`/`--tag question` should carry a literal table in the message
+  body (a markdown pipe table, `tg --table`, or an HTML `<table>`). A send with
+  none is WARNED — the actionable, copy-pasteable guidance is printed to stderr
+  and **the send still proceeds**. Set `ESCALATION_GATE_ENFORCE=1` (default OFF)
+  to make a table required (the send then hard-errors, exit 1). This is a
+  skill-first → warn → flip-to-block rollout: a later release flips the enforce
+  default once the tg skill documents the requirement and a warn period passes.
+- New `pre-send-text` agents-hooks/v1 point (the sibling of the existing
+  `pre-send-photo` point): fires for every text send, on the final assembled
+  body, right before the transmitter sends it. A trust-by-default drop-in
+  descriptor under `~/.agents/hooks/tg/` can inspect/warn/block a text send
+  the same way an existing photo hook does.
+- Ships a reference `escalation-format-gate` hook (WARN MODE ONLY — never
+  blocks) that checks the FINAL body for a literal table and prints an
+  actionable warning when missing; nothing installs it automatically yet.
+- `audit.jsonl` gains a generic `gate_*` / `body_sha256` field extension any
+  hook can report, and is now rotated (capped, mirroring the reply-history
+  cap) under a cross-process lock instead of growing forever.
+
 ## 1.33.4
 
 **Fix: Claude Code subagent auto labels now use sidechain metadata when available.**

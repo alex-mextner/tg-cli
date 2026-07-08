@@ -107,3 +107,59 @@ export function toTablePre(input: string): { html: string; hasWide: boolean } {
   const { rows, hasWide } = parseTableRows(input);
   return { html: `<pre>${escapeCell(renderTable(rows))}</pre>`, hasWide };
 }
+
+// --- Literal-table detection (escalation-format gate) ---
+//
+// A cheap, pure heuristic for "does this message body already contain a
+// literal table?" — used by both the parse-time TAG_GATES check
+// (features/cli/args.ts) and the pre-send-text escalation-format hook
+// (features/hooks/escalation-format-descriptor/pre_send_text_gate.ts). Recognizes the three shapes a
+// literal table can take in a tg message:
+//   'html'  — a real <table> tag (--format html / a rich send).
+//   'boxed' — our own box-drawn <pre> table (tg --table / toTablePre above).
+//   'pipe'  — a markdown-style `a | b | c` grid typed directly in the body:
+//             >=2 lines each carrying >=1 pipe, AND at least one of those
+//             lines is a markdown separator row (` --- | --- `-shaped: only
+//             dashes/colons/pipes/whitespace, AND itself contains a pipe).
+//             The pipe-per-row minimum is 1, not 2 (review finding: a
+//             borderless 2-column GFM table like `Option | Tradeoff` /
+//             `--- | ---` / `A | slower` has exactly ONE pipe per row — a
+//             >=2 threshold hard-REJECTED a legitimate table, worse than a
+//             false allow). The separator row is what stops code prose like
+//             "if a || b" / "while c || d" from false-positiving — a bare
+//             `---` divider between them does NOT count as that separator
+//             (review finding: it must itself contain a pipe, or two
+//             `||`-bearing lines plus an unrelated thematic break elsewhere
+//             in the body would false-positive as a table).
+// 'none' means no literal table was found by any of the three shapes.
+export type TableKind = 'html' | 'boxed' | 'pipe' | 'none';
+
+const HTML_TABLE_RE = /<table[\s>]/iu;
+// The box-drawing CORNER + T-junction glyphs renderTable() emits on its
+// top/bottom bars (┌┬┐ / └┴┘). Deliberately excludes the plain vertical
+// divider │ AND the row-separator T/cross glyphs ├┼┤ (review finding): │
+// alone is the most commonly-pasted box glyph in ordinary prose (quoted UI
+// text, ASCII-art fences, a stray cell divider) and would false-positive on
+// a body that never called renderTable at all. The top/bottom bar glyphs, by
+// contrast, are only ever emitted by our own box-drawn table.
+const BOXED_TABLE_RE = /[┌┬┐└┴┘]/u;
+// A markdown table separator row, e.g. `| --- | --- |` or `--- | :--:`.
+// Matched against a line that has ALREADY been confirmed to contain both '-'
+// and '|' (see hasSeparatorRow below) — this pattern alone is too loose
+// (matches a bare run of colons/spaces too) to gate on by itself.
+const PIPE_SEPARATOR_ROW_RE = /^[\s|:-]+$/u;
+
+export function detectTableKind(body: string): TableKind {
+  if (!body) return 'none';
+  if (HTML_TABLE_RE.test(body)) return 'html';
+  if (BOXED_TABLE_RE.test(body)) return 'boxed';
+  const lines = body.split('\n');
+  const pipeRows = lines.filter((line) => (line.match(/\|/g) ?? []).length >= 1);
+  // The separator row itself MUST contain a pipe (not just dashes) — a bare
+  // `---` thematic break elsewhere in the body must never count.
+  const hasSeparatorRow = lines.some(
+    (line) => line.includes('-') && line.includes('|') && PIPE_SEPARATOR_ROW_RE.test(line),
+  );
+  if (pipeRows.length >= 2 && hasSeparatorRow) return 'pipe';
+  return 'none';
+}

@@ -3,6 +3,7 @@ import {
   orderDescriptors,
   resolveTrust,
   runHooks,
+  trimAuditLines,
   validateDescriptor,
   type AuditLine,
   type RunnerDeps,
@@ -463,4 +464,75 @@ test('trustAutoActive is false for the guarded-but-not-auto values', () => {
     expect(trustAutoActive({ AGENTS_HOOKS_TRUST: v } as NodeJS.ProcessEnv)).toBe(false);
   }
   expect(trustAutoActive({} as NodeJS.ProcessEnv)).toBe(false);
+});
+
+// --- gate_* passthrough (escalation-format-gate generic audit extension) ---
+
+test('a hook that reports gate_* fields on stdout gets them copied into its audit line', () => {
+  const { deps, audits } = mkDeps({
+    untrustedGuard: false,
+    spawn: () => ({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        decision: 'allow',
+        gate_tag: 'decision',
+        gate_missing: 'table',
+        gate_table_kind: 'none',
+        gate_bypass: '',
+        body_sha256: 'abc123',
+        gate_version: '1',
+      }),
+      stderr: '',
+      timedOut: false,
+    }),
+  });
+  const v = runHooks([loaded()], evt, deps);
+  expect(v.blocked).toBe(false);
+  expect(audits).toHaveLength(1);
+  expect(audits[0].gate_tag).toBe('decision');
+  expect(audits[0].gate_missing).toBe('table');
+  expect(audits[0].gate_table_kind).toBe('none');
+  expect(audits[0].body_sha256).toBe('abc123');
+  expect(audits[0].gate_version).toBe('1');
+});
+
+test('a hook that never reports gate_* fields leaves them undefined (audit line unchanged)', () => {
+  const { deps, audits } = mkDeps({ untrustedGuard: false });
+  runHooks([loaded()], evt, deps);
+  expect(audits).toHaveLength(1);
+  expect(audits[0].gate_tag).toBeUndefined();
+  expect(audits[0].gate_missing).toBeUndefined();
+  expect(audits[0].gate_table_kind).toBeUndefined();
+  expect(audits[0].body_sha256).toBeUndefined();
+  // JSON.stringify drops undefined keys, so the on-disk line stays flat —
+  // this is what keeps a non-gate hook's audit output byte-identical.
+  expect(JSON.stringify(audits[0])).not.toContain('gate_tag');
+});
+
+// --- audit.jsonl rotation (mirrors features/replies/history.ts's MAX_HISTORY) ---
+
+test('trimAuditLines keeps a blob under the cap unchanged (besides a trailing newline)', () => {
+  const raw = ['{"a":1}', '{"a":2}'].join('\n') + '\n';
+  expect(trimAuditLines(raw, 5)).toBe(raw);
+});
+
+test('trimAuditLines drops the OLDEST lines once the cap is exceeded (FIFO by write order)', () => {
+  const lines = Array.from({ length: 10 }, (_, i) => JSON.stringify({ n: i }));
+  const raw = lines.join('\n') + '\n';
+  const trimmed = trimAuditLines(raw, 3);
+  const parsed = trimmed
+    .trim()
+    .split('\n')
+    .map((l) => JSON.parse(l).n);
+  expect(parsed).toEqual([7, 8, 9]); // last 3 writes survive
+});
+
+test('trimAuditLines drops blank lines and re-emits a single trailing newline', () => {
+  const raw = '{"a":1}\n\n{"a":2}\n\n\n';
+  expect(trimAuditLines(raw, 100)).toBe('{"a":1}\n{"a":2}\n');
+});
+
+test('trimAuditLines of an empty/blank blob returns empty string', () => {
+  expect(trimAuditLines('', 100)).toBe('');
+  expect(trimAuditLines('\n\n', 100)).toBe('');
 });

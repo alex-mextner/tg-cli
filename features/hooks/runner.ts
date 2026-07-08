@@ -39,6 +39,12 @@ export interface SpawnResult {
 }
 
 // One audit line (append-only). Shape is deliberately flat for jsonl grepping.
+//
+// gate_* / body_sha256 fields are OPTIONAL and TOP-LEVEL (not nested): a hook
+// that doesn't report them (e.g. the photo watermark hook) simply omits them
+// from its stdout, and JSON.stringify drops the `undefined` keys — so a
+// non-gate hook's audit line is byte-identical to before this feature. See
+// HookOutput in types.ts for what each field means.
 export interface AuditLine {
   ts: string;
   event_id: string;
@@ -50,6 +56,12 @@ export interface AuditLine {
   duration_ms: number;
   on_error_applied: OnError;
   trust_state: TrustState;
+  gate_tag?: string;
+  gate_missing?: string;
+  gate_table_kind?: string;
+  gate_bypass?: string;
+  body_sha256?: string;
+  gate_version?: string;
 }
 
 // Everything the pure runner needs from the outside world.
@@ -122,13 +134,16 @@ export function resolveTrust(
   return { state: 'trusted', pinnedOnError: pin.on_error };
 }
 
-// Map a subprocess result + on_error policy to a resolved decision.
+// Map a subprocess result + on_error policy to a resolved decision. `output`
+// is the hook's raw parsed stdout (possibly `{}`) — always returned alongside
+// the decision so the caller can copy any gate_* fields into the audit line
+// regardless of which branch decided the outcome.
 // Block iff exit 10 (canonical). Any other non-zero / timeout / null is an
 // ERROR; under on_error 'open' → allow+warn, under 'closed' → block.
 function resolveDecision(
   spawn: SpawnResult,
   onError: OnError,
-): { decision: Decision; errored: boolean; message?: string } {
+): { decision: Decision; errored: boolean; message?: string; output: HookOutput } {
   const parsed = parseOutput(spawn.stdout);
   const out = parsed.value;
   if (spawn.exitCode === BLOCK_EXIT_CODE) {
@@ -138,6 +153,7 @@ function resolveDecision(
       decision: 'block',
       errored: false,
       message: out.message ?? 'blocked by hook',
+      output: out,
     };
   }
   if (spawn.exitCode === 0 && !spawn.timedOut) {
@@ -146,27 +162,30 @@ function resolveDecision(
     // stdout (corrupting the protocol) would be silently allowed. Empty stdout is
     // valid (no extra fields) and means "allow".
     if (parsed.malformed) {
-      return applyOnError(onError, 'hook produced malformed stdout (not agents-hooks/v1 JSON)');
+      return { ...applyOnError(onError, 'hook produced malformed stdout (not agents-hooks/v1 JSON)'), output: out };
     }
     // Honour an explicit stdout decision:"block" too (belt & suspenders for the
     // DX camp), but exit-10 remains the primary block path.
     if (out.decision === 'block') {
-      return { decision: 'block', errored: false, message: out.message ?? 'blocked by hook' };
+      return { decision: 'block', errored: false, message: out.message ?? 'blocked by hook', output: out };
     }
     // An UNRECOGNIZED decision (a typo like "deny"/"blocked") is a protocol
     // violation, not an implicit allow — otherwise a broken fail-closed gate that
     // meant to block would be silently bypassed. Only "allow" or an absent
     // decision (empty/no field) count as a clean allow.
     if (out.decision !== undefined && out.decision !== 'allow') {
-      return applyOnError(onError, `hook returned an unknown decision: ${JSON.stringify(out.decision)}`);
+      return {
+        ...applyOnError(onError, `hook returned an unknown decision: ${JSON.stringify(out.decision)}`),
+        output: out,
+      };
     }
-    return { decision: 'allow', errored: false };
+    return { decision: 'allow', errored: false, output: out };
   }
   // Anything else (crash, kill, timeout) is a hook ERROR.
   const reason = spawn.timedOut
     ? 'hook timed out'
     : `hook exited ${spawn.exitCode === null ? 'abnormally' : spawn.exitCode}`;
-  return applyOnError(onError, out.message ?? reason, reason);
+  return { ...applyOnError(onError, out.message ?? reason, reason), output: out };
 }
 
 // Map a hook error to a decision per on_error: 'open' → allow+warn, 'closed' →
@@ -254,7 +273,7 @@ export function runHooks(
     const spawn = deps.spawn(d.cmd, d.args ?? [], stdinJson, timeoutMs);
     const durationMs = deps.now() - start;
 
-    const { decision, errored, message } = resolveDecision(spawn, onError);
+    const { decision, errored, message, output } = resolveDecision(spawn, onError);
     if (errored && message) deps.warn(`hook ${d.id}: ${message} (on_error=${onError})`);
     if (spawn.stderr.trim()) deps.warn(`hook ${d.id} stderr: ${spawn.stderr.trim()}`);
 
@@ -270,6 +289,15 @@ export function runHooks(
       trustState: state,
       errored,
       quarantined: false,
+      // Generic gate_* passthrough (see HookOutput in types.ts) — undefined
+      // for a hook that never reports them, so their audit line stays exactly
+      // as before this feature.
+      gateTag: output.gate_tag,
+      gateMissing: output.gate_missing,
+      gateTableKind: output.gate_table_kind,
+      gateBypass: output.gate_bypass,
+      bodySha256: output.body_sha256,
+      gateVersion: output.gate_version,
     };
     results.push(result);
     auditOne(deps, eventId, d, result, errored ? 'error' : decision);
@@ -327,6 +355,12 @@ function auditOne(
       duration_ms: r.durationMs,
       on_error_applied: r.onErrorApplied,
       trust_state: r.trustState,
+      gate_tag: r.gateTag,
+      gate_missing: r.gateMissing,
+      gate_table_kind: r.gateTableKind,
+      gate_bypass: r.gateBypass,
+      body_sha256: r.bodySha256,
+      gate_version: r.gateVersion,
     });
   } catch {
     // An audit failure must never break a send.
@@ -378,3 +412,31 @@ export function validateDescriptor(
 
 // Re-export the contract id so the seam can stamp events without importing types.
 export { HOOK_API };
+
+// Monotonic-ish event id generator, shared by every host seam
+// (run-photo-hooks.ts, run-text-hooks.ts, …) so the SAME id a hook sees on
+// stdin is the id written to its audit.jsonl line. One counter per process is
+// fine — ids only need to be unique within a single `tg` invocation.
+let eventCounter = 0;
+export function freshEventId(): string {
+  eventCounter += 1;
+  return `${Date.now()}-${process.pid}-${eventCounter}`;
+}
+
+// Cap on audit.jsonl's line count, mirroring features/replies/history.ts's
+// MAX_HISTORY rotation (same FIFO-by-write-order trim). Without this the file
+// grows forever — every hook firing on every tg send appends a line.
+export const MAX_AUDIT_LINES = 5000;
+
+// Trim a raw audit.jsonl blob to its last `max` non-empty lines, re-emitting a
+// trailing newline so the file stays append-ready. Pure string transform,
+// same shape as history.ts's trimHistoryLines — kept local since audit.jsonl
+// and the replies history are unrelated on-disk formats that just happen to
+// share the "rotate a JSONL log" pattern.
+export function trimAuditLines(raw: string, max: number = MAX_AUDIT_LINES): string {
+  const lines = raw.split('\n').filter((l) => l.trim() !== '');
+  if (lines.length <= max) {
+    return lines.length === 0 ? '' : lines.join('\n') + '\n';
+  }
+  return lines.slice(lines.length - max).join('\n') + '\n';
+}

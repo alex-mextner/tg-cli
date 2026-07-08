@@ -33,6 +33,15 @@ test('resolveTag: each canonical English tag resolves to its unicode fallback + 
     word: 'REPORT',
     known: true,
   });
+  // QUESTION renders identically to DECISION (same pill/dot/fallback) — the
+  // two only differ in downstream triage semantics, not rendering.
+  expect(resolveTag('QUESTION')).toEqual({
+    fallback: '🟠 QUESTION',
+    dot: '🟠',
+    cellDots: ['🟠', '▫️', '▫️'],
+    word: 'QUESTION',
+    known: true,
+  });
 });
 
 // --- Case-insensitive English input ---
@@ -66,18 +75,18 @@ test('resolveTag: an off-list tag is NOT known, has no fallback/dot/cellDots, wo
 
 // --- The canonical-tag list is the single source of truth ---
 test('CANONICAL_TAGS lists the four English canonicals', () => {
-  expect([...CANONICAL_TAGS]).toEqual(['ANSWER', 'DECISION', 'PROBLEM', 'REPORT']);
+  expect([...CANONICAL_TAGS]).toEqual(['ANSWER', 'DECISION', 'PROBLEM', 'QUESTION', 'REPORT']);
 });
 
 // === validateTag: lowercase-english ONLY (ROADMAP "tg --tag: lowercase-english only") ===
 
 test('ACCEPTED_TAGS are the lowercase-english spellings of the canonicals', () => {
-  expect([...ACCEPTED_TAGS]).toEqual(['answer', 'decision', 'problem', 'report']);
-  expect(ACCEPTED_TAGS_LIST).toBe('answer, decision, problem, report');
+  expect([...ACCEPTED_TAGS]).toEqual(['answer', 'decision', 'problem', 'question', 'report']);
+  expect(ACCEPTED_TAGS_LIST).toBe('answer, decision, problem, question, report');
 });
 
 test('validateTag ACCEPTS each lowercase-english tag (returns null)', () => {
-  for (const ok of ['answer', 'decision', 'problem', 'report']) {
+  for (const ok of ['answer', 'decision', 'problem', 'question', 'report']) {
     expect(validateTag(ok)).toBeNull();
   }
 });
@@ -96,7 +105,7 @@ test('validateTag REJECTS uppercase / mixed-case english with a 3-part error', (
     // WHY — the rule
     expect(err).toContain('lowercase english');
     // HOW — the accepted set
-    expect(err).toContain('Use one of: answer, decision, problem, report');
+    expect(err).toContain('Use one of: answer, decision, problem, question, report');
   }
 });
 
@@ -106,7 +115,7 @@ test('validateTag REJECTS Cyrillic aliases with the helpful error', () => {
     expect(err).not.toBeNull();
     expect(err).toContain(`invalid --tag '${bad}'`);
     expect(err).toContain('lowercase english');
-    expect(err).toContain('answer, decision, problem, report');
+    expect(err).toContain('answer, decision, problem, question, report');
   }
 });
 
@@ -115,6 +124,6 @@ test('validateTag REJECTS unknown words with the helpful error', () => {
     const err = validateTag(bad);
     expect(err).not.toBeNull();
     expect(err).toContain(`invalid --tag '${bad}'`);
-    expect(err).toContain('Use one of: answer, decision, problem, report');
+    expect(err).toContain('Use one of: answer, decision, problem, question, report');
   }
 });

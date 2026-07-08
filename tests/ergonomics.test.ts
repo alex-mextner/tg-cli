@@ -146,16 +146,17 @@ test('--title is parsed as an explicit title; the body is NEVER pulled up', () =
 });
 
 test('--tag is parsed; it composes with --title and with a body', () => {
-  // A non-answer tag composes freely. (The `answer` tag now REQUIRES --reply-to —
-  // covered in reply-table-args.test.ts — so this case uses `decision`.) Tags are
-  // lowercase-english only (validated at parse time).
-  expect(parseArgs(['--tag', 'decision', '--title', 'Done', 'body'], dir, HOME)).toEqual({
+  // A non-answer, non-escalation tag composes freely. (`answer` now REQUIRES
+  // --reply-to, and `decision`/`question` now want a literal table — both
+  // covered in reply-table-args.test.ts — so this case uses `problem`.) Tags
+  // are lowercase-english only (validated at parse time).
+  expect(parseArgs(['--tag', 'problem', '--title', 'Done', 'body'], dir, HOME)).toEqual({
     action: 'send',
     items: [],
     caption: 'body',
     format: 'plain',
     title: 'Done',
-    tag: 'decision',
+    tag: 'problem',
   });
   // Bare --tag with no body/title still sends.
   expect(parseArgs(['--tag', 'report'], dir, HOME)).toEqual({
@@ -240,7 +241,7 @@ test('--tag rejects uppercase / Cyrillic / unknown with a 3-part error (lowercas
     if (r.action === 'error') {
       expect(r.message).toContain(`invalid --tag '${bad}'`);
       expect(r.message).toContain('lowercase english');
-      expect(r.message).toContain('Use one of: answer, decision, problem, report');
+      expect(r.message).toContain('Use one of: answer, decision, problem, question, report');
     }
   }
 });

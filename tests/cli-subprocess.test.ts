@@ -120,7 +120,7 @@ test('--tag with an uppercase tag is rejected (lowercase-english only) before th
   expect(proc.exitCode).not.toBe(0);
   expect(err).toContain("invalid --tag 'ANSWER'");
   expect(err).toContain('lowercase english');
-  expect(err).toContain('Use one of: answer, decision, problem, report');
+  expect(err).toContain('Use one of: answer, decision, problem, question, report');
   expect(err).not.toContain('TG_BOT_TOKEN');
 });
 
@@ -155,4 +155,61 @@ test('--topic without a value errors before the credential gate', () => {
   expect(proc.exitCode).not.toBe(0);
   expect(err).toContain('--topic requires a topic id');
   expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+// --- Tier-1 escalation-format gate: WARN-mode default vs ESCALATION_GATE_ENFORCE ---
+
+function runWithEnv(args: string[], extraEnv: Record<string, string>) {
+  return Bun.spawnSync(['bun', TG_SCRIPT, ...args], {
+    env: { ...NO_CREDS_ENV, ...extraEnv },
+  });
+}
+
+test('WARN-mode default: --tag decision with no table prints guidance but PROCEEDS past the escalation gate', () => {
+  const proc = run(['--tag', 'decision', 'ship it or not?']);
+  const err = proc.stderr.toString();
+  // The core guidance is printed...
+  expect(err).toContain('--tag decision sends');
+  expect(err).toContain('| Option | Tradeoff | Recommendation |');
+  // ...with the WARN-mode framing (advisory, sending anyway)...
+  expect(err).toContain('Advisory only — sending anyway');
+  // ...but it did NOT hard-stop at the escalation gate: it fell through to the
+  // credential gate (no creds in this harness), proving the send proceeded.
+  expect(err).toContain('TG_BOT_TOKEN');
+  // And it was NOT the enforced hard-block (no contradictory "Blocked" line).
+  expect(err).not.toContain('ESCALATION_GATE_ENFORCE is set');
+  expect(err).not.toContain('Blocked:');
+});
+
+test('ESCALATION_GATE_ENFORCE=1: --tag decision with no table hard-blocks (exit 1) before the credential gate', () => {
+  const proc = runWithEnv(['--tag', 'decision', 'ship it or not?'], { ESCALATION_GATE_ENFORCE: '1' });
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).toBe(1);
+  expect(err).toContain('--tag decision sends'); // the same core guidance
+  expect(err).toContain('ESCALATION_GATE_ENFORCE is set'); // the hard-block reason
+  // The contradictory WARN framing must NOT appear in enforce mode (review
+  // finding): no "sending anyway", no "set the flag" (it's already set).
+  expect(err).not.toContain('Advisory only — sending anyway');
+  // Stopped at the escalation gate — never reached the credential gate.
+  expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+test('ESCALATION_GATE_ENFORCE=1: --tag question (not just decision) also hard-blocks, naming "question"', () => {
+  const proc = runWithEnv(['--tag', 'question', 'which option?'], { ESCALATION_GATE_ENFORCE: '1' });
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).toBe(1);
+  // The guidance names the ACTUAL tag used through the entrypoint path too.
+  expect(err).toContain('--tag question sends');
+  expect(err).toContain('ESCALATION_GATE_ENFORCE is set');
+  expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+test('ESCALATION_GATE_ENFORCE=1 WITH a table: no block, proceeds to the credential gate', () => {
+  const body = '| Option | Tradeoff |\n| --- | --- |\n| A | slower |';
+  const proc = runWithEnv(['--tag', 'decision', body], { ESCALATION_GATE_ENFORCE: '1' });
+  const err = proc.stderr.toString();
+  // A table is present, so the enforce flag has nothing to block: it falls
+  // through to the credential gate (no creds here).
+  expect(err).not.toContain('ESCALATION_GATE_ENFORCE is set');
+  expect(err).toContain('TG_BOT_TOKEN');
 });
