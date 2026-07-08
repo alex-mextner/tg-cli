@@ -17,9 +17,39 @@ import { createDaemonRegistry, reapDaemons, trackCfgDir, trackProc } from './hel
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const nowSec = Math.floor(Date.now() / 1000);
 const TRANSCRIPT = 'add a retry to the upload handler';
+const CONFIRMATION_PREFIX = '🎤 Расшифровка: ';
+
+type FakeVoiceUpdate = {
+  update_id: number;
+  message: {
+    message_id: number;
+    from: { id: number; first_name: string };
+    chat: { id: number };
+    date: number;
+    voice: { file_id: string; duration: number; mime_type: string; file_size: number };
+    reply_to_message?: {
+      message_id: number;
+      chat: { id: number };
+      date: number;
+      text: string;
+    };
+  };
+};
+
+type FakeCallbackUpdate = {
+  update_id: number;
+  callback_query: {
+    id: string;
+    from: { id: number; first_name: string };
+    message: { message_id: number; chat: { id: number }; date: number };
+    data: string;
+  };
+};
+
+type FakeUpdate = FakeVoiceUpdate | FakeCallbackUpdate;
 
 // A single voice note from the allowed sender.
-const QUEUE_CONFIGURED = [
+const QUEUE_CONFIGURED: FakeUpdate[] = [
   {
     update_id: 200,
     message: {
@@ -32,10 +62,37 @@ const QUEUE_CONFIGURED = [
   },
 ];
 
-function makeServer(queue: typeof QUEUE_CONFIGURED) {
+const QUEUE_REPLY_CONFIGURED: FakeUpdate[] = [
+  {
+    update_id: 300,
+    message: {
+      message_id: 11,
+      from: { id: 1, first_name: 'Alex' },
+      chat: { id: 1 },
+      date: nowSec,
+      voice: { file_id: 'voice-xyz', duration: 4, mime_type: 'audio/ogg', file_size: 4096 },
+      reply_to_message: {
+        message_id: 77,
+        chat: { id: 1 },
+        date: nowSec,
+        text: 'Проверь деплой',
+      },
+    },
+  },
+];
+
+function makeServer(queue: FakeUpdate[]) {
+  const updates: FakeUpdate[] = [...queue];
   const state = {
     offsets: [] as number[],
-    sent: [] as { chat_id: number; text: string }[],
+    sent: [] as {
+      chat_id: number;
+      text: string;
+      reply_to_message_id?: number;
+      message_id?: number;
+      reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+    }[],
+    reactions: [] as { chat_id: number; message_id: number; reaction: Array<{ type: string; emoji: string }> }[],
     fetchedFileId: null as string | null,
     fileDownloaded: false,
     serveCount: 0,
@@ -44,6 +101,18 @@ function makeServer(queue: typeof QUEUE_CONFIGURED) {
     releaseQueue: true,
     // When set, getFile returns a non-JSON body so the daemon's `.json()` throws.
     brokenGetFile: false,
+    nextMessageId: 1,
+    pushCallback(updateId: number, data: string, messageId: number): void {
+      updates.push({
+        update_id: updateId,
+        callback_query: {
+          id: `cb${updateId}`,
+          from: { id: 1, first_name: 'Alex' },
+          message: { message_id: messageId, chat: { id: 1 }, date: nowSec },
+          data,
+        },
+      });
+    },
   };
   const server = Bun.serve({
     port: 0,
@@ -52,7 +121,7 @@ function makeServer(queue: typeof QUEUE_CONFIGURED) {
       if (url.pathname.endsWith('/getUpdates')) {
         const offset = Number(url.searchParams.get('offset') ?? '0');
         state.offsets.push(offset);
-        const pending = state.releaseQueue ? queue.filter((u) => u.update_id >= offset) : [];
+        const pending = state.releaseQueue ? updates.filter((u) => u.update_id >= offset) : [];
         if (pending.length) {
           state.serveCount += 1;
           return Response.json({ ok: true, result: pending });
@@ -61,10 +130,23 @@ function makeServer(queue: typeof QUEUE_CONFIGURED) {
         return Response.json({ ok: true, result: [] });
       }
       if (url.pathname.endsWith('/sendMessage')) {
-        state.sent.push((await req.json()) as { chat_id: number; text: string });
-        return Response.json({ ok: true, result: { message_id: 1 } });
+        const body = (await req.json()) as {
+          chat_id: number;
+          text: string;
+          reply_to_message_id?: number;
+          reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+        };
+        const messageId = state.nextMessageId++;
+        state.sent.push({ ...body, message_id: messageId });
+        return Response.json({ ok: true, result: { message_id: messageId } });
       }
       if (url.pathname.endsWith('/setMessageReaction')) {
+        state.reactions.push(
+          (await req.json()) as { chat_id: number; message_id: number; reaction: Array<{ type: string; emoji: string }> },
+        );
+        return Response.json({ ok: true, result: true });
+      }
+      if (url.pathname.endsWith('/answerCallbackQuery') || url.pathname.endsWith('/editMessageText')) {
         return Response.json({ ok: true, result: true });
       }
       if (url.pathname.endsWith('/getFile')) {
@@ -95,6 +177,7 @@ function makeCfgDir(opts: {
   voiceMode: 'configured' | 'disabled' | 'absent' | 'stale-faster';
   withFfmpeg?: boolean;
   slowMs?: number;
+  transcript?: string;
 }): {
   cfgDir: string;
   shimDir: string;
@@ -133,7 +216,8 @@ function makeCfgDir(opts: {
   // event loop must keep servicing other messages while whisper runs).
   const whisperBin = join(shimDir, 'whisper-cli');
   const sleepLine = opts.slowMs ? `sleep ${(opts.slowMs / 1000).toFixed(2)}\n` : '';
-  writeFileSync(whisperBin, `#!/bin/sh\n${sleepLine}printf '[BLANK_AUDIO]\\n  ${TRANSCRIPT}  \\n'\nexit 0\n`, {
+  const transcript = opts.transcript ?? TRANSCRIPT;
+  writeFileSync(whisperBin, `#!/bin/sh\n${sleepLine}printf '[BLANK_AUDIO]\\n  ${transcript}  \\n'\nexit 0\n`, {
     mode: 0o755,
   });
 
@@ -153,6 +237,8 @@ function makeCfgDir(opts: {
       '  list-panes)',
       // session\twindow\tpane\tpid\tcommand\twindow_name\tpath
       `    printf 'work\\t0\\t%%1\\t4242\\t2.1.150\\twork\\t/tmp/proj\\n' ;;`,
+      '  load-buffer)',
+      `    cat >> '${tmuxLog}' ;;`,
       '  *) : ;;',
       'esac',
       'exit 0',
@@ -228,6 +314,54 @@ async function runDaemon(
   return daemon;
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 12_000, intervalMs = 100): Promise<void> {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (predicate()) return;
+    await Bun.sleep(intervalMs);
+  }
+  expect(predicate()).toBe(true);
+}
+
+function tmuxText(path: string): string {
+  return existsSync(path) ? readFileSync(path, 'utf8') : '';
+}
+
+function hasReaction(
+  reactions: Array<{ message_id: number; reaction: Array<{ emoji: string }> }>,
+  messageId: number,
+  emoji: string,
+): boolean {
+  return reactions.some((r) => r.message_id === messageId && r.reaction[0]?.emoji === emoji);
+}
+
+function startAsk(cfgDir: string, shimDir: string, apiBase: string): Subprocess {
+  const ask = Bun.spawn([process.execPath, TG_CTL, 'ask'], {
+    env: {
+      PATH: `${shimDir}:${process.env.PATH ?? ''}`,
+      HOME: cfgDir,
+      TG_CTL_CONFIG_DIR: cfgDir,
+      TG_API_BASE: apiBase,
+      TMUX_PANE: '%1',
+    },
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  trackProc(reg, ask);
+  ask.stdin.write(JSON.stringify({
+    requestId: 'voice_defer_block',
+    agent: 'claude',
+    kind: 'question',
+    paneId: '%1',
+    cwd: '/tmp/proj',
+    question: 'Proceed?',
+    options: [{ label: 'Yes' }],
+  }) + '\n');
+  ask.stdin.end();
+  return ask;
+}
+
 test('configured voice note → downloaded, transcribed, transcript injected into the agent pane', async () => {
   const { server, state } = makeServer(QUEUE_CONFIGURED);
   servers.push(server);
@@ -262,6 +396,198 @@ test('configured voice note → downloaded, transcribed, transcript injected int
 
   // No error reply was sent (the inject succeeded).
   expect(state.sent.some((m) => /failed|no agent|not set up/i.test(m.text))).toBe(false);
+  expect(state.sent).toContainEqual(expect.objectContaining({
+    chat_id: 1,
+    text: `${CONFIRMATION_PREFIX}${TRANSCRIPT}`,
+    reply_to_message_id: 10,
+  }));
+  expect(state.reactions).toContainEqual({
+    chat_id: 1,
+    message_id: 10,
+    reaction: [{ type: 'emoji', emoji: '👀' }],
+  });
+
+  daemon.kill('SIGTERM');
+  await Promise.race([daemon.exited, Bun.sleep(4000)]);
+}, 20_000);
+
+test('configured voice reply confirms transcript and marks both the voice and replied-to messages', async () => {
+  const { server, state } = makeServer(QUEUE_REPLY_CONFIGURED);
+  servers.push(server);
+  const { cfgDir, shimDir, tmuxLog } = makeCfgDir({ voiceMode: 'configured' });
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.routes.json'),
+    JSON.stringify([{ id: 77, paneId: '%1', cwd: '/tmp/proj', ts: nowSec }]),
+  );
+  const daemon = await runDaemon(cfgDir, shimDir, `http://127.0.0.1:${server.port}`);
+
+  const t0 = Date.now();
+  while (Date.now() - t0 < 12_000) {
+    if (state.offsets.includes(301)) break;
+    await Bun.sleep(100);
+  }
+
+  const tmuxCalls = readFileSync(tmuxLog, 'utf8');
+  expect(tmuxCalls).toContain('↩ tg#77 ');
+  expect(tmuxCalls).toContain(`[TG from Alex tg#11] 🎤 «${TRANSCRIPT}»`);
+  expect(state.sent).toContainEqual(expect.objectContaining({
+    chat_id: 1,
+    text: `${CONFIRMATION_PREFIX}${TRANSCRIPT}`,
+    reply_to_message_id: 11,
+  }));
+  expect(state.reactions).toContainEqual({
+    chat_id: 1,
+    message_id: 11,
+    reaction: [{ type: 'emoji', emoji: '👀' }],
+  });
+  expect(state.reactions).toContainEqual({
+    chat_id: 1,
+    message_id: 77,
+    reaction: [{ type: 'emoji', emoji: '👀' }],
+  });
+
+  daemon.kill('SIGTERM');
+  await Promise.race([daemon.exited, Bun.sleep(4000)]);
+}, 20_000);
+
+test('configured voice reply through picker marks the replied-to message only after the picker delivers', async () => {
+  const { server, state } = makeServer(QUEUE_REPLY_CONFIGURED);
+  servers.push(server);
+  const { cfgDir, shimDir, tmuxLog } = makeCfgDir({ voiceMode: 'configured' });
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.routes.json'),
+    JSON.stringify([{ id: 77, paneId: '%gone', cwd: '/tmp/gone', ts: nowSec }]),
+  );
+  const daemon = await runDaemon(cfgDir, shimDir, `http://127.0.0.1:${server.port}`);
+
+  const t0 = Date.now();
+  while (Date.now() - t0 < 12_000) {
+    if (state.sent.some((m) => m.reply_markup)) break;
+    await Bun.sleep(100);
+  }
+
+  const picker = state.sent.find((m) => m.reply_markup);
+  expect(picker).toBeDefined();
+  expect(state.sent).toContainEqual(expect.objectContaining({
+    chat_id: 1,
+    text: `${CONFIRMATION_PREFIX}${TRANSCRIPT}`,
+    reply_to_message_id: 11,
+  }));
+  expect(state.reactions.filter((r) => r.message_id === 77)).toHaveLength(0);
+  expect(state.reactions).toContainEqual({
+    chat_id: 1,
+    message_id: 11,
+    reaction: [{ type: 'emoji', emoji: '✍️' }],
+  });
+
+  const button = picker!.reply_markup!.inline_keyboard.flat()[0]!;
+  state.pushCallback(301, button.callback_data, picker!.message_id!);
+
+  const t1 = Date.now();
+  while (Date.now() - t1 < 12_000) {
+    const delivered = readFileSync(tmuxLog, 'utf8').includes(`[TG from Alex tg#11] 🎤 «${TRANSCRIPT}»`);
+    const voiceSeen = state.reactions.some((r) => r.message_id === 11 && r.reaction[0]?.emoji === '👀');
+    const replySeen = state.reactions.some((r) => r.message_id === 77 && r.reaction[0]?.emoji === '👀');
+    if (delivered && voiceSeen && replySeen) break;
+    await Bun.sleep(100);
+  }
+
+  expect(readFileSync(tmuxLog, 'utf8')).toContain(`[TG from Alex tg#11] 🎤 «${TRANSCRIPT}»`);
+  expect(state.reactions).toContainEqual({
+    chat_id: 1,
+    message_id: 11,
+    reaction: [{ type: 'emoji', emoji: '👀' }],
+  });
+  expect(state.reactions).toContainEqual({
+    chat_id: 1,
+    message_id: 77,
+    reaction: [{ type: 'emoji', emoji: '👀' }],
+  });
+
+  daemon.kill('SIGTERM');
+  await Promise.race([daemon.exited, Bun.sleep(4000)]);
+}, 20_000);
+
+test('configured voice reply through picker preserves replied-to reaction across deferred delivery', async () => {
+  const { server, state } = makeServer(QUEUE_REPLY_CONFIGURED);
+  servers.push(server);
+  state.releaseQueue = false;
+  const { cfgDir, shimDir, tmuxLog } = makeCfgDir({ voiceMode: 'configured' });
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.registration.json'),
+    JSON.stringify({ paneId: '%1', cwd: '/tmp/proj' }),
+  );
+  writeFileSync(
+    join(cfgDir, 'tg-ctl.123.routes.json'),
+    JSON.stringify([{ id: 77, paneId: '%gone', cwd: '/tmp/gone', ts: nowSec }]),
+  );
+  const daemon = await runDaemon(cfgDir, shimDir, `http://127.0.0.1:${server.port}`);
+  await waitFor(() => existsSync(join(cfgDir, 'tg-ctl.123.sock')), 5_000, 50);
+
+  const ask = startAsk(cfgDir, shimDir, `http://127.0.0.1:${server.port}`);
+  await waitFor(() => state.sent.some((m) => m.reply_markup), 5_000, 50);
+  const question = state.sent.find((m) => m.reply_markup)!;
+  const questionButton = question.reply_markup!.inline_keyboard.flat()[0]!;
+
+  state.releaseQueue = true;
+  await waitFor(() => state.sent.filter((m) => m.reply_markup).length >= 2);
+  const picker = state.sent.find((m) => m.reply_markup && m.message_id !== question.message_id)!;
+  const pickerButton = picker.reply_markup!.inline_keyboard.flat()[0]!;
+
+  state.pushCallback(301, pickerButton.callback_data, picker.message_id!);
+  await waitFor(() => hasReaction(state.reactions, 11, '✍️'), 8_000, 50);
+
+  expect(tmuxText(tmuxLog)).not.toContain(`[TG from Alex tg#11] 🎤 «${TRANSCRIPT}»`);
+  expect(state.reactions.filter((r) => r.message_id === 77)).toHaveLength(0);
+
+  state.pushCallback(302, questionButton.callback_data, question.message_id!);
+  const askOut = await new Response(ask.stdout).text();
+  await ask.exited;
+  expect(askOut.length).toBeGreaterThan(0);
+
+  await waitFor(
+    () =>
+      tmuxText(tmuxLog).includes(`[TG from Alex tg#11] 🎤 «${TRANSCRIPT}»`) &&
+      hasReaction(state.reactions, 11, '👀') &&
+      hasReaction(state.reactions, 77, '👀'),
+    12_000,
+    50,
+  );
+
+  expect(state.reactions).toContainEqual({
+    chat_id: 1,
+    message_id: 11,
+    reaction: [{ type: 'emoji', emoji: '👀' }],
+  });
+  expect(state.reactions).toContainEqual({
+    chat_id: 1,
+    message_id: 77,
+    reaction: [{ type: 'emoji', emoji: '👀' }],
+  });
+
+  daemon.kill('SIGTERM');
+  await Promise.race([daemon.exited, Bun.sleep(4000)]);
+}, 25_000);
+
+test('voice transcript confirmation is capped to one Telegram message', async () => {
+  const longTranscript = '🫧'.repeat(2300);
+  const { server, state } = makeServer(QUEUE_CONFIGURED);
+  servers.push(server);
+  const { cfgDir, shimDir } = makeCfgDir({ voiceMode: 'configured', transcript: longTranscript });
+  const daemon = await runDaemon(cfgDir, shimDir, `http://127.0.0.1:${server.port}`);
+
+  const t0 = Date.now();
+  while (Date.now() - t0 < 12_000) {
+    if (state.sent.some((m) => m.reply_to_message_id === 10)) break;
+    await Bun.sleep(100);
+  }
+
+  const confirmation = state.sent.find((m) => m.reply_to_message_id === 10);
+  expect(confirmation).toBeDefined();
+  expect(confirmation!.text.length).toBeLessThanOrEqual(4096);
+  expect(confirmation!.text).toStartWith(CONFIRMATION_PREFIX);
+  expect(confirmation!.text).toContain('🫧');
+  expect(confirmation!.text).toContain('полный текст не обрезается перед маршрутизацией');
 
   daemon.kill('SIGTERM');
   await Promise.race([daemon.exited, Bun.sleep(4000)]);
