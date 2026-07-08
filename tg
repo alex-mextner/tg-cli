@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
-import { tmpdir } from "os"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
+import { homedir, tmpdir } from "os"
 import { join, resolve } from "path"
 // Explicit import (not the global `crypto`) so the multi-part groupId token
 // doesn't depend on a runtime global being present — review: tg-cli#131 f/u.
@@ -136,13 +136,12 @@ Options:
                        orchestrator dispatching several subagents should pass a
                        descriptive name here so the recipient can tell WHICH
                        subagent sent a message (not just that some subagent
-                       did). Auto-detected as a generic "subagent" when running
-                       as a Claude Code Task-tool subagent and no --agent is
-                       given (env: CLAUDE_CODE_CHILD_SESSION) — that signal
-                       can't identify WHICH subagent, only that it is one, so
-                       an explicit --agent is still the recommended path for
-                       fan-out dispatches. No equivalent auto-detection exists
-                       for Codex CLI / opencode today. Also: TG_AGENT env
+                       did). When running as a Claude Code Task-tool subagent
+                       and no --agent is given, tg reads Claude sidechain
+                       metadata when available; otherwise it falls back to the
+                       generic "subagent" label (env:
+                       CLAUDE_CODE_CHILD_SESSION). No equivalent auto-detection
+                       exists for Codex CLI / opencode today. Also: TG_AGENT env
                        (same precedence as TG_AI_MODEL: explicit flag wins,
                        then env, then auto-detection). Check what would be
                        auto-detected in the current shell: --detect-agent.
@@ -635,7 +634,19 @@ if (import.meta.main) {
   // `--agent` (parsed below, in `parsed.agent`) wins when given; otherwise
   // fall back to env-based auto-detection. See features/agent-detect/detect.ts
   // for what IS and ISN'T auto-detectable per harness today.
-  const AGENT_LABEL_AUTO = detectAgentLabel(env)
+  const AGENT_LABEL_AUTO = detectAgentLabel(env, {
+    exists: existsSync,
+    readdir: (path) => readdirSync(path, { withFileTypes: true }),
+    readFile: (path) => readFileSync(path, "utf8"),
+    stat: (path) => {
+      try {
+        return statSync(path)
+      } catch {
+        return null
+      }
+    },
+    homedir,
+  })
 
   // --- Emoji helpers listing ---
   const listEmojiHelpers = (): string => {
