@@ -41,10 +41,11 @@ I/O, fetch, signals, `bun:ffi`):
   see "Rich messages" below), `--tag`/`--title` (header badge; compose with rich),
   `--agent <label>` (subagent/sender identification — renders `[label]` right after
   `[window]`; explicit flag wins over `TG_AGENT` env, which wins over auto-detection —
-  a Claude Code Task-tool subagent auto-labels as the generic `subagent` via
-  `CLAUDE_CODE_CHILD_SESSION`, no equivalent signal exists yet for Codex CLI/opencode;
-  `--detect-agent` prints what the current shell would auto-detect; NOT the same flag
-  as `tg-ctl`'s own `--agent` — see `features/agent-detect/detect.ts`),
+  a Claude Code Task-tool subagent auto-labels from sidechain metadata when readable
+  and otherwise falls back to the generic `subagent` via `CLAUDE_CODE_CHILD_SESSION`,
+  no equivalent signal exists yet for Codex CLI/opencode; `--detect-agent` prints what
+  the current shell would auto-detect; NOT the same flag as `tg-ctl`'s own `--agent`
+  — see `features/agent-detect/detect.ts`),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
   on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
   `--topic <id>` (post INTO a forum topic — stamps `message_thread_id` on EVERY outbound
@@ -80,8 +81,9 @@ tests can pass fakes.
 
 - `features/agent-detect/` — pure `detectAgentLabel(env)`: the auto-detection half of
   `--agent`/`[agent]` subagent identification (tg#6254). Env-injected like `detectAiModel`
-  in the `tg` entrypoint. Investigated once (2026-07-04) against every harness on the dev
-  machine — see the module's doc comment for what IS/ISN'T auto-detectable per harness.
+  in the `tg` entrypoint. Claude Code can read sidechain metadata when it is present;
+  other harnesses still need explicit `--agent` — see the module's doc comment for what
+  IS/ISN'T auto-detectable per harness.
 - `features/auto-attach/` — path detection → attach files, R1-R4 text rules, line-spec quotes,
   worktree-aware + recursive path resolution, transmitter with Telegram message/caption limits.
 - `features/autolink-tasks/` — detects Linear ticket codes in messages, resolves titles via the

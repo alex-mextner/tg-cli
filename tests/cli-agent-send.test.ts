@@ -57,13 +57,28 @@ function makeHome(): string {
   return home;
 }
 
+function writeClaudeSubagentMeta(
+  home: string,
+  projectDir: string,
+  sessionId: string,
+  agentId: string,
+  meta: Record<string, unknown>,
+): void {
+  const projectKey = projectDir.replace(/[^A-Za-z0-9]/g, '-');
+  const dir = join(home, '.claude', 'projects', projectKey, sessionId, 'subagents');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `agent-${agentId}.meta.json`), JSON.stringify(meta));
+}
+
 // MUST be async (Bun.spawn, not spawnSync): the mock server runs on this same
 // process's event loop.
 async function runSend(
   args: string[],
   extraEnv: Record<string, string> = {},
+  prepareHome?: (home: string) => void,
 ): Promise<{ exitCode: number; stderr: string }> {
   const home = makeHome();
+  prepareHome?.(home);
   const proc = Bun.spawn(['bun', TG_SCRIPT, ...args], {
     // Deliberately NOT inheriting process.env: a dev/CI machine running these
     // tests from inside a real Claude Code session would otherwise leak its
@@ -101,6 +116,53 @@ test('CLAUDE_CODE_CHILD_SESSION env auto-detects "[subagent]" when --agent is ab
   expect(exitCode).toBe(0);
   expect(sent).toHaveLength(1);
   expect(sent[0].text as string).toContain(styledBracket('subagent'));
+});
+
+test('Claude Code sidechain metadata auto-detects a named subagent label', async () => {
+  sent = [];
+  const projectDir = '/Users/alex/work/hyperide';
+  const { exitCode } = await runSend(
+    ['from a named subagent'],
+    {
+      PWD: projectDir,
+      CLAUDECODE: '1',
+      CLAUDE_CODE_CHILD_SESSION: 'agent-a93f269abbe5467f7',
+    },
+    (home) => {
+      writeClaudeSubagentMeta(home, projectDir, 'session-123', 'a93f269abbe5467f7', {
+        description: 'Retro velocity analysis',
+      });
+    },
+  );
+  expect(exitCode).toBe(0);
+  expect(sent).toHaveLength(1);
+  expect(sent[0].text as string).toContain(styledBracket('Retro velocity analysis'));
+  expect(sent[0].text as string).not.toContain(styledBracket('subagent'));
+});
+
+test('Claude Code sidechain metadata label is HTML-escaped on an HTML send', async () => {
+  sent = [];
+  const projectDir = '/Users/alex/work/hyperide';
+  const { exitCode } = await runSend(
+    ['body <b>ok</b>'],
+    {
+      PWD: projectDir,
+      CLAUDECODE: '1',
+      CLAUDE_CODE_CHILD_SESSION: 'agent-a93f269abbe5467f7',
+    },
+    (home) => {
+      writeClaudeSubagentMeta(home, projectDir, 'session-123', 'a93f269abbe5467f7', {
+        description: 'Fix <Foo> & bar',
+      });
+    },
+  );
+  expect(exitCode).toBe(0);
+  expect(sent).toHaveLength(1);
+  expect(sent[0].parse_mode).toBe('HTML');
+  expect(sent[0].text as string).toContain('&lt;');
+  expect(sent[0].text as string).toContain('&gt;');
+  expect(sent[0].text as string).toContain('&amp;');
+  expect(sent[0].text as string).not.toContain('[Fix <Foo> & bar]');
 });
 
 test('an explicit --agent WINS over the Claude Code child-session auto-detection', async () => {

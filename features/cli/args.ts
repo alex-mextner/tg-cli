@@ -63,8 +63,8 @@ export type ParseResult =
       // Wins over the entrypoint's env-based auto-detection (see
       // `features/agent-detect/detect.ts`) — an orchestrator dispatching many
       // subagents should pass a descriptive name here (e.g. `--agent
-      // hyperide-fixer`) since auto-detection can only say "some subagent",
-      // never which one.
+      // hyperide-fixer`) since metadata-based auto-detection is best-effort
+      // and may fall back to "some subagent".
       agent?: string;
       // code-as-pdf: also attach the raw original file alongside the rendered
       // PDF (`--with-original`). Default is PDF-only for code/config files.

@@ -1,5 +1,66 @@
 import { expect, test } from 'bun:test';
-import { detectAgentLabel } from '../features/agent-detect/detect';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from 'fs';
+import { homedir, tmpdir } from 'os';
+import { join } from 'path';
+import { detectAgentLabel, type AgentDetectDeps } from '../features/agent-detect/detect';
+
+const fsDeps: AgentDetectDeps = {
+  exists: existsSync,
+  readdir: (path) => readdirSync(path, { withFileTypes: true }),
+  readFile: (path) => readFileSync(path, 'utf8'),
+  stat: (path) => {
+    try {
+      return statSync(path);
+    } catch {
+      return null;
+    }
+  },
+  homedir,
+};
+
+function writeClaudeSubagentMeta(
+  home: string,
+  projectDir: string,
+  sessionId: string,
+  agentId: string,
+  meta: Record<string, unknown>,
+): string {
+  return writeClaudeSubagentMetaInConfig(join(home, '.claude'), projectDir, sessionId, agentId, meta);
+}
+
+function writeClaudeSubagentMetaInConfig(
+  configDir: string,
+  projectDir: string,
+  sessionId: string,
+  agentId: string,
+  meta: Record<string, unknown>,
+): string {
+  const projectKey = projectDir.replace(/[^A-Za-z0-9]/g, '-');
+  const dir = join(configDir, 'projects', projectKey, sessionId, 'subagents');
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `agent-${agentId}.meta.json`);
+  writeFileSync(path, JSON.stringify(meta));
+  return path;
+}
+
+function withTempHome<T>(fn: (home: string) => T): T {
+  const home = mkdtempSync(join(tmpdir(), 'tg-agent-detect-'));
+  try {
+    return fn(home);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
 
 // --- Explicit override wins over every auto-detection path ---
 test('TG_AGENT explicit override wins, even alongside Claude Code child-session signals', () => {
@@ -30,6 +91,248 @@ test('a whitespace-only TG_AGENT falls through to auto-detection, not an empty b
 // --- Claude Code: the one reliable automatic signal ---
 test('Claude Code subagent (CLAUDE_CODE_CHILD_SESSION set) auto-detects as "subagent"', () => {
   expect(detectAgentLabel({ CLAUDECODE: '1', CLAUDE_CODE_CHILD_SESSION: '1' })).toBe('subagent');
+});
+
+test('Claude Code subagent uses sidechain metadata description when child-session carries the agent id', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    writeClaudeSubagentMeta(home, projectDir, 'session-123', 'a93f269abbe5467f7', {
+      description: 'Retro velocity analysis',
+      toolUseId: 'toolu_123',
+    });
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: 'agent-a93f269abbe5467f7',
+      }, fsDeps),
+    ).toBe('Retro velocity analysis');
+  });
+});
+
+test('Claude Code subagent uses sidechain metadata matched by toolUseId', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    writeClaudeSubagentMeta(home, projectDir, 'session-123', '1111111111111111', {
+      description: 'Wrong worker',
+      toolUseId: 'toolu_wrong',
+    });
+    writeClaudeSubagentMeta(home, projectDir, 'session-123', '2222222222222222', {
+      description: 'Fable review seat',
+      toolUseId: 'toolu_right',
+    });
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'session-123',
+        CLAUDE_CODE_TOOL_USE_ID: 'toolu_right',
+      }, fsDeps),
+    ).toBe('Fable review seat');
+  });
+});
+
+test('Claude Code subagent uses a single unambiguous fresh metadata record as a fallback', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    writeClaudeSubagentMeta(home, projectDir, 'session-123', 'a93f269abbe5467f7', {
+      description: 'Single fresh worker',
+    });
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'session-123',
+      }, fsDeps),
+    ).toBe('Single fresh worker');
+  });
+});
+
+test('Claude Code subagent keeps the generic label when fresh metadata is ambiguous', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    writeClaudeSubagentMeta(home, projectDir, 'session-123', '1111111111111111', {
+      description: 'Worker one',
+    });
+    writeClaudeSubagentMeta(home, projectDir, 'session-123', '2222222222222222', {
+      description: 'Worker two',
+    });
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'session-123',
+      }, fsDeps),
+    ).toBe('subagent');
+  });
+});
+
+test('Claude Code freshness fallback ignores fresh metadata from another session', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    writeClaudeSubagentMeta(home, projectDir, 'other-session', '1111111111111111', {
+      description: 'Other session worker',
+    });
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'current-session',
+      }, fsDeps),
+    ).toBe('subagent');
+  });
+});
+
+test('Claude Code freshness fallback ignores stale metadata', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    const path = writeClaudeSubagentMeta(home, projectDir, 'session-123', 'a93f269abbe5467f7', {
+      description: 'Stale worker',
+    });
+    const old = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    utimesSync(path, old, old);
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'session-123',
+      }, fsDeps),
+    ).toBe('subagent');
+  });
+});
+
+test('Claude Code invalid or incomplete metadata falls back to the generic label', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    const projectKey = projectDir.replace(/\//g, '-');
+    const dir = join(home, '.claude', 'projects', projectKey, 'session-123', 'subagents');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'agent-badjson.meta.json'), '{');
+    writeFileSync(join(dir, 'agent-empty.meta.json'), JSON.stringify({ description: 123 }));
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'session-123',
+      }, fsDeps),
+    ).toBe('subagent');
+  });
+});
+
+test('Claude Code metadata can fall back to agentType when description is missing', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    writeClaudeSubagentMeta(home, projectDir, 'session-123', 'a93f269abbe5467f7', {
+      agentType: 'general-purpose',
+    });
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'session-123',
+      }, fsDeps),
+    ).toBe('general-purpose');
+  });
+});
+
+test('Claude Code metadata labels are collapsed and truncated', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    writeClaudeSubagentMeta(home, projectDir, 'session-123', 'a93f269abbe5467f7', {
+      description: `${'A'.repeat(50)} \n ${'B'.repeat(50)}`,
+    });
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'session-123',
+      }, fsDeps),
+    ).toBe(`${'A'.repeat(50)} ${'B'.repeat(26)}...`);
+  });
+});
+
+test('CLAUDE_CONFIG_DIR overrides the default ~/.claude metadata directory', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    const configDir = join(home, 'custom-claude');
+    writeClaudeSubagentMetaInConfig(configDir, projectDir, 'session-123', 'a93f269abbe5467f7', {
+      description: 'Custom config worker',
+    });
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        CLAUDE_CONFIG_DIR: configDir,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'session-123',
+      }, fsDeps),
+    ).toBe('Custom config worker');
+  });
+});
+
+test('Claude project key derivation matches dot and worktree path encoding', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/.files/repos/tg-cli/.worktrees/feat-v1.2';
+    const dir = join(
+      home,
+      '.claude',
+      'projects',
+      '-Users-alex--files-repos-tg-cli--worktrees-feat-v1-2',
+      'session-123',
+      'subagents',
+    );
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'agent-a93f269abbe5467f7.meta.json'),
+      JSON.stringify({ description: 'Dotted worktree worker' }),
+    );
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: projectDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'session-123',
+      }, fsDeps),
+    ).toBe('Dotted worktree worker');
+  });
+});
+
+test('false-like Claude Code child-session values do not mark the top-level process as a subagent', () => {
+  expect(detectAgentLabel({ CLAUDECODE: '1', CLAUDE_CODE_CHILD_SESSION: '0' })).toBe('');
+  expect(detectAgentLabel({ CLAUDECODE: '1', CLAUDE_CODE_CHILD_SESSION: 'false' })).toBe('');
+  expect(detectAgentLabel({ CLAUDECODE: '1', CLAUDE_CODE_CHILD_SESSION: 'FALSE' })).toBe('');
+  expect(detectAgentLabel({ CLAUDECODE: '1', CLAUDE_CODE_CHILD_SESSION: 'No' })).toBe('');
+  expect(detectAgentLabel({ CLAUDECODE: '1', CLAUDE_CODE_CHILD_SESSION: 'NULL' })).toBe('');
 });
 
 test('Claude Code detected via CLAUDE_CODE_ENTRYPOINT alone (no CLAUDECODE) still counts', () => {
