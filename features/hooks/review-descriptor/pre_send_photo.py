@@ -20,6 +20,10 @@ Verdict mapping (architecture spec §7.3):
   - review verdict keep                 -> allow, exit 0
   - review verdict rollback (unstyled / broken / blank)
                                         -> block, exit 10, message from reason
+  - review verdict rollback, SOLELY from the selection-highlight module veto
+                                        -> allow + WARN (tg-cli#163), exit 0
+    (caption-text-triggered CV check can't tell a HyperCanvas canvas selection
+    from a non-canvas one -- see decide_from_review_result / _sole_blocking_module)
   - human_review / unverified / no API  -> allow + WARN (fail-open), exit 0
     (a missing API key or an indecisive vision call must never brick a send)
 """
@@ -503,6 +507,150 @@ def run_review_visual(image_path: str, intent: str = "") -> subprocess.Completed
         return None
 
 
+# --- selection-highlight veto downgrade (WARN-only, see decide_from_review_result) --
+#
+# tg-cli#163 (Alex, tg#7133, re tg#6691): review-cli's selection-highlight module
+# (reviewlib/features/visual/contrib/selection_highlight.py) activates whenever the
+# outgoing caption/--intent matches a "selected"/"выбран"/"выделен"/"highlight"
+# keyword (intent_keywords.py synonyms), and vetoes with decision:"block" if it
+# can't find a 2px rgb(59,130,246) HyperCanvas selection outline in the image. That
+# activation is PURELY caption-text-based -- it has no way to know whether the
+# "selected" thing is actually a HyperCanvas canvas element (which SHOULD carry that
+# outline) or something else entirely: a file selected in the VS Code Explorer,
+# selected editor text, a selected checkbox/dropdown outside the canvas. In the
+# non-canvas case there is genuinely nothing to highlight, so a hard block was a
+# false positive with no escape hatch except rewording the caption (tg#6691: "попал
+# в блок на отправку фото" for exactly this).
+#
+# The fix downgrades ONLY this specific veto shape to a warn-and-allow. Everything
+# else that can produce a rollback verdict -- an unstyled/broken/blank render,
+# selection-highlight PLUS another module vetoing together, or a rollback with no
+# module breakdown at all -- still hard-blocks exactly as before. This module's own
+# CV check is real signal when it IS a canvas element (the outline genuinely should
+# be there), so the warn message is written as an urgent "go verify this", not a
+# shrug -- it is a downgrade of ENFORCEMENT, not of the underlying suspicion.
+#
+# SCOPE (deliberately NOT touched here, per Alex): review-cli's
+# policy_engine.py module-veto aggregation ("any module block is a hard veto,
+# modules can only tighten, never loosen") stays exactly as-is -- other consumers
+# (e.g. PR screenshot gates) depend on that hard-veto semantics, and loosening it
+# there would be a much bigger, out-of-scope architecture change reaching outside
+# this repo. This carve-out lives entirely in the tg-cli hook layer, downstream of
+# review-cli's own verdict, the same pattern warn_empty_watermark_if_detected()
+# uses for a different heuristic above.
+#
+# HONEST LIMITS (two, both verified against review-cli source, both deliberately
+# NOT "fixed" here because the fix would reach into review-cli — out of scope):
+#
+#   1. PARTIAL modules array on a CV-phase short-circuit. review-cli's module CV
+#      phase (pipeline.py: `for m in modules: ... if mv.decision == "block": return
+#      Verdict(...)`) stops at the FIRST blocking module and returns a
+#      module_verdicts list containing only the modules checked so far. So if
+#      selection-highlight's own CV check blocks first (no outline found), any
+#      module ordered AFTER it never runs, and this hook sees selection-highlight as
+#      the SOLE block even though a later module MIGHT have blocked too. The downgrade
+#      then allows a send that a not-yet-run module could have vetoed. Detecting that
+#      is impossible from the verdict alone (the other module produced no entry), and
+#      the only real fixes -- have review-cli mark the list "complete", or re-run
+#      remaining checks -- live in review-cli, which this ticket explicitly forbids
+#      touching. Accepted: the ticket's whole intent IS to stop selection-highlight
+#      alone from blocking, and blank/unstyled -- the dangerous class -- is caught by
+#      the core cvGate BEFORE any module runs (it surfaces as a rollback with an EMPTY
+#      modules array, which still hard-blocks here). The multi-MODULE-veto case that
+#      DOES survive into one verdict is the post-vision judge phase (policy_engine.py
+#      aggregates every module `block` at once), and that shape -- two blocks -- still
+#      hard-blocks correctly.
+#
+#   2. The `decision == "block"` string is load-bearing. `_sole_blocking_module`
+#      keys the whole carve-out on that exact literal. That is deliberate and correct:
+#      it MIRRORS review-cli's own authoritative blocking predicate
+#      (policy_engine.py: `blocking = [m for m in module_verdicts if m.decision ==
+#      "block"]`) -- the two must agree on what "a module veto" means, or this hook
+#      would downgrade a shape review-cli considers blocking (or vice versa).
+#      Inverting to "treat any unknown decision as a potential veto" (a reviewer
+#      suggestion) would DIVERGE from that source of truth -- "abstain"/"pass"/
+#      "loaded"/... are explicitly non-blocking there -- and defeat the feature. If
+#      review-cli ever adds a second veto string, its OWN policy_engine line above
+#      needs the same update, so the two move together; this is a shared-contract
+#      coupling, tracked by that mirror, not an unguarded assumption.
+_SELECTION_HIGHLIGHT_MODULE = "selection-highlight"
+
+
+def _sole_blocking_module(verdict: dict) -> str | None:
+    """Return the module name iff EXACTLY ONE `modules` entry vetoed with
+    decision=="block" AND that lone entry carries a non-empty string `module`
+    name; None in every other case (zero blocking entries, more than one, a
+    malformed/missing modules field, or a lone blocking entry whose module name
+    is missing/non-string/empty). `modules` is Verdict.to_dict()'s shape --
+    reviewlib/features/visual/policy_engine.py -- a list of
+    {"module": str, "decision": "block"|"pass"|"abstain"|..., "reason": str}.
+
+    Deliberately structural (module/decision fields), not string-matching the
+    combined `reason` text (tg-cli#163 review: text matching would silently break
+    the moment either module's wording changes).
+
+    CRITICAL — the blocking COUNT is taken over EVERY candidate entry, BEFORE any
+    check on the module NAME (tg-cli#163 review found this, twice): an earlier draft
+    filtered on `isinstance(module, str)` inside the counting comprehension, so a
+    SECOND genuine veto that happened to carry a corrupted/empty module field was
+    dropped from the count entirely -- shrinking the count back to 1 and silently
+    downgrading a real multi-module block to allow. That is a fail-open in the
+    dangerous direction. A follow-up review flagged the same hole for a NON-dict
+    sibling (a stray string/None in `modules`): `isinstance(m, dict)` in the count
+    would swallow it too. So the rule is uncompromising: ANY non-dict entry makes the
+    whole `modules` array malformed -> ambiguous -> return None (caller still
+    blocks); and a block entry with an unusable module name is likewise ambiguous.
+    Ambiguity never renders a real veto INVISIBLE."""
+    modules = verdict.get("modules")
+    if not isinstance(modules, list):
+        return None
+    # A non-dict entry is unparseable -- it could itself be a veto we can't read.
+    # Refuse to reason about the array at all rather than silently skip it.
+    if any(not isinstance(m, dict) for m in modules):
+        return None
+    blocking = [m for m in modules if m.get("decision") == "block"]
+    if len(blocking) != 1:
+        return None
+    name = blocking[0].get("module")
+    if isinstance(name, str) and name:
+        return name
+    return None
+
+
+def _warn_and_allow_selection_highlight(reason: str) -> int:
+    """tg-cli#163 WARN-and-allow path for a rollback whose ONLY blocking module is
+    selection-highlight. The message is deliberately LONGER than the file's other
+    one-line stderr warns (Alex's explicit ask on this ticket): it must spell out
+    WHEN proceeding is legitimate, because the whole point is that the CV check
+    cannot tell the two cases apart. It reads as an urgent "go verify", not a
+    shrug -- a genuinely-selected HyperCanvas element SHOULD carry the outline, so
+    its absence there is a real defect; proceeding is only fine when the selected
+    thing is NOT a canvas element and there is nothing to highlight."""
+    warn(
+        "review visual: selection-highlight veto downgraded to WARN "
+        f"(tg-cli#163) -- reason: {reason or 'no outline detected'}. "
+        "If a HyperCanvas canvas element IS actually selected in this "
+        "screenshot, the 2px rgb(59,130,246) selection outline SHOULD be "
+        "visible -- its absence is a real defect signal, so double-check "
+        "this render before treating the send as done. Proceeding without "
+        "the outline is only legitimate when the selected thing is NOT a "
+        "canvas element (a VS Code Explorer file, selected editor text, a "
+        "non-canvas UI control) -- there is genuinely nothing to highlight "
+        "in that case."
+    )
+    # The URGENT recommendation reaches a human via the warn() STDERR above --
+    # that is the load-bearing channel here, and the runner surfaces it (the
+    # `Warning: hook review-visual stderr: ...` line, asserted by the tg-cli#163
+    # console-capture test). The `reason` passed to allow() below rides on the
+    # hook's own emitted `{"decision":"allow","message":...}` protocol JSON, but a
+    # tg-cli#163 review finding verified the runner DROPS `message` for a clean
+    # (non-errored) allow -- runner.ts resolveDecision returns `{decision:"allow"}`
+    # with no message on that path -- so do NOT rely on it reaching the audit line
+    # or the caller; it is passed for symmetry with the indecisive-verdict fallback
+    # below and for any future runner that chooses to preserve it, nothing more.
+    return allow(reason or None)
+
+
 def decide_from_review_result(proc: subprocess.CompletedProcess) -> int:
     """Map a completed `review visual` run to the hook's allow/block decision
     (architecture spec §7.3 verdict mapping)."""
@@ -519,6 +667,14 @@ def decide_from_review_result(proc: subprocess.CompletedProcess) -> int:
     # `review visual --strict` itself exits 10 on a rollback verdict; honour
     # that directly (it is the same canonical block signal).
     if proc.returncode == BLOCK_EXIT_CODE or decision == "rollback":
+        # tg-cli#163: a rollback caused SOLELY by selection-highlight is a caption-
+        # text false-positive risk (see the module doc above) -- downgrade to
+        # warn-and-allow. Any other shape (another module vetoing too, or no
+        # single-module breakdown at all -- e.g. an unstyled/broken/blank render,
+        # which arrives as a rollback with an EMPTY modules array) still hard-
+        # blocks below, unchanged.
+        if _sole_blocking_module(verdict) == _SELECTION_HIGHLIGHT_MODULE:
+            return _warn_and_allow_selection_highlight(reason)
         return block(reason or "review visual: unstyled / broken render")
 
     # A zero exit with NON-EMPTY but UNPARSEABLE stdout is a broken/noisy review
