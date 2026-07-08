@@ -62,6 +62,27 @@ test('--help advertises `tg help format`, --table, --reply-to and --topic', () =
   expect(out).toContain('--topic');
 });
 
+test('--help nudges long messages toward readable structure', () => {
+  const proc = run(['--help']);
+  const out = proc.stdout.toString();
+  expect(proc.exitCode).toBe(0);
+  expect(out).toContain('Readable long messages');
+  expect(out).toContain('headings');
+  expect(out).toContain('paragraphs');
+  expect(out).toContain('lists');
+  expect(out).toContain('--format html');
+  expect(out).toContain('tg --table');
+});
+
+test('--help documents the successful send stdout refs', () => {
+  const proc = run(['--help']);
+  const out = proc.stdout.toString();
+  expect(proc.exitCode).toBe(0);
+  expect(out).toContain('Send output');
+  expect(out).toContain('OK tg#123');
+  expect(out).toContain('tg#124');
+});
+
 test('--help does NOT advertise the hidden terminal-only bypass flag', () => {
   // `--terminal-question` is the escape for the answer-requires-reply-to gate.
   // It must be discoverable ONLY from that gate's error message — never from

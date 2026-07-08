@@ -63,6 +63,11 @@ import { gateText } from "./features/hooks/run-text-hooks"
 import { runHooksCli } from "./features/hooks/cli"
 import { transmit } from "./features/auto-attach/transmitter"
 import { parseArgs, escalationGateEnforced, type Format } from "./features/cli/args"
+import {
+  LONG_UNSTRUCTURED_MESSAGE_WARNING,
+  shouldWarnLongUnstructuredPlainMessage,
+} from "./features/cli/message-structure"
+import { formatSendOk } from "./features/cli/send-output"
 import { versionOutput } from "./features/cli/version"
 import { loadEnv } from "./features/config/env"
 import {
@@ -109,6 +114,17 @@ toggles) apply to ANY of the above forms — see Options below.
 
 Help topics (\`tg help <topic>\`):
   format   what Telegram message formatting supports (HTML tags / entities)
+
+Readable long messages:
+  For longer status reports, avoid one dense plain-text block. Use headings,
+  blank-line paragraphs, lists, or tables so the Telegram message is scannable.
+  Use --format html for rich headings, lists, and native tables when useful;
+  use tg --table for a plain aligned fallback grid.
+
+Send output:
+  Successful sends print OK first. When Telegram returns message ids, the same
+  line includes reusable refs: OK tg#123, or OK tg#123 tg#124 for a multi-message
+  send. Failed sends do not print refs.
 
 Options:
   --format plain|html  message format (default: plain). A global modifier on
@@ -822,6 +838,10 @@ if (import.meta.main) {
     effectiveFormat = "html"
   } else {
     caption = decodeTextEscapes(rawCaption)
+  }
+
+  if (shouldWarnLongUnstructuredPlainMessage({ text: caption, format, table, items })) {
+    console.error(LONG_UNSTRUCTURED_MESSAGE_WARNING)
   }
 
   // `--tag` is validated at parse time (features/cli/args.ts → validateTag):
@@ -1560,5 +1580,5 @@ if (import.meta.main) {
 
   // Reaching here means every send actually went through (checkResponse exits
   // the process on any API failure).
-  console.log("OK")
+  console.log(formatSendOk(outboundIds))
 }

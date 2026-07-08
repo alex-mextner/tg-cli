@@ -442,6 +442,7 @@ test('/new <harness> <name> <task> asks that harness models after path, then spa
   expect(argv.length).toBe(1);
   expect(argv[0]).toContain('-n task-cli');
   expect(argv[0]).toContain('codex --model gpt-5.5 -- msg');
+  await waitFor(() => sent(sends, 'spawned `codex-gpt-5.5`'));
   expect(sent(sends, 'spawned `codex-gpt-5.5`')).toBe(true);
   daemon.kill();
 });
