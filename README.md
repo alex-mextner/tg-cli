@@ -370,17 +370,18 @@ same way (Sans-Serif Bold, `<b>` fallback for Cyrillic). `TG_AGENT` is the env
 equivalent — same precedence as `TG_AI_MODEL`: an explicit `--agent` flag wins, then
 `TG_AGENT`, then auto-detection.
 
-**Auto-detection today (investigated 2026-07-04): Claude Code only, and only
-generic.** A Claude Code Task-tool subagent's own process carries
-`CLAUDE_CODE_CHILD_SESSION=1` — present ONLY in a subagent, never in the top-level
-session — so `tg` auto-labels it `[subagent]` when no `--agent`/`TG_AGENT` is given.
-This flag can say "some subagent sent this," never WHICH one: no per-agent id, type, or
-task description reaches the child process env, and the shared `CLAUDE_CODE_SESSION_ID`
-is identical across every sibling subagent. **An orchestrator dispatching several
-subagents should pass a descriptive `--agent <name>` itself** — auto-detection is a
-floor, not a substitute. Codex CLI (checked: 0.142.4) and opencode (checked: 1.17.10)
-expose no equivalent child/parent signal today; `--agent` is the only path there. Check
-what the current shell would auto-detect: `tg --detect-agent`.
+**Auto-detection today: Claude Code only.** A Claude Code Task-tool subagent's own
+process carries `CLAUDE_CODE_CHILD_SESSION=1` — present ONLY in a subagent, never in
+the top-level session — so `tg` can identify that a message came from a subagent when
+no `--agent`/`TG_AGENT` is given. When Claude sidechain metadata is readable under
+`~/.claude/projects/<project>/<session>/subagents/*.meta.json`, `tg` uses the
+subagent `description` as the label. It matches by agent id, by `toolUseId`, or by a
+single unambiguous fresh metadata record; if the match is ambiguous or unavailable, it
+falls back to `[subagent]`. **An orchestrator dispatching several subagents should
+still pass a descriptive `--agent <name>` when identity matters** — auto-detection is
+best-effort. Codex CLI (checked: 0.142.4) and opencode (checked: 1.17.10) expose no
+equivalent child/parent signal today; `--agent` is the only path there. Check what the
+current shell would auto-detect: `tg --detect-agent`.
 
 Note: `tg-ctl`'s OWN `--agent <name>` (used by `tg-ctl ask --agent codex` / `tg-ctl
 harness-event`) is a DIFFERENT flag on a DIFFERENT binary — a closed harness-kind

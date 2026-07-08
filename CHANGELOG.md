@@ -3,6 +3,23 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.33.4
+
+**Fix: Claude Code subagent auto labels now use sidechain metadata when available.**
+
+- `tg` still treats `--agent` and `TG_AGENT` as the explicit source of truth, but a
+  Claude Code Task-tool child now tries to read
+  `~/.claude/projects/<project>/<session>/subagents/*.meta.json` before falling back
+  to the generic `[subagent]` label.
+- Matching is conservative: agent id and `toolUseId` are exact, and the freshness
+  fallback is used only when there is a single unambiguous recent metadata record.
+  Ambiguous parallel subagents continue to render `[subagent]` rather than risk the
+  wrong name.
+- `CLAUDE_CODE_CHILD_SESSION=0` / `false` no longer marks a top-level process as a
+  subagent, which protects shells that carry false-like Claude flags.
+- Added unit and real-CLI send coverage for metadata-derived labels, ambiguous
+  fallback, explicit-override precedence, and false-like child-session values.
+
 ## 1.33.3
 
 **Fix: bare `/agent` button selection now routes the next message.**

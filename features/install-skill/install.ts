@@ -109,12 +109,12 @@ and a subagent may call \`tg\` itself, ALWAYS pass \`--agent <descriptive-name>\
 subagent so the recipient can tell WHICH subagent sent a message, not just that some AI
 did: \`tg --agent hyperide-fixer "done, PR #123 open"\` → \`✳️ [window] [hyperide-fixer] …\`.
 
-Auto-detection exists ONLY for Claude Code, and ONLY as the generic label \`subagent\`
-(env: \`CLAUDE_CODE_CHILD_SESSION\`) — it proves a message came from SOME subagent, never
-which one (no per-agent id/description reaches the child process). Codex CLI and opencode
-have no equivalent signal today. So: **don't rely on auto-detection** for anything beyond
-"some subagent" — pass \`--agent\` explicitly whenever the identity matters. \`TG_AGENT\` env
-is the same-precedence override as \`TG_AI_MODEL\` (flag wins, then env, then auto-detect).
+Auto-detection exists ONLY for Claude Code. It reads Claude sidechain metadata when available
+and otherwise falls back to the generic label \`subagent\` (env:
+\`CLAUDE_CODE_CHILD_SESSION\`). Codex CLI and opencode have no equivalent signal today. So:
+**don't rely on auto-detection** for anything that must be exact — pass \`--agent\` explicitly
+whenever the identity matters. \`TG_AGENT\` env is the same-precedence override as
+\`TG_AI_MODEL\` (flag wins, then env, then auto-detect).
 Check what the current shell would auto-detect: \`tg --detect-agent\`.
 
 (Not the same flag as \`tg-ctl\`'s own \`--agent <name>\` — that one selects a closed
@@ -213,8 +213,8 @@ const SKILL_BLURB =
   'requires it. ' +
   'If you are an ORCHESTRATOR dispatching subagents that may call `tg` themselves, ' +
   'ALWAYS pass `--agent <descriptive-name>` from each subagent so the recipient can ' +
-  'tell WHICH subagent sent a message — auto-detection (Claude Code only) can only ' +
-  'say "some subagent", never which one. ' +
+  'tell WHICH subagent sent a message — auto-detection is Claude Code only and may ' +
+  'fall back to "some subagent" when metadata is unavailable or ambiguous. ' +
   '`--format html` auto-sends a native Rich Message (tables, ' +
   'headings, lists, LaTeX formulas) when the body has a rich tag like `<table>`/' +
   '`<h1>`/`<ul>` — same flag, tg routes by content. `tg --table` is the plain ' +
