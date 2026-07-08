@@ -303,6 +303,158 @@ test('review verdict "rollback" (unstyled) → BLOCKED with reason', () => {
   expect(v.blockMessage).toContain('Unstyled render');
 });
 
+// The verdict shape below mirrors what review-cli's Verdict.to_dict() actually
+// emits (reviewlib/features/visual/policy_engine.py): the top-level key is
+// `verdict` (the hook also accepts `decision`), plus a `modules` array of
+// {module, decision, reason}. These new tests use the REAL `verdict` key to pin
+// the caller/callee contract, not the `decision` alias the older tests above use.
+test('rollback caused SOLELY by selection-highlight → allow + warn (tg-cli#163), not blocked', () => {
+  mockReview(
+    JSON.stringify({
+      verdict: 'rollback',
+      reason: 'no selection outline detected',
+      modules: [{ module: 'selection-highlight', decision: 'block', reason: 'no outline' }],
+    }),
+    10,
+  );
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'element selected' }, process.env, home);
+  expect(v.blocked).toBe(false);
+});
+
+test('sole selection-highlight veto → the URGENT WARN text actually surfaces on stderr (tg-cli#163)', () => {
+  // A clean allow is worthless here if the human never sees WHY the send was let
+  // through. The runner drops the hook's protocol `message` for a non-errored
+  // allow (runner.ts resolveDecision), so the load-bearing recommendation MUST
+  // ride the hook's stderr, which the runner mirrors to its `warn` sink
+  // (console.error, per buildRunnerDeps). Capture that and prove the message both
+  // (a) fires and (b) spells out the one legitimate-bypass condition Alex asked
+  // for -- proceeding is fine ONLY when the selected thing is NOT a canvas element.
+  mockReview(
+    JSON.stringify({
+      verdict: 'rollback',
+      reason: 'no selection outline detected',
+      modules: [{ module: 'selection-highlight', decision: 'block', reason: 'no outline' }],
+    }),
+    10,
+  );
+  installDescriptorTrusted();
+  const originalError = console.error;
+  const warnings: string[] = [];
+  console.error = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  let v;
+  try {
+    v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'element selected' }, process.env, home);
+  } finally {
+    console.error = originalError;
+  }
+  expect(v.blocked).toBe(false);
+  const warnText = warnings.join('\n');
+  expect(warnText).toContain('selection-highlight veto downgraded to WARN');
+  expect(warnText).toContain('NOT a canvas element');
+});
+
+test('rollback from selection-highlight PLUS another blocking module → STILL BLOCKED', () => {
+  mockReview(
+    JSON.stringify({
+      verdict: 'rollback',
+      reason: 'multiple issues',
+      modules: [
+        { module: 'selection-highlight', decision: 'block', reason: 'no outline' },
+        { module: 'unstyled-render', decision: 'block', reason: 'no stylesheets' },
+      ],
+    }),
+    10,
+  );
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'element selected' }, process.env, home);
+  expect(v.blocked).toBe(true);
+});
+
+test('rollback from a non-selection-highlight module alone → STILL BLOCKED (regression)', () => {
+  mockReview(
+    JSON.stringify({
+      verdict: 'rollback',
+      reason: 'blank render',
+      modules: [{ module: 'blank-render', decision: 'block', reason: 'blank' }],
+    }),
+    10,
+  );
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath }, process.env, home);
+  expect(v.blocked).toBe(true);
+});
+
+test('rollback with an EMPTY modules array (unstyled/broken render) → STILL BLOCKED (regression)', () => {
+  // A CV-gate rollback (blank/unstyled) short-circuits before any module runs, so
+  // review emits `modules: []` — the downgrade must NOT fire on a missing single-
+  // module breakdown, it must hard-block exactly as an unstyled render always has.
+  mockReview(JSON.stringify({ verdict: 'rollback', reason: 'unstyled render', modules: [] }), 10);
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'element selected' }, process.env, home);
+  expect(v.blocked).toBe(true);
+});
+
+test('selection-highlight PLUS a second block entry with a malformed module name → STILL BLOCKED', () => {
+  // tg-cli#163 review finding: the blocking COUNT must be taken over every
+  // decision=="block" entry, NOT only those with a valid string module name. A
+  // second genuine veto carrying a corrupted/empty module field must NOT be
+  // dropped from the count (which would shrink `blocking` to 1 and silently
+  // downgrade a real multi-module block to allow — a fail-open in the dangerous
+  // direction).
+  mockReview(
+    JSON.stringify({
+      verdict: 'rollback',
+      reason: 'multiple issues, one malformed',
+      modules: [
+        { module: 'selection-highlight', decision: 'block', reason: 'no outline' },
+        { module: '', decision: 'block', reason: 'a real veto with a broken name' },
+      ],
+    }),
+    10,
+  );
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'element selected' }, process.env, home);
+  expect(v.blocked).toBe(true);
+});
+
+test('selection-highlight block PLUS a non-dict garbage entry in modules → STILL BLOCKED', () => {
+  // tg-cli#163 follow-up review: a non-dict sibling (a stray string/None) in the
+  // modules array must NOT be silently skipped during the blocking count — it could
+  // itself be an unreadable veto. Any non-dict entry makes the array ambiguous, so
+  // the carve-out must refuse to downgrade and hard-block instead.
+  mockReview(
+    JSON.stringify({
+      verdict: 'rollback',
+      reason: 'malformed modules array',
+      modules: [{ module: 'selection-highlight', decision: 'block', reason: 'no outline' }, 'garbage'],
+    }),
+    10,
+  );
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'element selected' }, process.env, home);
+  expect(v.blocked).toBe(true);
+});
+
+test('a lone selection-highlight entry whose decision is NOT "block" → STILL BLOCKED', () => {
+  // The whole carve-out is keyed on the exact `decision:"block"` string. A rollback
+  // that reached exit 10 for some other reason, with selection-highlight present but
+  // only abstaining/passing, must not be mistaken for a sole selection-highlight veto.
+  mockReview(
+    JSON.stringify({
+      verdict: 'rollback',
+      reason: 'unstyled render',
+      modules: [{ module: 'selection-highlight', decision: 'abstain', reason: 'no opinion' }],
+    }),
+    10,
+  );
+  installDescriptorTrusted();
+  const v = runPreSendPhotoHooks({ imagePath: pngPath, caption: 'element selected' }, process.env, home);
+  expect(v.blocked).toBe(true);
+});
+
 test('review missing on PATH → fail-open (send proceeds + warn)', () => {
   // ISOLATE the PATH so a real `review` installed on this machine can never be
   // found — otherwise this test silently exercises the wrong binary. We point
