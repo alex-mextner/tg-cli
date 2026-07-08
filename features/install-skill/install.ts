@@ -83,25 +83,38 @@ content on the header line:
 - \`--tag <tag>\` — an emoji badge labeling what the message IS. Composes with
   \`--title\`: \`✳️ [window] 🔵 ANSWER — <title>\`.
 
-Tags are LOWERCASE ENGLISH ONLY — \`answer\` / \`decision\` / \`problem\` / \`report\`.
-The badge (the unicode fallback non-premium clients see) is a colored dot + the
-English word:
+Tags are LOWERCASE ENGLISH ONLY — \`answer\` / \`decision\` / \`problem\` / \`question\` /
+\`report\`. The badge (the unicode fallback non-premium clients see) is a colored
+dot + the English word:
 
 | Tag | Badge | Use it for |
 |-----|-------|------------|
 | answer | 🔵 ANSWER | answering the user's question |
 | decision | 🟠 DECISION | a decision you need the user to make / confirm |
 | problem | 🔴 PROBLEM | a blocker / problem report |
+| question | 🟠 QUESTION | an open question needing the user's input |
 | report | 🟢 REPORT | a status / result report |
+
+\`decision\`/\`question\` SHOULD carry a literal table body — options / tradeoffs /
+recommendation — so the recipient can answer without re-deriving the ask. Send
+it as a markdown pipe table, \`tg --table\`, or an HTML \`<table>\` with
+\`--format html\`. A send with none is WARNED (advisory, printed to stderr) but
+still goes out; set \`ESCALATION_GATE_ENFORCE=1\` to make a table required (the
+send then hard-errors). An optional installed hook may additionally warn
+(without blocking) on a subtler case this cheap check can't catch.
 
 Uppercase (\`ANSWER\`), Cyrillic (\`ОТВЕТ\`), and unknown tags are REJECTED with a
 clear error and a non-zero exit — use a lowercase-english tag from the table.
 
 In a PUSH NOTIFICATION (rendered by the OS, which can't load the pill image) the
-badge shows as \`<color>▫️▫️\` — ONE colored dot identifies the tag
-(🔵 answer / 🟠 decision / 🔴 problem / 🟢 report), the rest are neutral squares.
-The tag word is not in the badge (any text after the dots is your \`--title\`/body).
-In-app, premium clients still see the full wordmark pill.
+badge shows as \`<color>▫️▫️\` — ONE colored dot identifies the tag's CLASS
+(🔵 answer / 🟠 decision-or-question / 🔴 problem / 🟢 report), the rest are
+neutral squares. \`decision\` and \`question\` share the same orange dot (see the
+QUESTION-pill note above), so a push notification alone can't tell them apart —
+only the in-app wordmark pill (ANSWER/DECISION/PROBLEM/REPORT; QUESTION has none
+yet) or the message body itself distinguishes them. The tag word is not in the
+badge (any text after the dots is your \`--title\`/body). In-app, premium
+clients still see the full wordmark pill for the four tags that have one.
 
 ## Subagent identification (\`--agent <label>\`) — REQUIRED when dispatching subagents
 If you are an orchestrator dispatching subagents (Claude Code Task tool or equivalent),
@@ -205,7 +218,7 @@ Always use \`tg\`, never direct curl to the Telegram API. tmux only.
 const SKILL_BLURB =
   '`tg` — send Telegram messages/files/reports: `tg "msg"`, ' +
   '`tg --format html "..."`, `tg --file f.pdf "cap"`, `tg --photo p.png`. ' +
-  'Label messages with `--tag <answer|decision|problem|report>` ' +
+  'Label messages with `--tag <answer|decision|problem|question|report>` ' +
   '(lowercase english only) and set an explicit header line with ' +
   '`--title "..."` (the body is never pulled up). ' +
   'Reply UNDER a specific inbound message with `--reply-to <message_id>` (the id ' +

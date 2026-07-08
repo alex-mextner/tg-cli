@@ -59,9 +59,10 @@ import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
 import { buildSendPlan } from "./features/auto-attach/normalize"
 import { gatePhotos, hooksActive } from "./features/hooks/run-photo-hooks"
+import { gateText } from "./features/hooks/run-text-hooks"
 import { runHooksCli } from "./features/hooks/cli"
 import { transmit } from "./features/auto-attach/transmitter"
-import { parseArgs, type Format } from "./features/cli/args"
+import { parseArgs, escalationGateEnforced, type Format } from "./features/cli/args"
 import { versionOutput } from "./features/cli/version"
 import { loadEnv } from "./features/config/env"
 import {
@@ -131,7 +132,14 @@ Options:
                          answer    🔵 ANSWER    answering a question
                          decision  🟠 DECISION  a decision to confirm
                          problem   🔴 PROBLEM   a blocker / problem
+                         question  🟠 QUESTION  an open question needing input
                          report    🟢 REPORT    a status / result report
+                       decision/question SHOULD carry a literal table body (a
+                       markdown pipe table, tg --table, or an HTML <table>).
+                       A send with none is WARNED (advisory) but still sent;
+                       set ESCALATION_GATE_ENFORCE=1 to make a table required
+                       (hard error). An optional installed hook may also warn
+                       on subtler cases without blocking — see 'tg hooks'.
   --agent <name>        label the sender: "✳️ [window] [name] <title>". An
                        orchestrator dispatching several subagents should pass a
                        descriptive name here so the recipient can tell WHICH
@@ -682,6 +690,28 @@ if (import.meta.main) {
   if (parsed.action === "detectAgent") {
     console.log(AGENT_LABEL_AUTO || "(none)")
     process.exit(0)
+  }
+
+  // --- Tier-1 escalation-format gate (WARN-mode default) -----------------
+  // parseArgs attaches `escalationWarning` when a --tag decision|question send
+  // carries no literal table. By DEFAULT this is advisory: print the guidance
+  // to stderr and let the send proceed. ONLY when ESCALATION_GATE_ENFORCE is
+  // set does it become a hard stop (exit 1). Placed BEFORE the credential gate
+  // so an enforced block reports the format problem first (and so the block
+  // path is observable in a no-creds subprocess test). See args.ts for the
+  // skill-first → warn → flip-to-block rollout rationale.
+  if (parsed.action === "send" && parsed.escalationWarning) {
+    console.error(parsed.escalationWarning)
+    if (escalationGateEnforced(env)) {
+      // Enforce mode: the flag is set, so a tableless decision/question send is
+      // a hard error. Do NOT print the "advisory / set the flag" framing here —
+      // that would contradict this branch.
+      console.error("Blocked: ESCALATION_GATE_ENFORCE is set and this --tag send has no table.")
+      process.exit(1)
+    }
+    // Warn mode (default): advisory only — the send proceeds. Tell the caller
+    // how to turn it into a hard requirement.
+    console.error("Advisory only — sending anyway. Set ESCALATION_GATE_ENFORCE=1 to require a table.")
   }
 
   const BOT_TOKEN = env.TG_BOT_TOKEN
@@ -1427,6 +1457,27 @@ if (import.meta.main) {
   ) {
     console.error("Error: no message text provided")
     process.exit(1)
+  }
+
+  // --- pre-send-text hooks (agents-hooks/v1). NON-BREAKING SEAM. ---
+  // The `pre-send-text` sibling of the pre-send-photo gate above: same
+  // `hooksActive` guard (no descriptors dir → byte-for-byte today's
+  // behaviour), same trust-by-default / fail-open policy. Fires for EVERY
+  // text message in the plan (plain `tg "msg"` included, not just photo
+  // captions), on the FINAL assembled body — after render/autolink/line-spec
+  // quotes, right before the transmitter splits/sends it, so a hook sees
+  // exactly what the recipient will read. Every entry is gated (review
+  // finding: gating only textMessages[0] silently skipped/un-audited any
+  // later text message the plan carries), mirroring gatePhotos looping over
+  // every disk photo. A `block` (a hook exits 10) HOLDS the send.
+  if (features["hooks"] !== false && hooksActive(env)) {
+    for (const tm of plan.textMessages) {
+      const gate = gateText(tm.text, { tag, chatId: CHAT_ID }, env)
+      if (gate.blocked) {
+        console.error(`Blocked: pre-send-text hook rejected the message` + (gate.message ? `\n  ${gate.message}` : ""))
+        process.exit(10)
+      }
+    }
   }
 
   // Build the bot-bound transport (api + chat + the route recorder + an

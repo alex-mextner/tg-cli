@@ -1,6 +1,13 @@
 import { expect, test } from 'bun:test';
 import { decodeHtmlEntities } from '../features/render/html';
-import { escapeCell, hasWideGlyph, parseTableRows, renderTable, toTablePre } from '../features/render/table';
+import {
+  detectTableKind,
+  escapeCell,
+  hasWideGlyph,
+  parseTableRows,
+  renderTable,
+  toTablePre,
+} from '../features/render/table';
 
 // --- parseTableRows ---
 
@@ -132,4 +139,64 @@ test('toTablePre alignment is computed on RAW cells (escaping does not skew colu
 test('toTablePre surfaces hasWide for emoji cells', () => {
   expect(toTablePre('a\tb').hasWide).toBe(false);
   expect(toTablePre('a\t✅ done').hasWide).toBe(true);
+});
+
+// --- detectTableKind (escalation-format gate) ---
+
+test('detectTableKind: empty/plain-prose body has no table', () => {
+  expect(detectTableKind('')).toBe('none');
+  expect(detectTableKind('just a normal sentence, no pipes here')).toBe('none');
+});
+
+test('detectTableKind: a single stray pipe in prose does not false-positive', () => {
+  expect(detectTableKind('either A|B works for me')).toBe('none');
+});
+
+test('detectTableKind: a real HTML <table> is detected', () => {
+  expect(detectTableKind('<table><tr><td>a</td></tr></table>')).toBe('html');
+  expect(detectTableKind('intro text\n<table>\n<tr><td>x</td></tr>\n</table>')).toBe('html');
+});
+
+test('detectTableKind: our own box-drawn <pre> table (toTablePre output) is detected', () => {
+  const { html } = toTablePre('a\tb\n1\t2');
+  expect(detectTableKind(html)).toBe('boxed');
+});
+
+test('detectTableKind: >=2 markdown pipe-delimited rows are detected', () => {
+  const body = ['| Option | Tradeoff |', '| --- | --- |', '| A | slower |'].join('\n');
+  expect(detectTableKind(body)).toBe('pipe');
+});
+
+test('detectTableKind: a single pipe row alone is NOT enough (needs >=2 rows)', () => {
+  expect(detectTableKind('| Option | Tradeoff |')).toBe('none');
+});
+
+// Review finding: boolean-OR code prose (`a || b`) has >=2 pipes per line and
+// >=2 such lines, but is NOT a table — a markdown separator row is required
+// too (real pipe tables always have one; code never does).
+test('detectTableKind: boolean-OR code prose does NOT false-positive as a pipe table', () => {
+  const body = 'if a || b\nwhile c || d';
+  expect(detectTableKind(body)).toBe('none');
+});
+
+test('detectTableKind: pipe rows WITHOUT a separator row are not a table', () => {
+  const body = '| Option | Tradeoff |\n| A | slower |';
+  expect(detectTableKind(body)).toBe('none');
+});
+
+// Review finding: a BORDERLESS 2-column GFM table has only ONE pipe per row
+// (no leading/trailing pipe). The earlier >=2-pipes-per-row threshold
+// hard-REJECTED this at the parse-time gate — a false BLOCK of a legitimate
+// table, worse than a false allow.
+test('detectTableKind: a borderless 2-column markdown table (one pipe per row) is detected', () => {
+  const body = 'Option | Tradeoff\n--- | ---\nA | slower';
+  expect(detectTableKind(body)).toBe('pipe');
+});
+
+// Review finding: a bare thematic-break `---` (no pipe) must NOT count as
+// the required separator row — otherwise two unrelated `||`-bearing lines
+// plus an unrelated `---` divider anywhere in the body would false-positive.
+test('detectTableKind: a pipe-less thematic break does NOT satisfy the separator requirement', () => {
+  const body = 'if a || b\n---\nwhile c || d';
+  expect(detectTableKind(body)).toBe('none');
 });

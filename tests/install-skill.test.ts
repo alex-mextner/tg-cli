@@ -33,15 +33,15 @@ test('writes SKILL.md, a blurb file, and the claude-skills symlink', () => {
   expect(existsSync(join(TH, '.claude/skills/tg'))).toBe(true);
 });
 
-test('SKILL.md and the blurb advertise --tag / --title and the four canonical tags', () => {
+test('SKILL.md and the blurb advertise --tag / --title and the five canonical tags', () => {
   installSkill();
   const skill = readFileSync(join(TH, '.agents/skills/tg/SKILL.md'), 'utf8');
   // Flags are documented.
   expect(skill).toContain('--tag');
   expect(skill).toContain('--title');
-  // The four lowercase-english canonical tags (the ONLY accepted form). No
+  // The five lowercase-english canonical tags (the ONLY accepted form). No
   // Cyrillic aliases anymore.
-  for (const tag of ['answer', 'decision', 'problem', 'report']) {
+  for (const tag of ['answer', 'decision', 'problem', 'question', 'report']) {
     expect(skill).toContain(tag);
   }
   for (const cyrillic of ['ОТВЕТ', 'РЕШЕНИЕ', 'ПРОБЛЕМА', 'ОТЧЁТ']) {

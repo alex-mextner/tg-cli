@@ -143,9 +143,19 @@ test('--tag answer WITH --reply-to is accepted (the reply threads)', () => {
 });
 
 test('the OTHER lowercase-english tags do NOT require --reply-to', () => {
-  for (const tag of ['decision', 'problem', 'report']) {
+  for (const tag of ['problem', 'report']) {
     const r = parseArgs(['--tag', tag, 'body'], CWD, HOME);
     expect(r.action).toBe('send');
+  }
+  // decision/question get an ADVISORY escalation-format warning for a tableless
+  // body (TAG_GATES, features/cli/args.ts — see escalation-gate-args.test.ts),
+  // but that is WARN-mode: they still SEND, they don't error. Only the
+  // off-by-default ESCALATION_GATE_ENFORCE flag would hard-block them (in the
+  // entrypoint), not parseArgs.
+  for (const tag of ['decision', 'question']) {
+    const r = parseArgs(['--tag', tag, 'body'], CWD, HOME);
+    expect(r.action).toBe('send');
+    if (r.action === 'send') expect(r.escalationWarning).toBeDefined();
   }
 });
 

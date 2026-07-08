@@ -7,12 +7,25 @@
 // is never even imported into the hot path.
 
 import { createHash } from 'crypto';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from 'fs';
 import { homedir } from 'os';
 import { dirname, join } from 'path';
+import { fsRoutesLockIo, withRoutesLock } from '../tg-ctl/routes';
 import {
+  freshEventId,
+  MAX_AUDIT_LINES,
   orderDescriptors,
   runHooks,
+  trimAuditLines,
   validateDescriptor,
   type AuditLine,
   type RunnerDeps,
@@ -130,11 +143,130 @@ function sha256OfString(s: string): string {
   return createHash('sha256').update(s, 'utf8').digest('hex');
 }
 
-function appendAudit(home: string, line: AuditLine): void {
+// --- audit.jsonl rotation, under a cross-process lock ----------------------
+//
+// A bare read-existing + append + trim + write-back (no lock) is a lost-update
+// race: two `tg` sends firing hooks concurrently could both read the same
+// bytes, then each write back a trimmed blob — the SECOND writer's write wins
+// and silently drops the FIRST writer's just-appended line. In a fail-open
+// system, that line is the only thing telling "honestly allowed" from
+// "silently bypassed" (see the module header in types.ts) — losing it is
+// exactly the failure this file exists to prevent.
+//
+// REVIEW FINDING (fixed): a first pass here hand-rolled its own O_EXCL +
+// pid-liveness lock instead of reusing features/tg-ctl/routes.ts's
+// `withRoutesLock` + `fsRoutesLockIo` — which already solves this EXACT
+// problem (routes.jsonl has the identical concurrent-append hazard) and is
+// unit-tested. The hand-rolled copy reintroduced a bug that pattern had
+// already fixed once: it treated an EMPTY lockfile (the SIGKILL window
+// between `openSync('wx')` and writing the pid) as "owner unknown, not dead"
+// forever, permanently wedging rotation. `fsRoutesLockIo` models that exact
+// case as `'unparseable'` (routes.ts's own comment explains why) and breaks
+// it like any other dead owner. So: reuse it directly rather than re-fix the
+// same bug twice. `lockPath`/`fsRoutesLockIo` are generic despite the
+// "routes" name (the lock path is just a constructor argument) — nothing
+// here is routes-specific.
+//
+// `onContended: 'skip'` means the READ-TRIM-WRITE body simply does not run
+// when the lock can't be acquired within the budget — it never falls through
+// to an UNLOCKED destructive write-back, which is what would let it race a
+// live holder's own write-back. The budget is generous (~1.5s of spinning)
+// so 'skip' is reached only in a genuinely pathological case (a live holder
+// stuck mid critical-section for over a second — the read+trim+write of a
+// small JSON file normally takes microseconds). When skipped, the caller
+// falls back to a bare atomic appendFileSync (O_APPEND) so THIS line still
+// lands in the common case — see that fallback's own comment for the one
+// residual scenario where even that isn't guaranteed.
+const AUDIT_LOCK_ATTEMPTS = 300;
+const AUDIT_LOCK_DELAY_MS = 5;
+
+// Exported for the audit-lock regression tests (tests/hooks-audit-lock.test.ts)
+// — not part of the public hook-firing API, just the audit-write primitive
+// itself. `lockOpts` lets tests shrink the spin budget instead of paying the
+// full ~1.5s on every contended-path test; production callers never pass it.
+export function appendAudit(
+  home: string,
+  line: AuditLine,
+  lockOpts: { attempts?: number; delayMs?: number } = {},
+): void {
+  const file = auditFile(home);
+  const jsonLine = JSON.stringify(line) + '\n';
   try {
-    const file = auditFile(home);
     mkdirSync(dirname(file), { recursive: true });
-    appendFileSync(file, JSON.stringify(line) + '\n');
+  } catch {
+    return; // best-effort; an audit failure must never break a send
+  }
+
+  const lockPath = `${file}.lock`;
+  // body returns `true` on completion — 'skip' also resolves to `undefined`
+  // (withRoutesLock's own not-acquired sentinel), so a truthy check is the
+  // only way to tell "ran" from "skipped" apart (both would look like
+  // `undefined` if body itself returned void).
+  //
+  // The WHOLE call is wrapped in try/catch (review finding): `writeFileSync`
+  // can throw (ENOSPC/EACCES/EROFS), and `fsRoutesLockIo`'s own `acquire()`
+  // deliberately re-throws any lock-open failure that ISN'T plain contention
+  // (its own comment: "any other errno... is a hard failure: signal it by
+  // THROWING so withRoutesLock doesn't waste the full spin budget" — its
+  // caller is expected to catch). Letting either propagate out of
+  // appendAudit would break the "an audit failure must never break a send"
+  // invariant this whole module exists to uphold; the body itself also
+  // swallows a write failure so a bad write still counts as "ran" (no
+  // pointless fallback-append retry of a write that just failed the same way).
+  let ran: true | undefined;
+  try {
+    ran = withRoutesLock(
+      fsRoutesLockIo(lockPath),
+      (): true => {
+        try {
+          let existing = '';
+          try {
+            existing = readFileSync(file, 'utf8');
+          } catch {
+            // first write — no existing file yet
+          }
+          // Review finding: below the cap, APPEND instead of rewriting the
+          // whole file. We still read the file above to count lines (so we
+          // know whether we're at the cap yet) — that read+split is O(file),
+          // but the file is bounded at MAX_AUDIT_LINES short JSONL lines
+          // (well under a MB), so it's sub-millisecond. What the fast path
+          // actually saves is the far more expensive part: the temp-file
+          // write + renameSync (extra open/write/rename syscalls) on EVERY
+          // append. Only AT/OVER the cap do we pay for the full trim +
+          // atomic temp-file+rename rewrite (a crash mid-write there can't
+          // truncate the log). We hold the lock throughout, so the bare
+          // appendFileSync on the fast path can't interleave with another
+          // writer.
+          const existingLines = existing === '' ? 0 : existing.split('\n').filter((l) => l.trim() !== '').length;
+          if (existingLines < MAX_AUDIT_LINES) {
+            appendFileSync(file, jsonLine);
+          } else {
+            const tmpFile = `${file}.tmp-${process.pid}`;
+            writeFileSync(tmpFile, trimAuditLines(existing + jsonLine));
+            renameSync(tmpFile, file);
+          }
+        } catch {
+          // best-effort; an audit failure must never break a send
+        }
+        return true;
+      },
+      {
+        attempts: lockOpts.attempts ?? AUDIT_LOCK_ATTEMPTS,
+        delayMs: lockOpts.delayMs ?? AUDIT_LOCK_DELAY_MS,
+        onContended: 'skip',
+      },
+    );
+  } catch {
+    ran = undefined; // fall through to the atomic-append fallback below
+  }
+  if (ran) return;
+
+  // Pathological last resort: the spin budget above was exhausted by a LIVE
+  // holder that never released (should not happen for a microsecond-scale
+  // read+trim+write — see the header comment). Rotation is skipped this
+  // round; fall back to a bare atomic append so THIS line still lands.
+  try {
+    appendFileSync(file, jsonLine);
   } catch {
     // best-effort; an audit failure must never break a send
   }
@@ -178,12 +310,6 @@ function spawnHook(
       timedOut: false,
     };
   }
-}
-
-let eventCounter = 0;
-function freshEventId(): string {
-  eventCounter += 1;
-  return `${Date.now()}-${process.pid}-${eventCounter}`;
 }
 
 // Build the real RunnerDeps from the live environment.

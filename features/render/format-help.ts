@@ -82,7 +82,7 @@ Header badge (--tag / --title), composes with BOTH basic and rich sends:
   --title "<text>"   explicit headline on the \`✳️ [window]\` line (renders as the
                      header line above a rich body too).
   --tag <tag>        a labeling pill: lowercase english only —
-                     answer/decision/problem/report. Composes with --title.
+                     answer/decision/problem/question/report. Composes with --title.
   --reply-to <id>    thread the message under an inbound Telegram message
                      (sendMessage: reply_to_message_id; sendRichMessage:
                      reply_parameters). The answer tag REQUIRES this.
