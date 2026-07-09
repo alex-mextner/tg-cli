@@ -62,12 +62,12 @@ export function buildGitStateBanner(state: PaneGitState | null): string | null {
   // DETACHED HEAD: parseBranch already turned a successful `git rev-parse` into either a real
   // branch name or '' for the literal 'HEAD' output. Name it plainly rather than rendering
   // "branch  (1 file changed)" with the name silently missing (review catch).
-  const branchLabel = state.branch || 'a detached HEAD';
+  const location = state.branch === '' ? 'a detached HEAD' : `branch ${state.branch}`;
   if (state.uncommittedCount > 0) {
     const files = `${state.uncommittedCount} file${state.uncommittedCount === 1 ? '' : 's'} changed`;
-    return `⚠ This pane currently has uncommitted work on ${branchLabel === 'a detached HEAD' ? branchLabel : `branch ${branchLabel}`} (${files}). ${BANNER_ADVICE}`;
+    return `⚠ This pane currently has uncommitted work on ${location} (${files}). ${BANNER_ADVICE}`;
   }
   // Clean tree, but not on main/master: still someone's deliberate feature-branch checkout.
-  // (branchLabel is always a real branch name here — see the comment above.)
-  return `⚠ This pane is currently on branch ${branchLabel} (not main/master, tree clean). ${BANNER_ADVICE}`;
+  // (location is always a real branch name here — see the comment above.)
+  return `⚠ This pane is currently on ${location} (not main/master, tree clean). ${BANNER_ADVICE}`;
 }

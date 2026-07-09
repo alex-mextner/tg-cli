@@ -96,6 +96,17 @@ test('buildGitStateBanner: singular file count reads naturally', () => {
   expect(banner).not.toContain('1 files changed');
 });
 
+test('buildGitStateBanner: a branch named like the detached label is still a branch', () => {
+  const banner = buildGitStateBanner({ branch: 'a detached HEAD', uncommittedCount: 1 });
+  expect(banner).toContain('uncommitted work on branch a detached HEAD');
+});
+
+test('buildGitStateBanner: clean branch named like the detached label is still a branch', () => {
+  const banner = buildGitStateBanner({ branch: 'a detached HEAD', uncommittedCount: 0 });
+  expect(banner).toContain('on branch a detached HEAD');
+  expect(banner).toContain('tree clean');
+});
+
 test('buildGitStateBanner: clean feature branch (0 files) still warns, with clean-tree wording', () => {
   const banner = buildGitStateBanner({ branch: 'feat/bar', uncommittedCount: 0 });
   expect(banner).not.toBeNull();
