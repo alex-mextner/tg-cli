@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import {
+  BANNER_ADVICE,
   buildGitStateBanner,
   buildPaneGitState,
   isPaneOccupiedWithWork,
@@ -62,6 +63,15 @@ test('isPaneOccupiedWithWork: undeterminable branch but uncommitted changes IS o
 
 // --- buildGitStateBanner ---
 
+test('BANNER_ADVICE gives operational routing guidance without the old finish/commit wording', () => {
+  expect(BANNER_ADVICE).toContain('another project');
+  expect(BANNER_ADVICE).toContain('clarify with the user');
+  expect(BANNER_ADVICE).toContain('active subagent');
+  expect(BANNER_ADVICE).toContain('new subagent');
+  expect(BANNER_ADVICE).not.toContain('DIFFERENT task');
+  expect(BANNER_ADVICE).not.toContain('finish/commit current work first');
+});
+
 test('buildGitStateBanner: null state → no banner', () => {
   expect(buildGitStateBanner(null)).toBeNull();
 });
@@ -77,8 +87,7 @@ test('buildGitStateBanner: uncommitted changes → banner names the branch + fil
   expect(banner).toContain('⚠');
   expect(banner).toContain('uncommitted work on branch feat/foo');
   expect(banner).toContain('3 files changed');
-  expect(banner).toContain('DIFFERENT task');
-  expect(banner).toContain('NEW agent');
+  expect(banner).toContain(BANNER_ADVICE);
 });
 
 test('buildGitStateBanner: singular file count reads naturally', () => {
@@ -92,6 +101,7 @@ test('buildGitStateBanner: clean feature branch (0 files) still warns, with clea
   expect(banner).not.toBeNull();
   expect(banner).toContain('branch feat/bar');
   expect(banner).toContain('tree clean');
+  expect(banner).toContain(BANNER_ADVICE);
   // Must NOT claim "uncommitted work" when there is none.
   expect(banner).not.toContain('uncommitted work');
 });

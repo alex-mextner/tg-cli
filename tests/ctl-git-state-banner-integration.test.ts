@@ -2,6 +2,7 @@ import { afterAll, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { BANNER_ADVICE } from '../features/tg-ctl/git-state';
 import { createDaemonRegistry, reapDaemons, spawnDaemon } from './helpers/daemon-lifecycle';
 
 // End-to-end verification of the git-state-check banner (features/tg-ctl/git-state.ts):
@@ -248,7 +249,7 @@ test('git-state banner: uncommitted changes on a feature branch → banner prepe
   const text = await injectedTextFor(fixture);
   expect(text).toContain('⚠');
   expect(text).toContain('feat/uncommitted-fixture');
-  expect(text).toContain('DIFFERENT task');
+  expect(text).toContain(BANNER_ADVICE);
   expect(text).toContain('[TG from Alex'); // the original wrap still follows, verbatim
   expect(text).toContain('fix the other thing');
 }, 15_000);
@@ -258,7 +259,7 @@ test('git-state banner: selected /agent route also prepends banner on a dirty pa
   const text = await injectedTextFor(fixture, 'fix the selected thing', 'selected');
   expect(text).toContain('⚠');
   expect(text).toContain('feat/uncommitted-fixture');
-  expect(text).toContain('DIFFERENT task');
+  expect(text).toContain(BANNER_ADVICE);
   expect(text).toContain('[TG from Alex');
   expect(text).toContain('fix the selected thing');
 }, 15_000);

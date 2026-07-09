@@ -47,8 +47,8 @@ export function buildPaneGitState(revParseOut: string, statusPorcelainOut: strin
   return { branch: parseBranch(revParseOut), uncommittedCount: parseUncommittedCount(statusPorcelainOut) };
 }
 
-const BANNER_ADVICE =
-  'If this new message is about a DIFFERENT task, consider: (a) finish/commit current work first, or (b) this should go to a NEW agent, not this pane.';
+export const BANNER_ADVICE =
+  'Routing check: if this message is about another project, clarify with the user before taking it here. If it clarifies an active task, route it to that active subagent. If it is a new task, start a new subagent.';
 
 // The banner text prepended to an inbound message before it is injected into a pane that already
 // has feature work in flight — so neither a human nor an AI agent silently treats an unrelated new
