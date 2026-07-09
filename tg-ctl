@@ -58,7 +58,9 @@ import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features
 import { buildGitStateBanner, buildPaneGitState, type PaneGitState } from "./features/tg-ctl/git-state"
 import {
   autoContinueDelayMs,
+  buildCodexHardLimitDiagnostic,
   buildLimitNotification,
+  buildTransientAutoContinue,
   buildUsageLimitNotification,
   continueCallbackData,
   extractAssistantText,
@@ -67,6 +69,7 @@ import {
   formatClock,
   formatDelta,
   parseContinueCallback,
+  type TransientAutoContinuePlan,
   type HarnessFailureEvent,
   type UsageLimitEvent,
 } from "./features/tg-ctl/limits"
@@ -222,7 +225,7 @@ export const USAGE = `Usage:
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
   tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude usage telemetry
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
-  tg-ctl harness-event [--dry-run] [--pane %N] [--agent NAME] [--language LANG]
+  tg-ctl harness-event [--dry-run] [--pane %N] [--window-name NAME] [--agent NAME] [--language LANG]
                         [--reason MATCHER]
                         [--reset-at ISO] [--source-message-id ID] [--transcript PATH]
                          # StopFailure/usage hook: notify the chat when a harness
@@ -232,7 +235,6 @@ export const USAGE = `Usage:
                          # --transcript or transcript_path alone is treated as failure input.
                          # Limit warnings localize from payload/locale hints; else English.
                          # --dry-run renders WITHOUT sending (safe smoke, #113).
-
 The run/start/status/stop/enable/disable lifecycle follows the shared agent-tools
 service-management contract (agenttools_service). Autostart matrix: macOS → launchd
 LaunchAgent; Linux → systemd --user unit; no supported autostart → start now but it
@@ -783,6 +785,30 @@ async function executeInjectSteps(steps: InjectStep[]): Promise<{ ok: true } | {
   return { ok: true }
 }
 
+function executeInjectStepsSync(steps: InjectStep[]): { ok: true } | { ok: false; error: string } {
+  for (const step of steps) {
+    if (step.kind === "verify-pane") {
+      const { panes, procs } = snapshot()
+      const pane = panes.find((p) => p.paneId === step.paneId)
+      if (!pane || findAgentInPane(pane, procs) === null) {
+        return { ok: false, error: `pane ${step.paneId} no longer hosts an agent — message not injected` }
+      }
+    } else if (step.kind === "tmux") {
+      const proc = Bun.spawnSync(step.argv, {
+        stdin: step.stdin !== undefined ? new TextEncoder().encode(step.stdin) : undefined,
+        stdout: "ignore",
+        stderr: "pipe",
+      })
+      if (proc.exitCode !== 0) {
+        return { ok: false, error: `${step.argv.join(" ")} failed: ${proc.stderr.toString().trim()}` }
+      }
+    } else {
+      Bun.sleepSync(step.ms)
+    }
+  }
+  return { ok: true }
+}
+
 // --- voice transcription (inbound STT) ---
 
 // Configured AND the on-disk artefacts still exist. The config gate
@@ -1199,7 +1225,7 @@ function startLauncher(ctx: Ctx, flags: StartFlags): void {
           serializeRegistrations(upsertRegistration(parseRegistrations(raw), reg)),
         )
       },
-      { onContended: "skip" },
+      { attempts: OVERLOAD_RETRY_LOCK_ATTEMPTS, delayMs: OVERLOAD_RETRY_LOCK_DELAY_MS, onContended: "skip" },
     )
   } catch {
     // best-effort registration bookkeeping — never block the daemon launch
@@ -2360,6 +2386,7 @@ interface HarnessEventFlags {
   dryRun: boolean
   paneId: string | null
   agent: string | null
+  windowName: string | null
   reason: string | null
   resetAtIso: string | null
   sourceMessageId: number | null
@@ -2372,6 +2399,7 @@ function parseHarnessEventFlags(argv: string[]): HarnessEventFlags {
     dryRun: false,
     paneId: process.env.TMUX_PANE ?? null,
     agent: null,
+    windowName: null,
     reason: null,
     resetAtIso: null,
     sourceMessageId: null,
@@ -2384,6 +2412,7 @@ function parseHarnessEventFlags(argv: string[]): HarnessEventFlags {
     if (a === "--dry-run") flags.dryRun = true
     else if (a === "--pane") flags.paneId = next()
     else if (a === "--agent") flags.agent = next()
+    else if (a === "--window-name") flags.windowName = next()
     else if (a === "--reason") flags.reason = next()
     else if (a === "--reset-at") flags.resetAtIso = next()
     else if (a === "--source-message-id") flags.sourceMessageId = Number(next()) || null
@@ -2418,6 +2447,20 @@ interface UsageLatestRecord {
   sampledAt: number
 }
 
+interface OverloadRetryRecord {
+  key: string
+  attempt: number
+  pid: number | null
+  lastFailureAt: number
+  nextAt: number
+}
+
+const OVERLOAD_RETRY_RESET_MS = 30 * 60_000
+const OVERLOAD_RETRY_STORE_MAX = 100
+const OVERLOAD_AUTO_CONTINUE_MAX_ATTEMPTS = 8
+const OVERLOAD_RETRY_LOCK_ATTEMPTS = 200
+const OVERLOAD_RETRY_LOCK_DELAY_MS = 10
+
 function usageWarningKey(ev: UsageLimitEvent): string {
   return JSON.stringify([ev.agent, ev.limitName ?? ""])
 }
@@ -2434,7 +2477,36 @@ function usageLatestLockPath(path: string): string {
   return `${path}.lock`
 }
 
-function parseUsageLatestRecords(blob: string | null, now: number): UsageLatestRecord[] {
+function overloadRetryLockPath(path: string): string {
+  return `${path}.lock`
+}
+
+function overloadRetryKey(ev: HarnessFailureEvent, windowName: string): string {
+  return JSON.stringify([ev.paneId ?? "", ev.sessionId ?? "", windowName])
+}
+
+function overloadRetryScope(key: string): { paneId: string; windowName: string } | null {
+  try {
+    const parsed = JSON.parse(key) as unknown
+    if (!Array.isArray(parsed)) return null
+    if (parsed.length >= 3 && typeof parsed[0] === "string" && typeof parsed[2] === "string") {
+      return { paneId: parsed[0], windowName: parsed[2] }
+    }
+    if (parsed.length === 2 && typeof parsed[0] === "string" && typeof parsed[1] === "string") {
+      return { paneId: parsed[0], windowName: parsed[1] }
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function overloadRetrySameScope(rec: OverloadRetryRecord, paneId: string, windowName: string): boolean {
+  const scope = overloadRetryScope(rec.key)
+  return scope !== null && scope.paneId === paneId && scope.windowName === windowName
+}
+
+function parseUsageLatestRecordsRaw(blob: string | null): UsageLatestRecord[] {
   if (!blob) return []
   try {
     const parsed = JSON.parse(blob) as { samples?: unknown }
@@ -2459,9 +2531,154 @@ function parseUsageLatestRecords(blob: string | null, now: number): UsageLatestR
           rec.sampledAt > 0
         )
       })
-      .filter((rec) => (rec.resetAt !== null ? rec.resetAt > now : rec.sampledAt > now - USAGE_LATEST_NO_RESET_MAX_AGE_MS))
   } catch {
     return []
+  }
+}
+
+function parseUsageLatestRecords(blob: string | null, now: number): UsageLatestRecord[] {
+  return parseUsageLatestRecordsRaw(blob)
+    .filter((rec) => (rec.resetAt !== null ? rec.resetAt > now : rec.sampledAt > now - USAGE_LATEST_NO_RESET_MAX_AGE_MS))
+}
+
+function parseOverloadRetryRecords(blob: string | null, now: number): OverloadRetryRecord[] {
+  if (!blob) return []
+  try {
+    const parsed = JSON.parse(blob) as { retries?: unknown }
+    if (!Array.isArray(parsed.retries)) return []
+    const records: OverloadRetryRecord[] = []
+    for (const item of parsed.retries) {
+      if (!item || typeof item !== "object") continue
+      const rec = item as Record<string, unknown>
+      const pid = rec.pid
+      if (
+        typeof rec.key !== "string" ||
+        typeof rec.attempt !== "number" ||
+        !Number.isInteger(rec.attempt) ||
+        rec.attempt <= 0 ||
+        typeof rec.lastFailureAt !== "number" ||
+        !Number.isFinite(rec.lastFailureAt) ||
+        rec.lastFailureAt <= 0 ||
+        typeof rec.nextAt !== "number" ||
+        !Number.isFinite(rec.nextAt) ||
+        rec.nextAt <= 0 ||
+        !(pid === undefined || pid === null || (typeof pid === "number" && Number.isInteger(pid) && pid > 0))
+      ) {
+        continue
+      }
+      records.push({
+        key: rec.key,
+        attempt: rec.attempt,
+        pid: typeof pid === "number" ? pid : null,
+        lastFailureAt: rec.lastFailureAt,
+        nextAt: rec.nextAt,
+      })
+    }
+    return records
+      .filter((rec) => rec.lastFailureAt > now - 24 * OVERLOAD_RETRY_RESET_MS)
+      .slice(-OVERLOAD_RETRY_STORE_MAX)
+  } catch {
+    return []
+  }
+}
+
+function writeOverloadRetryRecords(path: string, records: OverloadRetryRecord[]): void {
+  atomicWrite(path, `${JSON.stringify({ version: 1, retries: records.slice(-OVERLOAD_RETRY_STORE_MAX) })}\n`)
+}
+
+function runtimeOverloadAutoContinueDelayMs(delayMs: number): number {
+  const raw = Number(process.env.TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS)
+  if (Number.isFinite(raw) && raw >= 1000) return raw
+  return delayMs
+}
+
+function overloadRetryChildAlive(rec: OverloadRetryRecord): boolean {
+  if (rec.pid === null) return false
+  const match = overloadRetryChildMatchState(rec.pid, rec.key)
+  return match === true || match === null
+}
+
+function terminateSpawnedRetry(pid: number): void {
+  try {
+    process.kill(pid, "SIGTERM")
+  } catch {
+    /* best effort: the child may already have exited */
+  }
+}
+
+function overloadRetryChildMatches(pid: number, retryKey: string): boolean {
+  return overloadRetryChildMatchState(pid, retryKey) === true
+}
+
+function overloadRetryChildMatchState(pid: number, retryKey: string): boolean | null {
+  if (!kill0(pid)) return false
+  const proc = Bun.spawnSync(["ps", "-ww", "-p", String(pid), "-o", "command="], { stdout: "pipe", stderr: "ignore" })
+  if (proc.exitCode !== 0) return null
+  const command = new TextDecoder().decode(proc.stdout).trim()
+  return command.includes("auto-continue-once") && command.includes("--retry-key") && command.includes(retryKey)
+}
+
+function finishOverloadRetryRecord(records: OverloadRetryRecord[], retryKey: string, pid: number, now: number): OverloadRetryRecord[] {
+  return records.map((rec) => (rec.key === retryKey && rec.pid === pid ? { ...rec, pid: null, nextAt: now } : rec))
+}
+
+function claimOverloadAutoContinue(
+  ctx: Ctx,
+  ev: HarnessFailureEvent,
+  now: number,
+  language: string | null,
+  windowName: string | null,
+): TransientAutoContinuePlan | null {
+  if (!ev.paneId || !windowName) return null
+  const paneId = ev.paneId
+  try {
+    const claimed = withRoutesLock(
+      fsRoutesLockIo(overloadRetryLockPath(ctx.paths.overloadRetries)),
+      () => {
+        const key = overloadRetryKey(ev, windowName)
+        const records = parseOverloadRetryRecords(readFileOrNull(ctx.paths.overloadRetries), now)
+        const prev = records.find((rec) => rec.key === key)
+        if (prev && prev.nextAt > now && overloadRetryChildAlive(prev)) return null
+        const rearmingLostChild = Boolean(prev && prev.nextAt > now)
+        if (!rearmingLostChild && prev && prev.lastFailureAt > now - OVERLOAD_RETRY_RESET_MS && prev.attempt >= OVERLOAD_AUTO_CONTINUE_MAX_ATTEMPTS) {
+          return null
+        }
+        const attempt = rearmingLostChild && prev
+          ? prev.attempt
+          : prev && prev.lastFailureAt > now - OVERLOAD_RETRY_RESET_MS
+            ? prev.attempt + 1
+            : 1
+        const built = buildTransientAutoContinue(ev, { attempt, language })
+        if (!built) return null
+        const plan = { ...built, delayMs: runtimeOverloadAutoContinueDelayMs(built.delayMs) }
+        const spawned = spawnDelayedAutoContinue(ctx, ev, plan, windowName, key)
+        if (!spawned) return null
+        const replaced = records.filter((rec) => overloadRetrySameScope(rec, paneId, windowName))
+        const next = records.filter((rec) => !overloadRetrySameScope(rec, paneId, windowName))
+        next.push({
+          key,
+          attempt,
+          pid: spawned.pid,
+          lastFailureAt: now,
+          nextAt: now + plan.delayMs,
+        })
+        try {
+          writeOverloadRetryRecords(ctx.paths.overloadRetries, next)
+        } catch (err) {
+          terminateSpawnedRetry(spawned.pid)
+          throw err
+        }
+        for (const rec of replaced) {
+          if (rec.pid !== null && rec.pid !== spawned.pid && overloadRetryChildMatches(rec.pid, rec.key)) terminateSpawnedRetry(rec.pid)
+        }
+        return plan
+      },
+      { attempts: OVERLOAD_RETRY_LOCK_ATTEMPTS, delayMs: OVERLOAD_RETRY_LOCK_DELAY_MS, onContended: "skip" },
+    )
+    return claimed ?? null
+  } catch (err) {
+    log(`harness-event: overload auto-continue claim failed: ${err}`)
+    return null
   }
 }
 
@@ -2491,11 +2708,25 @@ function recordUsageLatest(path: string, events: UsageLimitEvent[], now: number)
         }
         writeUsageLatestRecords(path, [...byKey.values()].sort(compareUsageLatestRecords))
       },
-      { onContended: "skip" },
+      { attempts: OVERLOAD_RETRY_LOCK_ATTEMPTS, delayMs: OVERLOAD_RETRY_LOCK_DELAY_MS, onContended: "skip" },
     )
   } catch (err) {
     log(`harness-event: usage latest store failed: ${err}`)
   }
+}
+
+function latestRecentUsageLatest(path: string, agent: string, now: number): UsageLatestRecord | null {
+  const normalized = agent.trim().toLowerCase()
+  return parseUsageLatestRecords(readFileOrNull(path), now)
+    .filter((rec) => rec.agent.toLowerCase() === normalized)
+    .sort((a, b) => b.sampledAt - a.sampledAt || b.percent - a.percent)[0] ?? null
+}
+
+function latestAnyUsageLatest(path: string, agent: string): UsageLatestRecord | null {
+  const normalized = agent.trim().toLowerCase()
+  return parseUsageLatestRecordsRaw(readFileOrNull(path))
+    .filter((rec) => rec.agent.toLowerCase() === normalized)
+    .sort((a, b) => b.sampledAt - a.sampledAt || b.percent - a.percent)[0] ?? null
 }
 
 function compareUsageLatestRecords(a: UsageLatestRecord, b: UsageLatestRecord): number {
@@ -2590,7 +2821,7 @@ function claimUsageWarning(path: string, ev: UsageLimitEvent, now: number): bool
         writeUsageWarningRecords(path, next)
         return true
       },
-      { onContended: "skip" },
+      { attempts: OVERLOAD_RETRY_LOCK_ATTEMPTS, delayMs: OVERLOAD_RETRY_LOCK_DELAY_MS, onContended: "skip" },
     )
     return claimed === true
   } catch (err) {
@@ -2683,17 +2914,163 @@ function buildHarnessEvent(payloadText: string, flags: HarnessEventFlags, agent:
   // the raw JSON payload — parseResetTime would scan JSON noise (a real bug).
   const inline = strField(payload, "message") || strField(payload, "last_message") || strField(payload, "error") || (payload === null ? payloadText : "")
   const failureText = [inline, transcriptFailureText(tPath)].filter(Boolean).join("\n")
-  const extracted = extractFailure(reason, failureText, now)
+  const extracted = extractFailure(reason, failureText, now, { agent })
+  const sessionId = strField(payload, "session_id") || strField(payload, "sessionId") || null
   const explicitReset = flags.resetAtIso ? Date.parse(flags.resetAtIso) : NaN
   const resetAt = Number.isFinite(explicitReset) ? explicitReset : extracted.resetAt
   return {
     kind: resetAt !== null ? "session-limit" : extracted.kind,
     agent,
     paneId: flags.paneId,
+    sessionId,
     reason: extracted.reason,
     detail: extracted.detail,
     resetAt,
     sourceMessageId: flags.sourceMessageId,
+  }
+}
+
+function payloadLanguage(payloadText: string, flags: HarnessEventFlags): string | null {
+  if (flags.language) return flags.language
+  let payloadLanguage: string | null = null
+  try {
+    const payload = JSON.parse(payloadText)
+    payloadLanguage =
+      strField(payload, "language") ||
+      strField(payload, "locale") ||
+      strField(payload, "user_language") ||
+      strField(payload, "userLanguage") ||
+      null
+  } catch {
+    /* fall through to locale environment */
+  }
+  return payloadLanguage ?? languageFromProcessEnv(process.env)
+}
+
+function languageFromProcessEnv(env: NodeJS.ProcessEnv): string | null {
+  for (const key of ["LC_ALL", "LC_MESSAGES", "LANG"]) {
+    const raw = env[key]
+    if (!raw) continue
+    const normalized = raw.trim().toLowerCase()
+    if (normalized.startsWith("ru")) return "ru"
+    if (normalized.startsWith("en")) return "en"
+  }
+  return null
+}
+
+function formatAutoContinueDelay(ms: number): string {
+  if (ms < 60_000) return `${Math.ceil(ms / 1000)}s`
+  return formatDelta(ms)
+}
+
+function spawnDelayedAutoContinue(
+  ctx: Ctx,
+  ev: HarnessFailureEvent,
+  plan: TransientAutoContinuePlan,
+  windowName: string,
+  retryKey: string,
+): { pid: number } | null {
+  if (!ev.paneId) return null
+  let logFd: number | null = null
+  try {
+    logFd = openSync(ctx.paths.log, "a")
+    const runBin = import.meta.path
+    const argv = [
+      process.execPath,
+      runBin,
+      "auto-continue-once",
+      "--pane",
+      ev.paneId,
+      "--delay-ms",
+      String(plan.delayMs),
+      "--text",
+      plan.text,
+      "--retry-key",
+      retryKey,
+    ]
+    argv.push("--window-name", windowName)
+    const proc = Bun.spawn(argv, {
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      cwd: dirname(runBin),
+      env: { ...process.env, PWD: dirname(runBin), TG_CTL_CONFIG_DIR: ctx.configDir },
+    })
+    proc.unref()
+    closeSync(logFd)
+    logFd = null
+    log(`harness-event: auto-continue spawned for ${ev.paneId} in ${plan.delayMs}ms (attempt ${plan.attempt})`)
+    return { pid: proc.pid }
+  } catch (err) {
+    log(`harness-event: auto-continue spawn failed for ${ev.paneId}: ${err}`)
+    return null
+  } finally {
+    if (logFd !== null) closeSync(logFd)
+  }
+}
+
+interface AutoContinueOnceFlags {
+  paneId: string | null
+  delayMs: number
+  text: string
+  windowName: string | null
+  retryKey: string | null
+}
+
+function parseAutoContinueOnceFlags(argv: string[]): AutoContinueOnceFlags {
+  const flags: AutoContinueOnceFlags = { paneId: null, delayMs: 0, text: "", windowName: null, retryKey: null }
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    const next = (): string => argv[++i] ?? ""
+    if (a === "--pane") flags.paneId = next()
+    else if (a === "--delay-ms") flags.delayMs = Number(next())
+    else if (a === "--text") flags.text = next()
+    else if (a === "--window-name") flags.windowName = next()
+    else if (a === "--retry-key") flags.retryKey = next()
+  }
+  return flags
+}
+
+async function runAutoContinueOnce(ctx: Ctx, argv: string[]): Promise<number> {
+  const flags = parseAutoContinueOnceFlags(argv)
+  if (!flags.paneId || !flags.text || !Number.isFinite(flags.delayMs) || flags.delayMs < 0) return 2
+  if (!flags.windowName) return 2
+  if (!flags.retryKey) return 2
+  if (flags.text !== "continue" && flags.text !== "продолжи") return 2
+  if (flags.delayMs > 0) await Bun.sleep(flags.delayMs)
+  try {
+    const result = withRoutesLock(
+      fsRoutesLockIo(overloadRetryLockPath(ctx.paths.overloadRetries)),
+      () => {
+        const now = Date.now()
+        const records = parseOverloadRetryRecords(readFileOrNull(ctx.paths.overloadRetries), now)
+        const rec = records.find((item) => item.key === flags.retryKey)
+        if (!rec || rec.pid !== process.pid) {
+          log(`auto-continue-once skipped: retry state no longer matches ${flags.paneId}`)
+          return 0
+        }
+        const finish = (code: number): number => {
+          writeOverloadRetryRecords(ctx.paths.overloadRetries, finishOverloadRetryRecord(records, flags.retryKey!, process.pid, Date.now()))
+          return code
+        }
+        const live = listAgentCandidates().find((c) => c.paneId === flags.paneId)
+        if (!live || live.windowName !== flags.windowName) {
+          log(`auto-continue-once skipped: ${flags.paneId} no longer hosts ${flags.windowName}`)
+          return finish(0)
+        }
+        const res = executeInjectStepsSync(buildTextInjectPlan(flags.paneId, flags.text))
+        if (!res.ok) {
+          log(`auto-continue-once inject failed for ${flags.paneId}: ${res.error}`)
+          return finish(1)
+        }
+        log(`auto-continue-once fired for ${flags.paneId} (${flags.text})`)
+        return finish(0)
+      },
+      { attempts: OVERLOAD_RETRY_LOCK_ATTEMPTS, delayMs: OVERLOAD_RETRY_LOCK_DELAY_MS, onContended: "skip" },
+    )
+    return result ?? 0
+  } catch (err) {
+    log(`auto-continue-once failed for ${flags.paneId}: ${err}`)
+    return 1
   }
 }
 
@@ -2704,10 +3081,16 @@ function resolveAgentForPane(paneId: string | null): string {
   return listAgentCandidates().find((c) => c.paneId === paneId)?.windowName ?? "agent"
 }
 
+function resolveWindowNameForPane(paneId: string | null): string | null {
+  if (!paneId) return null
+  return listAgentCandidates().find((c) => c.paneId === paneId)?.windowName ?? null
+}
+
 async function runHarnessEvent(ctx: Ctx, argv: string[], now: number): Promise<number> {
   const flags = parseHarnessEventFlags(argv)
   const payloadText = await readStdinText().catch(() => "")
   const agent = flags.agent ?? resolveAgentForPane(flags.paneId)
+  const windowName = flags.windowName ?? resolveWindowNameForPane(flags.paneId)
   const usageEvents = extractUsageLimitEvents(payloadText, { agent, language: flags.language, env: process.env, now })
   const hasSupportedUsageTelemetry = extractUsageLimitEvents(payloadText, { agent, language: flags.language, env: process.env, now: 0 }).length > 0
   if (!flags.dryRun) recordUsageLatest(ctx.paths.usageLatest, usageEvents, now)
@@ -2736,7 +3119,17 @@ async function runHarnessEvent(ctx: Ctx, argv: string[], now: number): Promise<n
   const failurePayload = hasHarnessFailureSignal(payloadText, flags, hasSupportedUsageTelemetry)
   if (failurePayload) {
     const ev = buildHarnessEvent(payloadText, flags, agent, now)
-    const notif = buildLimitNotification(ev, now)
+    const latestCodexUsage = latestRecentUsageLatest(ctx.paths.usageLatest, "codex", now)
+    const anyCodexUsage = latestCodexUsage === null ? latestAnyUsageLatest(ctx.paths.usageLatest, "codex") : latestCodexUsage
+    const diagnostic = buildCodexHardLimitDiagnostic(ev, {
+      hasSupportedUsageTelemetry: hasSupportedUsageTelemetry || latestCodexUsage !== null,
+      latestSupportedUsagePercent: latestCodexUsage?.percent ?? null,
+      latestSupportedUsageLimitName: latestCodexUsage?.limitName ?? null,
+      hadExpiredSupportedUsageTelemetry: latestCodexUsage === null && anyCodexUsage !== null,
+    })
+    const notif = buildLimitNotification(ev, now, { diagnostic })
+    const overloadLanguage = payloadLanguage(payloadText, flags)
+    const retryableOverload = ev.paneId && windowName ? buildTransientAutoContinue(ev, { attempt: 1, language: overloadLanguage }) : null
     if (!notif) {
       if (await sendUsageWarningIfPresent()) return 0
       // Staleness guard (#113): a reset already in the past, or nothing to report.
@@ -2748,14 +3141,18 @@ async function runHarnessEvent(ctx: Ctx, argv: string[], now: number): Promise<n
       console.log("=== harness-event DRY-RUN (no send) ===")
       console.log(notif.text)
       if (notif.button) console.log(`[button] ${notif.button.label} → ${notif.button.data}`)
+      if (retryableOverload) console.log(`[auto-continue] ${retryableOverload.text} in ${formatAutoContinueDelay(retryableOverload.delayMs)} (attempt ${retryableOverload.attempt})`)
       if (ev.sourceMessageId !== null) console.log(`[reaction] ${reactionForStage("stalled")} on message ${ev.sourceMessageId}`)
       return 0
     }
     const keyboard = notif.button ? { inline_keyboard: [[{ text: notif.button.label, callback_data: notif.button.data }]] } : undefined
     const extra: Record<string, unknown> = { parse_mode: "HTML" }
     if (keyboard) extra.reply_markup = keyboard
-    await sendMessage(ctx, notif.text, extra)
+    const messageId = await sendMessage(ctx, notif.text, extra)
     if (ev.sourceMessageId !== null) await setMessageReaction(ctx, ev.sourceMessageId, reactionForStage("stalled"))
+    if (retryableOverload && messageId !== null) {
+      claimOverloadAutoContinue(ctx, ev, now, overloadLanguage, windowName)
+    }
     return 0
   }
   if (await sendUsageWarningIfPresent()) return 0
@@ -5991,7 +6388,9 @@ if (import.meta.main) {
     console.log(USAGE)
     process.exit(0)
   }
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event"].includes(cmd)) {
+  // Internal one-shot child spawned by `harness-event`; intentionally absent
+  // from USAGE and guarded by persisted retry state before it can inject text.
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "auto-continue-once"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -6076,6 +6475,9 @@ if (import.meta.main) {
   }
   if (cmd === "harness-event") {
     process.exit(await runHarnessEvent(ctx, process.argv.slice(3), Date.now()))
+  }
+  if (cmd === "auto-continue-once") {
+    process.exit(await runAutoContinueOnce(ctx, process.argv.slice(3)))
   }
   await runDaemon(ctx)
 }

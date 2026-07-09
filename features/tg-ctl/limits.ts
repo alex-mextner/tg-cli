@@ -42,6 +42,7 @@ export interface HarnessFailureEvent {
   kind: HarnessFailureKind;
   agent: string; // tmux window / session name the failed pane belongs to
   paneId: string | null; // originating pane — required to arm auto-continue
+  sessionId?: string | null; // harness session id, when the StopFailure payload carries one
   reason: string; // the StopFailure matcher (rate_limit, overloaded, session_limit, …)
   detail: string; // human-readable tail (trimmed synthetic message)
   resetAt: number | null; // ms epoch when the limit resets; null = unknown/not a limit
@@ -52,6 +53,10 @@ export interface LimitNotification {
   text: string; // HTML body (basic tags only — valid inside a plain sendMessage)
   button: { label: string; data: string } | null; // present iff auto-continue is armable
   resetAt: number | null;
+}
+
+export interface LimitNotificationOptions {
+  diagnostic?: string | null;
 }
 
 export type UsageReportLanguage = 'en' | 'ru';
@@ -84,11 +89,18 @@ interface UsageSample {
 }
 
 const USAGE_REPORT_THRESHOLD_PERCENT = 90;
+const OVERLOAD_AUTO_CONTINUE_MIN_DELAY_MS = 30_000;
+const OVERLOAD_AUTO_CONTINUE_MAX_DELAY_MS = 15 * 60_000;
 interface CodexRateLimitRoot {
   value: Record<string, unknown>;
   trustedDirect: boolean;
 }
 const LANGUAGE_KEYS = ['language', 'locale', 'user_language', 'userLanguage'];
+const NON_RETRYABLE_API_FAILURE_RE = /\b(authentication_failed|oauth_org_not_allowed|billing_error|invalid_request|model_not_found|max_output_tokens|permission|auth(?:entication)?|billing|invalid api key)\b/i;
+const TRANSIENT_OVERLOAD_RE = /\b(529|overload(?:ed)?|temporarily overloaded|temporarily unavailable|service unavailable)\b/i;
+const CODEX_HARD_USAGE_LIMIT_RE = /\b(you['’]ve hit your usage limit|hit your usage limit|usage limit)\b/i;
+const CODEX_RESET_REDEMPTION_NOTE =
+  'The reset time shown is the natural reset. Banked/earned resets are not auto-consumed by tg-cli; redeem one explicitly with /usage if available.';
 
 // Map a StopFailure matcher to a notification kind. A matcher naming a limit
 // (session/usage/rate) is a schedulable stop; anything else (overloaded,
@@ -341,6 +353,81 @@ function normalizeReportLanguage(raw: unknown): UsageReportLanguage | null {
   return null;
 }
 
+export interface TransientAutoContinuePlan {
+  attempt: number;
+  delayMs: number;
+  text: string;
+}
+
+export interface TransientAutoContinueOptions {
+  attempt: number;
+  language?: string | null;
+}
+
+export interface CodexHardLimitDiagnosticOptions {
+  hasSupportedUsageTelemetry: boolean;
+  latestSupportedUsagePercent?: number | null;
+  latestSupportedUsageLimitName?: string | null;
+  hadExpiredSupportedUsageTelemetry?: boolean;
+}
+
+export interface ExtractFailureOptions {
+  agent?: string | null;
+}
+
+// Logarithmic delay for transient overload StopFailure recovery. This is
+// separate from timer scheduling for known reset times (`autoContinueDelayMs`):
+// overloads have no reset timestamp, so repeated failures back off by attempt.
+export function overloadAutoContinueDelayMs(attempt: number): number {
+  const n = Number.isFinite(attempt) ? Math.max(1, Math.floor(attempt)) : 1;
+  const delay = Math.ceil(OVERLOAD_AUTO_CONTINUE_MIN_DELAY_MS * Math.log2(n + 1));
+  return Math.min(OVERLOAD_AUTO_CONTINUE_MAX_DELAY_MS, delay);
+}
+
+export function buildTransientAutoContinue(
+  ev: HarnessFailureEvent,
+  opts: TransientAutoContinueOptions,
+): TransientAutoContinuePlan | null {
+  if (ev.kind !== 'api-error' || ev.resetAt !== null) return null;
+  const haystack = `${ev.reason}\n${ev.detail}`;
+  if (NON_RETRYABLE_API_FAILURE_RE.test(haystack)) return null;
+  if (!TRANSIENT_OVERLOAD_RE.test(haystack)) return null;
+  const language = normalizeReportLanguage(opts.language) ?? 'en';
+  const attempt = Number.isFinite(opts.attempt) ? Math.max(1, Math.floor(opts.attempt)) : 1;
+  return {
+    attempt,
+    delayMs: overloadAutoContinueDelayMs(attempt),
+    text: language === 'ru' ? 'продолжи' : 'continue',
+  };
+}
+
+export function buildCodexHardLimitDiagnostic(
+  ev: HarnessFailureEvent,
+  opts: CodexHardLimitDiagnosticOptions,
+): string | null {
+  if (ev.agent.trim().toLowerCase() !== 'codex') return null;
+  if (!CODEX_HARD_USAGE_LIMIT_RE.test(`${ev.reason}\n${ev.detail}`)) return null;
+  if (opts.hasSupportedUsageTelemetry) {
+    const percent = opts.latestSupportedUsagePercent;
+    if (typeof percent === 'number' && Number.isFinite(percent)) {
+      const label = opts.latestSupportedUsageLimitName ? ` ${opts.latestSupportedUsageLimitName}` : '';
+      if (percent < USAGE_REPORT_THRESHOLD_PERCENT) {
+        return `Supported Codex usage telemetry was seen before this hard stop, but the latest${label} sample was ${formatUsageDiagnosticPercent(percent)}%, below the 90% warning threshold. ${CODEX_RESET_REDEMPTION_NOTE}`;
+      }
+      return `Supported Codex usage telemetry was seen before this hard stop, and the latest${label} sample was ${formatUsageDiagnosticPercent(percent)}%, at or above the 90% warning threshold. If no proactive warning was visible, the warning may have been shadowed, deduped for the active reset window, or failed to deliver. ${CODEX_RESET_REDEMPTION_NOTE}`;
+    }
+    return `Supported Codex usage telemetry was seen before this hard stop, but tg-cli could not identify a current warning percent. If no proactive warning was visible, the warning may have been shadowed, deduped for the active reset window, or failed to deliver. ${CODEX_RESET_REDEMPTION_NOTE}`;
+  }
+  if (opts.hadExpiredSupportedUsageTelemetry) {
+    return `Supported Codex usage telemetry was seen before this hard stop, but the latest stored sample was stale or its reset window had already elapsed, so tg-cli could not send a current 90% warning. ${CODEX_RESET_REDEMPTION_NOTE}`;
+  }
+  return `No supported Codex usage telemetry was seen before this hard stop, so tg-cli could not send a 90% warning. Check that a Codex token_count/account/rateLimits collector is installed, not shadowed by a local hook/statusline override, or previously deduped. ${CODEX_RESET_REDEMPTION_NOTE}`;
+}
+
+function formatUsageDiagnosticPercent(percent: number): string {
+  return Number.isInteger(percent) ? String(percent) : percent.toFixed(1).replace(/\.0$/, '');
+}
+
 function findStringByKeys(value: unknown, keys: string[]): string | null {
   const rec = asRecord(value);
   if (!rec) return null;
@@ -362,14 +449,21 @@ function detailFromUsagePayload(value: unknown): string {
 // resolved to its NEXT occurrence in the daemon's local timezone (which is the
 // operator's — the reset text's "(Europe/Belgrade)" is that same zone).
 export function parseResetTime(text: string, now: number): number | null {
+  return parseAnchoredTime(text, now, /reset/gi, /reset[s]?\s+(at|by)?\s*(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?/i);
+}
+
+function parseTryAgainTime(text: string, now: number): number | null {
+  return parseAnchoredTime(text, now, /try\s+again/gi, /try\s+again\s+(at|by)?\s*(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?/i);
+}
+
+function parseAnchoredTime(text: string, now: number, anchorRe: RegExp, clockRe: RegExp): number | null {
   // Scan EVERY "reset" mention (not just the first) and return the first that
   // yields a real time. Anchoring to a mention keeps an unrelated transcript ISO
   // stamp out; scanning all of them means a bare count ("resets 3 times") ahead
   // of the real "resets 4:10am" doesn't shadow it.
-  const re = /reset/gi;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    const parsed = parseResetWindow(text.slice(m.index, m.index + 120), now);
+  while ((m = anchorRe.exec(text)) !== null) {
+    const parsed = parseResetWindow(text.slice(m.index, m.index + 120), now, clockRe);
     if (parsed !== null) return parsed;
   }
   return null;
@@ -378,13 +472,13 @@ export function parseResetTime(text: string, now: number): number | null {
 // Parse a single "reset …" window → ms epoch, or null. An explicit ISO wins; else
 // a wall clock, guarded against a bare count (a lone integer with no am/pm, no
 // ":MM", and no "at/by" is NOT a time).
-function parseResetWindow(window: string, now: number): number | null {
+function parseResetWindow(window: string, now: number, clockRe: RegExp): number | null {
   const isoMatch = window.match(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?/);
   if (isoMatch) {
     const t = Date.parse(isoMatch[0].replace(' ', 'T'));
     if (Number.isFinite(t)) return t;
   }
-  const clockMatch = window.match(/reset[s]?\s+(at|by)?\s*(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?/i);
+  const clockMatch = window.match(clockRe);
   if (!clockMatch) return null;
   const [, atBy, hStr, mStr, ampm] = clockMatch;
   if (!atBy && !mStr && !ampm) return null; // a bare "resets 3" is not a time
@@ -461,12 +555,20 @@ function nextWallClock(now: number, hour: number, minute: number): number {
 // PURE: the entrypoint concatenates the reason + transcript tail and supplies the
 // pane/agent/source-message from tmux + the routes file. `detail` is the last
 // non-empty line of the failure text, trimmed to a phone-readable length.
+// Codex hard usage-limit prose is the only supported `try again at ...` reset
+// source; generic API errors with the same words stay unscheduled.
 export function extractFailure(
   reason: string,
   failureText: string,
   now: number,
+  opts: ExtractFailureOptions = {},
 ): { kind: HarnessFailureKind; reason: string; detail: string; resetAt: number | null } {
-  const resetAt = parseResetTime(failureText, now);
+  const agent = opts.agent?.trim().toLowerCase() ?? '';
+  const allowCodexTryAgainReset =
+    agent === 'codex' &&
+    CODEX_HARD_USAGE_LIMIT_RE.test(failureText) &&
+    !NON_RETRYABLE_API_FAILURE_RE.test(`${reason}\n${failureText}`);
+  const resetAt = parseResetTime(failureText, now) ?? (allowCodexTryAgainReset ? parseTryAgainTime(failureText, now) : null);
   // A parseable reset time means it IS a limit even if the matcher was vague.
   const kind = resetAt !== null ? 'session-limit' : classifyFailure(reason);
   const lines = failureText
@@ -484,7 +586,7 @@ function truncateDetail(s: string): string {
 
 // Build the operator notification, or null to SUPPRESS it. Suppressed when the
 // reset time is already in the past (stale — the leak this module prevents).
-export function buildLimitNotification(ev: HarnessFailureEvent, now: number): LimitNotification | null {
+export function buildLimitNotification(ev: HarnessFailureEvent, now: number, opts: LimitNotificationOptions = {}): LimitNotification | null {
   if (ev.resetAt !== null && ev.resetAt <= now) return null; // staleness guard
   const agent = escapeHtml(ev.agent || 'agent');
   const head =
@@ -493,11 +595,12 @@ export function buildLimitNotification(ev: HarnessFailureEvent, now: number): Li
       : `⚠️ <b>${agent}</b> stopped on an API error (${escapeHtml(ev.reason || 'unknown')}).`;
   const when = resetLine(ev, now);
   const detail = ev.detail ? `\n<blockquote>${escapeHtml(ev.detail)}</blockquote>` : '';
+  const diagnostic = opts.diagnostic ? `\n<blockquote>${escapeHtml(opts.diagnostic)}</blockquote>` : '';
   const button =
     ev.resetAt !== null && ev.paneId
       ? { label: `▶️ Auto-continue at ${formatClock(ev.resetAt)}`, data: continueCallbackData(ev.paneId, ev.resetAt, ev.sourceMessageId) }
       : null;
-  return { text: `${head}${when}${detail}`, button, resetAt: ev.resetAt };
+  return { text: `${head}${when}${detail}${diagnostic}`, button, resetAt: ev.resetAt };
 }
 
 export function buildUsageLimitNotification(ev: UsageLimitEvent, now: number): LimitNotification | null {
@@ -519,8 +622,8 @@ export function buildUsageLimitNotification(ev: UsageLimitEvent, now: number): L
       : `⚠️ <b>${agent}</b> is at <b>${pct}%</b> of ${limit}.`;
   const advice =
     ev.language === 'ru'
-      ? '\nЗапланируй паузу или переключи агента до жёсткой остановки.'
-      : '\nPlan around it or switch agents before the hard stop.';
+      ? '\nЗапланируй паузу или переключи агента до жёсткой остановки. Показанный сброс — естественный; если доступен накопленный сброс, активируй его вручную через /usage. tg-cli не тратит такие сбросы автоматически.'
+      : '\nPlan around it or switch agents before the hard stop. The reset shown is the natural reset; if a banked/earned reset is available, redeem it explicitly with /usage. tg-cli does not auto-spend it.';
   return { text: `${head}${when}${advice}${detail}`, button: null, resetAt: ev.resetAt };
 }
 

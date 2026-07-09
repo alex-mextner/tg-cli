@@ -393,6 +393,7 @@ export interface CtlPaths {
   topics: string; // threadId→agent binding map for forum-topics mode (always allocated)
   questions: string; // durable forwarded-question state (pending/abandoned + answered-replay)
   schedules: string; // durable auto-continue schedules (re-armed on restart, #113)
+  overloadRetries: string; // retry-attempt state for transient overload auto-continue
   usageWarnings: string; // recent proactive usage warnings, for duplicate suppression (#132)
   usageLatest: string; // latest supported usage/rate-limit telemetry for /limit
 }

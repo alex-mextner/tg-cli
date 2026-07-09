@@ -1,5 +1,5 @@
-import { afterAll, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { afterAll, afterEach, expect, test } from 'bun:test';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -17,12 +17,17 @@ writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
 
 const sentMessages: any[] = [];
 const reactions: any[] = [];
+let failNextSendMessage = false;
 
 const server = Bun.serve({
   port: 0,
   async fetch(req) {
     const url = new URL(req.url);
     if (url.pathname.endsWith('/sendMessage')) {
+      if (failNextSendMessage) {
+        failNextSendMessage = false;
+        return Response.json({ ok: false, description: 'forced failure' }, { status: 500 });
+      }
       sentMessages.push(await req.json());
       return Response.json({ ok: true, result: { message_id: 77 } });
     }
@@ -34,11 +39,18 @@ const server = Bun.serve({
   },
 });
 
-afterAll(() => server.stop(true));
+afterAll(() => {
+  killOverloadRetryChildren();
+  server.stop(true);
+});
 
-async function runHarnessEvent(args: string[], stdin: string): Promise<{ code: number; stdout: string }> {
+afterEach(() => {
+  failNextSendMessage = false;
+});
+
+async function runHarnessEvent(args: string[], stdin: string, extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string }> {
   const proc = Bun.spawn([process.execPath, TG_CTL, 'harness-event', ...args], {
-    env: { HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}` },
+    env: { HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}`, ...extraEnv },
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -48,6 +60,20 @@ async function runHarnessEvent(args: string[], stdin: string): Promise<{ code: n
   const stdout = await new Response(proc.stdout).text();
   await proc.exited;
   return { code: proc.exitCode ?? 1, stdout };
+}
+
+async function runAutoContinueOnce(args: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn([process.execPath, TG_CTL, 'auto-continue-once', ...args], {
+    env: { HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}`, ...extraEnv },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  await proc.exited;
+  return { code: proc.exitCode ?? 1, stdout, stderr };
 }
 
 function futureResetSeconds(minutes: number): number {
@@ -64,6 +90,42 @@ function clearUsageLatestState(): void {
   const path = join(cfgDir, 'tg-ctl.123.usage-latest.json');
   rmSync(path, { force: true });
   rmSync(`${path}.lock`, { force: true });
+}
+
+function clearOverloadRetryState(): void {
+  const path = join(cfgDir, 'tg-ctl.123.overload-retries.json');
+  killOverloadRetryChildren(path);
+  rmSync(path, { force: true });
+  rmSync(`${path}.lock`, { force: true });
+}
+
+function killOverloadRetryChildren(path = join(cfgDir, 'tg-ctl.123.overload-retries.json')): void {
+  if (!existsSync(path)) return;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { retries?: Array<{ pid?: unknown }> };
+    for (const rec of parsed.retries ?? []) {
+      if (typeof rec.pid !== 'number' || rec.pid <= 0) continue;
+      try {
+        process.kill(rec.pid, 'SIGTERM');
+      } catch {}
+    }
+  } catch {}
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForPidExit(pid: number): Promise<void> {
+  for (let i = 0; i < 20; i++) {
+    if (!pidAlive(pid)) return;
+    await Bun.sleep(50);
+  }
 }
 
 test('a session-limit with a parseable reset → notification + auto-continue button + stalled reaction', async () => {
@@ -216,6 +278,580 @@ test('production StopFailure shape (error_type/error, no reason/message) is read
   expect(msg.text).not.toContain('"error_type"');
 });
 
+test('retryable 529 overload StopFailure dry-run shows delayed English auto-continue', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'unknown',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded, please try again at 4:10pm.',
+  });
+  const { code, stdout } = await runHarnessEvent(['--dry-run', '--agent', 'ext', '--window-name', 'ext', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(stdout).toContain('API error');
+  expect(stdout).toContain('[auto-continue]');
+  expect(stdout).toContain('continue');
+  expect(stdout).toMatch(/attempt 1/);
+  expect(sentMessages).toHaveLength(0);
+  expect(reactions).toHaveLength(0);
+});
+
+test('retryable overload without a window guard notifies but does not claim auto-continue', async () => {
+  clearOverloadRetryState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  const dryRun = await runHarnessEvent(['--dry-run', '--agent', 'ext', '--pane', '%3'], payload);
+  expect(dryRun.code).toBe(0);
+  expect(dryRun.stdout).toContain('API error');
+  expect(dryRun.stdout).not.toContain('[auto-continue]');
+
+  const prod = await runHarnessEvent(['--agent', 'ext', '--pane', '%3'], payload, { TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS: '1000' });
+  expect(prod.code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(existsSync(join(cfgDir, 'tg-ctl.123.overload-retries.json'))).toBe(false);
+});
+
+test('retryable overload production path stores one pending retry across equivalent reasons', async () => {
+  clearOverloadRetryState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const env = { TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS: '60000' };
+  const first = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'unknown',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  const second = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  expect((await runHarnessEvent(['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'], first, env)).code).toBe(0);
+  expect((await runHarnessEvent(['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'], second, env)).code).toBe(0);
+  expect(sentMessages).toHaveLength(2);
+
+  const retryState = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.overload-retries.json'), 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number; nextAt: number }>;
+  };
+  expect(retryState.retries).toHaveLength(1);
+  expect(JSON.parse(retryState.retries[0].key)).toEqual(['%3', 'abc123', 'ext']);
+  expect(retryState.retries[0].attempt).toBe(1);
+  expect(retryState.retries[0].pid).toBeGreaterThan(0);
+  expect(retryState.retries[0].nextAt).toBeGreaterThan(Date.now());
+  killOverloadRetryChildren();
+});
+
+test('auto-continue-once requires a persisted retry key before it can inject', async () => {
+  clearOverloadRetryState();
+  const res = await runAutoContinueOnce([
+    '--pane', '%999999',
+    '--delay-ms', '0',
+    '--text', 'continue',
+    '--window-name', 'ext',
+  ]);
+  expect(res.code).toBe(2);
+  expect(existsSync(join(cfgDir, 'tg-ctl.123.overload-retries.json'))).toBe(false);
+});
+
+test('auto-continue-once marks its matching retry record as finished history after a terminal skip', async () => {
+  clearOverloadRetryState();
+  const retryPath = join(cfgDir, 'tg-ctl.123.overload-retries.json');
+  const retryKey = JSON.stringify(['%999999', 'abc123', 'ext']);
+  const proc = Bun.spawn([
+    process.execPath,
+    TG_CTL,
+    'auto-continue-once',
+    '--pane',
+    '%999999',
+    '--delay-ms',
+    '250',
+    '--text',
+    'continue',
+    '--window-name',
+    'ext',
+    '--retry-key',
+    retryKey,
+  ], {
+    env: { HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}` },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  writeFileSync(retryPath, `${JSON.stringify({
+    version: 1,
+    retries: [{
+      key: retryKey,
+      attempt: 8,
+      pid: proc.pid,
+      lastFailureAt: Date.now(),
+      nextAt: Date.now() + 250,
+    }],
+  })}\n`);
+  await new Response(proc.stdout).text();
+  await new Response(proc.stderr).text();
+  await proc.exited;
+  expect(proc.exitCode).toBe(0);
+  const retryState = JSON.parse(readFileSync(retryPath, 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number | null; nextAt: number }>;
+  };
+  expect(retryState.retries).toHaveLength(1);
+  expect(retryState.retries[0].key).toBe(retryKey);
+  expect(retryState.retries[0].attempt).toBe(8);
+  expect(retryState.retries[0].pid).toBeNull();
+  expect(retryState.retries[0].nextAt).toBeLessThanOrEqual(Date.now());
+});
+
+test('auto-continue-once waits through short retry-store lock contention before finishing', async () => {
+  clearOverloadRetryState();
+  const retryPath = join(cfgDir, 'tg-ctl.123.overload-retries.json');
+  const lockPath = `${retryPath}.lock`;
+  const retryKey = JSON.stringify(['%999999', 'abc123', 'ext']);
+  writeFileSync(lockPath, String(process.pid));
+  const proc = Bun.spawn([
+    process.execPath,
+    TG_CTL,
+    'auto-continue-once',
+    '--pane',
+    '%999999',
+    '--delay-ms',
+    '100',
+    '--text',
+    'continue',
+    '--window-name',
+    'ext',
+    '--retry-key',
+    retryKey,
+  ], {
+    env: { HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}` },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  writeFileSync(retryPath, `${JSON.stringify({
+    version: 1,
+    retries: [{
+      key: retryKey,
+      attempt: 2,
+      pid: proc.pid,
+      lastFailureAt: Date.now(),
+      nextAt: Date.now() + 100,
+    }],
+  })}\n`);
+  const release = setTimeout(() => rmSync(lockPath, { force: true }), 250);
+  try {
+    await new Response(proc.stdout).text();
+    await new Response(proc.stderr).text();
+    await proc.exited;
+  } finally {
+    clearTimeout(release);
+    rmSync(lockPath, { force: true });
+  }
+  expect(proc.exitCode).toBe(0);
+  const retryState = JSON.parse(readFileSync(retryPath, 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number | null; nextAt: number }>;
+  };
+  expect(retryState.retries).toHaveLength(1);
+  expect(retryState.retries[0].key).toBe(retryKey);
+  expect(retryState.retries[0].attempt).toBe(2);
+  expect(retryState.retries[0].pid).toBeNull();
+  expect(retryState.retries[0].nextAt).toBeLessThanOrEqual(Date.now());
+});
+
+test('retryable overload state is scoped by session id for the same pane/window', async () => {
+  clearOverloadRetryState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const env = { TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS: '60000' };
+  const payload = (sessionId: string) => JSON.stringify({
+    session_id: sessionId,
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  expect((await runHarnessEvent(['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'], payload('old-session'), env)).code).toBe(0);
+  const firstState = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.overload-retries.json'), 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number; nextAt: number }>;
+  };
+  const oldPid = firstState.retries[0].pid;
+  expect(pidAlive(oldPid)).toBe(true);
+  expect((await runHarnessEvent(['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'], payload('new-session'), env)).code).toBe(0);
+  await waitForPidExit(oldPid);
+
+  const retryState = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.overload-retries.json'), 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number; nextAt: number }>;
+  };
+  expect(retryState.retries).toHaveLength(1);
+  expect(JSON.parse(retryState.retries[0].key)).toEqual(['%3', 'new-session', 'ext']);
+  expect(retryState.retries[0].attempt).toBe(1);
+  expect(retryState.retries[0].pid).not.toBe(oldPid);
+  expect(pidAlive(oldPid)).toBe(false);
+  killOverloadRetryChildren();
+});
+
+test('retryable overload backoff increments from completed retry history', async () => {
+  clearOverloadRetryState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const retryPath = join(cfgDir, 'tg-ctl.123.overload-retries.json');
+  const retryKey = JSON.stringify(['%3', 'abc123', 'ext']);
+  writeFileSync(retryPath, `${JSON.stringify({
+    version: 1,
+    retries: [{
+      key: retryKey,
+      attempt: 1,
+      pid: null,
+      lastFailureAt: Date.now() - 1000,
+      nextAt: Date.now() - 500,
+    }],
+  })}\n`);
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  expect((await runHarnessEvent(
+    ['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'],
+    payload,
+    { TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS: '60000' },
+  )).code).toBe(0);
+
+  const retryState = JSON.parse(readFileSync(retryPath, 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number | null; nextAt: number }>;
+  };
+  expect(retryState.retries).toHaveLength(1);
+  expect(retryState.retries[0].key).toBe(retryKey);
+  expect(retryState.retries[0].attempt).toBe(2);
+  expect(retryState.retries[0].pid).toBeGreaterThan(0);
+  expect(retryState.retries[0].nextAt).toBeGreaterThan(Date.now());
+  killOverloadRetryChildren();
+});
+
+test('retryable overload re-arms a lost child without incrementing the attempt', async () => {
+  clearOverloadRetryState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const retryPath = join(cfgDir, 'tg-ctl.123.overload-retries.json');
+  const retryKey = JSON.stringify(['%3', 'abc123', 'ext']);
+  const exited = Bun.spawn(['/bin/sh', '-c', 'exit 0']);
+  const deadPid = exited.pid;
+  await exited.exited;
+  expect(pidAlive(deadPid)).toBe(false);
+  writeFileSync(retryPath, `${JSON.stringify({
+    version: 1,
+    retries: [{
+      key: retryKey,
+      attempt: 3,
+      pid: deadPid,
+      lastFailureAt: Date.now() - 1000,
+      nextAt: Date.now() + 60_000,
+    }],
+  })}\n`);
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  expect((await runHarnessEvent(
+    ['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'],
+    payload,
+    { TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS: '60000' },
+  )).code).toBe(0);
+
+  const retryState = JSON.parse(readFileSync(retryPath, 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number | null; nextAt: number }>;
+  };
+  expect(retryState.retries).toHaveLength(1);
+  expect(retryState.retries[0].key).toBe(retryKey);
+  expect(retryState.retries[0].attempt).toBe(3);
+  expect(retryState.retries[0].pid).toBeGreaterThan(0);
+  expect(retryState.retries[0].nextAt).toBeGreaterThan(Date.now());
+  killOverloadRetryChildren();
+});
+
+test('retryable overload ignores a stale live pid that is not its retry child', async () => {
+  clearOverloadRetryState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const retryPath = join(cfgDir, 'tg-ctl.123.overload-retries.json');
+  const retryKey = JSON.stringify(['%3', 'abc123', 'ext']);
+  writeFileSync(retryPath, `${JSON.stringify({
+    version: 1,
+    retries: [{
+      key: retryKey,
+      attempt: 3,
+      pid: process.pid,
+      lastFailureAt: Date.now() - 1000,
+      nextAt: Date.now() + 60_000,
+    }],
+  })}\n`);
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  expect((await runHarnessEvent(
+    ['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'],
+    payload,
+    { TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS: '60000' },
+  )).code).toBe(0);
+
+  const retryState = JSON.parse(readFileSync(retryPath, 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number | null; nextAt: number }>;
+  };
+  expect(retryState.retries).toHaveLength(1);
+  expect(retryState.retries[0].key).toBe(retryKey);
+  expect(retryState.retries[0].attempt).toBe(3);
+  expect(retryState.retries[0].pid).not.toBe(process.pid);
+  expect(retryState.retries[0].pid).toBeGreaterThan(0);
+  expect(pidAlive(process.pid)).toBe(true);
+  killOverloadRetryChildren();
+});
+
+test('retryable overload does not duplicate a live pending child when ps cannot inspect it', async () => {
+  clearOverloadRetryState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const retryPath = join(cfgDir, 'tg-ctl.123.overload-retries.json');
+  const retryKey = JSON.stringify(['%3', 'abc123', 'ext']);
+  const live = Bun.spawn(['/bin/sh', '-c', 'sleep 60']);
+  writeFileSync(retryPath, `${JSON.stringify({
+    version: 1,
+    retries: [{
+      key: retryKey,
+      attempt: 3,
+      pid: live.pid,
+      lastFailureAt: Date.now() - 1000,
+      nextAt: Date.now() + 60_000,
+    }],
+  })}\n`);
+  const fakeBin = mkdtempSync(join(tmpdir(), 'tgctl-fake-ps-'));
+  const fakePs = join(fakeBin, 'ps');
+  writeFileSync(fakePs, '#!/bin/sh\nexit 1\n');
+  chmodSync(fakePs, 0o755);
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  try {
+    expect((await runHarnessEvent(
+      ['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'],
+      payload,
+      {
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS: '60000',
+      },
+    )).code).toBe(0);
+  } finally {
+    try {
+      process.kill(live.pid, 'SIGTERM');
+    } catch {}
+    await live.exited.catch(() => {});
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+
+  const retryState = JSON.parse(readFileSync(retryPath, 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number | null }>;
+  };
+  expect(sentMessages).toHaveLength(1);
+  expect(retryState.retries).toHaveLength(1);
+  expect(retryState.retries[0]).toMatchObject({ key: retryKey, attempt: 3, pid: live.pid });
+});
+
+test('retryable overload waits through short retry-store lock contention instead of dropping recovery', async () => {
+  clearOverloadRetryState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const retryPath = join(cfgDir, 'tg-ctl.123.overload-retries.json');
+  const lockPath = `${retryPath}.lock`;
+  writeFileSync(lockPath, String(process.pid));
+  const release = setTimeout(() => rmSync(lockPath, { force: true }), 150);
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  try {
+    expect((await runHarnessEvent(
+      ['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'],
+      payload,
+      { TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS: '60000' },
+    )).code).toBe(0);
+  } finally {
+    clearTimeout(release);
+    rmSync(lockPath, { force: true });
+  }
+
+  const retryState = JSON.parse(readFileSync(retryPath, 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number | null }>;
+  };
+  expect(sentMessages).toHaveLength(1);
+  expect(retryState.retries).toHaveLength(1);
+  expect(retryState.retries[0]).toMatchObject({
+    key: JSON.stringify(['%3', 'abc123', 'ext']),
+    attempt: 1,
+    pid: expect.any(Number),
+  });
+  killOverloadRetryChildren();
+});
+
+test('retryable overload does not arm auto-continue when the Telegram alert fails to send', async () => {
+  clearOverloadRetryState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  failNextSendMessage = true;
+  const retryPath = join(cfgDir, 'tg-ctl.123.overload-retries.json');
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  expect((await runHarnessEvent(
+    ['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'],
+    payload,
+    { TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS: '60000' },
+  )).code).toBe(0);
+  expect(sentMessages).toHaveLength(0);
+  expect(existsSync(retryPath)).toBe(false);
+});
+
+test('retryable overload cap suppresses a ninth auto-continue in the same failure window', async () => {
+  clearOverloadRetryState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const retryPath = join(cfgDir, 'tg-ctl.123.overload-retries.json');
+  const retryKey = JSON.stringify(['%3', 'abc123', 'ext']);
+  writeFileSync(retryPath, `${JSON.stringify({
+    version: 1,
+    retries: [{
+      key: retryKey,
+      attempt: 8,
+      pid: null,
+      lastFailureAt: Date.now() - 1000,
+      nextAt: Date.now() - 500,
+    }],
+  })}\n`);
+  const payload = JSON.stringify({
+    session_id: 'abc123',
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  expect((await runHarnessEvent(
+    ['--agent', 'ext', '--window-name', 'ext', '--pane', '%3'],
+    payload,
+    { TG_CTL_OVERLOAD_AUTO_CONTINUE_TEST_DELAY_MS: '60000' },
+  )).code).toBe(0);
+
+  const retryState = JSON.parse(readFileSync(retryPath, 'utf8')) as {
+    retries: Array<{ key: string; attempt: number; pid: number | null }>;
+  };
+  expect(sentMessages).toHaveLength(1);
+  expect(retryState.retries).toHaveLength(1);
+  expect(retryState.retries[0]).toMatchObject({ key: retryKey, attempt: 8, pid: null });
+});
+
+test('retryable 529 overload StopFailure uses Russian continue text for Russian sessions', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  const { code, stdout } = await runHarnessEvent(['--dry-run', '--agent', 'ext', '--window-name', 'ext', '--pane', '%3', '--language', 'ru'], payload);
+  expect(code).toBe(0);
+  expect(stdout).toContain('[auto-continue]');
+  expect(stdout).toContain('продолжи');
+  expect(stdout).not.toContain('[auto-continue] continue');
+  expect(sentMessages).toHaveLength(0);
+  expect(reactions).toHaveLength(0);
+});
+
+test('retryable 529 overload StopFailure falls back to locale for Russian continue text', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    hook_event_name: 'StopFailure',
+    error_type: 'overloaded',
+    error: 'API Error: 529 Overloaded. Provider is temporarily overloaded.',
+  });
+  const { code, stdout } = await runHarnessEvent(
+    ['--dry-run', '--agent', 'ext', '--window-name', 'ext', '--pane', '%3'],
+    payload,
+    { LANG: 'ru_RU.UTF-8' },
+  );
+  expect(code).toBe(0);
+  expect(stdout).toContain('[auto-continue]');
+  expect(stdout).toContain('продолжи');
+  expect(stdout).not.toContain('[auto-continue] continue');
+  expect(sentMessages).toHaveLength(0);
+  expect(reactions).toHaveLength(0);
+});
+
+test('non-retryable StopFailure dry-run does not show auto-continue', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    hook_event_name: 'StopFailure',
+    error_type: 'billing_error',
+    error: 'Billing quota exhausted.',
+  });
+  const { code, stdout } = await runHarnessEvent(['--dry-run', '--agent', 'ext', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(stdout).toContain('API error');
+  expect(stdout).not.toContain('[auto-continue]');
+  expect(sentMessages).toHaveLength(0);
+  expect(reactions).toHaveLength(0);
+});
+
+test('non-Codex usage-limit prose with try-again text does not get a reset button', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    hook_event_name: 'StopFailure',
+    error_type: 'unknown',
+    error: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+  });
+  const { code, stdout } = await runHarnessEvent(['--dry-run', '--agent', 'ext', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(stdout).toContain('API error');
+  expect(stdout).not.toContain('[button]');
+  expect(stdout).not.toContain('Auto-continue');
+  expect(sentMessages).toHaveLength(0);
+  expect(reactions).toHaveLength(0);
+});
+
+test('Codex non-retryable usage-limit prose with try-again text does not get a reset button', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    hook_event_name: 'StopFailure',
+    error_type: 'billing_error',
+    error: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+  });
+  const { code, stdout } = await runHarnessEvent(['--dry-run', '--agent', 'codex', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(stdout).toContain('API error');
+  expect(stdout).not.toContain('[button]');
+  expect(stdout).not.toContain('Auto-continue');
+  expect(sentMessages).toHaveLength(0);
+  expect(reactions).toHaveLength(0);
+});
+
 // Review round 2 (Opus, PR #120): the api-error test above deliberately picked
 // a non-"limit" error_type, which left the actual TARGET scenario of this PR
 // series untested against the real field names — a rate-limit stop, where the
@@ -325,6 +961,7 @@ test('high usage payload at 90 percent sends a localized warning without auto-co
   expect(msg.text).toContain('использовано');
   expect(msg.text).toContain('91%');
   expect(msg.text).toContain('5-часового лимита');
+  expect(msg.text).toContain('/usage');
   expect(msg.reply_markup).toBeUndefined();
   expect(reactions).toHaveLength(0);
 });
@@ -577,4 +1214,119 @@ test('usage payload with stale reset is suppressed', async () => {
   expect(code).toBe(0);
   expect(sentMessages).toHaveLength(0);
   expect(reactions).toHaveLength(0);
+});
+
+test('Codex hard usage-limit StopFailure diagnoses missing telemetry before the hard stop', async () => {
+  clearUsageWarningState();
+  clearUsageLatestState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const payload = JSON.stringify({
+    hook_event_name: 'StopFailure',
+    error_type: 'unknown',
+    error: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], payload);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('usage limit');
+  expect(sentMessages[0].text).toContain('No supported Codex usage telemetry');
+  expect(sentMessages[0].text).toContain('90% warning');
+  expect(sentMessages[0].text).toContain('Banked/earned resets are not auto-consumed');
+  expect(sentMessages[0].text).toContain('/usage');
+  expect(sentMessages[0].reply_markup.inline_keyboard[0][0].callback_data).toMatch(/^lc:%3:\d+$/);
+});
+
+test('Codex hard usage-limit StopFailure does not claim missing telemetry after recent Codex usage samples', async () => {
+  clearUsageWarningState();
+  clearUsageLatestState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const telemetry = JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: { used_percent: 80, window_minutes: 300, resets_at: futureResetSeconds(60) },
+      },
+    },
+  });
+  expect((await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], telemetry)).code).toBe(0);
+  expect(sentMessages).toHaveLength(0);
+
+  const hardLimit = JSON.stringify({
+    hook_event_name: 'StopFailure',
+    error_type: 'unknown',
+    error: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], hardLimit);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('usage limit');
+  expect(sentMessages[0].text).not.toContain('No supported Codex usage telemetry');
+  expect(sentMessages[0].text).toContain('below the 90% warning threshold');
+  expect(sentMessages[0].text).toContain('/usage');
+});
+
+test('Codex hard usage-limit StopFailure diagnoses already-high telemetry as shadowed or deduped if no warning was visible', async () => {
+  clearUsageWarningState();
+  clearUsageLatestState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const telemetry = JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        primary: { used_percent: 91, window_minutes: 300, resets_at: futureResetSeconds(60) },
+      },
+    },
+  });
+  expect((await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], telemetry)).code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  sentMessages.length = 0;
+
+  const hardLimit = JSON.stringify({
+    hook_event_name: 'StopFailure',
+    error_type: 'unknown',
+    error: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], hardLimit);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('at or above the 90% warning threshold');
+  expect(sentMessages[0].text).toContain('shadowed');
+  expect(sentMessages[0].text).toContain('deduped');
+  expect(sentMessages[0].text).toContain('/usage');
+});
+
+test('Codex hard usage-limit StopFailure diagnoses stale stored telemetry distinctly from missing telemetry', async () => {
+  clearUsageWarningState();
+  clearUsageLatestState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  writeFileSync(join(cfgDir, 'tg-ctl.123.usage-latest.json'), `${JSON.stringify({
+    version: 1,
+    samples: [{
+      agent: 'codex',
+      limitName: 'primary',
+      percent: 91,
+      resetAt: Date.now() - 60_000,
+      language: 'en',
+      detail: '',
+      sampledAt: Date.now() - 120_000,
+    }],
+  })}\n`);
+
+  const hardLimit = JSON.stringify({
+    hook_event_name: 'StopFailure',
+    error_type: 'unknown',
+    error: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+  });
+  const { code } = await runHarnessEvent(['--agent', 'codex', '--pane', '%3'], hardLimit);
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('latest stored sample was stale');
+  expect(sentMessages[0].text).not.toContain('No supported Codex usage telemetry');
+  expect(sentMessages[0].text).toContain('/usage');
 });

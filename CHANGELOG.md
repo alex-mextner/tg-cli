@@ -19,6 +19,24 @@ semantic versioning.
 - Added pure helper coverage and real-CLI smoke tests against a mock Bot API,
   including split sends, media albums, and failure paths that print no fake refs.
 
+**Fix: StopFailure overloads auto-continue and Codex hard limits explain missing telemetry.**
+
+- Retryable StopFailure API overloads such as provider 529 responses now arm a
+  delayed automatic continue for the originating pane. The retry attempt is
+  persisted per pane/session with the delayed child PID, uses an increasing
+  logarithmic backoff, re-arms a lost child, and duplicate-pending events do not
+  spawn a tight retry loop. A retry window stops after eight auto-continue attempts.
+- Russian sessions inject a localized continue command; other sessions inject
+  `continue`. Non-retryable auth, billing, invalid-request, missing-model, and
+  max-output-token failures only notify.
+- Codex hard usage-limit StopFailure prose now parses `try again at ...` reset
+  times. The Telegram notification now diagnoses either missing/unsupported/
+  shadowed/deduped Codex quota telemetry, a stale stored sample, or a recent
+  supported telemetry sample that stayed below the 90% warning threshold.
+- Near-limit and hard-stop messages now state that the shown reset is the
+  natural reset, and that banked/earned resets require an explicit `/usage`
+  redemption. tg-cli does not silently auto-spend banked resets.
+
 ## 1.34.0
 
 **Feature: escalation-format gate — `question` tag + `pre-send-text` hook point.**

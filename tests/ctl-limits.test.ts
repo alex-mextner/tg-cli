@@ -1,7 +1,9 @@
 import { expect, test } from 'bun:test';
 import {
   autoContinueDelayMs,
+  buildCodexHardLimitDiagnostic,
   buildLimitNotification,
+  buildTransientAutoContinue,
   buildUsageLimitNotification,
   classifyFailure,
   continueCallbackData,
@@ -12,6 +14,7 @@ import {
   formatClock,
   formatDelta,
   MAX_TIMER_MS,
+  overloadAutoContinueDelayMs,
   parseContinueCallback,
   parseResetTime,
   type HarnessFailureEvent,
@@ -26,6 +29,7 @@ const ev = (over: Partial<HarnessFailureEvent> = {}): HarnessFailureEvent => ({
   kind: 'session-limit',
   agent: 'hyperide',
   paneId: '%3',
+  sessionId: null,
   reason: 'session_limit',
   detail: '',
   resetAt: null,
@@ -83,6 +87,7 @@ test('parseResetTime: explicit ISO timestamp wins', () => {
 
 test('parseResetTime: no reset info → null; nonsense clock → null', () => {
   expect(parseResetTime('overloaded_error: please try again', NOW)).toBeNull();
+  expect(parseResetTime('overloaded_error: please try again at 4:10pm', NOW)).toBeNull();
   expect(parseResetTime('resets 13pm', NOW)).toBeNull();
   expect(parseResetTime('resets 25:00', NOW)).toBeNull();
 });
@@ -170,6 +175,44 @@ test('notification: api-error → alert with reason, no button', () => {
   expect(n.button).toBeNull();
 });
 
+test('transient auto-continue: overload API errors get language-specific continue text', () => {
+  const failure = ev({
+    kind: 'api-error',
+    reason: 'unknown',
+    detail: 'API Error: 529 Overloaded. The upstream provider is temporarily overloaded.',
+    resetAt: null,
+  });
+  expect(buildTransientAutoContinue(failure, { attempt: 1, language: 'en' })).toMatchObject({
+    text: 'continue',
+    attempt: 1,
+    delayMs: overloadAutoContinueDelayMs(1),
+  });
+  expect(buildTransientAutoContinue(failure, { attempt: 2, language: 'ru' })).toMatchObject({
+    text: 'продолжи',
+    attempt: 2,
+    delayMs: overloadAutoContinueDelayMs(2),
+  });
+});
+
+test('transient auto-continue: backoff is increasing and never tight-loops', () => {
+  const delays = [1, 2, 4, 8].map((attempt) => overloadAutoContinueDelayMs(attempt));
+  expect(delays[0]).toBeGreaterThanOrEqual(30_000);
+  expect(delays[1]).toBeGreaterThan(delays[0]);
+  expect(delays[2]).toBeGreaterThan(delays[1]);
+  expect(delays[3]).toBeGreaterThan(delays[2]);
+});
+
+test('transient auto-continue: non-retryable failures are not auto-continued', () => {
+  for (const [reason, detail] of [
+    ['billing_error', 'Billing quota exhausted.'],
+    ['authentication_failed', 'Invalid API key.'],
+    ['invalid_request', 'Invalid request body.'],
+    ['max_output_tokens', 'Maximum output tokens exceeded.'],
+  ]) {
+    expect(buildTransientAutoContinue(ev({ kind: 'api-error', reason, detail, resetAt: null }), { attempt: 1, language: 'en' })).toBeNull();
+  }
+});
+
 test('notification: no button when the reset is known but the pane is not', () => {
   const n = buildLimitNotification(ev({ resetAt: NOW + 60_000, paneId: null }), NOW)!;
   expect(n.button).toBeNull();
@@ -221,6 +264,141 @@ test('extractFailure: a session-limit tail yields kind=session-limit + resetAt +
 test('extractFailure: a reset time upgrades a vague matcher to session-limit', () => {
   const f = extractFailure('', 'rate limited, resets 3pm', NOW);
   expect(f.kind).toBe('session-limit');
+});
+
+test('extractFailure: Codex hard usage-limit prose parses "try again at" as reset text', () => {
+  const f = extractFailure(
+    'unknown',
+    "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+    NOW,
+    { agent: 'codex' },
+  );
+  expect(f.kind).toBe('session-limit');
+  expect(new Date(f.resetAt!).getHours()).toBe(16);
+  expect(new Date(f.resetAt!).getMinutes()).toBe(10);
+  expect(f.detail).toContain("You've hit your usage limit");
+});
+
+test('extractFailure: non-Codex usage-limit prose with "try again at" does not become a session limit', () => {
+  const f = extractFailure(
+    'unknown',
+    "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+    NOW,
+    { agent: 'ext' },
+  );
+  expect(f.kind).toBe('api-error');
+  expect(f.resetAt).toBeNull();
+});
+
+test('extractFailure: non-retryable Codex StopFailure prose does not get a reset button from "try again at"', () => {
+  const f = extractFailure(
+    'billing_error',
+    "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+    NOW,
+    { agent: 'codex' },
+  );
+  expect(f.kind).toBe('api-error');
+  expect(f.resetAt).toBeNull();
+});
+
+test('extractFailure: overload prose with "try again at" remains an API error', () => {
+  const f = extractFailure(
+    'overloaded',
+    'API Error: 529 Overloaded. Provider is temporarily overloaded, please try again at 4:10pm.',
+    NOW,
+  );
+  expect(f.kind).toBe('api-error');
+  expect(f.resetAt).toBeNull();
+});
+
+test('Codex hard usage-limit diagnostic explains missing proactive telemetry', () => {
+  const failure = ev({
+    kind: 'session-limit',
+    agent: 'codex',
+    reason: 'unknown',
+    detail: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+    resetAt: NOW + 4 * 60 * 60_000,
+  });
+  const diagnostic = buildCodexHardLimitDiagnostic(failure, { hasSupportedUsageTelemetry: false });
+  expect(diagnostic).toContain('No supported Codex usage telemetry');
+  expect(diagnostic).toContain('90% warning');
+  expect(diagnostic).toContain('natural reset');
+  expect(diagnostic).toContain('Banked/earned resets are not auto-consumed');
+  expect(diagnostic).toContain('/usage');
+  const n = buildLimitNotification(failure, NOW, { diagnostic })!;
+  expect(n.text).toContain('No supported Codex usage telemetry');
+  expect(n.text).toContain('/usage');
+});
+
+test('Codex hard usage-limit diagnostic explains below-threshold telemetry', () => {
+  const failure = ev({
+    kind: 'session-limit',
+    agent: 'codex',
+    reason: 'unknown',
+    detail: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+    resetAt: NOW + 4 * 60 * 60_000,
+  });
+  const diagnostic = buildCodexHardLimitDiagnostic(failure, {
+    hasSupportedUsageTelemetry: true,
+    latestSupportedUsagePercent: 80,
+    latestSupportedUsageLimitName: 'primary',
+  });
+  expect(diagnostic).toContain('Supported Codex usage telemetry');
+  expect(diagnostic).toContain('below the 90% warning threshold');
+  expect(diagnostic).toContain('80%');
+  expect(diagnostic).toContain('natural reset');
+  expect(diagnostic).toContain('/usage');
+});
+
+test('Codex hard usage-limit diagnostic explains already-high telemetry without claiming a below-threshold sample', () => {
+  const failure = ev({
+    kind: 'session-limit',
+    agent: 'codex',
+    reason: 'unknown',
+    detail: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+    resetAt: NOW + 4 * 60 * 60_000,
+  });
+  const diagnostic = buildCodexHardLimitDiagnostic(failure, {
+    hasSupportedUsageTelemetry: true,
+    latestSupportedUsagePercent: 91,
+    latestSupportedUsageLimitName: 'primary',
+  });
+  expect(diagnostic).toContain('at or above the 90% warning threshold');
+  expect(diagnostic).toContain('shadowed');
+  expect(diagnostic).toContain('deduped');
+  expect(diagnostic).toContain('/usage');
+  expect(diagnostic).not.toContain('below the 90% warning threshold');
+});
+
+test('Codex hard usage-limit diagnostic distinguishes stale telemetry from missing telemetry', () => {
+  const failure = ev({
+    kind: 'session-limit',
+    agent: 'codex',
+    reason: 'unknown',
+    detail: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+    resetAt: NOW + 4 * 60 * 60_000,
+  });
+  const diagnostic = buildCodexHardLimitDiagnostic(failure, {
+    hasSupportedUsageTelemetry: false,
+    hadExpiredSupportedUsageTelemetry: true,
+  });
+  expect(diagnostic).toContain('Supported Codex usage telemetry was seen');
+  expect(diagnostic).toContain('latest stored sample was stale');
+  expect(diagnostic).not.toContain('No supported Codex usage telemetry');
+  expect(diagnostic).toContain('/usage');
+});
+
+test('Codex hard usage-limit diagnostic still explains banked reset redemption when telemetry exists', () => {
+  const failure = ev({
+    kind: 'session-limit',
+    agent: 'codex',
+    reason: 'unknown',
+    detail: "You've hit your usage limit. Please try again at 4:10pm (Europe/Belgrade).",
+    resetAt: NOW + 4 * 60 * 60_000,
+  });
+  const diagnostic = buildCodexHardLimitDiagnostic(failure, { hasSupportedUsageTelemetry: true });
+  expect(diagnostic).toContain('Banked/earned resets are not auto-consumed');
+  expect(diagnostic).toContain('/usage');
 });
 
 test('extractFailure: an API error with no reset → api-error, null resetAt', () => {
@@ -514,11 +692,17 @@ test('usage notification: Russian and English copy', () => {
   expect(ru.text).toContain('92%');
   expect(ru.text).toContain('основного лимита');
   expect(ru.text).toContain('Сброс');
+  expect(ru.text).toContain('/usage');
+  expect(ru.text).toContain('не тратит');
 
   const en = buildUsageLimitNotification(usageEv({ language: 'en', percent: 93 }), NOW)!;
   expect(en.text).toContain('is at');
   expect(en.text).toContain('93%');
   expect(en.text).toContain('Resets');
+  expect(en.text).toContain('natural reset');
+  expect(en.text).toContain('banked/earned reset');
+  expect(en.text).toContain('/usage');
+  expect(en.text).toContain('does not auto-spend');
 });
 
 test('usage notification: short Russian reset delta is HTML-escaped', () => {
