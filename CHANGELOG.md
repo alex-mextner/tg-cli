@@ -3,6 +3,15 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.34.3
+
+**Fix: dirty-pane routing warnings now guide clarification and subagent routing.**
+
+- Dirty-pane warnings no longer suggest finishing or committing unrelated work
+  before handling a new inbound Telegram message. They now ask the agent to
+  clarify cross-project messages, route clarifications to the active subagent,
+  or start a new subagent for genuinely new tasks.
+
 ## 1.34.2
 
 **Fix: StopFailure overloads auto-continue and Codex hard limits explain missing telemetry.**

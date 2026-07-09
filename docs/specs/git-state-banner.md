@@ -30,21 +30,19 @@ explicit signal instead of silence.
 This detects **"this pane's cwd is mid-flight"**, not **"this message is off-topic"** — those are
 not the same thing. An agent that always works on a feature branch will see the banner on
 **every** delivery to that pane; this is the check's expected shape, not a bug. It is a heads-up
-nudge, not a hard gate — it never blocks or drops the message, only prepends a line.
+nudge, not a hard gate — it never blocks or drops the message, only prepends operational prose
+for the receiving pane. The banner text is not a machine-readable routing API.
 
 ## Banner text
 
 ```
-⚠ This pane currently has uncommitted work on branch feat/foo (3 files changed). If this new
-message is about a DIFFERENT task, consider: (a) finish/commit current work first, or (b) this
-should go to a NEW agent, not this pane.
+⚠ This pane currently has uncommitted work on branch feat/foo (3 files changed). Routing check: if this message is about another project, clarify with the user before taking it here. If it clarifies an active task, route it to that active subagent. If it is a new task, start a new subagent.
 ```
 
 A clean-but-non-main-branch pane gets a variant that doesn't falsely claim "uncommitted work":
 
 ```
-⚠ This pane is currently on branch feat/foo (not main/master, tree clean). If this new message
-is about a DIFFERENT task, consider: …
+⚠ This pane is currently on branch feat/foo (not main/master, tree clean). Routing check: if this message is about another project, clarify with the user before taking it here. If it clarifies an active task, route it to that active subagent. If it is a new task, start a new subagent.
 ```
 
 `buildGitStateBanner(state)` returns `null` (no banner at all) when `state` is `null`
