@@ -304,6 +304,20 @@ These work **without** channels (pure hook return-value path). There is still **
 completion hook** for successful turns. A separate, quick `StopFailure` hook shells
 `tg-ctl harness-event`: it notifies Telegram when the harness reports an explicit
 limit/error and, when a reset time is known, includes the auto-continue button.
+Transient overload API stops (for example a 529/overloaded provider response)
+also arm an automatic delayed retry: the hook records the pane/session attempt
+and one-shot injector PID, spawns the delayed injector, then returns quickly.
+StopFailure JSON payloads may include `session_id` or `sessionId`; when present,
+that value scopes the retry. The retry key is pane id + session id + tmux window
+name (`--window-name` when supplied, otherwise inferred), so a later session in
+the same pane/window can replace an older pending retry.
+The injected command is localized for English and Russian sessions, with an
+increasing logarithmic backoff, duplicate-pending suppression, and an eight
+attempt cap per 30-minute failure window so repeated hook events cannot form a
+tight retry loop. If the recorded child process is gone before its delay elapses,
+the next matching overload event may re-arm the same attempt instead of silently
+dropping recovery. Non-retryable failures such as auth, billing, invalid request,
+missing model, or max-output-token stops only notify.
 The same subcommand also accepts confirmed proactive usage telemetry contracts
 piped by a harness hook or collector (Claude Code statusLine `rate_limits`, Codex
 `token_count.rate_limits` / `account/rateLimits/*`, Pi
@@ -312,6 +326,16 @@ piped by a harness hook or collector (Claude Code statusLine `rate_limits`, Code
 ignored because they do not carry a quota percent/reset contract, and repeated
 warnings for the same agent/limit are deduped for the current reset window (or a
 one-hour cooldown when no reset is known).
+When Codex reports a hard usage-limit StopFailure, the notification explains why
+the proactive 90% warning did not precede it: if no recent supported Codex
+telemetry was seen, it points at missing, unsupported, shadowed, or deduped
+telemetry; if only stale stored telemetry exists, it says the last sample is no
+longer current; if recent supported telemetry exists but stayed below threshold,
+it reports the latest below-threshold sample instead of claiming telemetry was
+absent. Hard-stop and near-limit copy also distinguishes the natural reset time
+from banked/earned resets: tg-cli does not auto-consume banked resets, and the
+operator must explicitly redeem one through `/usage` unless a future
+configuration explicitly opts into auto-redemption.
 `--agent` is a contract selector as well as a report label: Claude
 `context_window` telemetry is accepted only with `--agent claude`, and Pi session
 stats only with `--agent pi`. For StopFailure compatibility, `--transcript` or a
