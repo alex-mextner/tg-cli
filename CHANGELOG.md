@@ -3,21 +3,7 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.34.1
-
-**Fix: send UX now reports tg refs and warns on dense plain reports.**
-
-- Successful sends now print reusable `tg#<message_id>` refs on stdout while
-  keeping `OK` first for compatibility. Multi-message sends print every returned
-  ref in wire order.
-- `tg --help` now documents the success output refs and nudges longer agent
-  reports toward headings, blank-line paragraphs, lists, and tables, including
-  `--format html` and `tg --table` where appropriate.
-- Sending a long text-only plain message with no visible structure now emits a
-  non-blocking stderr warning before sending. Short pings, structured plain text,
-  `--format html`, `--table`, and media/file sends are left quiet.
-- Added pure helper coverage and real-CLI smoke tests against a mock Bot API,
-  including split sends, media albums, and failure paths that print no fake refs.
+## 1.34.2
 
 **Fix: StopFailure overloads auto-continue and Codex hard limits explain missing telemetry.**
 
@@ -36,6 +22,22 @@ semantic versioning.
 - Near-limit and hard-stop messages now state that the shown reset is the
   natural reset, and that banked/earned resets require an explicit `/usage`
   redemption. tg-cli does not silently auto-spend banked resets.
+
+## 1.34.1
+
+**Fix: send UX now reports tg refs and warns on dense plain reports.**
+
+- Successful sends now print reusable `tg#<message_id>` refs on stdout while
+  keeping `OK` first for compatibility. Multi-message sends print every returned
+  ref in wire order.
+- `tg --help` now documents the success output refs and nudges longer agent
+  reports toward headings, blank-line paragraphs, lists, and tables, including
+  `--format html` and `tg --table` where appropriate.
+- Sending a long text-only plain message with no visible structure now emits a
+  non-blocking stderr warning before sending. Short pings, structured plain text,
+  `--format html`, `--table`, and media/file sends are left quiet.
+- Added pure helper coverage and real-CLI smoke tests against a mock Bot API,
+  including split sends, media albums, and failure paths that print no fake refs.
 
 ## 1.34.0
 
