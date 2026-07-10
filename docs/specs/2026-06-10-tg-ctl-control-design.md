@@ -348,7 +348,16 @@ statusLine command, installs a silent collector when no statusLine exists, and
 `tg-ctl status` reports project/local statusLine overrides that shadow the
 user-level collector. Running `install-hooks` from a shadowed project wraps that
 project-local statusLine too. The statusLine collector samples at most every 30
-seconds by default; other harness collectors wire their own payload pipe.
+seconds by default. `install-hooks` also installs a Codex `Stop` hook in
+`$CODEX_HOME/hooks.json` when set, otherwise `~/.codex/hooks.json`, that runs
+`tg-ctl codex-usage-hook`, which reads the
+documented Codex hook `transcript_path`, extracts the latest supported
+`token_count.rate_limits` sample from the transcript tail, and forwards it into
+`tg-ctl harness-event --agent codex`. Codex documents the hook field, but not the
+transcript JSONL format as a stable hook contract; this collector is the local
+best-effort bridge until Codex exposes a stable quota/status hook payload.
+Codex still requires the user to trust the new hook hash in `/hooks`; other
+harness collectors wire their own payload pipe.
 The question/permission hook process awaits the button answer over the UDS
 request/response path with a hard client-side timeout.
 

@@ -62,6 +62,23 @@ async function runHarnessEvent(args: string[], stdin: string, extraEnv: Record<s
   return { code: proc.exitCode ?? 1, stdout };
 }
 
+async function runCodexUsageHook(stdin: string, extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn([process.execPath, TG_CTL, 'codex-usage-hook'], {
+    env: { HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}`, ...extraEnv },
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  proc.stdin.write(stdin);
+  proc.stdin.end();
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  await proc.exited;
+  return { code: proc.exitCode ?? 1, stdout, stderr };
+}
+
 async function runAutoContinueOnce(args: string[], extraEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn([process.execPath, TG_CTL, 'auto-continue-once', ...args], {
     env: { HOME: cfgDir, TG_CTL_CONFIG_DIR: cfgDir, TG_API_BASE: `http://127.0.0.1:${server.port}`, ...extraEnv },
@@ -1329,4 +1346,128 @@ test('Codex hard usage-limit StopFailure diagnoses stale stored telemetry distin
   expect(sentMessages[0].text).toContain('latest stored sample was stale');
   expect(sentMessages[0].text).not.toContain('No supported Codex usage telemetry');
   expect(sentMessages[0].text).toContain('/usage');
+});
+
+test('Codex usage Stop hook forwards a transcript token_count sample through harness-event', async () => {
+  clearUsageWarningState();
+  clearUsageLatestState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const transcript = join(cfgDir, 'codex-usage-high.jsonl');
+  writeFileSync(transcript, [
+    JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant', content: 'working' } }),
+    JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        rate_limits: {
+          limit_id: 'codex',
+          primary: { used_percent: 91, window_minutes: 300, resets_at: futureResetSeconds(60) },
+        },
+      },
+    }),
+  ].join('\n'));
+
+  const { code } = await runCodexUsageHook(JSON.stringify({
+    hook_event_name: 'Stop',
+    session_id: 'codex-session',
+    transcript_path: transcript,
+  }));
+
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('codex');
+  expect(sentMessages[0].text).toContain('91%');
+  expect(sentMessages[0].text).toContain('/usage');
+  const latest = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.usage-latest.json'), 'utf8')) as {
+    samples: Array<{ agent: string; percent: number; limitName: string | null }>;
+  };
+  expect(latest.samples).toEqual([
+    expect.objectContaining({ agent: 'codex', percent: 91, limitName: '5-hour' }),
+  ]);
+});
+
+test('Codex usage Stop hook reads only the transcript tail', async () => {
+  clearUsageWarningState();
+  clearUsageLatestState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const transcript = join(cfgDir, 'codex-usage-large.jsonl');
+  const oldHighSample = JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        limit_id: 'codex',
+        primary: { used_percent: 97, window_minutes: 300, resets_at: futureResetSeconds(60) },
+      },
+    },
+  });
+  writeFileSync(transcript, oldHighSample + '\n' + 'not json\n'.repeat(300_000));
+
+  const { code } = await runCodexUsageHook(JSON.stringify({
+    hook_event_name: 'Stop',
+    session_id: 'codex-session',
+    transcript_path: transcript,
+  }));
+
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(0);
+});
+
+test('Codex usage Stop hook stays quiet below threshold while updating /limit state', async () => {
+  clearUsageWarningState();
+  clearUsageLatestState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const transcript = join(cfgDir, 'codex-usage-low.jsonl');
+  writeFileSync(transcript, JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        limit_id: 'codex',
+        primary: { used_percent: 89, window_minutes: 300, resets_at: futureResetSeconds(60) },
+      },
+    },
+  }));
+
+  const { code } = await runCodexUsageHook(JSON.stringify({
+    hook_event_name: 'Stop',
+    transcript_path: transcript,
+  }));
+
+  expect(code).toBe(0);
+  expect(sentMessages).toHaveLength(0);
+  const latest = JSON.parse(readFileSync(join(cfgDir, 'tg-ctl.123.usage-latest.json'), 'utf8')) as {
+    samples: Array<{ agent: string; percent: number; limitName: string | null }>;
+  };
+  expect(latest.samples).toEqual([
+    expect.objectContaining({ agent: 'codex', percent: 89, limitName: '5-hour' }),
+  ]);
+});
+
+test('Codex usage Stop hook relies on existing warning dedupe for repeated samples', async () => {
+  clearUsageWarningState();
+  clearUsageLatestState();
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const transcript = join(cfgDir, 'codex-usage-dedupe.jsonl');
+  writeFileSync(transcript, JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      rate_limits: {
+        limit_id: 'codex',
+        primary: { used_percent: 92, window_minutes: 300, resets_at: futureResetSeconds(60) },
+      },
+    },
+  }));
+  const payload = JSON.stringify({ hook_event_name: 'Stop', transcript_path: transcript });
+
+  expect((await runCodexUsageHook(payload)).code).toBe(0);
+  expect((await runCodexUsageHook(payload)).code).toBe(0);
+
+  expect(sentMessages).toHaveLength(1);
+  expect(sentMessages[0].text).toContain('92%');
 });

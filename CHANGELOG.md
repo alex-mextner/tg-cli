@@ -3,6 +3,21 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.34.4
+
+**Fix: Codex usage telemetry now has an automatic local collector.**
+
+- `tg-ctl install-hooks` now installs a Codex `Stop` hook that runs
+  `tg-ctl codex-usage-hook`; after the user trusts it in Codex `/hooks`, it reads
+  the local Codex transcript tail and forwards supported `token_count.rate_limits`
+  samples into `tg-ctl harness-event --agent codex`.
+- The collector reuses the existing latest-sample store and warning dedupe, so
+  repeated high samples do not duplicate Telegram warnings and below-threshold
+  samples stay quiet while still updating `/limit codex`.
+- Codex documents `transcript_path` for hooks but does not make the transcript
+  JSONL format stable. The collector is therefore best-effort until Codex exposes
+  a stable quota/status hook payload.
+
 ## 1.34.3
 
 **Fix: dirty-pane routing warnings now guide clarification and subagent routing.**

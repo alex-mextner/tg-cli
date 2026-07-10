@@ -166,7 +166,7 @@ buttons grouped by tmux session; tap one to route. Bare `/agent` lists the agent
 ### Q→buttons (v1.5.0, seamless setup in v1.6.0)
 Agent questions and permission prompts are forwarded to Telegram as inline buttons — no need to touch the terminal. Tap to answer; the answer is injected back into the pane immediately. Supports Claude Code question/permission shapes, Codex `PermissionRequest`, and opencode `question.asked`/`permission.asked` events.
 
-**Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hooks into `~/.claude/settings.json` (backup first, existing hooks preserved), then restart the agent session. `tg-ctl status` reports q→buttons, StopFailure, and proactive statusLine usage telemetry separately, including project/local `statusLine` overrides that shadow the user-level collector. If you run `install-hooks` from such a project, it wraps that local statusLine too and backs the file up. (Codex/opencode: see the command's printed guidance.)
+**Setup:** run `tg-ctl install-hooks` once — it idempotently wires the Claude Code hooks into `~/.claude/settings.json` and the Codex usage collector into Codex's hooks file (`$CODEX_HOME/hooks.json` when set, otherwise `~/.codex/hooks.json`; backup first, existing hooks preserved), then restart the agent session. If either settings file is malformed, `install-hooks` reports it and exits without clobbering the file. `tg-ctl status` reports q→buttons, StopFailure, Claude statusLine usage telemetry, and Codex usage telemetry separately, including project/local Claude `statusLine` overrides that shadow the user-level collector. If you run `install-hooks` from such a project, it wraps that local statusLine too and backs the file up. Codex requires a manual `/hooks` trust review for the new `tg-ctl codex-usage-hook` Stop hook before it can run. (opencode: see the command's printed guidance.)
 
 `tg-ctl harness-event` also accepts externally-piped proactive limit telemetry
 from confirmed contracts: Claude Code statusLine `rate_limits` (and
@@ -189,12 +189,20 @@ show both `5-hour` and `weekly` buckets when Claude statusLine reports them.
 For StopFailure compatibility, `--transcript` or a `transcript_path` payload with
 no supported usage telemetry is treated as failure input and the last assistant
 message in that transcript is scanned for the limit/error text.
-`install-hooks` wires Claude StopFailure and Claude statusLine proactive telemetry
-automatically. Existing visible statusLine output is preserved; when no statusLine
-exists, the installed collector is silent. The collector samples statusLine payloads
-at most every 30 seconds (`TG_CTL_STATUSLINE_MIN_INTERVAL_SEC=0` disables the
-throttle for tests). Non-Claude proactive telemetry collectors must pipe their
-payloads to `tg-ctl harness-event`.
+`install-hooks` wires Claude StopFailure, Claude statusLine proactive telemetry,
+and Codex Stop-hook proactive telemetry automatically. Existing visible statusLine
+output is preserved; when no statusLine exists, the installed Claude collector is
+silent. The Claude collector samples statusLine payloads at most every 30 seconds
+(`TG_CTL_STATUSLINE_MIN_INTERVAL_SEC=0` disables the throttle for tests). Codex
+does not expose a stable statusLine-equivalent quota hook today: its Stop-hook
+payload documents `transcript_path`, while the transcript JSONL format is explicitly
+not a stable hook interface. `tg-ctl codex-usage-hook` is therefore a best-effort
+local collector that reads only the transcript tail (not the whole file, for
+performance and hook-time stability) and forwards only supported
+`token_count.rate_limits` samples into `tg-ctl harness-event --agent codex`; a
+quota sample older than the scanned tail can be missed.
+Other proactive telemetry collectors must pipe their payloads to
+`tg-ctl harness-event`.
 
 While an agent is **waiting on a question**, new messages you send it are **deferred** (queued, marked ✍️ on the message) and delivered once the question is answered — they don't interrupt the prompt.
 If the hook window closes or times out while the terminal prompt is still active,
