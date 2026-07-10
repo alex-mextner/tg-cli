@@ -11,6 +11,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   claudeStatusLineTelemetryInstalled,
+  codexUsageHookInstalled,
   harnessHooksInstalled,
   withClaudeHooks,
   withClaudeStatusLineTelemetry,
@@ -94,6 +95,15 @@ test('unknown subcommand exits 1 with USAGE on stderr', () => {
   expect(proc.stderr.toString()).toContain('Usage:');
 });
 
+test('codex-usage-hook is a quiet no-op when tg credentials are not configured', () => {
+  const home = mkdtempSync(join(tmpdir(), 'tgctl-no-creds-'));
+  const cfg = mkdtempSync(join(tmpdir(), 'tgctl-no-creds-cfg-'));
+  const proc = run(['codex-usage-hook'], { HOME: home, TG_CTL_CONFIG_DIR: cfg });
+  expect(proc.exitCode).toBe(0);
+  expect(proc.stdout.toString()).toBe('');
+  expect(proc.stderr.toString()).toBe('');
+});
+
 test.if(process.platform === 'darwin')(
   'enable --dry-run: prints the launchd plan (contract label + plist path + launchctl load) without touching launchd',
   () => {
@@ -149,17 +159,78 @@ test('status reports StopFailure hook separately from q→buttons hook', () => {
   expect(out).toContain('usage telemetry: NOT installed');
 });
 
-test('install-hooks provisions Claude statusLine usage telemetry collector', () => {
+test('install-hooks provisions Claude statusLine and Codex Stop usage telemetry collectors', () => {
   const { home, env } = fakeEnv();
 
   const proc = run(['install-hooks'], env);
   expect(proc.exitCode).toBe(0);
   const out = proc.stdout.toString();
   expect(out).toContain('statusLine usage telemetry');
+  expect(out).toContain('Codex Stop usage telemetry collector');
 
   const settings = JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf8'));
   expect(harnessHooksInstalled(settings, 'tg-ctl harness-event')).toBe(true);
   expect(claudeStatusLineTelemetryInstalled(settings, 'tg-ctl harness-event --agent claude')).toBe(true);
+
+  const codexHooks = JSON.parse(readFileSync(join(home, '.codex', 'hooks.json'), 'utf8'));
+  expect(codexUsageHookInstalled(codexHooks, 'tg-ctl codex-usage-hook')).toBe(true);
+});
+
+test('install-hooks and status respect CODEX_HOME for Codex hooks', () => {
+  const { home, env } = fakeEnv();
+  const codexHome = mkdtempSync(join(tmpdir(), 'tgctl-codex-home-'));
+  const codexEnv = { ...env, CODEX_HOME: codexHome };
+
+  const proc = run(['install-hooks'], codexEnv);
+  expect(proc.exitCode).toBe(0);
+
+  const codexHooks = JSON.parse(readFileSync(join(codexHome, 'hooks.json'), 'utf8'));
+  expect(codexUsageHookInstalled(codexHooks, 'tg-ctl codex-usage-hook')).toBe(true);
+  expect(existsSync(join(home, '.codex', 'hooks.json'))).toBe(false);
+
+  const status = run(['status'], codexEnv);
+  expect(status.exitCode).toBe(0);
+  expect(status.stdout.toString()).toContain('Codex usage telemetry: installed');
+});
+
+test('install-hooks reports malformed Claude settings without clobbering the file', () => {
+  const { home, env } = fakeEnv();
+  const settingsPath = join(home, '.claude', 'settings.json');
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  writeFileSync(settingsPath, '{ not valid json');
+
+  const proc = run(['install-hooks'], env);
+  expect(proc.exitCode).toBe(1);
+  expect(proc.stderr.toString()).toContain('is not valid JSON');
+  expect(readFileSync(settingsPath, 'utf8')).toBe('{ not valid json');
+});
+
+test('install-hooks reports malformed Codex hooks before writing Claude settings', () => {
+  const { home, env } = fakeEnv();
+  const settingsPath = join(home, '.claude', 'settings.json');
+  const codexHooksPath = join(home, '.codex', 'hooks.json');
+  mkdirSync(join(home, '.codex'), { recursive: true });
+  writeFileSync(codexHooksPath, '{ not valid json');
+
+  const proc = run(['install-hooks'], env);
+  expect(proc.exitCode).toBe(1);
+  expect(proc.stderr.toString()).toContain('is not valid JSON');
+  expect(readFileSync(codexHooksPath, 'utf8')).toBe('{ not valid json');
+  expect(existsSync(settingsPath)).toBe(false);
+});
+
+test('install-hooks rejects non-object Codex hooks without writing Claude settings', () => {
+  const { home, env } = fakeEnv();
+  const settingsPath = join(home, '.claude', 'settings.json');
+  const codexHooksPath = join(home, '.codex', 'hooks.json');
+  mkdirSync(join(home, '.codex'), { recursive: true });
+  writeFileSync(codexHooksPath, '[]');
+
+  const proc = run(['install-hooks'], env);
+  expect(proc.exitCode).toBe(1);
+  expect(proc.stderr.toString()).toContain('is not a JSON object');
+  expect(readFileSync(codexHooksPath, 'utf8')).toBe('[]');
+  expect(existsSync(settingsPath)).toBe(false);
 });
 
 test('status reports when a project-local Claude statusLine shadows the installed telemetry collector', () => {

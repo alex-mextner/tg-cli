@@ -9,9 +9,9 @@ shipped: a one-command **installer** (`tg-ctl install-hooks`) idempotently wires
 Claude Code question/permission hooks, `tg-ctl ask` **normalizes the raw harness
 payload** (so the installed hook is trivial), and `tg-ctl status` reports whether
 the hooks are installed. Current `install-hooks` also provisions Claude StopFailure
-limit/error notifications and proactive Claude statusLine usage telemetry. Run
-`tg-ctl install-hooks` once + restart the agent session, and agent questions reach
-Telegram as buttons.
+limit/error notifications, proactive Claude statusLine usage telemetry, and the
+Codex Stop-hook usage telemetry collector. Run `tg-ctl install-hooks` once +
+restart the agent session, and agent questions reach Telegram as buttons.
 
 > Original verification (2026-06-12) found the feature dead out of the box: the
 > hook was not installed and no installer existed. That gap is closed below.
@@ -38,18 +38,23 @@ Telegram as buttons.
   telemetry collector. Existing hooks are preserved; re-running is a no-op. If a
   project-local `.claude/settings*.json` statusLine overrides the user-level
   collector, running `install-hooks` from that project wraps the local statusLine
-  too and backs up that file. Pure merge in `features/tg-ctl/hook-install.ts`.
-  Codex/opencode get printed guidance (Codex needs a manual `/hooks` trust;
-  opencode is native SSE).
+  too and backs up that file. It also merges a Codex `Stop` hook into
+  `$CODEX_HOME/hooks.json` when set, otherwise `~/.codex/hooks.json`, running
+  `tg-ctl codex-usage-hook`; Codex requires a manual `/hooks` trust review before
+  that collector runs. Malformed Claude/Codex
+  settings are reported without clobbering the files. Pure merge in
+  `features/tg-ctl/hook-install.ts`. opencode gets printed guidance because it is
+  native SSE.
 - **`tg-ctl ask` normalizes the raw harness payload** — the hook pipes Claude
   Code's native `PreToolUse(AskUserQuestion)` / `PermissionRequest` JSON straight
   in; `features/tg-ctl/hook-normalize.ts` maps it to a `ButtonRequest` using the
   hook process's own `TMUX_PANE`/cwd/session. Single non-multiSelect questions
   with concrete options forward; multi-question / multiSelect / free-form fall
   back to the local dialog. (Codex uses `tg-ctl ask --agent codex`.)
-- **`tg-ctl status`** prints separate `q→buttons hooks`, `limit/error hooks`, and
-  `usage telemetry` lines, including project/local statusLine overrides that shadow
-  the user-level collector, so the state is never silently wrong.
+- **`tg-ctl status`** prints separate `q→buttons hooks`, `limit/error hooks`,
+  Claude `usage telemetry`, and `Codex usage telemetry` lines, including
+  project/local statusLine overrides that shadow the user-level collector, so the
+  state is never silently wrong.
 
 The verified-live AskUserQuestion contract (CC 2.1.170) — `answers` keyed by
 question TEXT, `updatedInput` replaces wholesale — is unchanged in
@@ -79,8 +84,13 @@ question TEXT, `updatedInput` replaces wholesale — is unchanged in
      Note the AskUserQuestion contract is an **undocumented internal** (answers
      keyed by question TEXT, multiSelect = comma-joined, `updatedInput` replaces
      wholesale so it must include `questions`).
-   - **Codex**: `PermissionRequest` only; hooks must be trusted by hash via
-     `/hooks` on first run (manual).
+   - **Codex**: q→buttons still use `PermissionRequest` only; usage telemetry uses
+     the installed `Stop` hook collector. Hooks must be trusted by hash via
+     `/hooks` on first run (manual). Codex documents the hook `transcript_path`,
+     but not the transcript JSONL format as a stable interface; usage telemetry is
+     best-effort until Codex exposes a stable quota/status hook payload. The
+     collector scans only the transcript tail for performance, so older quota
+     samples outside that tail can be missed.
    - **opencode**: native SSE question/permission events — no tmux hook needed.
 5. **A per-hook timeout** (~120 s) in settings; on expiry the local dialog takes
    over and the daemon edits the TG message to "expired".
@@ -90,7 +100,7 @@ question TEXT, `updatedInput` replaces wholesale — is unchanged in
 | Agent | Questions | Permissions | Notes |
 |---|---|---|---|
 | Claude Code | ✅ buttons | ✅ buttons | needs the undocumented AskUserQuestion hook |
-| Codex | ❌ | ✅ buttons | manual `/hooks` trust |
+| Codex | ❌ | ✅ buttons | manual `/hooks` trust; usage telemetry via Stop hook |
 | opencode | ✅ | ✅ | native, no tmux |
 | pi / aider / gemini | ❌ | ❌ | tmux floor only; bot replies "limited" |
 
@@ -142,7 +152,9 @@ prompt.
 
 - A **Claude canary e2e** (synthetic `AskUserQuestion` against a real `claude -p`)
   that fails loudly on contract drift — recommended next, not built here.
-- Codex/opencode hook auto-write (currently guided, not auto-installed).
+- Codex `PermissionRequest` q→buttons auto-write (currently guided, not
+  auto-installed). Codex usage telemetry now auto-writes its `Stop` hook, then
+  waits for manual `/hooks` trust.
 
 ## Agent capability matrix (unchanged)
 

@@ -6,11 +6,14 @@ import {
   harnessHooksInstalled,
   withClaudeStatusLineTelemetry,
   claudeStatusLineTelemetryInstalled,
+  withCodexUsageHook,
+  codexUsageHookInstalled,
 } from '../features/tg-ctl/hook-install';
 
 const CMD = 'tg-ctl ask';
 const HARNESS_CMD = 'tg-ctl harness-event';
 const STATUSLINE_TELEMETRY_CMD = 'tg-ctl harness-event --agent claude';
+const CODEX_USAGE_CMD = 'tg-ctl codex-usage-hook';
 
 test('empty settings → both hook groups added, changed=true', () => {
   const { settings, changed } = withClaudeHooks({}, CMD);
@@ -217,4 +220,35 @@ test('statusLine telemetry: a user command containing the marker is preserved if
   const statusLine = settings.statusLine as { command: string };
   expect(statusLine.command).toContain(command);
   expect(statusLine.command).not.toContain("sh -c ':'");
+});
+
+// --- Codex Stop-hook usage telemetry collector (#176) ---
+
+test('Codex usage hook: empty hooks → Stop collector added, changed=true', () => {
+  const { settings, changed } = withCodexUsageHook({}, CODEX_USAGE_CMD);
+  expect(changed).toBe(true);
+  const hooks = settings.hooks as Record<string, unknown[]>;
+  expect(hooks.Stop).toEqual([
+    { hooks: [{ type: 'command', command: CODEX_USAGE_CMD, timeout: 30 }] },
+  ]);
+  expect(codexUsageHookInstalled(settings, CODEX_USAGE_CMD)).toBe(true);
+});
+
+test('Codex usage hook: idempotent re-run does not duplicate', () => {
+  const once = withCodexUsageHook({}, CODEX_USAGE_CMD).settings;
+  const twice = withCodexUsageHook(once, CODEX_USAGE_CMD);
+  expect(twice.changed).toBe(false);
+  expect((twice.settings.hooks as Record<string, unknown[]>).Stop.length).toBe(1);
+});
+
+test('Codex usage hook: preserves unrelated hook groups', () => {
+  const existing = {
+    hooks: {
+      PermissionRequest: [{ matcher: '*', hooks: [{ type: 'command', command: 'tg-ctl ask --agent codex' }] }],
+    },
+  };
+  const { settings } = withCodexUsageHook(existing, CODEX_USAGE_CMD);
+  const hooks = settings.hooks as Record<string, unknown[]>;
+  expect(hooks.PermissionRequest).toEqual(existing.hooks.PermissionRequest);
+  expect(hooks.Stop).toHaveLength(1);
 });

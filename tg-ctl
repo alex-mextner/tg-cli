@@ -12,7 +12,7 @@
 // (`run`) takes the flock as its FIRST action and exits 0 when another
 // instance already owns the bot.
 
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { dirname, isAbsolute, join, resolve } from "path"
 import { detectAgentLabel } from "./features/agent-detect/detect"
@@ -45,6 +45,7 @@ import {
   type ProbedLaunchdJob,
 } from "./features/tg-ctl/autostart"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
+import { codexUsageTranscriptPath, latestCodexUsageTelemetryPayload } from "./features/tg-ctl/codex-usage"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
 import {
   findAgentInPane,
@@ -125,9 +126,11 @@ import {
 import {
   claudeHooksInstalled,
   claudeStatusLineTelemetryInstalled,
+  codexUsageHookInstalled,
   harnessHooksInstalled,
   withClaudeHooks,
   withClaudeStatusLineTelemetry,
+  withCodexUsageHook,
   withHarnessHooks,
 } from "./features/tg-ctl/hook-install"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
@@ -223,7 +226,7 @@ export const USAGE = `Usage:
                          # (--dry-run prints the plan and touches nothing)
   tg-ctl disable         # remove OS autostart AND stop
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
-  tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude usage telemetry
+  tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude/Codex usage telemetry
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
   tg-ctl harness-event [--dry-run] [--pane %N] [--window-name NAME] [--agent NAME] [--language LANG]
                         [--reason MATCHER]
@@ -235,6 +238,8 @@ export const USAGE = `Usage:
                          # --transcript or transcript_path alone is treated as failure input.
                          # Limit warnings localize from payload/locale hints; else English.
                          # --dry-run renders WITHOUT sending (safe smoke, #113).
+  tg-ctl codex-usage-hook
+                         # internal: Codex Stop hook; forwards transcript token_count telemetry.
 The run/start/status/stop/enable/disable lifecycle follows the shared agent-tools
 service-management contract (agenttools_service). Autostart matrix: macOS → launchd
 LaunchAgent; Linux → systemd --user unit; no supported autostart → start now but it
@@ -250,6 +255,8 @@ Env:         TG_CTL_CONFIG_DIR (default ~/.config/tg-cli),
 const CLAUDE_QUESTION_HOOK_CMD = "tg-ctl ask"
 const CLAUDE_HARNESS_HOOK_CMD = "tg-ctl harness-event"
 const CLAUDE_STATUSLINE_TELEMETRY_CMD = "tg-ctl harness-event --agent claude"
+const CODEX_USAGE_HOOK_CMD = "tg-ctl codex-usage-hook"
+const CODEX_TRANSCRIPT_TAIL_BYTES = 500_000
 
 // Spec §5.2 no-tmux guard, verbatim.
 export const NO_AGENT_REPLY =
@@ -352,6 +359,36 @@ function readFileOrNull(path: string): string | null {
     return readFileSync(path, "utf8")
   } catch {
     return null
+  }
+}
+
+function readFileTailOrNull(path: string, maxBytes: number): string | null {
+  let fd: number | null = null
+  try {
+    const stat = statSync(path)
+    if (!stat.isFile()) return null
+    const size = stat.size
+    const length = Math.min(Math.max(0, maxBytes), size)
+    const offset = Math.max(0, size - length)
+    const buf = Buffer.allocUnsafe(length)
+    fd = openSync(path, "r")
+    let bytesRead = 0
+    while (bytesRead < length) {
+      const chunkBytes = readSync(fd, buf, bytesRead, length - bytesRead, offset + bytesRead)
+      if (chunkBytes <= 0) break
+      bytesRead += chunkBytes
+    }
+    return buf.subarray(0, bytesRead).toString("utf8")
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {
+        // ignore close failure on best-effort hook telemetry
+      }
+    }
   }
 }
 
@@ -1085,6 +1122,7 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   let questionHooksOk = false
   let harnessHooksOk = false
   let statusLineTelemetryOk = false
+  let codexUsageTelemetryOk = false
   let shadowingStatusLine: string | null = null
   if (hooksRaw) {
     try {
@@ -1095,6 +1133,13 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
       if (statusLineTelemetryOk) {
         shadowingStatusLine = findShadowingClaudeStatusLine(ctx.home, statusScopeCwd, CLAUDE_STATUSLINE_TELEMETRY_CMD)
       }
+    } catch {}
+  }
+  const codexHooksRaw = readFileOrNull(join(codexConfigDir(ctx.home), "hooks.json"))
+  if (codexHooksRaw) {
+    try {
+      const codexHooksSettings = JSON.parse(codexHooksRaw)
+      codexUsageTelemetryOk = codexUsageHookInstalled(codexHooksSettings, CODEX_USAGE_HOOK_CMD)
     } catch {}
   }
   lines.push(
@@ -1113,6 +1158,11 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
       : statusLineTelemetryOk
         ? "usage telemetry: installed (Claude Code statusLine)"
         : "usage telemetry: NOT installed — run `tg-ctl install-hooks`",
+  )
+  lines.push(
+    codexUsageTelemetryOk
+      ? "Codex usage telemetry: installed (Stop hook transcript collector)"
+      : "Codex usage telemetry: NOT installed — run `tg-ctl install-hooks`, then trust it via Codex `/hooks`",
   )
   // Autostart (the shared service-management lifecycle): an installed unit means the daemon
   // comes back at login. Mirrors the q→buttons line — installed reports the kind/label, absent
@@ -1137,13 +1187,35 @@ function installHooks(home: string): void {
   const raw = readFileOrNull(settingsPath)
   let existing: Record<string, unknown> = {}
   if (raw) {
+    let parsed: unknown
     try {
-      const parsed = JSON.parse(raw)
-      if (parsed && typeof parsed === "object") existing = parsed as Record<string, unknown>
+      parsed = JSON.parse(raw)
     } catch {
       console.error(`tg-ctl: ${settingsPath} is not valid JSON — fix or move it aside, then re-run`)
       process.exit(1)
     }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      console.error(`tg-ctl: ${settingsPath} is not a JSON object — fix or move it aside, then re-run`)
+      process.exit(1)
+    }
+    existing = parsed as Record<string, unknown>
+  }
+  const codexHooksPath = join(codexConfigDir(home), "hooks.json")
+  const codexRaw = readFileOrNull(codexHooksPath)
+  let codexExisting: Record<string, unknown> = {}
+  if (codexRaw) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(codexRaw)
+    } catch {
+      console.error(`tg-ctl: ${codexHooksPath} is not valid JSON — fix or move it aside, then re-run`)
+      process.exit(1)
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      console.error(`tg-ctl: ${codexHooksPath} is not a JSON object — fix or move it aside, then re-run`)
+      process.exit(1)
+    }
+    codexExisting = parsed as Record<string, unknown>
   }
   const qButtons = withClaudeHooks(existing, CLAUDE_QUESTION_HOOK_CMD)
   // Also provision harness limit/error channels in the SAME pass so a single
@@ -1184,8 +1256,21 @@ function installHooks(home: string): void {
   if (!changed && !shadowChanged) {
     console.log("tg-ctl: Claude Code q→buttons + StopFailure + statusLine usage telemetry already installed — nothing to do.")
   }
+  const codexUsage = withCodexUsageHook(codexExisting, CODEX_USAGE_HOOK_CMD)
+  if (codexUsage.changed) {
+    if (codexRaw) {
+      try {
+        writeFileSync(`${codexHooksPath}.bak`, codexRaw)
+      } catch {}
+    }
+    mkdirSync(dirname(codexHooksPath), { recursive: true })
+    writeFileSync(codexHooksPath, `${JSON.stringify(codexUsage.settings, null, 2)}\n`)
+    console.log(`tg-ctl: installed Codex Stop usage telemetry collector → ${codexHooksPath}` + (codexRaw ? ` (backup: ${codexHooksPath}.bak)` : ""))
+  } else {
+    console.log("tg-ctl: Codex Stop usage telemetry collector already installed — nothing to do.")
+  }
   console.log("")
-  console.log("Codex: add a PermissionRequest hook running `tg-ctl ask --agent codex`, then trust it via /hooks (manual, first run).")
+  console.log("Codex: trust the `tg-ctl codex-usage-hook` Stop hook via /hooks so quota telemetry can flow; add a PermissionRequest hook running `tg-ctl ask --agent codex` if you also want q→buttons.")
   console.log("opencode: native — the bot subscribes to question/permission SSE events; no hook file needed.")
   console.log("Restart any running agent session so it loads the new hooks.")
 }
@@ -2293,6 +2378,11 @@ async function askDaemon(ctx: Ctx): Promise<void> {
   }
 }
 
+function codexConfigDir(home: string): string {
+  const override = process.env.CODEX_HOME?.trim()
+  return override ? override : join(home, ".codex")
+}
+
 async function readStdinText(): Promise<string> {
   return await new Promise((resolve, reject) => {
     let out = ""
@@ -3087,8 +3177,12 @@ function resolveWindowNameForPane(paneId: string | null): string | null {
 }
 
 async function runHarnessEvent(ctx: Ctx, argv: string[], now: number): Promise<number> {
-  const flags = parseHarnessEventFlags(argv)
   const payloadText = await readStdinText().catch(() => "")
+  return runHarnessEventPayload(ctx, argv, now, payloadText)
+}
+
+async function runHarnessEventPayload(ctx: Ctx, argv: string[], now: number, payloadText: string): Promise<number> {
+  const flags = parseHarnessEventFlags(argv)
   const agent = flags.agent ?? resolveAgentForPane(flags.paneId)
   const windowName = flags.windowName ?? resolveWindowNameForPane(flags.paneId)
   const usageEvents = extractUsageLimitEvents(payloadText, { agent, language: flags.language, env: process.env, now })
@@ -3159,6 +3253,17 @@ async function runHarnessEvent(ctx: Ctx, argv: string[], now: number): Promise<n
   if (!flags.dryRun) log(`harness-event: suppressed (no supported event) agent=${agent}`)
   else console.log("harness-event: SUPPRESSED (no supported event)")
   return 0
+}
+
+async function runCodexUsageHook(ctx: Ctx, now: number): Promise<number> {
+  const hookPayload = await readStdinText().catch(() => "")
+  const transcriptPath = codexUsageTranscriptPath(hookPayload)
+  if (!transcriptPath) return 0
+  const transcript = readFileTailOrNull(transcriptPath, CODEX_TRANSCRIPT_TAIL_BYTES)
+  if (!transcript) return 0
+  const payload = latestCodexUsageTelemetryPayload(transcript, { now })
+  if (!payload) return 0
+  return runHarnessEventPayload(ctx, ["--agent", "codex"], now, payload)
 }
 
 // --- run: the daemon itself ---
@@ -6390,7 +6495,7 @@ if (import.meta.main) {
   }
   // Internal one-shot child spawned by `harness-event`; intentionally absent
   // from USAGE and guarded by persisted retry state before it can inject text.
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "auto-continue-once"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -6421,7 +6526,7 @@ if (import.meta.main) {
 
   const token = env.TG_BOT_TOKEN ?? ""
   const botId = botIdFromToken(token)
-  if (cmd === "ask" && (!botId || !env.TG_CHAT_ID)) {
+  if ((cmd === "ask" || cmd === "codex-usage-hook") && (!botId || !env.TG_CHAT_ID)) {
     process.exit(0)
   }
   if (!botId || !env.TG_CHAT_ID) {
@@ -6475,6 +6580,9 @@ if (import.meta.main) {
   }
   if (cmd === "harness-event") {
     process.exit(await runHarnessEvent(ctx, process.argv.slice(3), Date.now()))
+  }
+  if (cmd === "codex-usage-hook") {
+    process.exit(await runCodexUsageHook(ctx, Date.now()))
   }
   if (cmd === "auto-continue-once") {
     process.exit(await runAutoContinueOnce(ctx, process.argv.slice(3)))

@@ -55,6 +55,11 @@ function desiredHarnessGroups(command: string): Array<{ event: string; group: Ho
   return [{ event: 'StopFailure', group: { matcher: '*', hooks: [cmd] } }];
 }
 
+function desiredCodexUsageGroups(command: string): Array<{ event: string; group: HookGroup }> {
+  const cmd: HookCmd = { type: 'command', command, timeout: HARNESS_TIMEOUT_SEC };
+  return [{ event: 'Stop', group: { hooks: [cmd] } }];
+}
+
 function groupHasCommand(group: unknown, matcher: string, command: string): boolean {
   if (!group || typeof group !== 'object') return false;
   const g = group as Record<string, unknown>;
@@ -114,6 +119,14 @@ export function harnessHooksInstalled(settings: Record<string, unknown>, command
 // Return a copy of `settings` with the StopFailure harness hook merged in (#113).
 export function withHarnessHooks(settings: Record<string, unknown>, command: string): { settings: Record<string, unknown>; changed: boolean } {
   return mergeGroups(settings, desiredHarnessGroups(command), command);
+}
+
+export function codexUsageHookInstalled(settings: Record<string, unknown>, command: string): boolean {
+  return groupsInstalled(settings, desiredCodexUsageGroups(command), command);
+}
+
+export function withCodexUsageHook(settings: Record<string, unknown>, command: string): { settings: Record<string, unknown>; changed: boolean } {
+  return mergeGroups(settings, desiredCodexUsageGroups(command), command);
 }
 
 function statusLineCommand(settings: Record<string, unknown>): string | null {
