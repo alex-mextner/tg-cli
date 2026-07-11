@@ -3,6 +3,19 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.34.5
+
+**Fix: Telegram `/tasks` now opens on the work that needs attention.**
+
+- The default `/tasks` board now filters to stuck/problem or ready tasks instead
+  of dumping every lifecycle state.
+- Task title cells start with compact status-group emoji, and rows group by
+  agent/project when that context is available.
+- The Telegram task board now includes quick filter buttons and pagination
+  callbacks for larger result sets.
+- Developer note: `matchPrsToTasks` now keys its returned map by `taskKey(task)`
+  so duplicate task ids from different projects do not overwrite each other.
+
 ## 1.34.4
 
 **Fix: Codex usage telemetry now has an automatic local collector.**

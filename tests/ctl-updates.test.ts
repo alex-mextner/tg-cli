@@ -131,6 +131,39 @@ test('callback_query with unknown data is answered as expired/unknown, not injec
   expect(r.newOffset).toBe(9);
 });
 
+test('callback_query for /tasks pagination emits a task action with the requested filter/page', () => {
+  const r = stepUpdates(
+    [
+      {
+        update_id: 8,
+        callback_query: {
+          id: 'cb1',
+          from: { id: CHAT_ID, first_name: 'Alex' },
+          message: { message_id: 50, chat: { id: CHAT_ID }, date: NOW },
+          data: 'tgt:page:active:2',
+        },
+      },
+    ],
+    makeOpts(),
+  );
+  expect(r.actions).toEqual([
+    {
+      kind: 'tasks',
+      agent: null,
+      status: null,
+      replyToMessageId: null,
+      view: 'active',
+      page: 2,
+      callbackKind: 'page',
+      callbackQueryId: 'cb1',
+      messageId: 50,
+      chatId: CHAT_ID,
+      threadId: null,
+    },
+  ]);
+  expect(r.newOffset).toBe(9);
+});
+
 test('callback_query for a post-timeout question close button emits close-card action', () => {
   const r = stepUpdates(
     [
@@ -354,7 +387,40 @@ test('/tasks carries reply target for scoped board lookup', () => {
     makeOpts(),
   );
   expect(r.actions).toEqual([
-    { kind: 'tasks', agent: null, status: null, replyToMessageId: 77 },
+    { kind: 'tasks', agent: null, status: null, replyToMessageId: 77, threadId: null },
+    { kind: 'ack', messageId: 10 },
+  ]);
+});
+
+test('/tasks ignores non-topic reply thread ids when building the board', () => {
+  const r = stepUpdates(
+    [
+      upd(10, {
+        text: '/tasks',
+        message_thread_id: 123,
+      }),
+    ],
+    makeOpts(),
+  );
+  expect(r.actions).toEqual([
+    { kind: 'tasks', agent: null, status: null, replyToMessageId: null, threadId: null },
+    { kind: 'ack', messageId: 10 },
+  ]);
+});
+
+test('/tasks ignores topic thread ids when topics mode is disabled', () => {
+  const r = stepUpdates(
+    [
+      upd(10, {
+        text: '/tasks',
+        message_thread_id: 123,
+        is_topic_message: true,
+      }),
+    ],
+    makeOpts({ cfg: { ...DEFAULT_CONTROL, topics: false } }),
+  );
+  expect(r.actions).toEqual([
+    { kind: 'tasks', agent: null, status: null, replyToMessageId: null, threadId: null },
     { kind: 'ack', messageId: 10 },
   ]);
 });

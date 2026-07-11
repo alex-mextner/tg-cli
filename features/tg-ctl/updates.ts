@@ -15,7 +15,7 @@ import { parseButtonCallback, parseQuestionCloseCallback } from './questions';
 import { isAgentCommand, parseAgentCallback, parseAgentCancelCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback } from './new-command';
-import { parseTasksCommand } from './tasks-command';
+import { parseTasksCallback, parseTasksCommand } from './tasks-command';
 import { parseContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
 
@@ -223,6 +223,23 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         });
         continue;
       }
+      const tasksCb = parseTasksCallback(cb.data);
+      if (tasksCb) {
+        callbackActions.push({
+          kind: 'tasks',
+          agent: null,
+          status: null,
+          replyToMessageId: null,
+          view: tasksCb.view,
+          page: tasksCb.page,
+          callbackKind: tasksCb.kind,
+          callbackQueryId: cb.id,
+          messageId: cb.message?.message_id ?? null,
+          chatId: cb.message?.chat?.id ?? null,
+          threadId: cb.message?.message_thread_id ?? null,
+        });
+        continue;
+      }
       // /agent selection taps (tgac:/tga:…) are appended to the normal action
       // stream, not callbackActions: a same-batch earlier message must not be
       // consumed by a later picker tap. Question callbacks still stay
@@ -372,7 +389,14 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
                 from: name,
                 messageId: m.message_id,
               }
-            : textAction(m.text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null);
+            : textAction(
+                m.text,
+                name,
+                opts,
+                m.message_id,
+                m.reply_to_message?.message_id ?? null,
+                opts.topicsEnabled && m.is_topic_message ? (m.message_thread_id ?? null) : null,
+              );
       }
     } else if (m.voice ?? m.audio) action = voiceAction(u.update_id, m, name, opts);
     else if (m.photo?.length) action = photoAction(u.update_id, m, name, opts);
@@ -417,7 +441,14 @@ function isDaemonSlashCommand(text: string): boolean {
 // Command-vs-prompt split (spec §13). Verbs match on the first whitespace
 // token; unknown slash commands pass through VERBATIM so the harness
 // interprets its own (/compact, /clear, …) — no wrap on those.
-function textAction(text: string, name: string, opts: StepOpts, messageId: number, replyToMessageId: number | null): Action {
+function textAction(
+  text: string,
+  name: string,
+  opts: StepOpts,
+  messageId: number,
+  replyToMessageId: number | null,
+  threadId: number | null = null,
+): Action {
   if (text.startsWith('/')) {
     const verb = text.split(/\s+/, 1)[0];
     const cmd = verb.replace(/@\w+$/, ''); // tolerate /cmd@botname in groups
@@ -430,7 +461,7 @@ function textAction(text: string, name: string, opts: StepOpts, messageId: numbe
     }
     if (cmd === '/tasks') {
       const p = parseTasksCommand(text);
-      return { kind: 'tasks', agent: p.agent, status: p.status, replyToMessageId };
+      return { kind: 'tasks', agent: p.agent, status: p.status, replyToMessageId, threadId };
     }
     if (cmd === '/agent') {
       const p = parseAgentCommand(text);
@@ -519,7 +550,7 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // Using an explicit set (not isDaemonSlashCommand) to avoid over-intercepting.
     const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit']);
     const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
-    if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id)];
+    if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null, threadId)];
     // §11 deferral 1: a prose reply carries the same ↩ «…» quote-anchor as flat-chat replies.
     // A /command reply still goes verbatim (the startsWith('/') guard above already passed it
     // through to the injectText path below).

@@ -4,6 +4,8 @@
 // real spawns, fetch, ffi flock and file I/O, and feeds these modules plain
 // data. Tests construct the same data by hand.
 
+import type { TaskViewFilter, TasksCallbackKind } from './tasks-command';
+
 // --- config (spec §9) ---
 
 export interface ControlConfig {
@@ -132,6 +134,7 @@ export interface TgCallbackQuery {
     message_id: number;
     chat: { id: number };
     date: number;
+    message_thread_id?: number;
   };
   data?: string;
 }
@@ -155,9 +158,22 @@ export type Action =
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
   | { kind: 'status' } // /status — entrypoint composes the reply
   | { kind: 'limit-status'; agent: string | null } // /limit [agent] — latest usage/rate-limit telemetry
-  // /tasks [<agent>] [<status>] — entrypoint resolves the agent→project scope,
-  // spawns task-cli + gh, composes a rich-HTML board table, sends it (#115).
-  | { kind: 'tasks'; agent: string | null; status: string | null; replyToMessageId: number | null }
+  // /tasks [<agent>] [<status>] and task-board callbacks — entrypoint resolves
+  // the agent→project scope, spawns task-cli + gh, composes a rich-HTML board
+  // with filters/pagination, sends it (#115/#178).
+  | {
+      kind: 'tasks';
+      agent: string | null;
+      status: string | null;
+      replyToMessageId: number | null;
+      view?: TaskViewFilter | null;
+      page?: number;
+      callbackKind?: TasksCallbackKind;
+      callbackQueryId?: string;
+      messageId?: number | null;
+      chatId?: number | string | null;
+      threadId?: number | null;
+    }
   // A tap on a limit-stop's "auto-continue" button (lc:<pane>:<resetAt>): the
   // entrypoint arms a timer that injects "continue" into that pane at reset time
   // (immediately if already past), persisted so a restart re-arms it (#113).
