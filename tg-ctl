@@ -14,7 +14,7 @@
 
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
-import { dirname, isAbsolute, join, resolve } from "path"
+import { basename, dirname, isAbsolute, join, resolve } from "path"
 import { detectAgentLabel } from "./features/agent-detect/detect"
 import {
   buildAgentSelectMessage,
@@ -76,10 +76,18 @@ import {
 } from "./features/tg-ctl/limits"
 import { isAllowedReaction, reactionForStage } from "./features/tg-ctl/reactions"
 import {
-  composeTasksTable,
+  DEFAULT_TASK_VIEW,
+  TASK_STATES,
+  TASKS_PAGE_SIZE,
+  composeTasksView,
+  isTaskViewFilter,
   matchPrsToTasks,
   parseTasksCommand,
   rollupCiState,
+  shortProjectName,
+  taskKey,
+  type TasksReplyMarkup,
+  type TaskViewFilter,
   type PrRef,
   type TaskItem,
 } from "./features/tg-ctl/tasks-command"
@@ -533,14 +541,18 @@ async function setMessageReaction(ctx: Ctx, messageId: number, emoji: string): P
 // path /tasks uses for its table (#115). Normalizes + pre-flights the HTML with
 // the same helpers `tg` uses, so an invalid table fails locally with a clear log
 // instead of an opaque API 400. Returns the sent message id or null.
-async function sendRich(ctx: Ctx, rawHtml: string): Promise<number | null> {
+async function sendRich(
+  ctx: Ctx,
+  rawHtml: string,
+  extra: { reply_markup?: TasksReplyMarkup; message_thread_id?: number; reply_parameters?: { message_id: number } } = {},
+): Promise<number | null> {
   const html = normalizeRichHtml(rawHtml)
   const check = validateRichHtml(html)
   if (!check.ok) {
     log(`sendRich invalid html: ${check.error}`)
     return null
   }
-  const json = await botPost(ctx, "sendRichMessage", { chat_id: ctx.chatId, rich_message: { html } })
+  const json = await botPost(ctx, "sendRichMessage", { chat_id: ctx.chatId, rich_message: { html }, ...extra })
   const result = json?.result
   if (!result || typeof result !== "object") return null
   const messageId = (result as { message_id?: unknown }).message_id
@@ -2401,13 +2413,17 @@ async function readStdinText(): Promise<string> {
 // selector, replies target the replied-to agent, otherwise the command uses the
 // same default target the daemon would route an inbound message to. Ambiguous
 // fleets without a reply/last-message signal fail explicitly instead of guessing.
-function resolveTasksScopeDir(ctx: Ctx, action: Pick<Extract<Action, { kind: "tasks" }>, "agent" | "replyToMessageId">): string | null {
+function resolveTasksScopeDir(ctx: Ctx, action: Pick<Extract<Action, { kind: "tasks" }>, "agent" | "replyToMessageId" | "threadId">): string | null {
   const regs = readRegistrations(ctx.paths)
   if (action.agent) {
     const m = matchWindows(action.agent, listAgentCandidates())
     if (!m.confident) return null
     const pane = m.matches[0]
     return pane?.panePath || (pane ? registeredCwdForPane(regs, pane) : null)
+  }
+  if (action.threadId !== null && action.threadId !== undefined) {
+    const topic = findTopic(parseTopics(readFileOrNull(ctx.paths.topics)), action.threadId)
+    return topic?.path ?? null
   }
   const routes = parseRoutes(readFileOrNull(ctx.paths.routes))
   if (action.replyToMessageId !== null) {
@@ -2422,8 +2438,25 @@ function resolveTasksScopeDir(ctx: Ctx, action: Pick<Extract<Action, { kind: "ta
   return null
 }
 
-async function loadTasks(scopeDir: string | null, status: string | null): Promise<TaskItem[]> {
-  const argv = ["task", "list", "--json", "--no-pager", "-n", "50"]
+async function loadTasks(scopeDir: string | null, status: string | null, includeUnfiltered: boolean): Promise<TaskItem[]> {
+  if (status) return loadTaskList(scopeDir, status)
+  // task-cli scoped JSON does not provide a reliable "all lifecycle states" view, so the board fans out by canonical state.
+  // The explicit All view also merges an unfiltered call so custom states stay visible when task-cli reports them.
+  const states: Array<string | null> = includeUnfiltered ? [null, ...TASK_STATES] : [...TASK_STATES]
+  const lists = await Promise.all(states.map((state) => loadTaskList(scopeDir, state)))
+  const out: TaskItem[] = []
+  const seen = new Set<string>()
+  for (const task of lists.flat()) {
+    const key = taskKey(task)
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(task)
+  }
+  return out
+}
+
+async function loadTaskList(scopeDir: string | null, status: string | null): Promise<TaskItem[]> {
+  const argv = ["task", "list", "--json", "--no-pager", "-n", "100"]
   if (status) argv.push("--state", status)
   if (scopeDir) argv.push("-C", scopeDir)
   const r = await spawnGuarded(argv, 15_000)
@@ -2433,10 +2466,29 @@ async function loadTasks(scopeDir: string | null, status: string | null): Promis
   }
   try {
     const parsed = JSON.parse(r.stdout)
-    return Array.isArray(parsed) ? (parsed.filter((t) => t && typeof t.id === "string") as TaskItem[]) : []
+    return flattenTaskListJson(parsed)
   } catch {
     return []
   }
+}
+
+function flattenTaskListJson(parsed: unknown): TaskItem[] {
+  if (!Array.isArray(parsed)) return []
+  const out: TaskItem[] = []
+  for (const item of parsed) {
+    if (!item || typeof item !== "object") continue
+    const rec = item as { id?: unknown; project?: unknown; tickets?: unknown }
+    if (typeof rec.id === "string") {
+      out.push({ ...(item as TaskItem), project: typeof rec.project === "string" ? rec.project : undefined })
+      continue
+    }
+    if (typeof rec.project !== "string" || !Array.isArray(rec.tickets)) continue
+    for (const ticket of rec.tickets) {
+      if (!ticket || typeof ticket !== "object" || typeof (ticket as { id?: unknown }).id !== "string") continue
+      out.push({ ...(ticket as TaskItem), project: rec.project })
+    }
+  }
+  return out
 }
 
 async function loadPrRefs(scopeDir: string | null): Promise<PrRef[]> {
@@ -2451,23 +2503,141 @@ async function loadPrRefs(scopeDir: string | null): Promise<PrRef[]> {
     if (!Array.isArray(parsed)) return []
     return parsed
       .filter((p) => p && typeof p.number === "number")
-      .map((p) => ({ number: p.number, url: p.url ?? "", title: p.title ?? "", body: p.body ?? "", ci: rollupCiState(p.statusCheckRollup) }))
+      .map((p) => {
+        const url = typeof p.url === "string" ? p.url : ""
+        return {
+          number: p.number,
+          url,
+          title: p.title ?? "",
+          body: p.body ?? "",
+          ci: rollupCiState(p.statusCheckRollup),
+          project: projectFromPrUrl(url),
+        }
+      })
   } catch {
     return []
   }
 }
 
+function projectFromPrUrl(rawUrl: string): string | undefined {
+  try {
+    const url = new URL(rawUrl)
+    const parts = url.pathname.split("/").filter(Boolean)
+    const pullIndex = parts.indexOf("pull")
+    if (pullIndex < 2) return undefined
+    return `${parts[pullIndex - 2]}/${parts[pullIndex - 1]}`
+  } catch {
+    return undefined
+  }
+}
+
+interface TaskBoardState {
+  scopeDir: string | null
+  agent: string | null
+  status: string | null
+  threadId: number | null
+}
+
+// Best-effort in-memory callback scope; a daemon restart intentionally expires old /tasks boards.
+const taskBoardStates = new Map<string, TaskBoardState>()
+const MAX_TASK_BOARD_STATES = 50
+
+function taskBoardStateKey(chatId: number | string, messageId: number): string {
+  return `${chatId}:${messageId}`
+}
+
+function rememberTaskBoardState(chatId: number | string, messageId: number | null, state: TaskBoardState): void {
+  if (messageId === null) return
+  const key = taskBoardStateKey(chatId, messageId)
+  taskBoardStates.delete(key)
+  taskBoardStates.set(key, state)
+  while (taskBoardStates.size > MAX_TASK_BOARD_STATES) {
+    const first = taskBoardStates.keys().next().value
+    if (typeof first !== "string") break
+    taskBoardStates.delete(first)
+  }
+}
+
 async function runTasksCommand(ctx: Ctx, action: Extract<Action, { kind: "tasks" }>): Promise<void> {
-  const scopeDir = resolveTasksScopeDir(ctx, action)
-  if (!scopeDir) {
-    const suffix = action.agent ? ` for /tasks ${action.agent}` : " for /tasks"
-    await sendMessage(ctx, `couldn't resolve a project${suffix} — reply to an agent message or use /tasks <agent>`)
+  const prior = priorTaskBoardState(ctx, action)
+  if (action.callbackQueryId && !prior) {
+    await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
     return
   }
-  const [tasks, prs] = await Promise.all([loadTasks(scopeDir, action.status), loadPrRefs(scopeDir)])
-  const html = composeTasksTable(tasks, matchPrsToTasks(tasks, prs), { agent: action.agent, status: action.status })
-  const sent = await sendRich(ctx, html)
-  if (sent === null) await sendMessage(ctx, "couldn't render the task board — see the daemon log")
+  if (action.callbackQueryId) await answerCallbackQuery(ctx, action.callbackQueryId, "updating")
+  const scopeDir = prior ? prior.scopeDir : resolveTasksScopeDir(ctx, action)
+  const agent = prior ? prior.agent : action.agent
+  const status = taskBoardStatusForAction(action, prior)
+  const threadId = prior ? prior.threadId : action.threadId ?? null
+  const messageContext: { message_thread_id?: number; reply_parameters?: { message_id: number } } = {}
+  if (threadId !== null) messageContext.message_thread_id = threadId
+  if (!action.callbackQueryId && action.replyToMessageId !== null) messageContext.reply_parameters = { message_id: action.replyToMessageId }
+  if (!scopeDir && !action.callbackQueryId) {
+    const suffix = agent ? ` for /tasks ${agent}` : " for /tasks"
+    await sendMessage(ctx, `couldn't resolve a project${suffix} — reply to an agent message or use /tasks <agent>`, messageContext)
+    return
+  }
+  const viewOptions = tasksViewOptions(action, status)
+  const [tasks, prs] = await Promise.all([loadTasks(scopeDir, status, viewOptions.view === "all" && status === null), scopeDir ? loadPrRefs(scopeDir) : Promise.resolve([])])
+  const prsByTask = matchPrsToTasks(tasks, prs)
+  const view = composeTasksView(annotateTasksWithAgents(tasks, agent), prsByTask, { agent, status }, viewOptions)
+  const sent = await sendRich(ctx, view.html, { ...messageContext, reply_markup: view.reply_markup })
+  rememberTaskBoardState(ctx.chatId, sent, { scopeDir, agent, status, threadId })
+  if (sent === null) await sendMessage(ctx, "couldn't render the task board — see the daemon log", messageContext)
+}
+
+function priorTaskBoardState(ctx: Ctx, action: Extract<Action, { kind: "tasks" }>): TaskBoardState | undefined {
+  if (!action.callbackQueryId || action.messageId == null) return undefined
+  if (action.chatId == null || String(action.chatId) !== String(ctx.chatId)) return undefined
+  return taskBoardStates.get(taskBoardStateKey(action.chatId, action.messageId))
+}
+
+function taskBoardStatusForAction(action: Extract<Action, { kind: "tasks" }>, prior: TaskBoardState | undefined): string | null {
+  if (!prior) return action.status
+  // Filter taps switch back to the full lifecycle view, dropping any prior /tasks <status> scope.
+  return action.callbackKind === "filter" ? null : prior.status
+}
+
+function tasksViewOptions(action: Extract<Action, { kind: "tasks" }>, status: string | null): { view: TaskViewFilter; page: number; pageSize: number; label?: string } {
+  const view = isTaskViewFilter(action.view) ? action.view : status ? "all" : DEFAULT_TASK_VIEW
+  return { view, page: action.page ?? 0, pageSize: TASKS_PAGE_SIZE, label: status ? taskStatusViewLabel(status) : undefined }
+}
+
+function taskStatusViewLabel(status: string): string {
+  switch (status) {
+    case "done":
+      return "Done"
+    case "in-progress":
+    case "in-review":
+      return "Active"
+    case "todo":
+      return "Ready"
+    case "cancelled":
+      return "Cancelled"
+    default:
+      return status
+        .split(/[-_\s]+/)
+        .filter(Boolean)
+        .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+        .join(" ")
+  }
+}
+
+function annotateTasksWithAgents(tasks: TaskItem[], fallbackAgent: string | null): TaskItem[] {
+  const candidates = listAgentCandidates()
+  return tasks.map((task) => {
+    const agent = task.agent || fallbackAgent || agentForTaskProject(task, candidates)
+    return agent ? { ...task, agent } : task
+  })
+}
+
+function agentForTaskProject(task: TaskItem, candidates: AgentCandidate[]): string | null {
+  const short = task.project ? shortProjectName(task.project) : null
+  if (!short) return null
+  const matches = candidates.filter((candidate): candidate is AgentCandidate & { panePath: string } => Boolean(candidate.panePath) && basename(candidate.panePath) === short)
+  if (matches.length !== 1) return null
+  const match = matches[0]
+  return isBareWindowName(match.windowName) ? basename(match.panePath) : match.windowName
 }
 
 // --- harness-event subcommand (#113): notify on a StopFailure hook ---

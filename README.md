@@ -217,7 +217,19 @@ plain text to send the answer into the agent pane post-factum.
 | `/kill` | SIGINT the agent — session ends |
 | `/status` | Report daemon state |
 | `/limit [<agent>]` | Show the latest saved 5-hour/weekly/context usage telemetry for all agents or one agent |
+| `/tasks [<agent>] [<status>]` | Show the task board; defaults to work that needs attention, with filters and pages |
 | `/agent [<window>] <msg>` | Route a message to a specific agent (fuzzy window match, else selection buttons) |
+
+`/tasks` renders a rich task table for the resolved project. The default view is
+the attention view: blocked/stuck/problem tasks plus ready tasks, not every task.
+Each title cell starts with a compact status group emoji (green ready/done,
+yellow active, red problem/blocked/stuck, gray canceled), rows group by agent and
+project when that context is available (for example `ext` or `rig • tg-cli`),
+and the bottom inline keyboard provides quick filters
+(`Needs`, `Active`, `Ready`, `Done`, `All`) plus pagination when there is more
+than one page. Status-specific commands such as `/tasks done` still work; tapping
+a quick filter switches back to the full lifecycle view. Old task-board buttons
+expire after a daemon restart.
 
 Photos and documents sent from Telegram are downloaded to `~/.cache/tg-cli/inbound/` and the local path is injected for the agent to read.
 
