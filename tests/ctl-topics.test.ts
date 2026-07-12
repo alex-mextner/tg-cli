@@ -719,7 +719,7 @@ test('§11 d2: /status in a bound topic → daemon-intercepted (kind: status)', 
     [upd(22, { text: '/status', message_thread_id: 50, is_topic_message: true })],
     makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
   );
-  expect(r.actions[0]).toMatchObject({ kind: 'status' });
+  expect(r.actions[0]).toMatchObject({ kind: 'status', threadId: 50 });
 });
 
 test('§11 d2: /agent @bot in a bound topic → daemon-intercepted (kind: agent-route, NOT topic-route)', () => {
@@ -729,6 +729,7 @@ test('§11 d2: /agent @bot in a bound topic → daemon-intercepted (kind: agent-
   );
   expect(r.actions[0]?.kind).not.toBe('topic-route');
   expect(r.actions[0]?.kind).toBe('agent-route');
+  expect(r.actions[0]).toMatchObject({ threadId: 50 });
 });
 
 test('§11 d2: /new model dir Name in a bound topic → daemon-intercepted (NOT topic-route)', () => {
@@ -738,6 +739,15 @@ test('§11 d2: /new model dir Name in a bound topic → daemon-intercepted (NOT 
   );
   expect(r.actions[0]?.kind).not.toBe('topic-route');
   expect(r.actions[0]?.kind).toBe('new-command');
+  expect(r.actions[0]).toMatchObject({ threadId: 50 });
+});
+
+test('§11 d2: /limit in a bound topic → daemon-intercepted with source thread id', () => {
+  const r = stepUpdates(
+    [upd(27, { text: '/limit codex', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]).toMatchObject({ kind: 'limit-status', agent: 'codex', threadId: 50 });
 });
 
 // Deferral 1: prose reply in a bound topic gets the ↩ tg#<id> «…» quote-anchor.

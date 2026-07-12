@@ -14,8 +14,8 @@ import { parseTopics } from '../features/tg-ctl/topics';
 //   1. createForumTopic SUCCEEDS → daemon spawns via spawnTopicWindow (TG_TOPIC in argv),
 //      writes a `bound` binding in the topics store, and the forum_topic_created echo is
 //      silently swallowed (no re-flow started).
-//   2. createForumTopic FAILS (Threaded Mode off, API error) → graceful fallback to plain
-//      spawnNewWindow (no TG_TOPIC, no binding written, same success message).
+//   2. private topics are disabled for the bot (`getMe.has_topics_enabled=false`) → graceful
+//      fallback to plain spawnNewWindow, plus a visible Telegram warning.
 
 const TG_CTL = join(import.meta.dir, '..', 'tg-ctl');
 const SPAWNED_PANE = '%8';
@@ -135,6 +135,21 @@ function textMsg(id: number, text: string): unknown {
   };
 }
 
+function topicTextMsg(id: number, threadId: number, text: string): unknown {
+  return {
+    update_id: id,
+    message: {
+      message_id: id,
+      from: { id: 1, first_name: 'Alex' },
+      chat: { id: 1 },
+      date: nowSec(),
+      message_thread_id: threadId,
+      is_topic_message: true,
+      text,
+    },
+  };
+}
+
 function modelTap(id: number, token: string, modelId: string): unknown {
   return {
     update_id: id,
@@ -178,9 +193,10 @@ test(
   async () => {
     const { cfgDir, spawnLog } = makeCfgDir(true);
     const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
+    writeFileSync(topicsFile, JSON.stringify([{ threadId: 77, name: 'source', status: 'bound', paneId: '%1', ts: nowSec() }]));
 
     // The server returns threadId=42 for createForumTopic; normal endpoints for spawn flow.
-    const queue: unknown[][] = [[textMsg(10, `/new claude-default ${cfgDir} myproj`)]];
+    const queue: unknown[][] = [[topicTextMsg(10, 77, `/new claude-default ${cfgDir} myproj`)]];
     const creates: Array<Record<string, unknown>> = [];
     const sends: Array<Record<string, unknown>> = [];
     const server = Bun.serve({
@@ -192,6 +208,9 @@ test(
           if (batch) return Response.json({ ok: true, result: batch });
           await Bun.sleep(60);
           return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/getMe')) {
+          return Response.json({ ok: true, result: { id: 123, is_bot: true, username: 'bot', has_topics_enabled: true } });
         }
         if (url.pathname.endsWith('/createForumTopic')) {
           const body = (await req.json()) as Record<string, unknown>;
@@ -256,6 +275,9 @@ test(
     // Confirmation message sent.
     await waitFor(() => sent(sends, 'spawned `claude-default`'));
     expect(sent(sends, 'spawned `claude-default`')).toBe(true);
+    const confirmations = sends.filter((s) => String(s.text ?? '').includes('spawned `claude-default`'));
+    expect(confirmations.length).toBeGreaterThan(0);
+    expect(confirmations.every((s) => s.message_thread_id === 77)).toBe(true);
 
     daemon.kill();
   },
@@ -276,6 +298,9 @@ test(
           if (batch) return Response.json({ ok: true, result: batch });
           await Bun.sleep(60);
           return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/getMe')) {
+          return Response.json({ ok: true, result: { id: 123, is_bot: true, username: 'bot', has_topics_enabled: true } });
         }
         if (url.pathname.endsWith('/createForumTopic')) {
           const body = (await req.json()) as Record<string, unknown>;
@@ -338,6 +363,9 @@ test(
           if (batch) return Response.json({ ok: true, result: batch });
           await Bun.sleep(60);
           return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/getMe')) {
+          return Response.json({ ok: true, result: { id: 123, is_bot: true, username: 'bot', has_topics_enabled: true } });
         }
         if (url.pathname.endsWith('/createForumTopic')) {
           return Response.json({ ok: true, result: { message_thread_id: 44, name: 'crashpt' } });
@@ -402,17 +430,18 @@ test(
   },
 );
 
-// --- Scenario 2: createForumTopic FAILS (graceful fallback) ---
+// --- Scenario 2: private topics disabled (graceful fallback + visible warning) ---
 
 test(
-  'private_topics: createForumTopic fails → falls back to flat spawn, NO topic binding written',
+  'private_topics: getMe.has_topics_enabled=false → warns, falls back to flat spawn, NO topic binding written',
   async () => {
     const { cfgDir, spawnLog } = makeCfgDir(true);
     const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
 
-    // The server returns an API error for createForumTopic (Threaded Mode off).
+    // The bot reports private-topic mode disabled, exactly like the live bot did.
     const queue: unknown[][] = [[textMsg(20, `/new claude-default ${cfgDir} flatproj`)]];
     const sends: Array<Record<string, unknown>> = [];
+    let createTopicCalls = 0;
     const server = Bun.serve({
       port: 0,
       async fetch(req) {
@@ -423,12 +452,12 @@ test(
           await Bun.sleep(60);
           return Response.json({ ok: true, result: [] });
         }
+        if (url.pathname.endsWith('/getMe')) {
+          return Response.json({ ok: true, result: { id: 123, is_bot: true, username: 'bot', has_topics_enabled: false, allows_users_to_create_topics: false } });
+        }
         if (url.pathname.endsWith('/createForumTopic')) {
-          // Simulate Threaded Mode not enabled → API error
-          return Response.json(
-            { ok: false, description: 'FORUM_NOT_ENABLED' },
-            { status: 400 },
-          );
+          createTopicCalls += 1;
+          return Response.json({ ok: false, description: 'unexpected createForumTopic' }, { status: 500 });
         }
         if (url.pathname.endsWith('/sendMessage')) {
           sends.push((await req.json()) as Record<string, unknown>);
@@ -473,11 +502,155 @@ test(
       const bindings = parseTopics(readFileSync(topicsFile, 'utf8'));
       expect(bindings.length).toBe(0);
     }
+    expect(createTopicCalls).toBe(0);
     // (topics file may not exist at all if nothing was written — both outcomes are correct)
 
+    // The user sees the reason; the fallback is no longer hidden in daemon logs.
+    await waitFor(() => sent(sends, 'getMe.has_topics_enabled=false'));
+    expect(sent(sends, 'getMe.has_topics_enabled=false')).toBe(true);
+    expect(sent(sends, 'This chat does not need to be converted to a forum')).toBe(true);
     // Confirmation message still sent (graceful — user gets their agent regardless).
     await waitFor(() => sent(sends, 'spawned `claude-default`'));
     expect(sent(sends, 'spawned `claude-default`')).toBe(true);
+
+    daemon.kill();
+  },
+);
+
+test(
+  'private_topics: createForumTopic failure warning does not invent has_topics_enabled=false',
+  async () => {
+    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
+    const queue: unknown[][] = [[textMsg(21, `/new claude-default ${cfgDir} apierr`)]];
+    const sends: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/getMe')) {
+          return Response.json({ ok: true, result: { id: 123, is_bot: true, username: 'bot', has_topics_enabled: true } });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          return Response.json(
+            { ok: false, error_code: 400, description: 'Bad Request: topic quota exceeded' },
+            { status: 400 },
+          );
+        }
+        if (url.pathname.endsWith('/sendMessage')) {
+          sends.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_id: 900 + sends.length } });
+        }
+        if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const daemon: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd,
+    });
+    closeSync(logFd);
+
+    await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+    await waitFor(() => sent(sends, 'topic quota exceeded'));
+    expect(sent(sends, 'Telegram Bot API rejected `createForumTopic`: Bad Request: topic quota exceeded')).toBe(true);
+    expect(sent(sends, '{"ok":false')).toBe(false);
+    expect(sent(sends, 'getMe.has_topics_enabled=false')).toBe(false);
+    expect(sent(sends, 'This chat does not need to be converted to a forum')).toBe(true);
+    await waitFor(() => sent(sends, 'spawned `claude-default`'));
+    expect(sent(sends, 'spawned `claude-default`')).toBe(true);
+    if (existsSync(topicsFile)) {
+      expect(parseTopics(readFileSync(topicsFile, 'utf8'))).toHaveLength(0);
+    }
+
+    daemon.kill();
+  },
+);
+
+test(
+  'private_topics: getMe failure still tries createForumTopic and reports that API error',
+  async () => {
+    const { cfgDir, spawnLog } = makeCfgDir(true);
+    const topicsFile = join(cfgDir, 'tg-ctl.123.topics.json');
+    const queue: unknown[][] = [[textMsg(22, `/new claude-default ${cfgDir} getme-fails`)]];
+    const sends: Array<Record<string, unknown>> = [];
+    let createTopicCalls = 0;
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname.endsWith('/getUpdates')) {
+          const batch = queue.shift();
+          if (batch) return Response.json({ ok: true, result: batch });
+          await Bun.sleep(60);
+          return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/getMe')) {
+          return Response.json({ ok: false, error_code: 500, description: 'Internal Server Error' }, { status: 500 });
+        }
+        if (url.pathname.endsWith('/createForumTopic')) {
+          createTopicCalls += 1;
+          return Response.json(
+            { ok: false, error_code: 400, description: 'Bad Request: private topics not available' },
+            { status: 400 },
+          );
+        }
+        if (url.pathname.endsWith('/sendMessage')) {
+          sends.push((await req.json()) as Record<string, unknown>);
+          return Response.json({ ok: true, result: { message_id: 950 + sends.length } });
+        }
+        if (url.pathname.endsWith('/answerCallbackQuery')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/editMessageReplyMarkup')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMessageReaction')) return Response.json({ ok: true, result: true });
+        if (url.pathname.endsWith('/setMyCommands')) return Response.json({ ok: true, result: true });
+        return Response.json({ ok: false, description: `unexpected: ${url.pathname}` }, { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const logFd = openSync(join(cfgDir, 'daemon.log'), 'a');
+    const daemon: Subprocess = await spawnDaemon(reg, {
+      tgCtlPath: TG_CTL,
+      cfgDir,
+      env: {
+        PATH: `${join(cfgDir, 'bin')}:/usr/bin:/bin`,
+        HOME: cfgDir,
+        TG_CTL_CONFIG_DIR: cfgDir,
+        TG_API_BASE: `http://127.0.0.1:${server.port}`,
+      },
+      logFd,
+    });
+    closeSync(logFd);
+
+    await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+    await waitFor(() => sent(sends, 'private topics not available'));
+    expect(createTopicCalls).toBe(1);
+    expect(sent(sends, 'Telegram Bot API rejected `createForumTopic`: Bad Request: private topics not available')).toBe(true);
+    expect(sent(sends, 'getMe.has_topics_enabled=false')).toBe(false);
+    await waitFor(() => sent(sends, 'spawned `claude-default`'));
+    expect(sent(sends, 'spawned `claude-default`')).toBe(true);
+    if (existsSync(topicsFile)) {
+      expect(parseTopics(readFileSync(topicsFile, 'utf8'))).toHaveLength(0);
+    }
 
     daemon.kill();
   },
@@ -504,6 +677,9 @@ test(
           if (batch) return Response.json({ ok: true, result: batch });
           await Bun.sleep(60);
           return Response.json({ ok: true, result: [] });
+        }
+        if (url.pathname.endsWith('/getMe')) {
+          return Response.json({ ok: true, result: { id: 123, is_bot: true, username: 'bot', has_topics_enabled: true } });
         }
         if (url.pathname.endsWith('/createForumTopic')) {
           const body = (await req.json()) as Record<string, unknown>;

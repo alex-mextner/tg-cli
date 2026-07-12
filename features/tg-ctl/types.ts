@@ -21,11 +21,12 @@ export interface ControlConfig {
   // handling (1:1 behaviour byte-identical). Opt in per machine with `control.topics: true`
   // once the chat is a forum supergroup with the bot as a topic-managing admin.
   topics: boolean;
-  // Private-chat forum topics (Bot API 9.4). Default OFF: when true the daemon calls
+  // Private-chat topics (Bot API 9.4). Default OFF: when true the daemon calls
   // `createForumTopic` after each flat /new spawn and binds the returned thread to the new
-  // agent (same TopicBinding store as supergroup topics). Requires BotFather "Threaded Mode"
-  // to be enabled for the bot — if `createForumTopic` fails the daemon falls back silently
-  // to the current flat-chat behaviour. Opt in with `control.private_topics: true`.
+  // agent (same TopicBinding store as supergroup topics). Requires the Bot API private-topic
+  // capability for the bot (`getMe.has_topics_enabled`); if `createForumTopic` fails the daemon
+  // falls back to the current flat-chat behaviour with a visible diagnostic. Opt in with
+  // `control.private_topics: true`.
   privateTopics: boolean;
   // Git-state-check banner (git-state.ts): default ON. Before auto-binding a fresh, non-reply
   // message into the discovered pane, the entrypoint checks that pane's cwd for uncommitted
@@ -54,8 +55,8 @@ export const DEFAULT_CONTROL: ControlConfig = {
   // OFF by default — topic mode activates only when the operator opts in (the routing half
   // ships before the spawn executor, so an accidental opt-in must not break the flat path).
   topics: false,
-  // OFF by default — private-chat topics auto-degrade when BotFather Threaded Mode is not
-  // enabled (createForumTopic fails → fall through to flat behaviour).
+  // OFF by default — private-chat topics auto-degrade when Bot API reports no private-topic
+  // capability (createForumTopic fails → fall through to flat behaviour).
   privateTopics: false,
   // ON by default — the banner is a heads-up nudge, not a hard gate; opt out per machine with
   // `control.git_state_banner: false`.
@@ -156,8 +157,8 @@ export type Action =
   | { kind: 'inject-text'; text: string; messageId: number } // already wrapped (or verbatim /cmd passthrough)
   | { kind: 'inject-key'; key: 'Escape' } // /stop
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
-  | { kind: 'status' } // /status — entrypoint composes the reply
-  | { kind: 'limit-status'; agent: string | null } // /limit [agent] — latest usage/rate-limit telemetry
+  | { kind: 'status'; threadId?: number | null } // /status — entrypoint composes the reply
+  | { kind: 'limit-status'; agent: string | null; threadId?: number | null } // /limit [agent] — latest usage/rate-limit telemetry
   // /tasks [<agent>] [<status>] and task-board callbacks — entrypoint resolves
   // the agent→project scope, spawns task-cli + gh, composes a rich-HTML board
   // with filters/pagination, sends it (#115/#178).
@@ -180,7 +181,7 @@ export type Action =
   | { kind: 'limit-continue'; callbackQueryId: string; paneId: string; resetAt: number; sourceMessageId: number | null; messageId: number | null }
   // /agent [<win>] <msg> — entrypoint discovers panes, fuzzy-matches the window
   // (phonetic), routes <msg> to that agent or asks via session-grouped buttons.
-  | { kind: 'agent-route'; selector: string | null; rest: string; all: string; from: string; messageId: number }
+  | { kind: 'agent-route'; selector: string | null; rest: string; all: string; from: string; messageId: number; threadId?: number | null }
   // A tap on a /agent selection button (tga:<token>:<index>): the entrypoint
   // looks up the pending message + candidate and injects it into the chosen pane.
   | {
@@ -312,6 +313,7 @@ export type Action =
       name: string;
       task: string;
       from: string;
+      threadId?: number | null;
     }
   // A tap on a flat-/new harness button (tnh:<token>:<harness>) → ask models for that harness.
   // callbackQueryId answers the tap; messageId is the prompt (its keyboard is cleared on advance).

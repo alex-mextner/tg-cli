@@ -374,6 +374,9 @@ export interface NewSession {
   // The recent-dir choices OFFERED as awaiting-dir buttons, so a `tnp:<token>:<index>` tap
   // recovers the dir by index. Only meaningful while awaiting-dir.
   dirChoices?: string[];
+  // Forum/private-topic id of the slash command that opened this flat /new flow. Null/absent keeps
+  // the normal flat-chat behavior; a number makes daemon prompts and confirmations stay in topic.
+  threadId?: number | null;
   // The Telegram message_id of the current prompt (its keyboard is cleared when the step advances
   // so a stale button can't be re-tapped). Null until the send returns.
   promptMessageId?: number | null;

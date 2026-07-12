@@ -3,6 +3,19 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.34.6
+
+**Fix: tg-ctl keeps daemon replies in their Telegram topic and reports private-topic setup accurately.**
+
+- Daemon-owned commands such as `/status`, `/limit`, `/agent`, and flat `/new`
+  prompts now preserve the source topic thread instead of replying in General.
+- Private-chat topic setup now follows the Bot API private-topic capability path:
+  it checks `getMe.has_topics_enabled`, uses `createForumTopic`, and reports
+  explicit fallback diagnostics without telling users to convert the chat to a
+  forum.
+- Telegram API 4xx error bodies are parsed for their `description`, so setup
+  warnings show the actionable Bot API error instead of raw JSON.
+
 ## 1.34.5
 
 **Fix: Telegram `/tasks` now opens on the work that needs attention.**
