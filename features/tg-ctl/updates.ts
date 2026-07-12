@@ -452,12 +452,13 @@ function textAction(
   if (text.startsWith('/')) {
     const verb = text.split(/\s+/, 1)[0];
     const cmd = verb.replace(/@\w+$/, ''); // tolerate /cmd@botname in groups
+    const topic = typeof threadId === 'number' ? { threadId } : {};
     if (cmd === '/stop') return { kind: 'inject-key', key: 'Escape' };
     if (cmd === '/kill') return { kind: 'kill-agent' };
-    if (cmd === '/status') return { kind: 'status' };
+    if (cmd === '/status') return { kind: 'status', ...topic };
     if (cmd === '/limit') {
       const rest = text.slice(verb.length).trim();
-      return { kind: 'limit-status', agent: rest || null };
+      return { kind: 'limit-status', agent: rest || null, ...topic };
     }
     if (cmd === '/tasks') {
       const p = parseTasksCommand(text);
@@ -465,11 +466,11 @@ function textAction(
     }
     if (cmd === '/agent') {
       const p = parseAgentCommand(text);
-      return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name, messageId };
+      return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name, messageId, ...topic };
     }
     if (cmd === '/new') {
       const p = parseNewCommand(text);
-      return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, from: name };
+      return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, from: name, ...topic };
     }
     return { kind: 'inject-text', text, messageId };
   }

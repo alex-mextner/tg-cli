@@ -278,6 +278,41 @@ test('topics ON: a message in a BOUND topic injects into THAT topic pane (%2), n
   await daemon.exited;
 }, 30_000);
 
+test('topics ON: daemon slash commands in a BOUND topic reply inside that topic, not General', async () => {
+  const cfgDir = makeCfgDir({
+    topics: true,
+    seedTopics: (dir) => [{ threadId: 50, name: 'api', status: 'bound', paneId: TOPIC_PANE, path: dir, ts: 1 }],
+  });
+  const updateQueue: unknown[][] = [];
+  const { server, sends, reactions } = makeServer(updateQueue);
+  servers.push(server);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([topicMsg(16, 50, '/status', nowSec)]);
+
+  await waitFor(() => sends.some((s) => String(s.text ?? '').includes('tg-ctl: running')));
+  expect(injected(cfgDir)).toEqual([]);
+  const statusReplies = sends.filter((s) => String(s.text ?? '').includes('tg-ctl: running'));
+  expect(statusReplies.length).toBeGreaterThan(0);
+  expect(statusReplies.every((s) => s.message_thread_id === 50)).toBe(true);
+  await waitFor(() => reactions.length >= 1);
+  expect(reactions.at(-1)).toMatchObject({ message_id: 16 });
+
+  updateQueue.push([topicMsg(17, 50, '/limit codex', nowSec)]);
+
+  await waitFor(() => sends.some((s) => String(s.text ?? '').includes('No recent limit telemetry for codex')));
+  expect(injected(cfgDir)).toEqual([]);
+  const limitReplies = sends.filter((s) => String(s.text ?? '').includes('No recent limit telemetry for codex'));
+  expect(limitReplies.length).toBeGreaterThan(0);
+  expect(limitReplies.every((s) => s.message_thread_id === 50)).toBe(true);
+  await waitFor(() => reactions.length >= 2);
+  expect(reactions.at(-1)).toMatchObject({ message_id: 17 });
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
 test('topics ON: a REUSED pane (binding path != live pane path) does NOT leak — message refused, binding NOT closed', async () => {
   // The bound pane %2 still hosts an agent in the fake tmux, but its path is cfgDir while the
   // binding recorded a DIFFERENT project path. tmux reuses pane ids after kill-pane, so this
@@ -330,8 +365,9 @@ test('topics ON: a BOUND topic whose pane is DEAD does NOT leak to the flat agen
   // The replies are threaded into the topic (message_thread_id = T), not General. The restart flow
   // (no path/model seed) posts the path prompt AND an "exited — set it up again" notice into T.
   await waitFor(() => sends.some((s) => s.message_thread_id === 50 && String(s.text).includes('exited')));
-  expect(sends.every((s) => s.message_thread_id === 50)).toBe(true);
-  expect(sends.some((s) => String(s.text).includes('exited'))).toBe(true);
+  const exitedReplies = sends.filter((s) => String(s.text).includes('exited'));
+  expect(exitedReplies.length).toBeGreaterThan(0);
+  expect(exitedReplies.every((s) => s.message_thread_id === 50)).toBe(true);
   // The dead binding flips to closed, then increment 4 recovers: this seed has NO path/model, so
   // the entrypoint restarts the /new flow (back to awaiting-path) rather than a one-tap re-spawn —
   // the human is never left at a dead-end. (A seed WITH path+model would offer a Re-spawn button;

@@ -468,6 +468,32 @@ function api(ctx: Ctx): string {
 // Daemon-side Bot API call. Never throws and never exits — a failed notice
 // must not take the poll loop down with it.
 async function botPost(ctx: Ctx, method: string, body: unknown): Promise<Record<string, unknown> | null> {
+  const result = await botPostResult(ctx, method, body)
+  // Preserve the legacy wrapper contract: transport-level HTTP errors return null,
+  // but Telegram's historical HTTP-200 {ok:false} envelopes remain visible to callers.
+  if (!result.ok && typeof result.status === "number") return null
+  return result.json ?? null
+}
+
+type BotPostResult =
+  | { ok: true; json: Record<string, unknown> }
+  | { ok: false; status?: number; description: string; json?: Record<string, unknown> }
+
+function telegramErrorDescription(text: string): { description: string; json?: Record<string, unknown> } {
+  try {
+    const parsed = JSON.parse(text) as unknown
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const json = parsed as Record<string, unknown>
+      if (typeof json.description === "string") return { description: json.description, json }
+      return { description: JSON.stringify(json).slice(0, 200), json }
+    }
+  } catch {
+    // Fall through to the raw body; non-JSON upstream failures are still useful diagnostics.
+  }
+  return { description: text.slice(0, 200) }
+}
+
+async function botPostResult(ctx: Ctx, method: string, body: unknown): Promise<BotPostResult> {
   try {
     const resp = await fetch(`${api(ctx)}/${method}`, {
       method: "POST",
@@ -476,14 +502,22 @@ async function botPost(ctx: Ctx, method: string, body: unknown): Promise<Record<
       signal: AbortSignal.timeout(15_000),
     })
     if (!resp.ok) {
-      log(`${method} failed: ${resp.status} ${(await resp.text()).slice(0, 200)}`)
-      return null
+      const text = await resp.text()
+      const error = telegramErrorDescription(text)
+      log(`${method} failed: ${resp.status} ${text.slice(0, 200)}`)
+      return { ok: false, status: resp.status, ...error }
     }
     const json = (await resp.json()) as Record<string, unknown>
-    return json && typeof json === "object" ? json : null
+    if (!json || typeof json !== "object") return { ok: false, description: "non-object JSON response" }
+    if (json.ok === false) {
+      const description =
+        typeof json.description === "string" ? json.description : JSON.stringify(json).slice(0, 200)
+      return { ok: false, description, json }
+    }
+    return { ok: true, json }
   } catch (err) {
     log(`${method} failed: ${err}`)
-    return null
+    return { ok: false, description: String(err) }
   }
 }
 
@@ -3553,6 +3587,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // message; control pickers (/stop, /kill) only hand back the selector.
       selectOnly?: boolean
       armNextMessage?: boolean
+      threadId?: number | null
     }
   >()
   let agentTokenSeq = 0
@@ -3562,6 +3597,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     paneId: string
     label: string
     messageId: number | null
+    threadId: number | null
     timer: ReturnType<typeof setTimeout>
   }
   let selectedAgentRoute: SelectedAgentRoute | null = null
@@ -3897,6 +3933,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return banner ? `${banner}\n${text}` : text
   }
 
+  const replyContext = (threadId?: number | null): Record<string, unknown> =>
+    typeof threadId === "number" ? { message_thread_id: threadId } : {}
+
   // Resolve a DiscoverResult's ambiguous `TargetPane[]` to the picker's
   // `AgentCandidate[]` (window names + cwd → distinct labels). The TargetPane
   // shape carries no window name, so re-derive over a fresh listAgentCandidates()
@@ -4025,7 +4064,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return i >= 0 ? distinctLabels(fleet)[i] : `${target.windowName} · ${target.agent}`
   }
 
-  const armSelectedAgentRoute = (target: AgentCandidate, label: string, messageId: number | null): string => {
+  const armSelectedAgentRoute = (target: AgentCandidate, label: string, messageId: number | null, threadId: number | null): string => {
     const previous = cancelSelectedAgentRoute()
     if (previous && previous.messageId !== null && previous.messageId !== messageId) {
       void editMessageText(ctx, previous.messageId, `cancelled ${previous.label} — replaced by another selection`)
@@ -4036,7 +4075,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       selectedAgentRoute = null
       if (messageId !== null) void editMessageText(ctx, messageId, `selected ${label} — expired`)
     }, SELECTED_AGENT_TTL_MS)
-    selectedAgentRoute = { token, paneId: target.paneId, label, messageId, timer }
+    selectedAgentRoute = { token, paneId: target.paneId, label, messageId, threadId, timer }
     return token
   }
 
@@ -4049,15 +4088,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     subset: AgentCandidate[],
     message: string,
     sourceMessageId: number | null,
-    options: { armNextMessage?: boolean } = {},
+    options: { armNextMessage?: boolean; messageExtra?: Record<string, unknown>; threadId?: number | null } = {},
   ): Promise<boolean> => {
     const token = `a${++agentTokenSeq}`
     const payload = buildAgentSelectMessage(ctx.chatId, subset, token, message)
-    const messageId = await sendMessage(ctx, payload.text, { reply_markup: payload.reply_markup })
+    const messageExtra = options.messageExtra ?? {}
+    const messageId = await sendMessage(ctx, payload.text, { ...messageExtra, reply_markup: payload.reply_markup })
     // Picker send failed (Telegram rejected / >4096-char list / network): do NOT
     // store a pending route it can never resolve, and do NOT earn a 👀 receipt.
     if (messageId === null) {
-      await sendMessage(ctx, "couldn't post the agent picker — try a narrower /agent <window>")
+      await sendMessage(ctx, "couldn't post the agent picker — try a narrower /agent <window>", messageExtra)
       return false
     }
     const timer = setTimeout(() => pendingAgent.delete(token), 10 * 60_000)
@@ -4070,6 +4110,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       timer,
       selectOnly: message.trim() === "",
       armNextMessage: message.trim() === "" && options.armNextMessage === true,
+      threadId: options.threadId ?? null,
     })
     if (message.trim() !== "") queueAckReaction(sourceMessageId, DEFER_REACTION)
     return true
@@ -4188,7 +4229,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const liveFleet = listAgentCandidates()
     const liveTarget = liveFleet.find((c) => c.paneId === selected.paneId)
     if (!liveTarget) {
-      await sendMessage(ctx, `selected ${selected.label} is no longer running — routing this message normally`)
+      await sendMessage(ctx, `selected ${selected.label} is no longer running — routing this message normally`, replyContext(selected.threadId))
       if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, `selected ${selected.label} — agent is no longer running`)
       return null
     }
@@ -4202,7 +4243,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const text = withGitStateBanner(liveTarget.panePath, prewrappedText)
     const res = await executeInjectSteps(buildTextInjectPlan(liveTarget.paneId, text))
     if (!res.ok) {
-      await sendMessage(ctx, res.error)
+      await sendMessage(ctx, res.error, replyContext(selected.threadId))
       if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, `inject failed: ${res.error}`)
       return false
     }
@@ -4215,19 +4256,20 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // direct inject; ambiguous → the same session-grouped picker carrying the pending
   // message; named selector with NO match → error reply, never silent fallback.
   const handleAgentRoute = async (action: Extract<Action, { kind: "agent-route" }>): Promise<boolean> => {
+    const out = replyContext(action.threadId)
     cancelSelectedAgentRouteForAgentCommand()
     const candidates = listAgentCandidates()
     const msgPreview = action.all.slice(0, 60).replace(/\n/g, " ")
     if (candidates.length === 0) {
       log(`agent-route: no candidates — selector=${action.selector || "(none)"} msg="${msgPreview}"`)
-      await sendMessage(ctx, NO_AGENT_REPLY)
+      await sendMessage(ctx, NO_AGENT_REPLY, out)
       return false
     }
     if (!action.all.trim()) {
       // Bare `/agent`: show the tappable picker so the CTO can SELECT an agent
       // (the buttons he asked for — "где кнопки?"), with distinct labels.
       log(`agent-route: bare /agent → picker over ${candidates.length} candidates`)
-      return postAgentPicker(candidates, "", null, { armNextMessage: true })
+      return postAgentPicker(candidates, "", null, { armNextMessage: true, messageExtra: out, threadId: action.threadId ?? null })
     }
 
     if (action.selector) {
@@ -4235,7 +4277,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (m.matches.length > 0) {
         if (!action.rest.trim()) {
           const names = m.matches.map((c) => c.windowName).join(", ")
-          await sendMessage(ctx, `matched ${names} — add a message: /agent ${action.selector} <message>`)
+          await sendMessage(ctx, `matched ${names} — add a message: /agent ${action.selector} <message>`, out)
           return true
         }
         if (m.confident) {
@@ -4244,7 +4286,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           const res = await injectToPane(target.paneId, action.from, action.rest, action.messageId, true)
           if (!res.ok) {
             log(`agent-route: inject failed → ${target.paneId}: ${res.error}`)
-            await sendMessage(ctx, res.error ?? "inject failed")
+            await sendMessage(ctx, res.error ?? "inject failed", out)
             return false
           }
           return true
@@ -4252,13 +4294,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // Ambiguous: multiple matches — show picker over matched subset
         const names = m.matches.map((c) => c.windowName).join(", ")
         log(`agent-route: selector="${action.selector}" → ambiguous (${m.matches.length} matches: ${names}) → picker`)
-        return postAgentPicker(m.matches, action.rest, action.messageId)
+        return postAgentPicker(m.matches, action.rest, action.messageId, { messageExtra: out, threadId: action.threadId ?? null })
       }
       // Named selector matched NOTHING — never silently fall back to a random agent.
       // Report the miss clearly so the user knows their intent was not routed.
       const names = candidates.map((c) => c.windowName).join(", ")
       log(`agent-route: selector="${action.selector}" → NO match among [${names}] — reporting error`)
-      await sendMessage(ctx, `no agent matching '${action.selector}' (running: ${names}) — try /agent to pick`)
+      await sendMessage(ctx, `no agent matching '${action.selector}' (running: ${names}) — try /agent to pick`, out)
       return false
     }
 
@@ -4269,15 +4311,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`agent-route: no selector, single candidate → ${target.paneId}/${target.windowName} msg="${msgPreview}"`)
       const res = await injectToPane(target.paneId, action.from, action.all, action.messageId, true)
       if (!res.ok) {
-        await sendMessage(ctx, res.error ?? "inject failed")
+        await sendMessage(ctx, res.error ?? "inject failed", out)
         return false
       }
-      await sendMessage(ctx, routedReply(labelFor(target, candidates), res.deferred))
+      await sendMessage(ctx, routedReply(labelFor(target, candidates), res.deferred), out)
       return true
     }
 
     log(`agent-route: no selector, ${candidates.length} candidates → picker msg="${msgPreview}"`)
-    return postAgentPicker(candidates, action.all, action.messageId)
+    return postAgentPicker(candidates, action.all, action.messageId, { messageExtra: out, threadId: action.threadId ?? null })
   }
 
   const handleAgentCallback = async (action: Extract<Action, { kind: "agent-callback" }>): Promise<boolean> => {
@@ -4312,7 +4354,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         const liveTarget = fleet.find((c) => c.paneId === target.paneId) ?? target
         const label = labelFor(liveTarget, fleet)
         if (pending.armNextMessage) {
-          const token = armSelectedAgentRoute(liveTarget, label, pending.messageId)
+          const token = armSelectedAgentRoute(liveTarget, label, pending.messageId, pending.threadId ?? null)
           void editMessageText(ctx, pending.messageId, `selected ${label} — send the next message here`, selectedAgentCancelMarkup(token))
         } else {
           const selector = suggestSelector(liveTarget, fleet)
@@ -5334,20 +5376,57 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     }
   }
 
-  // Create a private-chat forum topic via Bot API 9.4 `createForumTopic` and return the new
-  // `message_thread_id`, or null on any failure (the daemon falls back to flat-chat behaviour).
-  // Graceful: a failure is logged once with a BotFather hint and NEVER thrown — the caller
-  // continues with the flat /new path. No retry: a flaky network gets a second chance on the
-  // NEXT /new; a misconfigured bot (Threaded Mode off) gets the log hint.
-  const createPrivateTopic = async (name: string): Promise<number | null> => {
-    const json = await botPost(ctx, "createForumTopic", { chat_id: ctx.chatId, name })
-    const result = json?.result
+  type PrivateTopicResult =
+    | { ok: true; threadId: number }
+    | { ok: false; message: string }
+
+  const privateTopicWarning = (reason: string): string =>
+    `tg-ctl private_topics is enabled, but ${reason}. This chat does not need to be converted to a forum. Spawning without a topic for now; after the bot capability/provisioning reports true, run \`tg-ctl restart\` and retry \`/new\`.`
+
+  // Create a private-chat topic via Bot API 9.4 `createForumTopic` and return the new
+  // `message_thread_id`, or a user-visible failure reason (the daemon falls back to flat-chat behaviour).
+  // Graceful: a failure is logged and returned to the caller so Telegram gets an explicit
+  // capability diagnostic instead of hiding "chat is not a forum" in the daemon log.
+  const createPrivateTopic = async (name: string): Promise<PrivateTopicResult> => {
+    const me = await botPostResult(ctx, "getMe", {})
+    if (me.ok) {
+      const user = me.json.result
+      if (user && typeof user === "object") {
+        const enabled = (user as { has_topics_enabled?: unknown }).has_topics_enabled
+        if (enabled === false) {
+          log("private chat topic create unavailable — getMe.has_topics_enabled=false")
+          return {
+            ok: false,
+            message: privateTopicWarning("Telegram Bot API currently reports `getMe.has_topics_enabled=false` for this bot, so `createForumTopic` cannot create a private-chat topic"),
+          }
+        }
+      }
+    }
+    const topicResp = await botPostResult(ctx, "createForumTopic", { chat_id: ctx.chatId, name })
+    if (!topicResp.ok) {
+      log(`private chat topic create unavailable — createForumTopic: ${topicResp.description}`)
+      return {
+        ok: false,
+        message: privateTopicWarning(`Telegram Bot API rejected \`createForumTopic\`: ${topicResp.description}`),
+      }
+    }
+    const result = topicResp.json.result
     if (!result || typeof result !== "object") {
-      log("Private chat topics not enabled — enable Threaded Mode in BotFather.")
-      return null
+      log("private chat topic create unavailable — createForumTopic returned no result object")
+      return {
+        ok: false,
+        message: privateTopicWarning("Telegram Bot API returned no topic object from `createForumTopic`"),
+      }
     }
     const threadId = (result as { message_thread_id?: unknown }).message_thread_id
-    return typeof threadId === "number" ? threadId : null
+    if (typeof threadId !== "number") {
+      log("private chat topic create unavailable — createForumTopic returned no message_thread_id")
+      return {
+        ok: false,
+        message: privateTopicWarning("Telegram Bot API returned no `message_thread_id` from `createForumTopic`"),
+      }
+    }
+    return { ok: true, threadId }
   }
 
   // Spawn a flat `/new` agent into a named tmux window and return the pane id, or a typed error.
@@ -5401,8 +5480,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const askNewDir = async (session: NewSession): Promise<void> => {
     const choices = gatherNewDirChoices()
     session.dirChoices = choices
+    const out = replyContext(session.threadId)
     const extra: Record<string, unknown> =
-      choices.length > 0 ? { reply_markup: { inline_keyboard: buildNewDirKeyboard(session.token, choices) } } : {}
+      choices.length > 0 ? { ...out, reply_markup: { inline_keyboard: buildNewDirKeyboard(session.token, choices) } } : out
     const prompt =
       choices.length > 0
         ? `New agent \`${session.name}\`. Pick a recent project below, or send an absolute path (e.g. /Users/you/project).`
@@ -5415,6 +5495,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     session.status = "awaiting-harness"
     session.ts = Math.floor(Date.now() / 1000)
     session.promptMessageId = await sendMessage(ctx, `Which harness should \`${session.name}\` use?`, {
+      ...replyContext(session.threadId),
       reply_markup: { inline_keyboard: buildNewHarnessKeyboard(session.token) },
     })
   }
@@ -5426,6 +5507,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const catalog = session.harness ? modelsForHarness(session.harness) : MODEL_CATALOG
     const harnessName = session.harness ? `${harnessLabel(session.harness)} ` : ""
     session.promptMessageId = await sendMessage(ctx, `Which ${harnessName}model should \`${session.name}\` run?`, {
+      ...replyContext(session.threadId),
       reply_markup: { inline_keyboard: buildNewModelKeyboard(session.token, catalog) },
     })
   }
@@ -5441,23 +5523,27 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // agent is now a plain pane). On a spawn failure the session stays awaiting-model so a re-tap can
   // retry without losing dir/name. Clears the prompt keyboard on success so it can't be re-tapped.
   const spawnNewSession = async (session: NewSession, modelId: string, promptMessageId: number | null): Promise<boolean> => {
+    const out = replyContext(session.threadId)
     if (!session.dir || !isAbsolute(session.dir) || !isExistingDirectory(session.dir)) {
       // The dir vanished between the prompt and now → back to awaiting-dir so the user re-picks.
       // Clear the stale MODEL keyboard first (review #6) so the user isn't left with two live sets.
       if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
       session.status = "awaiting-dir"
       session.ts = Math.floor(Date.now() / 1000)
-      await sendMessage(ctx, `\`${session.dir ?? "(none)"}\` is not an absolute existing directory — send a full path like /Users/you/project.`)
+      await sendMessage(ctx, `\`${session.dir ?? "(none)"}\` is not an absolute existing directory — send a full path like /Users/you/project.`, out)
       await askNewDir(session)
       return false
     }
     const slug = slugifyTopicName(session.name, 0)
     const spawnToken = `new-${session.token}-${Math.floor(Date.now() / 1000)}`
     // Private-chat topic: try to create a per-session topic BEFORE spawning so the window is born
-    // with TG_TOPIC already set. Failure (Threaded Mode off, API error) → graceful flat fallback.
-    const threadId = ctx.cfg.privateTopics ? await createPrivateTopic(session.name) : null
-    if (threadId !== null) {
-      return spawnNewSessionWithTopic(session, modelId, threadId, slug, promptMessageId)
+    // with TG_TOPIC already set. Failure (capability/API error) → graceful flat fallback.
+    const privateTopic = ctx.cfg.privateTopics ? await createPrivateTopic(session.name) : null
+    if (privateTopic?.ok) {
+      return spawnNewSessionWithTopic(session, modelId, privateTopic.threadId, slug, promptMessageId)
+    }
+    if (privateTopic && !privateTopic.ok) {
+      await sendMessage(ctx, privateTopic.message, out)
     }
     // Flat spawn path (no private topic, or createForumTopic failed gracefully).
     const spawned = spawnNewWindow(slug, session.dir, modelId, session.task, spawnToken)
@@ -5467,7 +5553,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // without re-asking there'd be nothing to re-tap and the session would just rot to TTL. Clear
       // the OLD model keyboard first (review #5) so the user isn't left with two live button sets.
       if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
-      await sendMessage(ctx, spawned.error)
+      await sendMessage(ctx, spawned.error, out)
       await askNewModel(session) // sets status=awaiting-model, posts the (fresh) model buttons
       return false
     }
@@ -5475,7 +5561,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     pendingNew.delete(session.token)
     if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
     const taskNote = session.task.trim().length > 0 ? ` with task: ${session.task.trim()}` : ""
-    await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`)${taskNote} — use \`/agent ${slug}\` to talk to it`)
+    await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`)${taskNote} — use \`/agent ${slug}\` to talk to it`, out)
     return true
   }
 
@@ -5493,6 +5579,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     slug: string,
     promptMessageId: number | null,
   ): Promise<boolean> => {
+    const out = replyContext(session.threadId)
     const ts = Math.floor(Date.now() / 1000)
     // Write a preliminary binding BEFORE spawn so the forum_topic_created echo is absorbed even if
     // the spawn fails (no dangling untracked threadId that triggers the /new flow from a Telegram echo).
@@ -5503,7 +5590,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     if (!spawned.ok) {
       persistTopics(appendTopic(loadTopics(), clearSpawnPending(preliminary, Math.floor(Date.now() / 1000))))
       if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
-      await sendMessage(ctx, spawned.error)
+      await sendMessage(ctx, spawned.error, out)
       await askNewModel(session)
       return false
     }
@@ -5516,7 +5603,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     pendingNew.delete(session.token)
     if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
     const taskNote = session.task.trim().length > 0 ? ` with task: ${session.task.trim()}` : ""
-    await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`)${taskNote} — use \`/agent ${slug}\` to talk to it`)
+    await sendMessage(ctx, `spawned \`${modelId}\` in \`${session.dir}\` (window \`${slug}\`)${taskNote} — use \`/agent ${slug}\` to talk to it`, out)
     return true
   }
 
@@ -5525,14 +5612,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // piece is asked via buttons. A name collision with a live window is a non-fatal WARNING (tmux
   // allows dup names).
   const handleNewCommand = async (action: Extract<Action, { kind: "new-command" }>): Promise<boolean> => {
+    const out = replyContext(action.threadId)
     if (!action.name) {
-      await sendMessage(ctx, "usage: /new [<harness>|<model>] [<dir>] <name> [<task>] — e.g. `/new codex /Users/you/app api fix the build`")
+      await sendMessage(ctx, "usage: /new [<harness>|<model>] [<dir>] <name> [<task>] — e.g. `/new codex /Users/you/app api fix the build`", out)
       return false
     }
     // Name-uniqueness WARNING (issue #27): warn if the resulting window slug collides, don't block.
     const slug = slugifyTopicName(action.name, 0)
     if (nameCollides(slug, liveWindowNames())) {
-      await sendMessage(ctx, `⚠️ a window named \`${slug}\` already exists — the new agent will share the name. Continuing.`)
+      await sendMessage(ctx, `⚠️ a window named \`${slug}\` already exists — the new agent will share the name. Continuing.`, out)
     }
     // A flat chat has at most ONE /new in flight (review #2): a second /new REPLACES any prior
     // pending session, so a typed path can never be mis-applied to a stale earlier session that the
@@ -5541,7 +5629,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // Validate a supplied dir up front; an invalid one is dropped (→ asked) rather than failing.
     let dir = action.dir
     if (dir && (!isAbsolute(dir) || !isExistingDirectory(dir))) {
-      await sendMessage(ctx, `\`${dir}\` is not an absolute existing directory — pick one below or send a full path.`)
+      await sendMessage(ctx, `\`${dir}\` is not an absolute existing directory — pick one below or send a full path.`, out)
       dir = null
     }
     const token = `n${++newTokenSeq}`
@@ -5552,6 +5640,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       status: "awaiting-dir",
       task: action.task,
       ts: Math.floor(Date.now() / 1000),
+      threadId: action.threadId ?? null,
       ...(dir ? { dir } : {}),
       ...(action.harness ? { harness: action.harness } : {}),
     }
@@ -5580,12 +5669,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       .filter((s) => s.status === "awaiting-dir")
       .sort((a, b) => b.ts - a.ts)[0]
     if (!session) return false // no /new awaiting a dir — defensive (stepUpdates only emits when one is)
+    const out = replyContext(session.threadId)
     const path = action.text.trim()
     // Reject the filesystem ROOT as a typed cwd (review #4): the dir BUTTONS already exclude `/`
     // (parentDirs stops above root — spawning an agent at `/` is never the intent), so mirror that
     // guard for a typed `/` instead of letting it slip past `isExistingDirectory('/')`.
     if (path === "/") {
-      await sendMessage(ctx, "the filesystem root `/` isn't a project directory — send a real project path like /Users/you/project.")
+      await sendMessage(ctx, "the filesystem root `/` isn't a project directory — send a real project path like /Users/you/project.", out)
       return false
     }
     if (!path || !isAbsolute(path) || !isExistingDirectory(path)) {
@@ -5601,7 +5691,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // git-state banner (see withGitStateBanner's scope note).
         return injectViaTarget((target) => buildTextInjectPlan(target.pane.paneId, path), path, true, action.messageId)
       }
-      await sendMessage(ctx, `\`${path || "(empty)"}\` is not an absolute path to an existing directory — send a full path like /Users/you/project.`)
+      await sendMessage(ctx, `\`${path || "(empty)"}\` is not an absolute path to an existing directory — send a full path like /Users/you/project.`, out)
       return false
     }
     session.dir = path
@@ -5624,7 +5714,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const path = session.dirChoices?.[action.index]
     if (!path || !isAbsolute(path) || !isExistingDirectory(path)) {
       await answerCallbackQuery(ctx, action.callbackQueryId, "that path is gone — send one")
-      await sendMessage(ctx, `\`${path ?? "(unknown)"}\` is no longer an existing directory — send an absolute path.`)
+      await sendMessage(ctx, `\`${path ?? "(unknown)"}\` is no longer an existing directory — send an absolute path.`, replyContext(session.threadId))
       return false
     }
     await answerCallbackQuery(ctx, action.callbackQueryId, "ok")
@@ -5649,7 +5739,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const catalog = modelsForHarness(action.harness)
     if (catalog.length === 0) {
       await answerCallbackQuery(ctx, action.callbackQueryId, "no models")
-      await sendMessage(ctx, `no models configured for \`${harnessLabel(action.harness)}\``)
+      await sendMessage(ctx, `no models configured for \`${harnessLabel(action.harness)}\``, replyContext(session.threadId))
       return false
     }
     await answerCallbackQuery(ctx, action.callbackQueryId, "ok")
@@ -5676,7 +5766,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const modelEntry = findModel(action.modelId)
     if (!modelEntry) {
       await answerCallbackQuery(ctx, action.callbackQueryId, "unknown model")
-      await sendMessage(ctx, `unknown model \`${action.modelId}\` — pick a model again`)
+      await sendMessage(ctx, `unknown model \`${action.modelId}\` — pick a model again`, replyContext(session.threadId))
       return false
     }
     if (session.harness && modelEntry.kind !== session.harness) {
@@ -6352,10 +6442,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return true
       }
       case "status":
-        await sendMessage(ctx, composeStatus(ctx, null))
+        await sendMessage(ctx, composeStatus(ctx, null), replyContext(action.threadId))
         return true
       case "limit-status":
-        await sendMessage(ctx, composeLimitStatus(ctx, action.agent))
+        await sendMessage(ctx, composeLimitStatus(ctx, action.agent), replyContext(action.threadId))
         return true
       case "tasks":
         await runTasksCommand(ctx, action)
