@@ -6913,9 +6913,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         offset = step.newOffset
         writeFileSync(ctx.paths.offset, `${offset}\n`)
       }
-      if (step.skippedStale > 0) {
-        await sendMessage(ctx, `skipped ${step.skippedStale} stale messages`)
-      }
 
       // Persist inbound history for `tg replies` recall — every message the CTO
       // sent in this batch. Best-effort, off the inject path: a read/write error

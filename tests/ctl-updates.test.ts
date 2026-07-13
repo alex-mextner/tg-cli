@@ -310,31 +310,49 @@ test("disallowed sender's /kill is ignored entirely", () => {
   expect(r.newOffset).toBe(2);
 });
 
-// --- staleness (spec §10) ---
+// --- staleness (#183): owner inbound is NEVER dropped by age ---
+// If Telegram delivered the update after daemon downtime, it is still a real
+// instruction and must reach the agent — the old "skipped N stale" drop lost
+// real requests sent while agents were busy or tg-ctl was paused.
 
-test('stale message is dropped and counted', () => {
-  const r = stepUpdates([upd(1, { text: 'old', date: NOW - 301 })], makeOpts());
-  expect(r.actions).toEqual([]);
-  expect(r.skippedStale).toBe(1);
+test('old owner message is still delivered, never dropped or counted stale', () => {
+  const r = stepUpdates([upd(1, { text: 'old', date: NOW - 9999 })], makeOpts());
+  expect(r.actions).toHaveLength(2); // delivery action + its ack
+  expect(r.actions[0]).toMatchObject({ kind: 'inject-text' });
+  expect(r.skippedStale).toBe(0);
   expect(r.newOffset).toBe(2);
 });
 
-test('message exactly stalenessSec old is NOT stale (strict >)', () => {
+test('message exactly stalenessSec old is delivered', () => {
   const r = stepUpdates([upd(1, { text: 'edge', date: NOW - 300 })], makeOpts());
   expect(r.actions).toHaveLength(2); // delivery action + its ack
   expect(r.skippedStale).toBe(0);
 });
 
-test('stale command is counted stale, never executed', () => {
+test('old owner command is still executed after downtime', () => {
   const r = stepUpdates([upd(1, { text: '/kill', date: NOW - 9999 })], makeOpts());
-  expect(r.actions).toEqual([]);
-  expect(r.skippedStale).toBe(1);
+  expect(r.actions.length).toBeGreaterThan(0);
+  expect(r.skippedStale).toBe(0);
 });
 
-test('stale message from a disallowed sender does not inflate the stale count', () => {
+test('message from a disallowed sender is dropped regardless of age', () => {
   const r = stepUpdates([upd(1, { text: 'x', date: NOW - 9999, from: { id: 666 } })], makeOpts());
+  expect(r.actions).toEqual([]);
   expect(r.skippedStale).toBe(0);
   expect(r.newOffset).toBe(2);
+});
+
+test('a STALE forum lifecycle service message is still ignored by age (#183 excludes service msgs)', () => {
+  // Owner text is delivered regardless of age, but a stale topic-state event
+  // (close/reopen/created/renamed) carries no instruction and must not re-drive
+  // routing after downtime — consistent with the same-batch lifecycle pre-scan.
+  const staleClose = upd(1, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, date: NOW - 9999 });
+  const r = stepUpdates([staleClose], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
+  expect(r.actions.some((a) => a.kind === 'topic-close')).toBe(false);
+  // A FRESH close of the same topic IS processed.
+  const freshClose = upd(2, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false });
+  const r2 = stepUpdates([freshClose], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
+  expect(r2.actions.some((a) => a.kind === 'topic-close')).toBe(true);
 });
 
 // --- command split (spec §13) ---
@@ -771,12 +789,12 @@ test('voice from a disallowed sender is dropped entirely', () => {
 
 // --- batch combinations ---
 
-test('batch: ordered actions, stale counted, intruder dropped, offset correct', () => {
+test('batch: ordered actions, old message still delivered, intruder dropped, offset correct', () => {
   const updates: TgUpdate[] = [
     upd(10, { text: 'hello' }),
     upd(11, { text: '/status' }),
     { update_id: 12 }, // non-message update
-    upd(13, { text: 'late', date: NOW - 1000 }), // stale
+    upd(13, { text: 'late', date: NOW - 1000 }), // old (post-downtime) — still delivered (#183)
     upd(14, { text: '/kill', from: { id: 666 } }), // intruder
     upd(15, { text: 'world' }),
   ];
@@ -786,10 +804,12 @@ test('batch: ordered actions, stale counted, intruder dropped, offset correct', 
     { kind: 'ack', messageId: 10 },
     { kind: 'status' },
     { kind: 'ack', messageId: 11 },
+    { kind: 'inject-text', text: '[TG from Alex] late', messageId: 13 },
+    { kind: 'ack', messageId: 13 },
     { kind: 'inject-text', text: '[TG from Alex] world', messageId: 15 },
     { kind: 'ack', messageId: 15 },
   ]);
-  expect(r.skippedStale).toBe(1);
+  expect(r.skippedStale).toBe(0);
   expect(r.newOffset).toBe(16);
 });
 

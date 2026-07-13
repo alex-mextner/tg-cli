@@ -17,8 +17,8 @@ export interface InboundOpts {
   chatId: number; // the owner chat id (always allowed)
   allowedSenders: number[]; // extra allowed sender user ids (cfg.allowedSenders)
   pane: string | null; // the DEFAULT routed target pane (null when none discovered)
-  // Staleness drop, mirroring stepUpdates so recall == what the daemon actually
-  // processed. Omit both to log every allowed message regardless of age.
+  // Legacy options kept for older callers. Owner messages are no longer dropped
+  // by age (#183), so recall keeps every allowed message Telegram delivered.
   nowSec?: number;
   stalenessSec?: number;
   // Per-message pane override: a REPLY routes to its recognized origin pane, not
@@ -57,10 +57,8 @@ export function inboundHistoryRecords(updates: TgUpdate[], opts: InboundOpts): H
     const m = u.message;
     if (!m) continue; // callback queries + non-message updates are not history
     if (!senderAllowed(m.from?.id, opts)) continue; // a group member is never logged
-    // Mirror stepUpdates' staleness drop so recall reflects what was processed.
-    if (opts.nowSec !== undefined && opts.stalenessSec !== undefined && opts.nowSec - m.date > opts.stalenessSec) {
-      continue;
-    }
+    // Owner inbound is not dropped by age (#183): if Telegram delivered it after
+    // daemon downtime it is still a real request and belongs in recall.
     const from = m.from?.first_name || m.from?.username || 'tg';
     const resolved = opts.resolvePane?.(m) ?? null;
     const pane = resolved ?? opts.pane;
