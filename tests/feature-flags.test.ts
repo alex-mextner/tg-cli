@@ -42,6 +42,10 @@ test('DEFAULT_FEATURES has auto-attach true', () => {
   expect(DEFAULT_FEATURES['auto-attach']).toBe(true);
 });
 
+test('DEFAULT_FEATURES has cjk-guard true (guard is ON by default)', () => {
+  expect(DEFAULT_FEATURES['cjk-guard']).toBe(true);
+});
+
 // --- config overrides default ---
 test('config can disable auto-attach', () => {
   const r = resolveFeatures({ 'auto-attach': false }, { enable: [], disable: [] });

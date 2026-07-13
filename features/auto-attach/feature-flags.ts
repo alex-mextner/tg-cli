@@ -33,6 +33,10 @@ export const DEFAULT_FEATURES: FeatureMap = {
   'code-as-pdf': true,
   'attach-denylist': true,
   'recursive-attach': true,
+  // cjk-guard rejects a message with isolated CJK/ideographic codepoints stuck
+  // mid-word into otherwise Latin/Cyrillic text (the "hieroglyph in a normal
+  // word" bug); a genuinely CJK message passes. `--no-feature cjk-guard` off.
+  'cjk-guard': true,
   // pre-send-photo hooks (agents-hooks/v1). ON by default, but it is a TRUE
   // no-op unless ~/.agents/hooks/tg/ exists (one `stat`), so default-ON costs
   // nothing on machines with no descriptors. `--no-feature hooks` or

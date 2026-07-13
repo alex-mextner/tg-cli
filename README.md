@@ -129,6 +129,10 @@ File paths mentioned in the message text are detected and attached automatically
 
 Secret-looking files are **never** attached: `.env` family, SSH private keys, `*.pem`/`*.key`/`*.p12`/`*.pfx`/`*.ppk`, credential rc-files (`.netrc`, `.npmrc`, `.git-credentials`, …), shell histories, `*.tfvars`, `credentials.json`/`client_secret*.json`, `kubeconfig`. Auto-detected mentions are silently skipped; an explicit `--file prod.env` is a hard error. Override: `--no-feature attach-denylist`.
 
+### Stray-CJK guard
+
+A message (or `--title`) whose dominant script is Latin/Cyrillic but that carries a **lone** CJK / ideographic codepoint stuck mid-word — the "hieroglyph in a normal word" garble an LLM occasionally emits (e.g. `ка<CJK>eat`, `<CJK>ляет`) — is a **hard error** before send, naming the offending character, its `U+XXXX` codepoint and position so you re-send clean. Precision over recall: a lone CJK codepoint is flagged only when a Latin/Cyrillic **letter immediately follows** it (the ideograph splits or prefixes a word). So a genuinely CJK message, a multi-character bilingual word (`Deploy到生产`, `3D打印`), a CJK suffix or particle that ends a token (`iOS版`, `React를 배포`), a space-delimited CJK quote, emoji, and accented Latin all pass. Override: `--no-feature cjk-guard`.
+
 ### Autolinks
 
 **Linear tickets** (`HYP-576` style) — verified via the `linear` CLI, title inlined or appended. Requires `brew install schpet/tap/linear` + `linear auth login`. Disable: `--no-feature autolink-tasks`.
