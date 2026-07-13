@@ -18,7 +18,11 @@ import {
   rankNewDirChoices,
   resolveHarnessToken,
   resolveModelToken,
+  sessionTargetArgs,
+  parseNewRetryCallback,
+  buildNewRetryKeyboard,
   NEW_HARNESS_CALLBACK_PREFIX,
+  NEW_RETRY_CALLBACK_PREFIX,
 } from '../features/tg-ctl/new-command';
 import { DEFAULT_MODEL_ID, MODEL_CATALOG, modelsForHarness } from '../features/tg-ctl/models';
 
@@ -87,6 +91,13 @@ describe('parseNewCommand', () => {
   test('a lone model alias is reclaimed as the NAME (review #1): /new opus names the session opus', () => {
     expect(parseNewCommand('/new opus')).toEqual({ harness: null, model: null, dir: null, name: 'opus', task: '' });
     expect(parseNewCommand('/new sonnet')).toEqual({ harness: null, model: null, dir: null, name: 'sonnet', task: '' });
+  });
+
+  test('a lone harness token is reclaimed as the NAME (symmetry with the lone-model case)', () => {
+    // `/new codex` — codex is the only token; consuming it as a harness would leave no name, so it
+    // is reclaimed as the name (exercises the empty-`applyConsumed` reclaim path).
+    expect(parseNewCommand('/new codex')).toEqual({ harness: null, model: null, dir: null, name: 'codex', task: '' });
+    expect(parseNewCommand('/new oc')).toEqual({ harness: null, model: null, dir: null, name: 'oc', task: '' });
   });
 
   test('model + lone-dir reclaims the dir as the name, keeping the model', () => {
@@ -213,13 +224,64 @@ describe('parseNewCommand', () => {
     });
   });
 
-  test('a path-like token after the name stays in the task unless it came before the name', () => {
+  test('an absolute path CONTIGUOUS after the name IS taken as the dir (issue: inline dir arg)', () => {
+    // BUG 2: `/new hyperos /Users/ultra/work/foo` must USE the path as the dir and skip the dir
+    // prompt — a supplied absolute path is a dir selector in ANY position, not task text. Only the
+    // FIRST leftover bareword is the name; the abs path right after it fills the (empty) dir slot.
+    expect(parseNewCommand('/new hyperos /Users/ultra/work/foo')).toEqual({
+      harness: null,
+      model: null,
+      dir: '/Users/ultra/work/foo',
+      name: 'hyperos',
+      task: '',
+    });
+    // The path fills the dir slot; the trailing non-selector word begins the task.
     expect(parseNewCommand('/new api /tmp/do it')).toEqual({
       harness: null,
       model: null,
-      dir: null,
+      dir: '/tmp/do',
       name: 'api',
-      task: '/tmp/do it',
+      task: 'it',
+    });
+  });
+
+  test('BUG 3: /new accepts name, dir, harness, model in ANY order', () => {
+    const expected = {
+      harness: 'codex' as const,
+      model: 'codex-gpt-5.5',
+      dir: '/Users/me/app',
+      name: 'api',
+      task: '',
+    };
+    // name → dir → model (model infers codex harness), all after the name.
+    expect(parseNewCommand('/new api /Users/me/app gpt-5.5')).toEqual(expected);
+    // dir → name → model.
+    expect(parseNewCommand('/new /Users/me/app api gpt-5.5')).toEqual(expected);
+    // model → name → dir.
+    expect(parseNewCommand('/new gpt-5.5 api /Users/me/app')).toEqual(expected);
+    // name → model → dir.
+    expect(parseNewCommand('/new api gpt-5.5 /Users/me/app')).toEqual(expected);
+  });
+
+  test('BUG 3: harness + dir supplied after the name are both consumed, leaving the task', () => {
+    expect(parseNewCommand('/new hyperos codex /Users/me/app fix the build')).toEqual({
+      harness: 'codex',
+      model: null,
+      dir: '/Users/me/app',
+      name: 'hyperos',
+      task: 'fix the build',
+    });
+  });
+
+  test('BUG 3: a run of CONSISTENT post-name selectors is fully consumed, terminating at task text', () => {
+    // harness + a consistent concrete model + a dir, all after the name, then real task text — the
+    // contiguous consistent selectors are all consumed and `do stuff` begins the task.
+    expect(parseNewCommand('/new api codex gpt-5.5 /Users/me/app do stuff')).toEqual({
+      harness: 'codex',
+      model: 'codex-gpt-5.5',
+      dir: '/Users/me/app',
+      name: 'api',
+      task: 'do stuff',
     });
   });
 
@@ -243,7 +305,10 @@ describe('parseNewCommand', () => {
     });
   });
 
-  test('only one selector is consumed after the name; the rest is task text', () => {
+  test('post-name selectors are consumed only while contiguous and CONSISTENT; the rest is task text', () => {
+    // codex is taken as harness; glm-5.2 is an opencode model — inconsistent with the codex harness,
+    // so it is NOT consumed and begins the task tail (a task word that merely looks like a model of
+    // the wrong harness stays in the task).
     expect(parseNewCommand('/new task-cli codex glm-5.2 msg')).toEqual({
       harness: 'codex',
       model: null,
@@ -258,6 +323,39 @@ describe('parseNewCommand', () => {
       name: 'task-cli',
       task: 'opus msg',
     });
+  });
+});
+
+describe('sessionTargetArgs (tmux new-window session target)', () => {
+  test('a NUMERIC session name is targeted as a session, not a window index (index-collision bug)', () => {
+    // BUG 1: with a session literally named `1`, a bare `-t 1` is misparsed by tmux as WINDOW
+    // INDEX 1 → `create window failed: index 1 in use`. The trailing `:` (and `=` exact match)
+    // forces session interpretation; `-a` appends at the next free index.
+    expect(sessionTargetArgs('1')).toEqual(['-a', '-t', '=1:']);
+  });
+  test('an ordinary named session gets the same unambiguous session target', () => {
+    expect(sessionTargetArgs('main')).toEqual(['-a', '-t', '=main:']);
+  });
+  test('no session → no target flag (tmux uses the current/only session)', () => {
+    expect(sessionTargetArgs(undefined)).toEqual([]);
+    expect(sessionTargetArgs('')).toEqual([]);
+  });
+});
+
+describe('flat /new retry callback (spawn-failure retry, no re-ask loop)', () => {
+  test('parseNewRetryCallback round-trips tnr:<token>', () => {
+    expect(parseNewRetryCallback(`${NEW_RETRY_CALLBACK_PREFIX}:abc`)).toEqual({ token: 'abc' });
+  });
+  test('parseNewRetryCallback rejects malformed / foreign prefixes', () => {
+    expect(parseNewRetryCallback('tnr:')).toBeNull();
+    expect(parseNewRetryCallback('tnr:abc:extra')).toBeNull();
+    expect(parseNewRetryCallback('tnm:abc')).toBeNull();
+    expect(parseNewRetryCallback(undefined)).toBeNull();
+  });
+  test('buildNewRetryKeyboard is a single Retry button carrying the token', () => {
+    expect(buildNewRetryKeyboard('tok')).toEqual([
+      [{ text: 'Retry spawn', callback_data: 'tnr:tok' }],
+    ]);
   });
 });
 

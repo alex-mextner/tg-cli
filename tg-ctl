@@ -182,9 +182,11 @@ import {
   buildNewDirKeyboard,
   buildNewHarnessKeyboard,
   buildNewModelKeyboard,
+  buildNewRetryKeyboard,
   nameCollides,
   parseNewCommand,
   rankNewDirChoices,
+  sessionTargetArgs,
   type NewSession,
 } from "./features/tg-ctl/new-command"
 import {
@@ -4758,7 +4760,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const tmuxArgv = [
         "tmux",
         "new-window",
-        ...(session ? ["-t", session] : []),
+        // `=<session>:` (not a bare name) so a NUMERIC session name isn't misparsed as a window
+        // index — a bare `-t 1` fails `create window failed: index 1 in use`. See sessionTargetArgs.
+        ...sessionTargetArgs(session),
         // -e sets the spawned PROCESS env so the agent's plain `tg` threads back into this topic.
         "-e",
         `TG_TOPIC=${threadId}`,
@@ -5448,7 +5452,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const tmuxArgv = [
         "tmux",
         "new-window",
-        ...(session ? ["-t", session] : []),
+        // `=<session>:` (not a bare name) so a NUMERIC session name isn't misparsed as a window
+        // index — a bare `-t 1` fails `create window failed: index 1 in use`. See sessionTargetArgs.
+        ...sessionTargetArgs(session),
         // Stamp the per-spawn token into the window env too, mirroring the topic spawn — harmless
         // for a flat /new (no reconcile depends on it) but keeps spawn provenance greppable.
         "-e",
@@ -5519,9 +5525,30 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
+  // After a spawn FAILURE, report the tmux error ONCE and offer a single "Retry spawn" button —
+  // NEVER re-enter the questionnaire (the earlier bug: a failure fell back to re-asking the model,
+  // so the user answered the same question in a loop while the real error scrolled away). The
+  // session keeps name+dir+harness+model and moves to `awaiting-retry`; a tap re-runs the spawn with
+  // those preserved answers. Clears the old prompt keyboard so no stale button lingers.
+  const offerNewRetry = async (
+    session: NewSession,
+    errorText: string,
+    oldPromptMessageId: number | null,
+  ): Promise<boolean> => {
+    if (oldPromptMessageId !== null) await clearMessageKeyboard(ctx, oldPromptMessageId)
+    session.status = "awaiting-retry"
+    session.ts = Math.floor(Date.now() / 1000)
+    session.promptMessageId = await sendMessage(ctx, `${errorText}\n\nYour picks are kept — tap Retry to try again.`, {
+      ...replyContext(session.threadId),
+      reply_markup: { inline_keyboard: buildNewRetryKeyboard(session.token) },
+    })
+    return false
+  }
+
   // Do the actual spawn for a session that has name + dir + model, then DELETE the session (the
-  // agent is now a plain pane). On a spawn failure the session stays awaiting-model so a re-tap can
-  // retry without losing dir/name. Clears the prompt keyboard on success so it can't be re-tapped.
+  // agent is now a plain pane). On a spawn failure the session moves to `awaiting-retry` (all
+  // answers preserved) and offers a Retry button — it never re-asks. Clears the prompt keyboard on
+  // success so it can't be re-tapped.
   const spawnNewSession = async (session: NewSession, modelId: string, promptMessageId: number | null): Promise<boolean> => {
     const out = replyContext(session.threadId)
     if (!session.dir || !isAbsolute(session.dir) || !isExistingDirectory(session.dir)) {
@@ -5548,14 +5575,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // Flat spawn path (no private topic, or createForumTopic failed gracefully).
     const spawned = spawnNewWindow(slug, session.dir, modelId, session.task, spawnToken)
     if (!spawned.ok) {
-      // Spawn FAILED → leave the session retryable AND re-post the model keyboard (review #3): the
-      // "immediate spawn" path (model+dir supplied on the /new line) never sent a keyboard, so
-      // without re-asking there'd be nothing to re-tap and the session would just rot to TTL. Clear
-      // the OLD model keyboard first (review #5) so the user isn't left with two live button sets.
-      if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
-      await sendMessage(ctx, spawned.error, out)
-      await askNewModel(session) // sets status=awaiting-model, posts the (fresh) model buttons
-      return false
+      // Spawn FAILED → report the error once and offer a Retry button (answers preserved), NEVER
+      // re-ask the model. See offerNewRetry.
+      return offerNewRetry(session, spawned.error, promptMessageId)
     }
     stampSpawnToken(spawned.paneId, spawnToken)
     pendingNew.delete(session.token)
@@ -5589,10 +5611,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const spawned = spawnTopicWindow(threadId, slug, session.dir, modelId, session.task)
     if (!spawned.ok) {
       persistTopics(appendTopic(loadTopics(), clearSpawnPending(preliminary, Math.floor(Date.now() / 1000))))
-      if (promptMessageId !== null) await clearMessageKeyboard(ctx, promptMessageId)
-      await sendMessage(ctx, spawned.error, out)
-      await askNewModel(session)
-      return false
+      // Report the error once and offer a Retry button (answers preserved), never re-ask the model.
+      return offerNewRetry(session, spawned.error, promptMessageId)
     }
     // Upgrade the preliminary binding to `bound` now that the pane exists. Do not persist a
     // spawnPending record with paneId: a crash between that write and markBound would leave a
@@ -5777,6 +5797,24 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     session.model = action.modelId
     session.harness = modelEntry.kind
     return spawnNewSession(session, action.modelId, action.messageId)
+  }
+
+  // A "Retry spawn" tap (tnr:<token>) after a spawn failure → re-run the spawn with the session's
+  // preserved name/dir/harness/model. Refuses a stale/forged tap (no session, wrong state, or a
+  // model that vanished from the catalog). NEVER re-asks — the whole point of the retry button.
+  const handleNewRetry = async (action: Extract<Action, { kind: "new-retry" }>): Promise<boolean> => {
+    reapNewSessions()
+    const session = pendingNew.get(action.token)
+    if (!session) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired — run /new again")
+      return false
+    }
+    if (session.status !== "awaiting-retry" || !session.model || !findModel(session.model)) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "nothing to retry — run /new again")
+      return false
+    }
+    await answerCallbackQuery(ctx, action.callbackQueryId, "retrying…")
+    return spawnNewSession(session, session.model, action.messageId)
   }
 
   // --- crash-window orphan reconcile (docs/specs/tg-forum-topics.md §9 increment 4) ---
@@ -6545,6 +6583,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return handleNewHarness(action)
       case "new-model":
         return handleNewModel(action)
+      case "new-retry":
+        return handleNewRetry(action)
       case "ack":
       {
         const queuedReaction = takeAckReaction(action.messageId)

@@ -3,6 +3,22 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.34.7
+
+**Fix: flat `/new` spawns reliably, honors an inline directory, accepts args in any order, and never loops on a spawn failure.**
+
+- `tmux new-window` now targets the session unambiguously (`-a -t =<session>:`),
+  so a numeric session name (e.g. a session literally named `1`) is no longer
+  misparsed as a window index — the `create window failed: index 1 in use`
+  collision that aborted every `/new` in such a session is gone.
+- An inline absolute directory is used in ANY position, including after the name
+  (`/new hyperos /path`), and skips the "pick a project" prompt.
+- `/new` parses its arguments (name, directory, harness, model) by shape in any
+  order, so only the genuinely-missing pieces are asked interactively.
+- A spawn failure now reports the real error once and offers a single "Retry
+  spawn" button that keeps the already-chosen name/dir/harness/model, instead of
+  silently re-asking the model question in a loop.
+
 ## 1.34.6
 
 **Fix: tg-ctl keeps daemon replies in their Telegram topic and reports private-topic setup accurately.**
