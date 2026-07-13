@@ -12,6 +12,7 @@ import { buildFileIndex, isRecursiveCandidate, matchFromIndex, type ListDir } fr
 import { looksPathLike, resolveAcrossWorktrees } from '../auto-attach/worktree';
 import { ESCALATION_TAGS, validateTag } from '../render/tag';
 import { detectMsgRefs } from '../autolink-msgrefs/detect';
+import { detectTicketCodesExpanded } from '../autolink-tasks/detect';
 import { detectTableKind } from '../render/table';
 
 export interface ItemLineSpec {
@@ -329,6 +330,13 @@ export function parseArgs(
   // the title while the identical literal is freely allowed in the body (task-cli#45 / tg-cli
   // review finding on PR #139).
   msgrefAutolink = true,
+  // Ticket-code autolinking (feature `autolink-tasks`, ON by default): gates the `--title`
+  // HYP-<id> guard below, mirroring the `msgrefAutolink` gating of the tg#<id> guard. A bare
+  // ticket code in the one-line header is inert (nothing there ever linkifies it) and only
+  // duplicates a body reference the reader can follow — the same rule task-cli/gh-ship enforce
+  // on a ticket title (tg-cli#116). With the feature off, a `TEAM-123` is inert plain text in
+  // BOTH title and body, so it must not be banned in one and allowed in the other.
+  ticketAutolink = true,
 ): ParseResult {
   // 1. Help / version win anywhere, before the empty check.
   for (const a of args) {
@@ -411,6 +419,19 @@ export function parseArgs(
         return {
           action: 'error',
           message: 'Refusing: --title contains a tg#<id> reference — move it into the message body.',
+        };
+      }
+      // Same rule for a bare ticket code (`HYP-1234`, any `TEAM-<n>`): inert in the header,
+      // and it only duplicates a body reference the reader can actually follow. Uses the SAME
+      // `detectTicketCodesExpanded` the body linkifies with (so a compound list like `HYP-1/2/3`
+      // — which the plain detector treats as a path — is still caught), gated on the SAME
+      // `autolink-tasks` flag. The FIRST detected code names the offender. (GitHub-style `#N` is
+      // deliberately NOT banned — it is not a code and a title `closes #42` is legitimate.)
+      const ticketCodes = ticketAutolink ? detectTicketCodesExpanded(nextArg) : [];
+      if (ticketCodes.length > 0) {
+        return {
+          action: 'error',
+          message: `Refusing: --title contains a ticket reference (${ticketCodes[0]}) — move it into the message body.`,
         };
       }
       title = nextArg;

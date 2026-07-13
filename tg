@@ -526,6 +526,9 @@ if (import.meta.main) {
   // Stray-CJK guard (feature `cjk-guard`, ON by default): checked below on the
   // final decoded caption/title, right before send.
   const cjkGuardOn = features["cjk-guard"] !== false
+  // Same flag the body-detection `detectTicketCodesExpanded` call below gates on — threaded so
+  // the --title HYP-<id> guard honours a disabled feature identically to the body.
+  const ticketAutolinkOn = features["autolink-tasks"] !== false
   const parsed = parseArgs(
     args,
     process.cwd(),
@@ -536,6 +539,7 @@ if (import.meta.main) {
     recursiveAttachOn,
     undefined,
     msgrefAutolinkOn,
+    ticketAutolinkOn,
   )
 
   // No-send actions resolve BEFORE the credential gate so help/version/info
