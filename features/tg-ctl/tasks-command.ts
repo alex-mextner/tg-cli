@@ -80,18 +80,42 @@ export interface TaskItem {
   agent?: string;
 }
 
-// A PR as `gh pr list --json number,title,url,body,state,statusCheckRollup`
-// emits it, after the daemon normalizes the CI rollup to a verdict.
+// A PR as `gh pr list --json number,title,url,body,state,statusCheckRollup,reviewDecision,isDraft`
+// emits it, after the daemon normalizes the CI rollup to a verdict and the review
+// decision to a lifecycle verdict.
 export interface PrRef {
   number: number;
   url: string;
   title: string;
   body?: string;
   ci: CiState;
+  // Optional (like `body?`): an absent review is treated exactly like `null` — a dash — per the
+  // module's no-fabrication rule, so a caller that has no review data need not synthesize one.
+  review?: ReviewState;
   project?: string;
 }
 
 export type CiState = 'pass' | 'fail' | 'pending' | null;
+
+// The PR review lifecycle for the message→acceptance→CI→review board (tg-cli#117, Alex tg#5698).
+export type ReviewState = 'approved' | 'changes' | 'review-required' | 'draft' | null;
+
+// Reduce gh's `reviewDecision` string + `isDraft` boolean to one review verdict. A draft PR
+// dominates (it is explicitly not ready for review). Never fabricates an "approved" — an
+// unrecognized/empty decision is null (a dash), same posture as rollupCiState.
+export function rollupReviewState(reviewDecision: unknown, isDraft: unknown): ReviewState {
+  if (isDraft === true) return 'draft';
+  switch (String(reviewDecision ?? '').toUpperCase()) {
+    case 'APPROVED':
+      return 'approved';
+    case 'CHANGES_REQUESTED':
+      return 'changes';
+    case 'REVIEW_REQUIRED':
+      return 'review-required';
+    default:
+      return null;
+  }
+}
 
 export const TASK_VIEW_FILTERS = ['attention', 'active', 'ready', 'done', 'all'] as const;
 export type TaskViewFilter = (typeof TASK_VIEW_FILTERS)[number];
@@ -181,6 +205,25 @@ export function matchPrsToTasks(tasks: TaskItem[], prs: PrRef[]): Map<string, Pr
 }
 
 const CI_GLYPH: Readonly<Record<Exclude<CiState, null>, string>> = { pass: '✓', fail: '✗', pending: '…' };
+// Full-color emoji here vs CI_GLYPH's spare text symbols is a DELIBERATE register difference:
+// the Review verdict is the lifecycle leg a human scans for on a phone, so it gets the louder
+// glyphs. Also distinct from the STATUS_GROUP_EMOJI axis (🟢🟡🔴⚪ prepended to the Title cell)
+// — `changes` uses 🔁, NOT the 🔴 problem circle, so a changes-requested review and a
+// problem-status task never show two identical reds in one row.
+const REVIEW_GLYPH: Readonly<Record<Exclude<ReviewState, null>, string>> = {
+  approved: '✅',
+  changes: '🔁',
+  'review-required': '👀',
+  draft: '✏️',
+};
+
+// The lifecycle table's columns, in render order — the ONE source of truth. The header HTML and
+// the group-separator colspan both derive from this list, so they cannot drift; each taskRow
+// emits exactly TASKS_TABLE_COLUMNS <td> cells (guarded by a structural test) or Telegram's rich
+// <table> render breaks. Add/remove a column here.
+const TASKS_TABLE_HEADERS = ['ID', 'Title', 'State', 'Due', 'PR', 'CI', 'Review'] as const;
+const TASKS_TABLE_COLUMNS = TASKS_TABLE_HEADERS.length;
+const TASKS_TABLE_HEADER_HTML = `<tr>${TASKS_TABLE_HEADERS.map((h) => `<th>${h}</th>`).join('')}</tr>`;
 
 // The scope line above the table (what the filters resolved to), for context.
 export function tasksScopeLabel(scope: TasksScope): string {
@@ -220,7 +263,7 @@ export function composeTasksView(
       totalTasks: filtered.length,
     };
   }
-  const header = '<tr><th>ID</th><th>Title</th><th>State</th><th>Due</th><th>PR</th><th>CI</th></tr>';
+  const header = TASKS_TABLE_HEADER_HTML;
   const rows = taskRowsByGroup(pageTasks, agentProjects, prsByTask);
   const pageLabel = totalPages > 1 ? ` page ${page + 1}/${totalPages}` : '';
   return {
@@ -296,7 +339,8 @@ function taskRow(t: TaskItem, pr: PrRef | null): string {
   const due = t.due ? escapeHtml(t.due) : '—';
   const prCell = pr ? `<a href="${escapeHtml(pr.url)}">#${pr.number}</a>` : '—';
   const ci = pr && pr.ci ? CI_GLYPH[pr.ci] : '—';
-  return `<tr><td>${id}</td><td>${title}</td><td>${state}</td><td>${due}</td><td>${prCell}</td><td>${ci}</td></tr>`;
+  const review = pr && pr.review ? REVIEW_GLYPH[pr.review] : '—';
+  return `<tr><td>${id}</td><td>${title}</td><td>${state}</td><td>${due}</td><td>${prCell}</td><td>${ci}</td><td>${review}</td></tr>`;
 }
 
 function taskRowsByGroup(pageTasks: TaskItem[], agentProjects: Map<string, Set<string>>, prsByTask: Map<string, PrRef>): string {
@@ -308,7 +352,7 @@ function taskRowsByGroup(pageTasks: TaskItem[], agentProjects: Map<string, Set<s
     const label = taskGroupLabel(task, agentProjects);
     if (label !== current) {
       current = label;
-      rows.push(`<tr><th colspan="6">${escapeHtml(label)}</th></tr>`);
+      rows.push(`<tr><th colspan="${TASKS_TABLE_COLUMNS}">${escapeHtml(label)}</th></tr>`);
     }
     rows.push(taskRow(task, prsByTask.get(taskKey(task)) ?? null));
   }
@@ -369,6 +413,9 @@ function statusGroupForTask(task: TaskItem, pr: PrRef | null): StatusGroup {
 
 function hasProblemSignal(task: TaskItem, pr: PrRef | null, state: string): boolean {
   if (pr?.ci === 'fail') return true;
+  // NOTE: a `review === 'changes'` verdict is display-only (the Review column) and deliberately
+  // does NOT flag the task into the attention/problem view for v1 (tg-cli#117 is scope-limited to
+  // rendering the review leg). Wiring changes-requested into the attention filter is a follow-up.
   const labels = Array.isArray(task.labels) ? task.labels.filter((label): label is string => typeof label === 'string') : [];
   const haystack = [...labels, task.what ?? ''].join(' ').toLowerCase();
   if (PROBLEM_WORDS_RE.test(haystack)) return true;

@@ -10,6 +10,7 @@ import {
   normalizeTaskStatus,
   parseTasksCommand,
   rollupCiState,
+  rollupReviewState,
   statusEmojiForTask,
   taskKey,
   tasksScopeLabel,
@@ -157,6 +158,68 @@ test('composeTasksTable: header + one row per task; missing data is an em dash, 
   expect(html).toContain('2026-07-10');
 });
 
+test('rollupReviewState: draft dominates, then the gh reviewDecision enum, else null', () => {
+  // A draft PR is not up for review yet, regardless of any decision echo.
+  expect(rollupReviewState('APPROVED', true)).toBe('draft');
+  expect(rollupReviewState(null, true)).toBe('draft');
+  // The three gh reviewDecision values map to lifecycle verdicts.
+  expect(rollupReviewState('APPROVED', false)).toBe('approved');
+  expect(rollupReviewState('CHANGES_REQUESTED', false)).toBe('changes');
+  expect(rollupReviewState('REVIEW_REQUIRED', false)).toBe('review-required');
+  // Case-insensitive — the .toUpperCase() normalization is exercised, not just the canonical form.
+  expect(rollupReviewState('approved', false)).toBe('approved');
+  expect(rollupReviewState('changes_requested', false)).toBe('changes');
+  // No reviewers / no review required / unknown → null (rendered as a dash, never fabricated).
+  expect(rollupReviewState('', false)).toBeNull();
+  expect(rollupReviewState('SOMETHING_ELSE', false)).toBeNull();
+  expect(rollupReviewState(null, false)).toBeNull();
+  expect(rollupReviewState(undefined, undefined)).toBeNull();
+});
+
+test('composeTasksTable: a Review column renders every verdict glyph, em dash when PR/review absent', () => {
+  const sample: TaskItem[] = [
+    { id: '#1', title: 'Approved work', state: 'in-review', url: 'https://x/1' },
+    { id: '#2', title: 'Changes requested', state: 'in-review', url: 'https://x/2' },
+    { id: '#3', title: 'Awaiting review', state: 'in-review', url: 'https://x/3' },
+    { id: '#4', title: 'Draft PR', state: 'in-progress', url: 'https://x/4' },
+    { id: '#5', title: 'PR but no verdict', state: 'in-progress', url: 'https://x/5' },
+    { id: '#6', title: 'No PR yet', state: 'todo', url: 'https://x/6' },
+  ];
+  const prs = new Map<string, PrRef>([
+    ['#1', { number: 11, url: 'https://x/pr/11', title: 'ref #1', ci: 'pass', review: 'approved' }],
+    ['#2', { number: 12, url: 'https://x/pr/12', title: 'ref #2', ci: 'pass', review: 'changes' }],
+    ['#3', { number: 13, url: 'https://x/pr/13', title: 'ref #3', ci: 'pass', review: 'review-required' }],
+    ['#4', { number: 14, url: 'https://x/pr/14', title: 'ref #4', ci: 'pending', review: 'draft' }],
+    ['#5', { number: 15, url: 'https://x/pr/15', title: 'ref #5', ci: 'pass', review: null }],
+  ]);
+  const html = composeTasksTable(sample, prs, { agent: null, status: null });
+  expect(html).toContain('<th>Review</th>');
+  // Every glyph is asserted so a swapped REVIEW_GLYPH key can't pass silently.
+  expect(html).toContain('✅'); // approved
+  expect(html).toContain('🔁'); // changes requested
+  expect(html).toContain('👀'); // awaiting review
+  expect(html).toContain('✏️'); // draft
+  // The changes glyph must NOT reuse the problem-status red circle (avoid a same-row collision).
+  expect(html).not.toContain('🔴');
+  // #5 (PR, review null) and #6 (no PR) both render an em dash in the Review cell.
+  expect(html.match(/—/g)!.length).toBeGreaterThanOrEqual(2);
+});
+
+test('lifecycle table columns stay in lockstep: header th count == row td count == group colspan', () => {
+  // Guards the TASKS_TABLE_COLUMNS single-source-of-truth invariant by deriving the counts from
+  // the rendered HTML — adding a header/row cell without the colspan (or vice-versa) fails here.
+  // A populated PR row (prCell/ci/review filled) exercises the same 7-<td> branch as an empty one.
+  const grouped: TaskItem[] = [{ id: '#1', title: 'x', state: 'in-review', url: 'https://x/1', agent: 'a', project: 'p' }];
+  const prs = new Map<string, PrRef>([['p:#1', { number: 9, url: 'https://x/pr/9', title: 'ref #1', ci: 'pass', review: 'approved' }]]);
+  const html = composeTasksTable(grouped, prs, { agent: null, status: null });
+  const headerThs = (html.match(/<th>[^<]*<\/th>/g) ?? []).length;
+  const rowTds = (html.match(/<td>/g) ?? []).length;
+  const colspan = Number(/<th colspan="(\d+)"/.exec(html)?.[1]);
+  expect(headerThs).toBeGreaterThan(0);
+  expect(rowTds).toBe(headerThs);
+  expect(colspan).toBe(headerThs);
+});
+
 test('filterTasksForView: attention default keeps stuck/forgotten tasks, not active or done tasks', () => {
   const sample: TaskItem[] = [
     { id: '#1', title: 'Ready but forgotten', state: 'todo', labels: [], url: '' },
@@ -208,7 +271,7 @@ test('composeTasksView: title cells get emoji prefixes and tasks group by agent 
   const view = composeTasksView(grouped, new Map(), { agent: null, status: null }, { view: 'all', page: 0, pageSize: 10 });
   expect(view.html).toContain('rig • tg-cli');
   expect(view.html).toContain('rig • rig-cli');
-  expect(view.html).toContain('<th colspan="6">ext</th>');
+  expect(view.html).toContain('<th colspan="7">ext</th>');
   expect(view.html).toContain('<td>🟢 tg task</td>');
   expect(view.html.indexOf('rig • rig-cli')).toBeLessThan(view.html.indexOf('rig task'));
   expect(view.html.indexOf('rig • tg-cli')).toBeLessThan(view.html.indexOf('tg task'));
