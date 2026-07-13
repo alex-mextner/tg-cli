@@ -33,8 +33,8 @@ modules import it, never redefine the shapes.
   nowSec: number }): StepResult` — the heart. Rules (spec §9, §10, §13):
   - allowlist: `message.from.id` must be `chatId` or in `cfg.allowedSenders`;
     rejected → no action, but offset still advances.
-  - staleness: `nowSec - message.date > cfg.stalenessSec` → drop, count in
-    `skippedStale` (caller sends ONE "skipped N stale messages" notice).
+  - old owner messages are processed normally; tg-ctl no longer drops inbound
+    by message age or sends a "skipped N stale messages" notice.
   - commands: text starting with `/`: `/stop` → inject-key Escape; `/kill` →
     kill-agent; `/status` → status; any other `/cmd …` → inject-text VERBATIM
     (passthrough, no wrap).
@@ -111,7 +111,7 @@ Subcommands:
     no-tmux guard text.
   - kill-agent → SIGINT to discovered agentPid; reply "session killed —
     restore via `claude --resume`".
-  - skippedStale > 0 → one "skipped N stale messages" sendMessage.
+  - `skippedStale` is legacy and remains 0; there is no stale-message notice.
 - 409 → backoff 1,2,4…60s; after 5 consecutive → one warning sendMessage/log
   line, keep idling. Other HTTP/network errors → log + 5s sleep.
 - Idle TTL: track lastAgentSeen; no agent pane for `idleExitMin` → clean exit.

@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.34.7
+
+**Fix: tg-ctl no longer drops old owner messages as stale.**
+
+- Telegram messages from the owner are now processed even when they arrive after
+  the old staleness window, so requests sent during daemon downtime or long agent
+  work are not silently lost.
+- The daemon no longer sends the user-visible `skipped N stale messages` notice.
+- `tg replies` history keeps old owner messages too, so agents can recover them
+  by message id after a pause.
+
 ## 1.34.6
 
 **Fix: tg-ctl keeps daemon replies in their Telegram topic and reports private-topic setup accurately.**

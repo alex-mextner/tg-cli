@@ -92,14 +92,15 @@ test('inboundHistoryRecords: pane=null is preserved (logged outside a known pane
   expect(recs[0].pane).toBeNull();
 });
 
-test('inboundHistoryRecords: drops stale messages when nowSec + stalenessSec given (mirrors stepUpdates)', () => {
+test('inboundHistoryRecords: keeps old owner messages when nowSec + stalenessSec are present', () => {
   const old = msg({ text: 'ancient' }); // date 1700000000
   const recs = inboundHistoryRecords([old], {
     ...opts,
-    nowSec: 1700000000 + 1000, // 1000s later, staleness 300 → dropped
+    nowSec: 1700000000 + 1000,
     stalenessSec: 300,
   });
-  expect(recs).toEqual([]);
+  expect(recs).toHaveLength(1);
+  expect(recs[0].text).toBe('ancient');
 });
 
 test('inboundHistoryRecords: keeps fresh messages under the staleness window', () => {

@@ -161,8 +161,8 @@ function makeServer(updateQueue: unknown[][]): {
   return { server, sends, callbacks };
 }
 
-// `date` must be CURRENT (the daemon drops messages older than stalenessSec, 300s) — a date of 0
-// would be "skipped N stale", never processed.
+// Keep `date` current so the fixture represents a normal live /new flow. tg-ctl no
+// longer drops owner messages by age.
 const nowSec = (): number => Math.floor(Date.now() / 1000);
 
 function textMsg(id: number, text: string): unknown {

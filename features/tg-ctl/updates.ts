@@ -7,8 +7,10 @@
 // template).
 //
 // Delivery semantics are at-most-once (spec §10): the offset advances over
-// EVERY update — rejected senders, stale messages and unsupported kinds
-// included — so nothing is ever replayed into a live agent session.
+// EVERY update — rejected senders and unsupported kinds included — so nothing is
+// ever replayed into a live agent session. Owner messages are not dropped by age:
+// if Telegram delivered the update after daemon downtime, it is still a real
+// instruction and must reach the agent.
 
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
 import { parseButtonCallback, parseQuestionCloseCallback } from './questions';
@@ -98,7 +100,6 @@ export function buildReplyInject(m: TgMessage, name: string, opts: StepOpts): st
 export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   const callbackActions: Action[] = [];
   const actions: Action[] = [];
-  let skippedStale = 0;
   let maxId = -1;
 
   // PRE-SCAN for threads this batch undergoes a LIFECYCLE TRANSITION (close OR reopen): callbacks
@@ -108,8 +109,8 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   // topic (codex r21); for a REOPEN, markReopened drops the freshly-bound paneId → orphans it too
   // (codex r27). So suppress any topic spawn-flow callback (model/path/re-spawn) for a thread the
   // SAME batch closes OR reopens, letting the lifecycle transition win. Apply the SAME filters the
-  // message loop uses (codex r22): a STALE or UNAUTHORIZED service message is ignored there, so it
-  // must NOT suppress a valid same-batch tap here either. Only an allowed, fresh, TRACKED-topic one.
+  // message loop uses (codex r22): an UNAUTHORIZED service message is ignored there, so it
+  // must NOT suppress a valid same-batch tap here either. Only an allowed, TRACKED-topic one.
   // Map each such thread to the EARLIEST lifecycle update_id (codex r30): suppression is ORDER-AWARE
   // for text/media messages — only a message that came AFTER the transition (higher update_id) is
   // suppressed; one that came BEFORE it is processed normally (it happened before the close/reopen).
@@ -120,7 +121,6 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       const t = m?.message_thread_id;
       if (!(m?.forum_topic_closed || m?.forum_topic_reopened) || t === undefined) continue;
       if (!senderAllowed(m.from?.id, opts)) continue;
-      if (opts.nowSec - m.date > opts.cfg.stalenessSec) continue;
       if ((opts.topicStatusOf?.(t) ?? null) === null) continue;
       const prior = lifecycleInBatch.get(t);
       if (prior === undefined || u.update_id < prior) lifecycleInBatch.set(t, u.update_id);
@@ -308,14 +308,8 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     if (!m) continue; // non-message/callback update → advance silently
 
     // Sender allowlist FIRST (spec §9: from.id, not chat id — a group member
-    // must not inject prompts). Rejected senders also never inflate the stale
-    // count, so the "skipped N stale" notice only reports the owner's backlog.
+    // must not inject prompts).
     if (!senderAllowed(m.from?.id, opts)) continue;
-
-    if (opts.nowSec - m.date > opts.cfg.stalenessSec) {
-      skippedStale += 1;
-      continue;
-    }
 
     const name = m.from?.first_name || m.from?.username || 'tg';
 
@@ -414,7 +408,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   return {
     actions: [...callbackActions, ...actions],
     newOffset: updates.length ? maxId + 1 : opts.currentOffset,
-    skippedStale,
+    skippedStale: 0,
   };
 }
 

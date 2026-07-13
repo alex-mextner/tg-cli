@@ -310,28 +310,31 @@ test("disallowed sender's /kill is ignored entirely", () => {
   expect(r.newOffset).toBe(2);
 });
 
-// --- staleness (spec §10) ---
+// --- old owner messages (no age-based drop) ---
 
-test('stale message is dropped and counted', () => {
+test('old owner message is processed, not skipped by tg-ctl age', () => {
   const r = stepUpdates([upd(1, { text: 'old', date: NOW - 301 })], makeOpts());
-  expect(r.actions).toEqual([]);
-  expect(r.skippedStale).toBe(1);
+  expect(r.actions).toEqual([
+    { kind: 'inject-text', text: '[TG from Alex] old', messageId: 1 },
+    { kind: 'ack', messageId: 1 },
+  ]);
+  expect(r.skippedStale).toBe(0);
   expect(r.newOffset).toBe(2);
 });
 
-test('message exactly stalenessSec old is NOT stale (strict >)', () => {
+test('message exactly stalenessSec old is processed', () => {
   const r = stepUpdates([upd(1, { text: 'edge', date: NOW - 300 })], makeOpts());
   expect(r.actions).toHaveLength(2); // delivery action + its ack
   expect(r.skippedStale).toBe(0);
 });
 
-test('stale command is counted stale, never executed', () => {
+test('old owner command is processed, not skipped by tg-ctl age', () => {
   const r = stepUpdates([upd(1, { text: '/kill', date: NOW - 9999 })], makeOpts());
-  expect(r.actions).toEqual([]);
-  expect(r.skippedStale).toBe(1);
+  expect(r.actions).toEqual([{ kind: 'kill-agent' }, { kind: 'ack', messageId: 1 }]);
+  expect(r.skippedStale).toBe(0);
 });
 
-test('stale message from a disallowed sender does not inflate the stale count', () => {
+test('old message from a disallowed sender is still ignored', () => {
   const r = stepUpdates([upd(1, { text: 'x', date: NOW - 9999, from: { id: 666 } })], makeOpts());
   expect(r.skippedStale).toBe(0);
   expect(r.newOffset).toBe(2);
@@ -723,12 +726,12 @@ test('voice from a disallowed sender is dropped entirely', () => {
 
 // --- batch combinations ---
 
-test('batch: ordered actions, stale counted, intruder dropped, offset correct', () => {
+test('batch: ordered actions, old owner message kept, intruder dropped, offset correct', () => {
   const updates: TgUpdate[] = [
     upd(10, { text: 'hello' }),
     upd(11, { text: '/status' }),
     { update_id: 12 }, // non-message update
-    upd(13, { text: 'late', date: NOW - 1000 }), // stale
+    upd(13, { text: 'late', date: NOW - 1000 }), // old, still delivered
     upd(14, { text: '/kill', from: { id: 666 } }), // intruder
     upd(15, { text: 'world' }),
   ];
@@ -738,10 +741,12 @@ test('batch: ordered actions, stale counted, intruder dropped, offset correct', 
     { kind: 'ack', messageId: 10 },
     { kind: 'status' },
     { kind: 'ack', messageId: 11 },
+    { kind: 'inject-text', text: '[TG from Alex] late', messageId: 13 },
+    { kind: 'ack', messageId: 13 },
     { kind: 'inject-text', text: '[TG from Alex] world', messageId: 15 },
     { kind: 'ack', messageId: 15 },
   ]);
-  expect(r.skippedStale).toBe(1);
+  expect(r.skippedStale).toBe(0);
   expect(r.newOffset).toBe(16);
 });
 

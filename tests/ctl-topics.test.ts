@@ -316,14 +316,14 @@ test('topics ON: a DUPLICATE forum_topic_created for an in-flight/bound topic do
   expect(fresh.actions[0]).toEqual({ kind: 'topic-new', threadId: 51, name: 'new', from: 'Alex' });
 });
 
-test('topics ON: a STALE topic message yields NO topic action (never leaks to a live agent)', () => {
-  const stale: TgUpdate = {
+test('topics ON: an old topic message still routes to its bound topic', () => {
+  const old: TgUpdate = {
     update_id: 20,
     message: { message_id: 20, from: { id: CHAT_ID, first_name: 'Alex' }, chat: { id: CHAT_ID }, date: NOW - 9999, text: 'old', message_thread_id: 50, is_topic_message: true },
   };
-  const r = stepUpdates([stale], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
-  expect(r.actions).toEqual([]);
-  expect(r.skippedStale).toBe(1);
+  const r = stepUpdates([old], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
+  expect(r.actions).toEqual([{ kind: 'topic-route', threadId: 50, from: 'Alex', injectText: '[TG from Alex #20] old', messageId: 20 }, { kind: 'ack', messageId: 20 }]);
+  expect(r.skippedStale).toBe(0);
 });
 
 test('topics ON: a topic message from a NON-allowed sender yields NO topic action', () => {
@@ -639,14 +639,15 @@ test('topics ON: a same-batch close + a TEXT message to that thread → ack only
   expect(r.actions).toContainEqual({ kind: 'ack', messageId: 41 }); // the text is acked, not routed
 });
 
-test('topics ON: a STALE or UNAUTHORIZED same-batch close does NOT suppress a valid tap (codex r22)', () => {
+test('topics ON: an old same-batch close suppresses a later tap because owner events are not dropped by age', () => {
   const opts = makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' });
-  // STALE close (date far in the past, beyond stalenessSec): it's ignored by the loop, so it must
-  // NOT suppress the fresh tgr tap on the same thread.
-  const staleClose = upd(30, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, date: NOW - 10 * 3600 });
-  const rStale = stepUpdates([staleClose, cbUpd(31, 'tgr:50')], opts);
-  expect(rStale.actions.some((a) => a.kind === 'topic-respawn')).toBe(true);
+  const oldClose = upd(30, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, date: NOW - 10 * 3600 });
+  const rOld = stepUpdates([oldClose, cbUpd(31, 'tgr:50')], opts);
+  expect(rOld.actions.some((a) => a.kind === 'topic-respawn')).toBe(false);
+});
 
+test('topics ON: an UNAUTHORIZED same-batch close does NOT suppress a valid tap (codex r22)', () => {
+  const opts = makeOpts({ topicsEnabled: true, topicStatusOf: () => 'closed' });
   // UNAUTHORIZED close (from a non-allowlisted user id): same — must not suppress the valid tap.
   const unauthClose = upd(32, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, from: { id: 999_999, first_name: 'Mallory' } });
   const rUnauth = stepUpdates([unauthClose, cbUpd(33, 'tgr:50')], opts);

@@ -13,7 +13,7 @@ export interface ControlConfig {
   transport: 'auto' | 'tmux' | 'channel'; // 'channel' reserved for v1.2+
   session?: string; // fixed tmux session name (else auto-discover)
   injectWrap: string; // template: {name}, {msg}
-  stalenessSec: number; // drop inbound older than this (default 300)
+  stalenessSec: number; // legacy config; owner inbound is no longer dropped by age
   idleExitMin: number; // daemon exits after this long with no agent pane (default 30)
   allowedSenders: number[]; // extra allowed sender user ids
   // Forum-topics mode (docs/specs/tg-forum-topics.md). Default OFF: when false the daemon
@@ -339,7 +339,7 @@ export type Action =
 export interface StepResult {
   actions: Action[];
   newOffset: number; // next getUpdates offset (last update_id + 1)
-  skippedStale: number; // count for the one-shot "skipped N stale" notice
+  skippedStale: number; // legacy field; owner inbound is no longer skipped by age
 }
 
 // --- tmux injection plans (spec §16 module 5) ---

@@ -451,10 +451,10 @@ delayed, or hung waiting for a button tap.
   between confirm and inject loses that message (the human notices no response
   and resends); the alternative (at-least-once) double-injects ghost prompts
   into a live agent session, which is strictly worse for a control channel.
-- **Stale flood (review F4):** offset persistence does NOT stop the 24 h Telegram
-  backlog accumulated while the daemon was down. Drop every inbound whose
-  `message.date` is older than `control.staleness_sec` (default 300 s) and send
-  ONE summary notice: "skipped N stale messages".
+- **Backlog handling:** offset persistence does NOT stop the 24 h Telegram
+  backlog accumulated while the daemon was down. Owner messages are still real
+  instructions regardless of age, so they are processed normally; rejected
+  senders and unsupported updates still advance the offset without action.
 - **409 in the poll loop (review F9):** exponential backoff with cap; after N
   consecutive 409s send one TG/log notice "another consumer is polling this bot"
   and idle. The flock cannot prevent a lingering server-side long poll right

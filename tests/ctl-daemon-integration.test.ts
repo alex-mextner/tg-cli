@@ -19,7 +19,7 @@ const nowSec = Math.floor(Date.now() / 1000);
 // Scripted updates, served at-most-once via the offset param:
 // 100 → allowed sender, plain text  → inject attempt → no-agent guard reply
 // 101 → /status                     → status reply containing "running"
-// 102 → stale (older than 300s)     → "skipped 1 stale messages" notice
+// 102 → old owner message           → inject attempt → no-agent guard reply
 // 103 → DISALLOWED sender           → no reply, but the offset must still advance
 // 104 → photo from allowed sender   → getFile + download, then no-agent reply
 const QUEUE = [
@@ -120,7 +120,7 @@ afterAll(async () => {
   server.stop(true);
 });
 
-test('daemon round-trip: stale notice, guard replies, /status, allowlist drop, media download', async () => {
+test('daemon round-trip: old owner message, guard replies, /status, allowlist drop, media download', async () => {
   mkdirSync(join(cfgDir, '.claude'), { recursive: true });
   const hooks = withClaudeHooks({}, 'tg-ctl ask');
   const harness = withHarnessHooks(hooks.settings, 'tg-ctl harness-event');
@@ -162,15 +162,15 @@ test('daemon round-trip: stale notice, guard replies, /status, allowlist drop, m
     await Bun.sleep(100);
   }
 
-  // (c) one stale notice for the whole batch, sent BEFORE any action.
-  expect(sent[0]?.text).toBe('skipped 1 stale messages');
   // (a) prompt from allowed sender → inject attempted → no panes → guard reply.
-  expect(sent[1]?.text).toBe(NO_AGENT_REPLY);
+  expect(sent[0]?.text).toBe(NO_AGENT_REPLY);
   // (b) /status → composed status names THIS daemon as running.
-  expect(sent[2]?.text).toContain(`tg-ctl: running (pid ${daemon.pid})`);
-  expect(sent[2]?.text).toContain('offset: 105');
-  expect(sent[2]?.text).toContain('usage telemetry: shadowed by');
-  expect(sent[2]?.text).toContain(join(statusProject, '.claude', 'settings.json'));
+  expect(sent[1]?.text).toContain(`tg-ctl: running (pid ${daemon.pid})`);
+  expect(sent[1]?.text).toContain('offset: 105');
+  expect(sent[1]?.text).toContain('usage telemetry: shadowed by');
+  expect(sent[1]?.text).toContain(join(statusProject, '.claude', 'settings.json'));
+  // (c) old owner message → still processed; no "skipped stale" notice.
+  expect(sent[2]?.text).toBe(NO_AGENT_REPLY);
   // (e) photo → downloaded, then the inject for it degrades to the guard too.
   expect(sent[3]?.text).toBe(NO_AGENT_REPLY);
   expect(sent).toHaveLength(4);
