@@ -178,6 +178,34 @@ test('Claude Code subagent keeps the generic label when fresh metadata is ambigu
   });
 });
 
+// Production shape (tg#7012/#7108): a Task-tool subagent's own cwd (PWD) is a
+// WORKTREE, never the orchestrator's project dir. Claude writes the metadata
+// under the ORCHESTRATOR's project key + the (parent) session id, so the project
+// key cannot be derived from PWD. The only reliable locator is
+// CLAUDE_CODE_SESSION_ID. Before the fix, detection derived the project key from
+// PWD, missed the real subagents dir, and always fell back to 'subagent'.
+test('Claude Code subagent finds metadata by session id when PWD is a worktree, not the project dir', () => {
+  withTempHome((home) => {
+    const projectDir = '/Users/alex/work/hyperide';
+    // The subagent runs in a worktree whose path dashes to a DIFFERENT project
+    // key that has no subagents dir of its own.
+    const worktreeDir = '/Users/alex/work/hyperide/.worktrees/agent-aae53807f09d9cffa';
+    writeClaudeSubagentMeta(home, projectDir, 'session-parent', 'a93f269abbe5467f7', {
+      description: 'Fix ctl routing',
+    });
+
+    expect(
+      detectAgentLabel({
+        HOME: home,
+        PWD: worktreeDir,
+        CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'session-parent',
+      }, fsDeps),
+    ).toBe('Fix ctl routing');
+  });
+});
+
 test('Claude Code freshness fallback ignores fresh metadata from another session', () => {
   withTempHome((home) => {
     const projectDir = '/Users/alex/work/hyperide';

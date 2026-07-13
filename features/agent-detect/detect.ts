@@ -257,12 +257,18 @@ function claudeSubagentDirs(env: AgentDetectEnv, deps: AgentDetectDeps): ClaudeS
       dirs.push({ path: join(root, projectKey, sessionId, 'subagents'), freshFallbackAllowed: true });
     }
   }
-  if (projectKeys.length === 0) {
-    for (const sessionId of sessionIds) {
-      for (const project of safeReaddir(deps, root)) {
-        if (!project.isDirectory()) continue;
-        dirs.push({ path: join(root, project.name, sessionId, 'subagents'), freshFallbackAllowed: true });
-      }
+  // Scan EVERY project dir for the current session id. A Task-tool subagent's own
+  // cwd (PWD) is a WORKTREE, not the orchestrator's project dir, so the project
+  // key above (derived from PWD) points at a dir that has no subagents — Claude
+  // writes the metadata under the ORCHESTRATOR's project key + the parent session
+  // id (CLAUDE_CODE_SESSION_ID). Locating by session id is the only reliable way
+  // (tg#7012/#7108). This used to be gated on `projectKeys.length === 0`, which
+  // made it dead code in practice — PWD is essentially always set, so the gate
+  // never opened and detection always fell back to the generic 'subagent'.
+  for (const sessionId of sessionIds) {
+    for (const project of safeReaddir(deps, root)) {
+      if (!project.isDirectory()) continue;
+      dirs.push({ path: join(root, project.name, sessionId, 'subagents'), freshFallbackAllowed: true });
     }
   }
   for (const projectKey of projectKeys) {
