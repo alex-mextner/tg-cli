@@ -33,3 +33,19 @@ export function agentNameForPane(
   // so a caller still gets SOME identifier; null only when both are empty.
   return win || null;
 }
+
+// Parse a `tmux display-message -p '#{window_name}\t#{pane_current_path}'` line into the
+// agent name. SPLITS ON THE FIRST TAB ONLY and strips ONLY the trailing newline — never a
+// blanket `.trim()`, which would eat the tab delimiter itself when the window name is empty
+// (`"\t/some/path\n"` → `"/some/path"`), shifting the PATH into the window-name slot and
+// yielding a wrong label. The empty-window-name case is exactly the one the cwd fallback in
+// agentNameForPane exists for (bare/auto-named panes), so it must parse correctly. A line
+// with no tab is treated as a lone window name (empty path). Mirrors the daemon, which reads
+// the same two tmux fields from its snapshot.
+export function agentNameFromDisplayLine(raw: string): string | null {
+  const line = raw.replace(/\r?\n$/, '');
+  const tab = line.indexOf('\t');
+  const windowName = tab >= 0 ? line.slice(0, tab) : line;
+  const panePath = tab >= 0 ? line.slice(tab + 1) : '';
+  return agentNameForPane(windowName, panePath);
+}

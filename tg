@@ -53,6 +53,7 @@ import { appendRecordsToBlob, parseHistory } from "./features/replies/history"
 import { buildOutboundHistoryRecords, outboundHistoryText } from "./features/replies/outbound"
 import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
+import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
 import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
 import { detectAgentLabel } from "./features/agent-detect/detect"
 import { installSkill } from "./features/install-skill/install"
@@ -306,6 +307,32 @@ Only those HTML tags are supported. Escape raw <, >, and & outside tags as
 &lt;, &gt;, and &amp;.
 `
 
+// The human AGENT NAME for THIS shell's tmux pane — the SAME derivation the
+// daemon stamps on inbound records (agentNameForPane over #{window_name} +
+// #{pane_current_path}). Used by BOTH the `tg replies` read path (its default
+// `current` scope resolves the reader's own agent) AND the outbound history
+// writer (it stamps `targetAgent` on each record it appends), so a session's
+// outbound and the inbound routed to it share one label and the default
+// agent-scoped view groups them together. Returns null when not in tmux / the
+// query fails / neither signal is usable — the caller then degrades to untagged.
+function currentPaneAgentName(): string | null {
+  const pane = process.env.TMUX_PANE
+  if (!process.env.TMUX || !pane) return null
+  try {
+    const result = Bun.spawnSync(
+      ["tmux", "display-message", "-p", "-t", pane, "#{window_name}\t#{pane_current_path}"],
+      { stdout: "pipe", stderr: "pipe" },
+    )
+    if (result.exitCode !== 0) return null
+    // Parse via the shared helper: it splits on the FIRST tab and strips only the trailing
+    // newline, so an empty window name (a bare/auto-named pane — the cwd-fallback case) keeps
+    // the path in the right slot instead of a blanket .trim() eating the tab delimiter.
+    return agentNameFromDisplayLine(new TextDecoder().decode(result.stdout))
+  } catch {
+    return null // tmux missing / pane gone
+  }
+}
+
 function decodeTextEscapes(value: string): string {
   return value.replace(/\\([nrt\\])/g, (_match: string, escaped: string) => {
     if (escaped === "n") return "\n"
@@ -438,6 +465,10 @@ if (import.meta.main) {
         }
       },
       detectPane: detectRepliesPane,
+      // The reader's OWN agent name (this pane's window/project) — the default
+      // `current` scope filters history to it. SAME derivation the daemon stamps
+      // as targetAgent, so the default view actually matches the tagged rows.
+      currentAgent: currentPaneAgentName,
       // `--session ext` → the pane ids of every tmux window named exactly "ext".
       resolveWindow: (name: string) => resolveWindowPanes(name, runTmuxListPanes),
       // Local time (Europe/Belgrade for the CTO) — matches the daemon's wrap.
@@ -1208,6 +1239,11 @@ if (import.meta.main) {
         TMUX_PANE,
         randomUUID(),
         currentChatId,
+        // This session's own agent name (agentNameForPane over its pane) — the
+        // SAME label the daemon stamps on inbound, so `tg replies` groups a
+        // session's outbound and its inbound under one current-agent scope.
+        // Undefined when unresolvable → the record stays untagged.
+        currentPaneAgentName() ?? undefined,
       )
       // 0o600: the log is a conversation transcript — owner-only, like the daemon socket.
       writeFileSync(
