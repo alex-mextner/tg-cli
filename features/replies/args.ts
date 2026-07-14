@@ -12,6 +12,14 @@
 export type Direction = 'user' | 'agent' | 'all';
 export type Action = 'list' | 'find';
 
+// Which agents' messages to show. DEFAULT is `current` — only the agent this
+// shell IS (resolved from the current tmux pane). The flags widen or redirect it.
+export type AgentScope =
+  | { mode: 'current' } // default: the current agent (falls back to untagged when unresolvable)
+  | { mode: 'named'; name: string } // --agent <name>: one specific agent
+  | { mode: 'all' } // --all: every agent, tagged and untagged
+  | { mode: 'untagged' }; // --untagged: only legacy / no-target rows
+
 export interface RepliesQuery {
   kind: 'query';
   direction: Direction;
@@ -21,6 +29,7 @@ export interface RepliesQuery {
   full: boolean;
   json: boolean;
   regex: boolean;
+  agentScope: AgentScope; // which agents' messages to show (default: current)
   allSessions: boolean;
   session?: string; // explicit scope (--session): a tmux window name (`ext`) or a %-pane id (`%7`)
   since?: number; // unix seconds lower bound (inclusive), from --since
@@ -80,6 +89,10 @@ export function parseRepliesArgs(argv: string[]): RepliesArgs {
   let session: string | undefined;
   let since: number | undefined;
   let until: number | undefined;
+  // Agent scope — at most ONE of --agent/--all/--untagged may be set; the first
+  // one seen claims the scope and a second conflicting one is an error.
+  let agentScope: AgentScope = { mode: 'current' };
+  let agentScopeSet = false;
 
   const positionals: string[] = [];
   let i = 0;
@@ -98,6 +111,23 @@ export function parseRepliesArgs(argv: string[]): RepliesArgs {
     } else if (tok === '--all-sessions') {
       allSessions = true;
       i += 1;
+    } else if (tok === '--all') {
+      if (agentScopeSet) return { kind: 'error', message: agentScopeConflict('--all') };
+      agentScope = { mode: 'all' };
+      agentScopeSet = true;
+      i += 1;
+    } else if (tok === '--untagged') {
+      if (agentScopeSet) return { kind: 'error', message: agentScopeConflict('--untagged') };
+      agentScope = { mode: 'untagged' };
+      agentScopeSet = true;
+      i += 1;
+    } else if (tok === '--agent') {
+      const v = argv[i + 1];
+      if (v === undefined || v.trim() === '') return { kind: 'error', message: '--agent requires an agent name' };
+      if (agentScopeSet) return { kind: 'error', message: agentScopeConflict('--agent') };
+      agentScope = { mode: 'named', name: v.trim() };
+      agentScopeSet = true;
+      i += 2;
     } else if (tok === '-n' || tok === '--limit') {
       const v = argv[i + 1];
       if (v === undefined) return { kind: 'error', message: `${tok} requires a number` };
@@ -174,9 +204,16 @@ export function parseRepliesArgs(argv: string[]): RepliesArgs {
     full,
     json,
     regex,
+    agentScope,
     allSessions,
     session,
     since,
     until,
   };
+}
+
+// One agent-scope flag at a time — --agent/--all/--untagged are mutually
+// exclusive (each names a different, incompatible set of agents to show).
+function agentScopeConflict(flag: string): string {
+  return `${flag} conflicts with another agent scope (--agent/--all/--untagged are mutually exclusive)`;
 }

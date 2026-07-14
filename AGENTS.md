@@ -173,11 +173,13 @@ tests can pass fakes.
 
 - **Message history & recall (`tg replies`, v1.11.0):** an append-only JSONL log at
   `tg-ctl.<botid>.history.jsonl` (path added to `CtlPaths`, next to `routes`) records one
-  `{ts, message_id, direction, from, text, pane, groupId?}` object per line. TWO writers, both
-  best-effort (a corrupt/unwritable log NEVER breaks a send or an inject, exactly like `routes`):
-  the `tg-ctl` poll loop appends every inbound message it processes (stamped with the routed
-  target pane), and `tg` appends one `agent` record per OUTBOUND Telegram message_id (stamped
-  with `$TMUX_PANE`) — a >4096 split or a media-group album emits several ids for one logical
+  `{ts, message_id, direction, from, text, pane, groupId?, targetAgent?}` object per line. TWO
+  writers, both best-effort (a corrupt/unwritable log NEVER breaks a send or an inject, exactly
+  like `routes`): the `tg-ctl` poll loop appends every inbound message it processes (stamped with
+  the routed target pane AND `targetAgent` — the routed pane's agent NAME via `agentNameForPane`),
+  and `tg` appends one `agent` record per OUTBOUND Telegram message_id (stamped with `$TMUX_PANE`
+  AND `targetAgent` — the sending session's own agent name, the SAME namespace, so a session's
+  inbound and outbound share one label) — a >4096 split or a media-group album emits several ids for one logical
   send, and each gets its own record (same text) so a reply anchored to any of them stays
   recall-able (tg-cli#131). Every sibling of such a multi-part send shares a `groupId` (a random
   per-send token, NOT the group's first id — Telegram message_id is sequential PER CHAT, so
@@ -186,8 +188,14 @@ tests can pass fakes.
   plain listing and `--json`, and never truncates a kept send mid-group); the plain listing
   additionally collapses each group to one line, while `--json` always returns every id of the
   kept sends uncollapsed (tg-cli#131 follow-up, closes #134).
-  The file is trimmed to its last ~5000 lines on each write. `tg replies` defaults to the CURRENT
-  pane's session + `user` direction ("recall what the user wrote"); `--all-sessions`/`--session`
+  The file is trimmed to its last ~5000 lines on each write. `tg replies` is AGENT-SCOPED: it
+  defaults to the CURRENT agent (resolved from the current pane's window/project via the SAME
+  `agentNameForPane`) + `user` direction, and MARKS every line with `[→ <agent>]` (`[→ ?]` =
+  untagged/legacy). `--agent <name>` filters to one agent (case-insensitive), `--all` shows every
+  agent, `--untagged` shows only untagged/legacy rows (the three are mutually exclusive; an
+  explicit one of them drops the current-pane default so the agent filter is the axis). When the
+  current agent can't be resolved (outside tmux) the default degrades to untagged + a stderr note.
+  The pane axis is orthogonal: `--all-sessions`/`--session`
   override scope — `--session` takes a tmux WINDOW NAME (`--session ext`, exact match → the pane
   set of every window so named, unioned across sessions) or a raw `%`-pane id (`--session %7`);
   `--all-sessions` drops the pane filter entirely (`tg replies agent --all-sessions`);

@@ -43,7 +43,7 @@ test('inbound writer → file → tg replies reader, scoped to the routed pane',
     errlog: () => {},
   });
   expect(code).toBe(0);
-  expect(out).toEqual(['[T] #10 ship it']);
+  expect(out).toEqual(['[T] #10 [→ ?] ship it']);
 });
 
 test('outbound writer → file → tg replies agent reader', () => {
@@ -71,7 +71,7 @@ test('outbound writer → file → tg replies agent reader', () => {
     log: (m) => out.push(m),
     errlog: () => {},
   });
-  expect(out).toEqual(['[T] #99 done, shipped']);
+  expect(out).toEqual(['[T] #99 [→ ?] done, shipped']);
 });
 
 // tg-cli#131: production writes via buildOutboundHistoryRecords(outboundIds,
@@ -129,7 +129,7 @@ test('outbound writer (multi-id) → file → plain listing collapses to ONE lin
     errlog: () => {},
   });
   expect(code).toBe(0);
-  expect(out).toEqual(['[T] #301 [3 photos]']); // ONE line, not three
+  expect(out).toEqual(['[T] #301 [→ ?] [3 photos]']); // ONE line, not three
 });
 
 test('both writers append to the SAME file; `all` shows the conversation in order', () => {
@@ -174,5 +174,5 @@ test('both writers append to the SAME file; `all` shows the conversation in orde
     log: (m) => out.push(m),
     errlog: () => {},
   });
-  expect(out).toEqual(['← [T] #10 status?', '→ [T] #11 all green']);
+  expect(out).toEqual(['← [T] #10 [→ ?] status?', '→ [T] #11 [→ ?] all green']);
 });

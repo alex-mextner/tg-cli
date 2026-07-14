@@ -46,25 +46,25 @@ test('runReplies: default scope = detected pane, default direction = user', () =
   expect(code).toBe(0);
   // pane %1, user only → message 10 (not 11 agent, not 12 pane %2)
   expect(out.length).toBe(1);
-  expect(out[0]).toBe('[T] #10 deploy the canary');
+  expect(out[0]).toBe('[T] #10 [→ ?] deploy the canary');
 });
 
 test('runReplies: `all` in the detected pane shows both directions with markers', () => {
   const { deps, out } = makeDeps();
   runReplies(['replies', 'all'], deps);
-  expect(out).toEqual(['← [T] #10 deploy the canary', '→ [T] #11 deployed OK']);
+  expect(out).toEqual(['← [T] #10 [→ ?] deploy the canary', '→ [T] #11 [→ ?] deployed OK']);
 });
 
 test('runReplies: --all-sessions ignores the pane scope', () => {
   const { deps, out } = makeDeps();
   runReplies(['replies', 'user', '--all-sessions'], deps);
-  expect(out).toEqual(['[T] #10 deploy the canary', '[T] #12 roll it back']);
+  expect(out).toEqual(['[T] #10 [→ ?] deploy the canary', '[T] #12 [→ ?] roll it back']);
 });
 
 test('runReplies: --session overrides the detected pane', () => {
   const { deps, out } = makeDeps();
   runReplies(['replies', 'user', '--session', '%2'], deps);
-  expect(out).toEqual(['[T] #12 roll it back']);
+  expect(out).toEqual(['[T] #12 [→ ?] roll it back']);
 });
 
 test('runReplies: --session %N (pane id) is passed through WITHOUT calling resolveWindow', () => {
@@ -77,7 +77,7 @@ test('runReplies: --session %N (pane id) is passed through WITHOUT calling resol
   });
   runReplies(['replies', 'user', '--session', '%2'], deps);
   expect(called).toBe(0); // a %-prefixed arg is a pane id, never a window lookup
-  expect(out).toEqual(['[T] #12 roll it back']);
+  expect(out).toEqual(['[T] #12 [→ ?] roll it back']);
 });
 
 test('runReplies: --session <windowName> resolves to its panes and scopes recall', () => {
@@ -85,7 +85,7 @@ test('runReplies: --session <windowName> resolves to its panes and scopes recall
     resolveWindow: (name) => (name === 'ext' ? ['%2'] : []),
   });
   runReplies(['replies', 'user', '--session', 'ext'], deps);
-  expect(out).toEqual(['[T] #12 roll it back']); // %2 is the only pane of window "ext"
+  expect(out).toEqual(['[T] #12 [→ ?] roll it back']); // %2 is the only pane of window "ext"
 });
 
 test('runReplies: --session <windowName> unions duplicate window names across sessions', () => {
@@ -94,7 +94,7 @@ test('runReplies: --session <windowName> unions duplicate window names across se
   });
   runReplies(['replies', 'all', '--session', 'work'], deps);
   // %1 (#10 user, #11 agent) ∪ %2 (#12 user)
-  expect(out).toEqual(['← [T] #10 deploy the canary', '→ [T] #11 deployed OK', '← [T] #12 roll it back']);
+  expect(out).toEqual(['← [T] #10 [→ ?] deploy the canary', '→ [T] #11 [→ ?] deployed OK', '← [T] #12 [→ ?] roll it back']);
 });
 
 test('runReplies: --session matches EXACTLY, not by prefix (ext ≠ "ext: diagram")', () => {
@@ -105,11 +105,11 @@ test('runReplies: --session matches EXACTLY, not by prefix (ext ≠ "ext: diagra
   };
   const a = makeDeps({ resolveWindow });
   runReplies(['replies', 'user', '--session', 'ext'], a.deps);
-  expect(a.out).toEqual(['[T] #10 deploy the canary']); // only %1
+  expect(a.out).toEqual(['[T] #10 [→ ?] deploy the canary']); // only %1
 
   const b = makeDeps({ resolveWindow });
   runReplies(['replies', 'user', '--session', 'ext: diagram'], b.deps);
-  expect(b.out).toEqual(['[T] #12 roll it back']); // only %2
+  expect(b.out).toEqual(['[T] #12 [→ ?] roll it back']); // only %2
 });
 
 test('runReplies: an unknown window name → exit 1 + a clear error, never a silent empty', () => {
@@ -123,7 +123,7 @@ test('runReplies: an unknown window name → exit 1 + a clear error, never a sil
 test('runReplies: find filters by query within the scope', () => {
   const { deps, out } = makeDeps({ detectPane: () => null });
   runReplies(['replies', 'all', 'find', 'roll', '--all-sessions'], deps);
-  expect(out).toEqual(['→ [T] #12 roll it back'.replace('→', '←')]); // #12 is a user message
+  expect(out).toEqual(['→ [T] #12 [→ ?] roll it back'.replace('→', '←')]); // #12 is a user message
 });
 
 test('runReplies: --json emits a single JSON array line', () => {
@@ -195,7 +195,7 @@ test('runReplies: a multi-part send (3 ids) prints as ONE line in the plain list
     detectPane: () => '%3',
   });
   runReplies(['replies', 'agent'], deps);
-  expect(out).toEqual(['[T] #301 [3 photos]']); // ONE line, not three
+  expect(out).toEqual(['[T] #301 [→ ?] [3 photos]']); // ONE line, not three
 });
 
 // The SAME multi-part history, but --json: every id must stay individually

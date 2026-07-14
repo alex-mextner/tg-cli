@@ -20,6 +20,14 @@ export interface HistoryRecord {
   from: string; // display name ('Alex', 'agent', …)
   text: string; // the message body, verbatim (UNWRAPPED — no `[TG from …]` envelope)
   pane: string | null; // tmux pane id this message was routed to / sent from; null outside tmux
+  // The human AGENT NAME this message was routed to (inbound) or sent from
+  // (outbound) — derived from the target pane's window name / cwd project by
+  // `agentNameForPane`. This is the attribution `tg replies` filters + marks on.
+  // ABSENT on a legacy row (written before this field existed) or when no
+  // specific target could be resolved (a broadcast / no discovered agent); the
+  // reader treats absent as "untagged / unknown" (marked `[→ ?]`), never hiding
+  // it from `--all` / `--untagged`.
+  targetAgent?: string;
   // Set ONLY on a true multi-part send (a >4096 split or a media-group album —
   // buildOutboundHistoryRecords, review: tg-cli#131) to a random per-send
   // token; every sibling record of that ONE send carries the same value.
@@ -68,6 +76,10 @@ function parseLine(line: string): HistoryRecord | null {
   // corrupted line — the write path only ever emits crypto.randomUUID(),
   // never '') would otherwise satisfy that check and wrongly merge.
   const groupId = typeof r.groupId === 'string' && r.groupId !== '' ? r.groupId : undefined;
+  // targetAgent is optional/informational, symmetric with groupId: an absent or
+  // empty value is "untagged / unknown" (a legacy row, or a send with no
+  // resolvable target), never an invalid record.
+  const targetAgent = typeof r.targetAgent === 'string' && r.targetAgent !== '' ? r.targetAgent : undefined;
   return {
     ts: r.ts,
     message_id: r.message_id,
@@ -77,6 +89,7 @@ function parseLine(line: string): HistoryRecord | null {
     text: r.text,
     pane: r.pane,
     ...(groupId !== undefined ? { groupId } : {}),
+    ...(targetAgent !== undefined ? { targetAgent } : {}),
   };
 }
 
