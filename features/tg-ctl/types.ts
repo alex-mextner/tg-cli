@@ -424,6 +424,7 @@ export interface CtlPaths {
   overloadRetries: string; // retry-attempt state for transient overload auto-continue
   usageWarnings: string; // recent proactive usage warnings, for duplicate suppression (#132)
   usageLatest: string; // latest supported usage/rate-limit telemetry for /limit
+  deferred: string; // durable defer-while-waiting backlog (restored on reload, no message loss)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---

@@ -26,6 +26,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     overloadRetries: join(configDir, `${base}.overload-retries.json`),
     usageWarnings: join(configDir, `${base}.usage-warnings.json`),
     usageLatest: join(configDir, `${base}.usage-latest.json`),
+    deferred: join(configDir, `${base}.deferred.json`),
   };
 }
 

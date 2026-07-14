@@ -65,6 +65,26 @@ export class DeferQueues<T = string> {
     const later = this.byPane.get(paneId) ?? [];
     this.byPane.set(paneId, [...items, ...later]);
   }
+
+  // A snapshot of every pane holding a non-empty backlog, as [paneId, items]
+  // entries in insertion order. The daemon persists this to disk (deferred-store)
+  // on mutation so a `tg-ctl restart` / launchd reload doesn't drop queued
+  // messages. Item arrays are copied so a later mutation can't alias the snapshot.
+  snapshot(): Array<[string, T[]]> {
+    const out: Array<[string, T[]]> = [];
+    for (const [pane, q] of this.byPane) if (q.length > 0) out.push([pane, [...q]]);
+    return out;
+  }
+
+  // Rebuild the per-pane queues from a snapshot (daemon startup, after a reload).
+  // Empty item lists are skipped so a restore never resurrects an empty backlog.
+  // Copies each list so the restored queue owns its own array.
+  restore(entries: Array<[string, T[]]>): void {
+    for (const [pane, items] of entries) {
+      if (items.length === 0) continue;
+      this.byPane.set(pane, [...items]);
+    }
+  }
 }
 
 // Drive a queue flush, re-checking the pane between EVERY item via isPaneBusy().

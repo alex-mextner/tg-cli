@@ -457,6 +457,71 @@ test('restart: stops any running daemon and starts a fresh one, exits 0', () => 
   reapDaemon(cfg, '123456');
 }, 10_000);
 
+// A signal-0 liveness probe (does the pid exist and are we allowed to signal it).
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Poll the pidfile until it names a LIVE pid (the daemon took the flock + wrote
+// its pid AND is running), or the bound elapses. Returns the pid, or 0.
+function waitForLivePid(pidFile: string, tries = 120): number {
+  for (let i = 0; i < tries; i++) {
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, 'utf8').trim());
+      if (pid > 0 && pidAlive(pid)) return pid;
+    }
+    Bun.sleepSync(50);
+  }
+  return 0;
+}
+
+// restart while the old daemon is ALIVE must leave a LIVE successor — the whole
+// point of the graceful reload is that a restart never drops the channel. The
+// regression this guards (review): the cooperative SIGTERM drain can hold the
+// flock briefly; if `restart`'s stopDaemon returned early (its old flat 2s wait,
+// unlinking a live pidfile), startLauncher would launch INTO the still-alive old
+// daemon, the successor would no-op-exit on the contended flock, and once the old
+// finally drained NOTHING would remain running. Unlike the test above, this does
+// NOT reap the first daemon before restarting — it stays alive so restart must
+// truly wait it out. A dead API base keeps both daemons looping without network.
+test('restart while the old daemon is alive leaves a live successor (no dropped channel)', () => {
+  const { env, cfg } = fakeEnv();
+  const fullEnv = { ...env, TG_API_BASE: 'http://127.0.0.1:1' };
+  const pidFile = join(cfg, 'tg-ctl.123456.pid');
+  let oldPid = 0;
+  let newPid = 0;
+  try {
+    const started = run(['start'], fullEnv);
+    expect(started.exitCode).toBe(0);
+    oldPid = waitForLivePid(pidFile);
+    expect(oldPid).toBeGreaterThan(0); // genuinely alive, NOT reaped
+    // restart while it is alive: stopDaemon must wait for the drain, THEN start.
+    const restarted = run(['restart'], fullEnv);
+    expect(restarted.exitCode).toBe(0);
+    // A live daemon MUST remain — restart never leaves the channel unmanned.
+    newPid = waitForLivePid(pidFile);
+    expect(newPid).toBeGreaterThan(0);
+    expect(pidAlive(newPid)).toBe(true);
+  } finally {
+    // Reap whatever is (still) running — the successor, and the old pid if it
+    // somehow survived — so the test leaves no detached daemon behind.
+    for (const pid of new Set([newPid, oldPid])) {
+      if (pid > 0) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+    }
+  }
+}, 20_000);
+
 // --- env-pin (#61) ---
 
 // startLauncher passes TG_CTL_CONFIG_DIR: ctx.configDir to the grandchild even

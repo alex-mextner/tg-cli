@@ -47,6 +47,7 @@ import {
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { codexUsageTranscriptPath, latestCodexUsageTelemetryPayload } from "./features/tg-ctl/codex-usage"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
+import { serializeDeferredStore, parseDeferredStore } from "./features/tg-ctl/deferred-store"
 import {
   findAgentInPane,
   panesWithRetry,
@@ -231,7 +232,7 @@ export const USAGE = `Usage:
   tg-ctl run             # foreground (blocking) daemon — the process itself
   tg-ctl status          # is it running? pid / bot / target pane / autostart
   tg-ctl stop            # stop the background daemon
-  tg-ctl restart         # stop the daemon (if running) then start it again
+  tg-ctl restart         # graceful reload — drains in-flight, keeps queued messages + questions
   tg-ctl enable [--dry-run]
                          # install OS autostart (launchd / systemd --user) AND start now
                          # (--dry-run prints the plan and touches nothing)
@@ -1412,12 +1413,28 @@ function stopDaemon(ctx: Ctx): void {
     console.error(`tg-ctl: SIGTERM failed for pid ${pid}: ${err}`)
     process.exit(1)
   }
-  // Brief wait so `stop && status` doesn't race the dying daemon.
-  for (let i = 0; i < 20 && kill0(pid!); i++) Bun.sleepSync(100)
-  try {
-    unlinkSync(ctx.paths.pid)
-  } catch {}
-  console.log(kill0(pid!) ? `tg-ctl: SIGTERM sent (pid ${pid}, still exiting)` : `tg-ctl: stopped (pid ${pid})`)
+  // Wait for the daemon to actually exit — up to the cooperative-drain ceiling
+  // plus a margin, NOT a flat 2s. The SIGTERM drain can legitimately hold the
+  // flock for up to GRACEFUL_SHUTDOWN_MS while it finishes the in-flight batch;
+  // `restart` calls this then immediately startLauncher(), so returning early
+  // (while the old daemon still owns the flock) makes the successor no-op-exit on
+  // the contended flock and, once the old finally drains, leaves NOTHING running
+  // (review: restart can leave no daemon). Poll until the pid is gone or the
+  // ceiling elapses.
+  const deadlineMs = GRACEFUL_SHUTDOWN_MS + 2000
+  for (let waited = 0; waited < deadlineMs && kill0(pid!); waited += 100) Bun.sleepSync(100)
+  const stillAlive = kill0(pid!)
+  // Only unlink the pidfile when the process is truly gone. The daemon's own
+  // cleanExit removes its pidfile (ownsPidFile-guarded); unlinking here while it
+  // is STILL ALIVE would strip a live daemon's pidfile — `status` would then read
+  // no pid and falsely report "not running" (tg#93 in reverse). Fall back to the
+  // unlink only for a daemon that died without cleaning up.
+  if (!stillAlive) {
+    try {
+      unlinkSync(ctx.paths.pid)
+    } catch {}
+  }
+  console.log(stillAlive ? `tg-ctl: SIGTERM sent (pid ${pid}, still exiting)` : `tg-ctl: stopped (pid ${pid})`)
 }
 
 // --- enable / disable: OS autostart self-registration (the agenttools_service contract) ---
@@ -3475,6 +3492,12 @@ async function runCodexUsageHook(ctx: Ctx, now: number): Promise<number> {
 
 // --- run: the daemon itself ---
 
+// Upper bound on a cooperative (SIGTERM) drain: finish the in-flight batch, then
+// exit. If some await hangs past this, hard-exit anyway so a reload never stalls.
+// Comfortably under launchd's own SIGTERM→SIGKILL grace, and well above a normal
+// batch's action time (a few tmux send-keys).
+const GRACEFUL_SHUTDOWN_MS = 8000
+
 async function runDaemon(ctx: Ctx): Promise<never> {
   mkdirSync(ctx.configDir, { recursive: true })
 
@@ -3711,6 +3734,56 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // paneHasPendingQuestion while the prompt is open.
   const shouldDeferInbound = (paneId: string): boolean =>
     paneHasPendingQuestion(paneId) || flushingPanes.has(paneId)
+  // Persist the defer-while-waiting backlog to disk so a reload (a deliberate
+  // `tg-ctl restart`, a launchd bootout/bootstrap, or a crash-relaunch) doesn't
+  // silently drop the human's queued messages (graceful-reload). Best-effort like
+  // routes/questions: a persist failure must never break the hot enqueue/flush
+  // path — the backlog simply isn't durable until the next mutation. The runtime
+  // `delivered` flag is dropped; a restored item is re-created with delivered:false.
+  const persistDeferred = (): void => {
+    try {
+      atomicWrite(
+        ctx.paths.deferred,
+        serializeDeferredStore({
+          panes: deferred.snapshot().map(([paneId, items]) => ({
+            paneId,
+            items: items.map((i) => ({
+              text: i.text,
+              sourceMessageId: i.sourceMessageId,
+              relatedReactionMessageId: i.relatedReactionMessageId,
+            })),
+          })),
+        }),
+      )
+    } catch (err) {
+      log(`deferred backlog persist failed: ${err}`)
+    }
+  }
+  // Restore the durable backlog on bootstrap. Items re-enter the SAME per-pane
+  // queues; each pane's restored question (restored into abandonedButtons above)
+  // flushes this backlog when it is answered (lateDeliver → onQuestionReleased).
+  // Until then the items wait — never pasted into a still-open prompt. Malformed
+  // state degrades to "no restored backlog" (parseDeferredStore never throws).
+  {
+    const restored = parseDeferredStore(readFileOrNull(ctx.paths.deferred))
+    if (restored.panes.length) {
+      deferred.restore(
+        restored.panes.map(
+          (p): [string, DeferredInbound[]] => [
+            p.paneId,
+            p.items.map((i) => ({
+              text: i.text,
+              sourceMessageId: i.sourceMessageId,
+              relatedReactionMessageId: i.relatedReactionMessageId,
+              delivered: false,
+            })),
+          ],
+        ),
+      )
+      const count = restored.panes.reduce((n, p) => n + p.items.length, 0)
+      log(`deferred backlog restored: ${count} message(s) across ${restored.panes.length} pane(s)`)
+    }
+  }
   // Enqueue only — the caller queues the source-message ack reaction when this
   // came from a MESSAGE action (which earns a ⏳ ack); a button-callback defer
   // edits its prompt instead and must NOT leak onto the next message's ack.
@@ -3722,6 +3795,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ): DeferredInbound => {
     const item = { text: wrappedText, sourceMessageId, relatedReactionMessageId, delivered: false }
     deferred.enqueue(paneId, item)
+    persistDeferred()
     return item
   }
   const markDeferredForAck = (item: DeferredInbound): void => {
@@ -3783,6 +3857,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
     } finally {
       flushingPanes.delete(paneId)
+      // The queue changed (drained and/or re-deferred) — keep the durable backlog
+      // in sync so a reload restores exactly what is still queued. Persisting once
+      // HERE (not per delivered item) means a hard SIGKILL mid-flush — after some
+      // items typed into the pane but before this runs — leaves those already-
+      // delivered items still on disk, so a restart RE-PASTES them: at-least-once,
+      // a deliberate bias to no-LOSS over no-duplicate (persisting after each take
+      // would instead lose the not-yet-injected tail on a mid-flush crash — worse).
+      // The GRACEFUL path never hits this: the cooperative drain lets the flush
+      // finish before exit; only a SIGKILL escalation (past GRACEFUL_SHUTDOWN_MS)
+      // can duplicate, and a duplicate queued line is far less bad than a lost one.
+      persistDeferred()
     }
   }
   // A scoped question's hook socket closed while the agent may still be waiting in
@@ -3852,6 +3937,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
   let hookServer: Server | null = null
   const cleanExit = (code: number): never => {
+    // Flush the durable defer-while-waiting backlog on EVERY exit path (graceful
+    // drain, idle-exit, SIGINT, AND the hard-exit fallback timer) so the last
+    // queue mutations are never lost — the timer used to call cleanExit directly,
+    // skipping the persist the cooperative paths do. Best-effort; a persist error
+    // must never keep the daemon from vacating.
+    try {
+      persistDeferred()
+    } catch {}
     // Remove the pidfile ONLY when it still names OUR pid (tg#93). On a launchd
     // relaunch a newer instance can take ownership and rewrite the pidfile with
     // ITS pid before this departing daemon's cleanExit runs; a blind unlink would
@@ -3868,8 +3961,46 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     } catch {}
     process.exit(code)
   }
-  process.on("SIGTERM", () => cleanExit(0))
+  // Cooperative graceful shutdown (graceful-reload). A launchd bootout/bootstrap
+  // reload — and `tg-ctl restart` — SIGTERMs the daemon. An IMMEDIATE cleanExit
+  // mid-batch would drop the current getUpdates batch's not-yet-executed actions
+  // (the offset is persisted BEFORE acting → at-most-once: those messages are lost
+  // and Telegram won't redeliver them). Instead, SIGTERM sets a flag and aborts
+  // only the IDLE long-poll; the loop finishes the in-flight batch's actions, then
+  // exits at the top of the next iteration — so a batch that drains within
+  // GRACEFUL_SHUTDOWN_MS misses no update across the swap. The hard-exit fallback
+  // bounds a hung/oversized batch: if the remaining actions exceed the ceiling it
+  // exits mid-batch and that tail is lost at-most-once (the normal non-graceful
+  // behaviour) — in practice a batch is a few send-keys, far under the ceiling.
+  // (launchd would SIGKILL after its own grace period regardless.)
+  let shuttingDown = false
+  let pollAbort: AbortController | null = null
+  const beginGracefulShutdown = (): void => {
+    if (shuttingDown) {
+      cleanExit(0) // a second SIGTERM → give up on draining and go now
+    }
+    shuttingDown = true
+    log("SIGTERM — draining in-flight batch, then exiting (graceful reload)")
+    pollAbort?.abort() // wake the idle long-poll immediately
+    setTimeout(() => cleanExit(0), GRACEFUL_SHUTDOWN_MS).unref?.()
+  }
+  process.on("SIGTERM", beginGracefulShutdown)
+  // SIGINT (interactive Ctrl-C / explicit kill -INT) exits immediately — a human
+  // at a terminal wants it gone now, not a drain.
   process.on("SIGINT", () => cleanExit(0))
+  // A backoff/idle sleep that returns EARLY once a graceful shutdown begins, so a
+  // reload during an error/409 backoff doesn't wait out the full delay before the
+  // loop can see `shuttingDown` and exit (keeping the drain — and thus the
+  // restart hand-off — snappy). Polled in small steps rather than racing a timer
+  // against the signal.
+  const drainAwareSleep = async (ms: number): Promise<void> => {
+    const start = Date.now()
+    while (!shuttingDown) {
+      const remaining = ms - (Date.now() - start)
+      if (remaining <= 0) return
+      await Bun.sleep(Math.min(200, remaining))
+    }
+  }
 
   hookServer = startHookServer(ctx, questionRuntime)
 
@@ -6300,6 +6431,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return true
     }
     log(`ask-late-delivered: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label} pane=${paneId}`)
+    // The pane's question is now answered — flush any defer-while-waiting backlog
+    // queued behind it (in FIFO order, after the agent consumes this answer). This
+    // is what makes a RESTORED backlog deliverable after a reload: the restored
+    // question lives in `abandonedButtons`, so only its late-delivery reaches here
+    // to release the queue. (Also closes a latent gap: answering a socket-closed
+    // question never used to flush its pane backlog.) onQuestionReleased self-guards
+    // against an in-flight flush or another live question on the pane.
+    if (paneId) onQuestionReleased(paneId)
     await answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
     const cardId = retained.messageId ?? action.messageId
     if (cardId !== null) {
@@ -6631,6 +6770,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   log(`daemon up — pid ${process.pid}, bot ${ctx.botId}, offset ${offset}`)
 
   for (;;) {
+    // Graceful shutdown lands here BETWEEN batches — after the previous batch's
+    // actions fully executed, before the next long-poll — so a reload never drops
+    // an in-flight batch. cleanExit persists the durable backlog on its way out.
+    if (shuttingDown) cleanExit(0)
     try {
       // Idle TTL first, so even an error-backoff loop eventually exits. A
       // newer registration file also counts as agent activity (the daemon may
@@ -6643,9 +6786,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         cleanExit(0)
       }
 
+      // The idle long-poll is abortable by SIGTERM (beginGracefulShutdown) so a
+      // reload doesn't wait out the 50s poll; the timeout is the normal ceiling.
+      // Re-check shuttingDown AFTER creating the controller and pre-abort if set:
+      // a SIGTERM that landed between the loop-top check and here fired abort() on
+      // the PREVIOUS (settled) controller — a no-op — and would otherwise let this
+      // fresh long-poll run to its full ceiling (drain would then rely on the 8s
+      // fallback instead of the snappy hand-off). Pre-aborting the current
+      // controller makes the fetch reject at once → the catch exits gracefully.
+      pollAbort = new AbortController()
+      if (shuttingDown) pollAbort.abort()
       const resp = await fetch(
         `${api(ctx)}/getUpdates?timeout=50&offset=${offset}&allowed_updates=${encodeURIComponent('["message","callback_query"]')}`,
-        { signal: AbortSignal.timeout(60_000) },
+        { signal: AbortSignal.any([AbortSignal.timeout(60_000), pollAbort.signal]) },
       )
       if (resp.status === 409) {
         // Another consumer is long-polling this bot (other machine, or a
@@ -6657,18 +6810,18 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           log("5 consecutive 409s — another consumer is polling this bot")
           await sendMessage(ctx, "another consumer is polling this bot")
         }
-        await Bun.sleep(Math.min(2 ** (consecutive409 - 1), 60) * 1000)
+        await drainAwareSleep(Math.min(2 ** (consecutive409 - 1), 60) * 1000)
         continue
       }
       if (!resp.ok) {
         log(`getUpdates HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`)
-        await Bun.sleep(5000)
+        await drainAwareSleep(5000)
         continue
       }
       const json = (await resp.json()) as { ok: boolean; result?: TgUpdate[]; description?: string }
       if (!json.ok || !Array.isArray(json.result)) {
         log(`getUpdates API error: ${json.description ?? "malformed response"}`)
-        await Bun.sleep(5000)
+        await drainAwareSleep(5000)
         continue
       }
       consecutive409 = 0
@@ -6810,10 +6963,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         lastActionOk = await executeAction(action)
       }
     } catch (err) {
+      // A SIGTERM-aborted long-poll surfaces here as an AbortError — that is a
+      // clean graceful exit (no batch was in flight, since fetch never returned),
+      // not a fault to back off from. cleanExit persists the backlog on its way out.
+      if (shuttingDown) cleanExit(0)
       // The daemon must survive anything — malformed updates, network
       // failures, tmux races. Log and back off.
       log(`poll loop error: ${err}`)
-      await Bun.sleep(5000)
+      await drainAwareSleep(5000)
     }
   }
 }
