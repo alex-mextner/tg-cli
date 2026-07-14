@@ -567,6 +567,13 @@ adapter layer; until then unknown `/cmd` passes through verbatim (below).
   - TUI harnesses: inject `/cmd …` via `send-keys -l` + `Enter` (the harness interprets
     its own slash command).
   - opencode: `POST /session/{id}/command` (native), no keystrokes.
+- **`!<shell command>`** — a message STARTING with `!` (column 0, no leading space) is a
+  harness `!` shell-command: injected **VERBATIM**, with **no `[TG from …]` wrapper and no
+  reply quote-anchor**, so the harness runs the rest as an in-session shell command. Any
+  wrapper/prefix would knock the `!` off column 0 and defeat the convention. Owner-gated by
+  the same sender allowlist as every other inbound message (§9) — a non-owner never reaches
+  the passthrough. A `!` reply is verbatim too (the quote-anchor is dropped). Multi-line `!`
+  bodies inject whole via bracketed paste.
 
 ## 14. Multi-harness support
 

@@ -165,6 +165,28 @@ test('inboundHistoryRecords: a media reply is stamped under the routed origin pa
   expect(recs.map((r) => r.pane)).toEqual(['%origin', '%origin']);
 });
 
+test('inboundHistoryRecords: a `!shell` text reply is NOT stamped under the origin — it routes to the default pane', () => {
+  // A `!` reply goes verbatim via the default auto-bind path (updates.ts excludes it from
+  // reply-route), so its `tg replies` history must be stamped under the DEFAULT pane, not the
+  // replied-to origin — else scoped recall shows the command in the wrong pane.
+  const bangReply = msg({
+    message_id: 202,
+    text: '!git status',
+    reply_to_message: { message_id: 50, chat: { id: ALLOWED }, date: 1, text: 'which one?' },
+  });
+  const resolvePane = (m: TgMessage): string | null =>
+    m.reply_to_message &&
+    ((m.text !== undefined && !m.text.startsWith('/') && !m.text.startsWith('!')) ||
+      (m.photo !== undefined && !isAgentCommand(m.caption ?? '')) ||
+      (m.document !== undefined && !isAgentCommand(m.caption ?? '')) ||
+      m.voice !== undefined ||
+      m.audio !== undefined)
+      ? '%origin'
+      : null;
+  const recs = inboundHistoryRecords([bangReply], { ...opts, pane: '%default', resolvePane });
+  expect(recs.map((r) => r.pane)).toEqual(['%default']);
+});
+
 test('inboundHistoryRecords: a media reply with /agent caption is not stamped under the replied-to origin', () => {
   const explicitAgentPhotoReply = msg({
     photo: [{ file_id: 'p' }],

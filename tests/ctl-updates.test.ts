@@ -433,6 +433,44 @@ test('unknown /cmd passes through VERBATIM — full text, no wrap', () => {
   ]);
 });
 
+// --- `!` shell-command passthrough (harness `!` convention) ---
+// A message STARTING with `!` reaches the harness verbatim — no `[TG from …]`
+// wrapper — so the harness runs it as an in-session shell command. The `!` MUST
+// stay at column 0, so no wrap and no reply quote-anchor may be prepended.
+
+test('`!cmd` from owner is injected VERBATIM — no wrap, `!` at column 0', () => {
+  const r = stepUpdates([upd(1, { text: '!git status' })], makeOpts());
+  expect(r.actions).toEqual([
+    { kind: 'inject-text', text: '!git status', messageId: 1 },
+    { kind: 'ack', messageId: 1 },
+  ]);
+});
+
+test('multi-line `!cmd` is injected VERBATIM — full body, `!` still at column 0', () => {
+  const body = '!for f in *.ts; do\n  echo "$f"\ndone';
+  const r = stepUpdates([upd(1, { text: body })], makeOpts());
+  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: body, messageId: 1 });
+});
+
+test('`!cmd` sent as a REPLY is still VERBATIM — no quote-anchor prepended', () => {
+  const r = stepUpdates(
+    [upd(1, { text: '!ls', reply_to_message: { message_id: 55, chat: { id: CHAT_ID }, date: NOW, text: 'earlier' } })],
+    makeOpts(),
+  );
+  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '!ls', messageId: 1 });
+});
+
+test('a leading space before `!` is NOT passthrough — wrapped like prose (strict column-0)', () => {
+  const r = stepUpdates([upd(1, { text: ' !git status' })], makeOpts());
+  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '[TG from Alex]  !git status', messageId: 1 });
+});
+
+test('non-owner `!cmd` gets NO raw passthrough — rejected before any action', () => {
+  const r = stepUpdates([upd(1, { text: '!rm -rf /', from: { id: 666 } })], makeOpts());
+  expect(r.actions).toEqual([]);
+  expect(r.newOffset).toBe(2);
+});
+
 // --- plain text → wrapped inject (wrap fn injected via opts) ---
 
 test('plain text is wrapped with first_name', () => {

@@ -3923,14 +3923,15 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // prior work to protect), a picker tap (the human explicitly chose that pane), or a message
   // deferred behind an open question (flushed through a separate code path, out of scope here).
   //
-  // Never banner a SLASH-COMMAND passthrough (review catch, PR #153): the flat inject-text action
-  // also carries an unrecognized `/command` (e.g. `/compact`, `/clear`) VERBATIM so the harness TUI
-  // can execute it — updates.ts's textAction only wraps ordinary prose, never a passthrough command.
-  // Prepending a banner line ahead of it would push the `/` off the first character, so the harness
-  // reads it as plain prompt text instead of a command. A wrapped inject (the normal case) always
-  // starts with the injectWrap template, never `/`, so this guard only ever skips a real passthrough.
+  // Never banner a COMMAND passthrough (review catch, PR #153): the flat inject-text action also
+  // carries an unrecognized `/command` (e.g. `/compact`, `/clear`) or a `!shell` command VERBATIM so
+  // the harness TUI can execute it — updates.ts's textAction only wraps ordinary prose, never a
+  // passthrough command. Prepending a banner line ahead of it would push the leading `/` or `!` off
+  // the first character, so the harness reads it as plain prompt text instead of a command. A wrapped
+  // inject (the normal case) always starts with the injectWrap template, never `/`/`!`, so this guard
+  // only ever skips a real passthrough.
   const withGitStateBanner = (panePath: string, text: string): string => {
-    if (!ctx.cfg.gitStateBanner || text.startsWith("/")) return text
+    if (!ctx.cfg.gitStateBanner || text.startsWith("/") || text.startsWith("!")) return text
     const banner = buildGitStateBanner(gitStateForPath(panePath))
     return banner ? `${banner}\n${text}` : text
   }
@@ -6740,10 +6741,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           const replyId = m.reply_to_message?.message_id
           if (replyId === undefined) return null
           // ONLY the kinds that actually reply-route (updates.ts): a text reply
-          // whose body is NOT a /command, a photo/document reply after download,
-          // or a voice/audio reply after transcription.
+          // whose body is NOT a /command AND NOT a `!shell` passthrough (both go
+          // verbatim via the default auto-bind path, never reply-route), a
+          // photo/document reply after download, or a voice/audio reply after
+          // transcription.
           const isRoutedReply =
-            (m.text !== undefined && !m.text.startsWith("/")) ||
+            (m.text !== undefined && !m.text.startsWith("/") && !m.text.startsWith("!")) ||
             (m.photo !== undefined && !isAgentCommand(m.caption ?? "")) ||
             (m.document !== undefined && !isAgentCommand(m.caption ?? "")) ||
             m.voice !== undefined ||
