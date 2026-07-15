@@ -35,10 +35,10 @@ export function buildPrefix(opts: {
   aiEmoji: string;
   model: string;
   tmuxWindow: string;
-  // Explicit or auto-detected subagent/sender label (`--agent`, or the
-  // env-based fallback in `features/agent-detect/detect.ts`). Rendered as its
-  // own `[agent]` bracket right after `[window]`, styled identically
-  // (styleWindowName) — see the header-shape table above.
+  // Explicit SUBAGENT self-label (`--subagent <name>` / `TG_AGENT`). Rendered as
+  // its own bracket right after `[window]`, styled identically (styleWindowName)
+  // — see the header-shape table above. There is no env-based auto-detection;
+  // the MAIN agent passes nothing and gets no second bracket.
   agentLabel?: string;
   // Explicit message tag (`--tag`). The CLI validates this to a lowercase-english
   // word (answer/decision/problem/report) before it reaches here; resolveTag

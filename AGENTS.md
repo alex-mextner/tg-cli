@@ -39,13 +39,13 @@ I/O, fetch, signals, `bun:ffi`):
   to a native **Rich Message** — `sendRichMessage` — when the body contains a rich-only tag
   like `<table>`/`<h1>`/`<ul>`/`<hr>`/`<details>`/`<tg-math>`, otherwise normal `sendMessage`;
   see "Rich messages" below), `--tag`/`--title` (header badge; compose with rich),
-  `--agent <label>` (subagent/sender identification — renders `[label]` right after
-  `[window]`; explicit flag wins over `TG_AGENT` env, which wins over auto-detection —
-  a Claude Code Task-tool subagent auto-labels from sidechain metadata when readable
-  and otherwise falls back to the generic `subagent` via `CLAUDE_CODE_CHILD_SESSION`,
-  no equivalent signal exists yet for Codex CLI/opencode; `--detect-agent` prints what
-  the current shell would auto-detect; NOT the same flag as `tg-ctl`'s own `--agent`
-  — see `features/agent-detect/detect.ts`),
+  `--subagent <label>` (a SUBAGENT self-label — renders a second `[label]` bracket right
+  after `[window]`; the MAIN/orchestrator agent needs NO flag, its `[window]` bracket
+  already carries the project via `resolveWindowAgentLabel` — the tmux window name, or its
+  cwd basename when the window is auto-renamed to a version/shell; explicit flag wins over
+  `TG_AGENT` env; there is NO env-based auto-detection — `CLAUDE_CODE_CHILD_SESSION` is not
+  a reliable main-vs-subagent signal; deprecated alias `--agent`; `--detect-agent` prints
+  the resolved `[window]` label; NOT the same flag as `tg-ctl`'s own `--agent`),
   `--reply-to <message_id>` (thread the message UNDER an inbound one — `reply_to_message_id`
   on sendMessage, `reply_parameters` on sendRichMessage; the `answer` tag requires it),
   `--topic <id>` (post INTO a forum topic — stamps `message_thread_id` on EVERY outbound
@@ -79,11 +79,12 @@ tests can pass fakes.
 
 ### Existing Features
 
-- `features/agent-detect/` — pure `detectAgentLabel(env)`: the auto-detection half of
-  `--agent`/`[agent]` subagent identification (tg#6254). Env-injected like `detectAiModel`
-  in the `tg` entrypoint. Claude Code can read sidechain metadata when it is present;
-  other harnesses still need explicit `--agent` — see the module's doc comment for what
-  IS/ISN'T auto-detectable per harness.
+- `features/agent-detect/` — pure `detectAgentLabel(env)`: the historical env-based
+  subagent auto-detection (tg#6254). NO LONGER wired into the outbound `[subagent]` label
+  (removed because `CLAUDE_CODE_CHILD_SESSION` mislabelled the orchestrator itself); kept
+  because open PRs still evolve it. The outbound subagent bracket is explicit-only now
+  (`--subagent`/`TG_AGENT`). The `[window]` label lives in
+  `resolveWindowAgentLabel` (`features/tg-ctl/agent-match.ts`).
 - `features/auto-attach/` — path detection → attach files, R1-R4 text rules, line-spec quotes,
   worktree-aware + recursive path resolution, transmitter with Telegram message/caption limits.
 - `features/autolink-tasks/` — detects Linear ticket codes in messages, resolves titles via the
