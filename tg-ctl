@@ -3961,6 +3961,19 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     } catch {}
     process.exit(code)
   }
+  // Graceful exit that first DRAINS any in-flight deferred flush (codex #198).
+  // Answering a question starts flushDeferred(pane) fire-and-forget — an 800ms
+  // settle, then the queued backlog is pasted and the store re-persisted. Exiting
+  // (cleanExit) while that flush is mid-settle would snapshot a queue that is
+  // either still full but has no pending question left to release it (wedged after
+  // restart) or half-taken by the flush (dropped items). So wait for flushingPanes
+  // to empty before cleanExit persists the now-consistent backlog. Bounded: the
+  // GRACEFUL_SHUTDOWN_MS backstop timer (beginGracefulShutdown) force-cleanExits a
+  // flush that hangs, and a second SIGTERM gives up immediately.
+  const cleanExitAfterFlushDrain = async (): Promise<never> => {
+    while (flushingPanes.size > 0) await Bun.sleep(50)
+    return cleanExit(0)
+  }
   // Cooperative graceful shutdown (graceful-reload). A launchd bootout/bootstrap
   // reload — and `tg-ctl restart` — SIGTERMs the daemon. An IMMEDIATE cleanExit
   // mid-batch would drop the current getUpdates batch's not-yet-executed actions
@@ -6772,8 +6785,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   for (;;) {
     // Graceful shutdown lands here BETWEEN batches — after the previous batch's
     // actions fully executed, before the next long-poll — so a reload never drops
-    // an in-flight batch. cleanExit persists the durable backlog on its way out.
-    if (shuttingDown) cleanExit(0)
+    // an in-flight batch. Wait out any in-flight deferred flush before exiting so
+    // an answered-question backlog is drained, not wedged/dropped (codex #198);
+    // cleanExit then persists the durable backlog on its way out.
+    if (shuttingDown) await cleanExitAfterFlushDrain()
     try {
       // Idle TTL first, so even an error-backoff loop eventually exits. A
       // newer registration file also counts as agent activity (the daemon may
@@ -6965,8 +6980,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     } catch (err) {
       // A SIGTERM-aborted long-poll surfaces here as an AbortError — that is a
       // clean graceful exit (no batch was in flight, since fetch never returned),
-      // not a fault to back off from. cleanExit persists the backlog on its way out.
-      if (shuttingDown) cleanExit(0)
+      // not a fault to back off from. Drain any in-flight deferred flush first
+      // (codex #198); cleanExit persists the backlog on its way out.
+      if (shuttingDown) await cleanExitAfterFlushDrain()
       // The daemon must survive anything — malformed updates, network
       // failures, tmux races. Log and back off.
       log(`poll loop error: ${err}`)

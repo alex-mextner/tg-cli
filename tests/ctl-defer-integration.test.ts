@@ -1421,3 +1421,99 @@ test('an UNSCOPED question abandoned by SOCKET CLOSE (process dies) flushes its 
   daemon.kill('SIGTERM');
   await daemon.exited;
 }, 40_000);
+
+test('SIGTERM during an in-flight deferred flush drains the backlog before exiting (codex #198)', async () => {
+  // The race #194 opened: answering a question starts flushDeferred(%1)
+  // fire-and-forget — it sleeps 800ms, THEN pastes the queued backlog and
+  // re-persists the store. A SIGTERM that lands in that settle window must not let
+  // the graceful loop-top exit run process.exit before the flush drains: the
+  // queued message would be snapshotted with no pending question left to release
+  // it (wedged after restart) or dropped while the flush had taken ownership. The
+  // daemon must WAIT for the in-flight flush, so the backlog lands in the pane.
+  const cfgDir = makeCfgDir();
+  const updateQueue: unknown[][] = [];
+  const reactions: Array<Record<string, unknown>> = [];
+  let buttonMessageId = 0;
+  let questionCallbackData = '';
+
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        const batch = updateQueue.shift();
+        if (batch) return Response.json({ ok: true, result: batch });
+        await Bun.sleep(80);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = (await req.json()) as Record<string, unknown>;
+        const kb = (body.reply_markup as { inline_keyboard?: Array<Array<{ callback_data: string }>> } | undefined)
+          ?.inline_keyboard;
+        if (kb?.length) {
+          buttonMessageId += 1;
+          questionCallbackData = kb[0][0].callback_data;
+          return Response.json({ ok: true, result: { message_id: buttonMessageId } });
+        }
+        return Response.json({ ok: true, result: { message_id: 900 } });
+      }
+      if (url.pathname.endsWith('/setMessageReaction')) {
+        reactions.push((await req.json()) as Record<string, unknown>);
+        return Response.json({ ok: true, result: true });
+      }
+      return Response.json({ ok: true, result: true });
+    },
+  });
+  servers.push(server);
+
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  // Open Q1 and defer one inbound behind it (✍️ queued, nothing injected yet).
+  const ask1 = startAsk(cfgDir, server.port, {
+    requestId: 'q1',
+    agent: 'claude',
+    kind: 'question',
+    question: 'First?',
+    options: [{ label: 'Yes' }],
+  });
+  trackProc(reg, ask1);
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000 && questionCallbackData === '') await Bun.sleep(50);
+    expect(questionCallbackData).not.toBe('');
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  updateQueue.push([
+    {
+      update_id: 30,
+      message: { message_id: 31, from: { id: 1, first_name: 'Alex' }, chat: { id: 1 }, date: nowSec, text: 'sigterm backlog' },
+    },
+  ]);
+  await waitForTelegramReaction(reactions, 31, '✍️');
+  expect(injected(cfgDir)).toEqual([]);
+
+  // Answer Q1 → flushDeferred(%1) starts and sleeps 800ms (in flight). ask1 exits
+  // once the daemon delivers the answer, which is AFTER flushDeferred was armed —
+  // so by here the flush is reliably mid-settle.
+  updateQueue.push([
+    {
+      update_id: 31,
+      callback_query: {
+        id: 'cbq1',
+        from: { id: 1, first_name: 'Alex' },
+        message: { message_id: buttonMessageId, chat: { id: 1 }, date: nowSec },
+        data: questionCallbackData,
+      },
+    },
+  ]);
+  await new Response(ask1.stdout).text();
+  await ask1.exited;
+
+  // SIGTERM DURING the settle window. The graceful exit must drain the flush.
+  daemon.kill('SIGTERM');
+
+  // The queued backlog must still land in the pane before the daemon exits — the
+  // proof the flush drained rather than the process exiting out from under it.
+  await waitForInjected(cfgDir, 'sigterm backlog', 8000);
+  await daemon.exited;
+}, 30_000);
