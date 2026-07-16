@@ -5648,9 +5648,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     pendingNew.clear()
     // Validate a supplied dir up front; an invalid one is dropped (→ asked) rather than failing.
     let dir = action.dir
+    let task = action.task
     if (dir && (!isAbsolute(dir) || !isExistingDirectory(dir))) {
-      await sendMessage(ctx, `\`${dir}\` is not an absolute existing directory — pick one below or send a full path.`, out)
-      dir = null
+      if (action.dirAfterName && isLikelySlashCommand(dir)) {
+        // A COMMAND-SHAPED inline token after the name (`/compact`, `/clear`) is a
+        // harness passthrough, not a dir (codex #187). Preserve it at the FRONT of
+        // the task instead of dropping it, then ask for a dir normally. A
+        // multi-component path that merely doesn't exist (`/does/not/exist`) is a
+        // genuine dir typo, NOT command-shaped → it still errors + drops below,
+        // mirroring the typed-path flow (handleNewAnswer) which gates on the same
+        // isLikelySlashCommand. (A dir BEFORE the name is always a dir attempt —
+        // dirAfterName is false there — so it errors too.)
+        task = task ? `${dir} ${task}` : dir
+        dir = null
+      } else {
+        await sendMessage(ctx, `\`${dir}\` is not an absolute existing directory — pick one below or send a full path.`, out)
+        dir = null
+      }
     }
     const token = `n${++newTokenSeq}`
     const modelEntry = action.model ? findModel(action.model) : null
@@ -5658,7 +5672,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       token,
       name: action.name,
       status: "awaiting-dir",
-      task: action.task,
+      task,
       ts: Math.floor(Date.now() / 1000),
       threadId: action.threadId ?? null,
       ...(dir ? { dir } : {}),

@@ -325,6 +325,64 @@ test('BUG 2: an inline absolute dir AFTER the name is used and skips the dir pro
   daemon.kill();
 });
 
+test('an inline /command after the name is preserved as task text, not a dropped dir (codex #187)', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  // `/new api /compact first`: `/compact` looks like a dir (absolute) but is a
+  // harness passthrough, not a real directory. It must NOT raise the bad-dir error
+  // and must NOT be dropped — it is preserved at the FRONT of the task, and the dir
+  // prompt is asked normally. The whole task reaches the spawned agent as
+  // `/compact first`.
+  const queue: unknown[][] = [[textMsg(200, '/new api /compact first')]];
+  const { server, sends } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'Pick a recent project') || sent(sends, 'is not an absolute existing directory'));
+  expect(sent(sends, 'is not an absolute existing directory')).toBe(false);
+  expect(sent(sends, 'Pick a recent project')).toBe(true);
+  // Complete the flow: tap the recent dir (cfgDir), harness, model → spawn.
+  queue.push([dirTap(201, 'n1', 0)]);
+  await waitFor(() => sent(sends, 'Which harness should `api` use?'));
+  queue.push([harnessTap(202, 'n1', 'claude')]);
+  await waitFor(() => sent(sends, 'Which Claude model should `api` run?'));
+  queue.push([modelTap(203, 'n1', 'claude-default')]);
+  await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+  // The preserved task is the trailing positional prompt, after the `--` separator.
+  expect(spawnArgvLog(spawnLog)[0]).toContain('-- /compact first');
+  daemon.kill();
+});
+
+test('an inline single-component absolute dir after the name is used, not treated as a command (codex #187)', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  // Guards the P1 regression: a single-segment path like /tmp is a REAL directory,
+  // so it must be used as the dir (skip the prompt), never mistaken for a command.
+  const queue: unknown[][] = [[textMsg(210, '/new svc /tmp keep running')]];
+  const { server, sends } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'Which harness should `svc` use?'));
+  expect(sent(sends, 'Which harness should `svc` use?')).toBe(true);
+  expect(sent(sends, 'Pick a recent project')).toBe(false);
+  expect(sent(sends, 'is not an absolute existing directory')).toBe(false);
+  queue.push([harnessTap(211, 'n1', 'claude')]);
+  await waitFor(() => sent(sends, 'Which Claude model should `svc` run?'));
+  queue.push([modelTap(212, 'n1', 'claude-default')]);
+  await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+  expect(spawnArgvLog(spawnLog)[0]).toContain('-c /tmp');
+  expect(spawnArgvLog(spawnLog)[0]).toContain('-- keep running');
+  daemon.kill();
+});
+
+test('an inline nonexistent MULTI-component path after the name still errors, not preserved as task (codex #187)', async () => {
+  const { cfgDir } = makeCfgDir(false);
+  // `/does/not/exist` is not command-shaped (a second slash) — it is a genuine
+  // dir typo, so it must raise the invalid-directory error, NOT be silently
+  // buried in the task. Mirrors the typed-path flow's isLikelySlashCommand gate.
+  const queue: unknown[][] = [[textMsg(220, '/new proj /does/not/exist fix the bug')]];
+  const { server, sends } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'is not an absolute existing directory'));
+  expect(sent(sends, 'is not an absolute existing directory')).toBe(true);
+  daemon.kill();
+});
+
 test('/new with model+dir+name+task spawns immediately, task as the initial prompt arg', async () => {
   const { cfgDir, spawnLog } = makeCfgDir(false);
   const { server, sends } = makeServer([[textMsg(20, `/new opus ${cfgDir} api fix the build`)]]);

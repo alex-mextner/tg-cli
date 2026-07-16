@@ -480,7 +480,7 @@ function textAction(
     }
     if (cmd === '/new') {
       const p = parseNewCommand(text);
-      return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, from: name, ...topic };
+      return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, dirAfterName: p.dirAfterName, from: name, ...topic };
     }
     return { kind: 'inject-text', text, messageId };
   }

@@ -28,7 +28,7 @@ import { DEFAULT_MODEL_ID, MODEL_CATALOG, modelsForHarness } from '../features/t
 
 describe('parseNewCommand', () => {
   test('name only — model + dir omitted', () => {
-    expect(parseNewCommand('/new myproj')).toEqual({ harness: null, model: null, dir: null, name: 'myproj', task: '' });
+    expect(parseNewCommand('/new myproj')).toEqual({ harness: null, model: null, dir: null, name: 'myproj', task: '', dirAfterName: false });
   });
 
   test('name + task', () => {
@@ -38,6 +38,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'myproj',
       task: 'fix the build',
+      dirAfterName: false,
     });
   });
 
@@ -48,6 +49,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'myproj',
       task: '',
+      dirAfterName: false,
     });
   });
 
@@ -58,6 +60,7 @@ describe('parseNewCommand', () => {
       dir: '/Users/me/app',
       name: 'api',
       task: 'do the thing',
+      dirAfterName: false,
     });
   });
 
@@ -68,6 +71,7 @@ describe('parseNewCommand', () => {
       dir: '/Users/me/app',
       name: 'api',
       task: '',
+      dirAfterName: false,
     });
   });
 
@@ -85,19 +89,20 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'opus',
       task: '',
+      dirAfterName: false,
     });
   });
 
   test('a lone model alias is reclaimed as the NAME (review #1): /new opus names the session opus', () => {
-    expect(parseNewCommand('/new opus')).toEqual({ harness: null, model: null, dir: null, name: 'opus', task: '' });
-    expect(parseNewCommand('/new sonnet')).toEqual({ harness: null, model: null, dir: null, name: 'sonnet', task: '' });
+    expect(parseNewCommand('/new opus')).toEqual({ harness: null, model: null, dir: null, name: 'opus', task: '', dirAfterName: false });
+    expect(parseNewCommand('/new sonnet')).toEqual({ harness: null, model: null, dir: null, name: 'sonnet', task: '', dirAfterName: false });
   });
 
   test('a lone harness token is reclaimed as the NAME (symmetry with the lone-model case)', () => {
     // `/new codex` — codex is the only token; consuming it as a harness would leave no name, so it
     // is reclaimed as the name (exercises the empty-`applyConsumed` reclaim path).
-    expect(parseNewCommand('/new codex')).toEqual({ harness: null, model: null, dir: null, name: 'codex', task: '' });
-    expect(parseNewCommand('/new oc')).toEqual({ harness: null, model: null, dir: null, name: 'oc', task: '' });
+    expect(parseNewCommand('/new codex')).toEqual({ harness: null, model: null, dir: null, name: 'codex', task: '', dirAfterName: false });
+    expect(parseNewCommand('/new oc')).toEqual({ harness: null, model: null, dir: null, name: 'oc', task: '', dirAfterName: false });
   });
 
   test('model + lone-dir reclaims the dir as the name, keeping the model', () => {
@@ -109,6 +114,43 @@ describe('parseNewCommand', () => {
       dir: null,
       name: '/Users/me/app',
       task: '',
+      dirAfterName: false,
+    });
+  });
+
+  test('an inline dir after the name is flagged dirAfterName (codex #187)', () => {
+    // The parser can't tell `/compact` (a harness command) from `/tmp` (a real
+    // dir) — existence is an fs check it must not do. It consumes any `/`-token
+    // after the name as the dir but flags dirAfterName so the entrypoint can
+    // preserve a REJECTED inline token as task text instead of dropping it.
+    expect(parseNewCommand('/new api /compact first')).toEqual({
+      harness: null,
+      model: null,
+      dir: '/compact',
+      name: 'api',
+      task: 'first',
+      dirAfterName: true,
+    });
+    expect(parseNewCommand('/new api /Users/me/app fix the build')).toEqual({
+      harness: null,
+      model: null,
+      dir: '/Users/me/app',
+      name: 'api',
+      task: 'fix the build',
+      dirAfterName: true,
+    });
+  });
+
+  test('a dir BEFORE the name is not flagged dirAfterName (codex #187)', () => {
+    // A leading path is a dir attempt, never task text — so a rejected leading
+    // token is dropped by the entrypoint, not prepended to the task.
+    expect(parseNewCommand('/new /Users/me/app api do it')).toEqual({
+      harness: null,
+      model: null,
+      dir: '/Users/me/app',
+      name: 'api',
+      task: 'do it',
+      dirAfterName: false,
     });
   });
 
@@ -119,6 +161,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'myproj',
       task: 'hello world',
+      dirAfterName: false,
     });
   });
 
@@ -133,6 +176,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'relative/path',
       task: '',
+      dirAfterName: false,
     });
   });
 
@@ -143,6 +187,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'task-cli',
       task: 'msg',
+      dirAfterName: false,
     });
   });
 
@@ -153,6 +198,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'task-cli',
       task: 'msg',
+      dirAfterName: false,
     });
     expect(parseNewCommand('/new task-cli claude msg')).toEqual({
       harness: 'claude',
@@ -160,6 +206,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'task-cli',
       task: 'msg',
+      dirAfterName: false,
     });
   });
 
@@ -170,6 +217,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'task-cli',
       task: 'msg',
+      dirAfterName: false,
     });
   });
 
@@ -180,6 +228,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'task-cli',
       task: 'msg',
+      dirAfterName: false,
     });
     expect(parseNewCommand('/new task-cli opencode msg')).toEqual({
       harness: 'opencode',
@@ -187,6 +236,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'task-cli',
       task: 'msg',
+      dirAfterName: false,
     });
   });
 
@@ -197,6 +247,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'task-cli',
       task: 'msg',
+      dirAfterName: false,
     });
     expect(parseNewCommand('/new task-cli glm-5.2 msg')).toEqual({
       harness: 'opencode',
@@ -204,6 +255,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'task-cli',
       task: 'msg',
+      dirAfterName: false,
     });
   });
 
@@ -214,6 +266,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'api',
       task: 'default behavior is broken',
+      dirAfterName: false,
     });
     expect(parseNewCommand('/new api spark joy')).toEqual({
       harness: null,
@@ -221,6 +274,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'api',
       task: 'spark joy',
+      dirAfterName: false,
     });
   });
 
@@ -234,6 +288,7 @@ describe('parseNewCommand', () => {
       dir: '/Users/ultra/work/foo',
       name: 'hyperos',
       task: '',
+      dirAfterName: true,
     });
     // The path fills the dir slot; the trailing non-selector word begins the task.
     expect(parseNewCommand('/new api /tmp/do it')).toEqual({
@@ -242,6 +297,7 @@ describe('parseNewCommand', () => {
       dir: '/tmp/do',
       name: 'api',
       task: 'it',
+      dirAfterName: true,
     });
   });
 
@@ -253,14 +309,16 @@ describe('parseNewCommand', () => {
       name: 'api',
       task: '',
     };
+    // dirAfterName tracks whether the dir token came after the name (see codex #187):
+    // true when the path follows the name, false when it precedes it.
     // name → dir → model (model infers codex harness), all after the name.
-    expect(parseNewCommand('/new api /Users/me/app gpt-5.5')).toEqual(expected);
+    expect(parseNewCommand('/new api /Users/me/app gpt-5.5')).toEqual({ ...expected, dirAfterName: true });
     // dir → name → model.
-    expect(parseNewCommand('/new /Users/me/app api gpt-5.5')).toEqual(expected);
+    expect(parseNewCommand('/new /Users/me/app api gpt-5.5')).toEqual({ ...expected, dirAfterName: false });
     // model → name → dir.
-    expect(parseNewCommand('/new gpt-5.5 api /Users/me/app')).toEqual(expected);
+    expect(parseNewCommand('/new gpt-5.5 api /Users/me/app')).toEqual({ ...expected, dirAfterName: true });
     // name → model → dir.
-    expect(parseNewCommand('/new api gpt-5.5 /Users/me/app')).toEqual(expected);
+    expect(parseNewCommand('/new api gpt-5.5 /Users/me/app')).toEqual({ ...expected, dirAfterName: true });
   });
 
   test('BUG 3: harness + dir supplied after the name are both consumed, leaving the task', () => {
@@ -270,6 +328,7 @@ describe('parseNewCommand', () => {
       dir: '/Users/me/app',
       name: 'hyperos',
       task: 'fix the build',
+      dirAfterName: true,
     });
   });
 
@@ -282,6 +341,7 @@ describe('parseNewCommand', () => {
       dir: '/Users/me/app',
       name: 'api',
       task: 'do stuff',
+      dirAfterName: true,
     });
   });
 
@@ -292,6 +352,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'opus',
       task: '',
+      dirAfterName: false,
     });
   });
 
@@ -302,6 +363,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'codex',
       task: '',
+      dirAfterName: false,
     });
   });
 
@@ -315,6 +377,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'task-cli',
       task: 'glm-5.2 msg',
+      dirAfterName: false,
     });
     expect(parseNewCommand('/new task-cli claude opus msg')).toEqual({
       harness: 'claude',
@@ -322,6 +385,7 @@ describe('parseNewCommand', () => {
       dir: null,
       name: 'task-cli',
       task: 'opus msg',
+      dirAfterName: false,
     });
   });
 });

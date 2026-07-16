@@ -312,6 +312,10 @@ export type Action =
       dir: string | null;
       name: string;
       task: string;
+      // True when `dir` was an inline token AFTER the name: if the entrypoint then
+      // rejects it as non-existent it prepends the raw token onto the task rather
+      // than dropping it (codex #187), preserving `/new api /compact first`.
+      dirAfterName: boolean;
       from: string;
       threadId?: number | null;
     }

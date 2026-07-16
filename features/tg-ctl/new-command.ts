@@ -33,6 +33,15 @@ export interface ParsedNewCommand {
   name: string;
   // The optional initial task to inject once the agent is up. Empty when omitted.
   task: string;
+  // Whether the `dir` token was consumed AFTER the name (an inline dir in the task
+  // region) rather than before it. The parser can't tell a real path from a bare
+  // harness command like `/compact` (both are absolute-looking, and existence is
+  // an fs check the pure parser must not do), so when the entrypoint later rejects
+  // an inline dir as non-existent it uses this to PREPEND the raw token back onto
+  // the task instead of dropping it — preserving `/new api /compact first` →
+  // task `/compact first` (codex #187). False for a dir given before the name (a
+  // leading bad path is a dir attempt, not task text) or when there is no dir.
+  dirAfterName: boolean;
 }
 
 // A few human-friendly aliases for the catalog model ids so a phone-typed `/new opus foo`
@@ -175,12 +184,20 @@ export function parseNewCommand(text: string): ParsedNewCommand {
   let i = 0;
   let name = '';
   let nameSeen = false;
+  // Whether the dir slot was filled while the name was already seen (an inline dir
+  // AFTER the name). Used by the entrypoint to preserve a rejected inline token
+  // as task text (codex #187).
+  let dirAfterName = false;
   // Consume selectors wherever they appear. Once the name is set, the first token that fills NO
   // slot begins the task tail (so a task word that merely looks like a selector of the wrong
   // harness, or a soft alias, stays in the task rather than being silently swallowed).
   for (; i < tokens.length; i++) {
     const tok = tokens[i];
-    if (consumeSelector(tok, slots, nameSeen)) continue;
+    const dirWasEmpty = slots.dir === null;
+    if (consumeSelector(tok, slots, nameSeen)) {
+      if (dirWasEmpty && slots.dir !== null && nameSeen) dirAfterName = true;
+      continue;
+    }
     if (!nameSeen) {
       name = tok;
       nameSeen = true;
@@ -196,10 +213,11 @@ export function parseNewCommand(text: string): ParsedNewCommand {
   if (!nameSeen && consumed.length > 0) {
     const last = consumed[consumed.length - 1];
     const replayed = applyConsumed(consumed.slice(0, -1));
-    return { ...replayed, name: last.raw, task: '' };
+    // No name was ever seen, so any surviving dir came before it → not inline.
+    return { ...replayed, name: last.raw, task: '', dirAfterName: false };
   }
   const task = tokens.slice(i).join(' ');
-  return { harness, model, dir, name, task };
+  return { harness, model, dir, name, task, dirAfterName };
 }
 
 // --- parents-aware LRU/MRU directory ranker (issue #27 acceptance) ---
