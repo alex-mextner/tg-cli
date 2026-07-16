@@ -2,18 +2,44 @@
 // the hooks" decision (tg#8672), reached via `python3 -m agenttools_rig_delegate ...` (agent-tools
 // PR #282). These build a MINIMAL fake `agenttools_rig_delegate` package under a throwaway
 // checkout (not the real agent-tools repo — the CLI contract is small and stable: `detect` exits
-// 0/1, `delegate [ARGS...]` runs `rig <ARGS...>` and exits with rig's code, or 3 (NO_RIG_EXIT) if
+// 0/1, `delegate [ARGS...]` runs `rig <ARGS...>` and exits with rig's code, or 97 (NO_RIG_EXIT) if
 // rig is absent) so the test never depends on a real agent-tools checkout being present on disk.
-import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { afterAll, afterEach, beforeEach, expect, test } from 'bun:test';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { detectRig, resolveAgentToolsLib, runRigDelegate } from '../features/tg-ctl/rig-delegate';
 
-// A PATH containing ONLY python3's own directory — deliberately excludes wherever a real `rig`
-// might be installed on the dev machine (this machine has one), so "rig absent" tests are not
-// accidentally polluted by a real system install.
-const PYTHON3_ONLY_PATH = require('path').dirname(Bun.which('python3') ?? '/usr/bin/python3');
+// An isolated PATH that has a WORKING `python3` and nothing else — deliberately excludes
+// wherever a real `rig` might be installed on the dev machine (this machine has one), so the
+// "rig absent" tests are not accidentally polluted by a real system install.
+//
+// It must NOT be `dirname(which('python3'))`: when python3 is a pyenv SHIM, that directory
+// holds only the shim, whose `#!/usr/bin/env bash` shebang then can't find bash/env (nothing
+// else is on PATH) and every subprocess dies with 127 before it can see the fake `rig` (codex
+// review). Resolve the REAL interpreter behind any shim (`sys.executable`) and expose only a
+// `python3` symlink to it — a working interpreter with zero chance of a stray `rig` leaking in.
+let pythonBinDir: string | null = null;
+function pythonOnlyPath(): string {
+  const probe = Bun.which('python3') ?? '/usr/bin/python3';
+  const out = Bun.spawnSync([probe, '-c', 'import sys; print(sys.executable)']);
+  const exe = out.stdout.toString().trim();
+  // Fail SETUP loudly if isolation can't be established: falling back to `probe` (which may be a
+  // pyenv shim, or sit next to a real `rig`) would quietly defeat the "rig absent" tests — the
+  // exact false green this helper exists to prevent (opus review). Better a hard error.
+  if (out.exitCode !== 0 || !exe) {
+    throw new Error(`cannot resolve the real python3 interpreter for test isolation (probe=${probe}, exit=${out.exitCode})`);
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'tgctl-py3-bin-'));
+  symlinkSync(exe, join(dir, 'python3'));
+  pythonBinDir = dir;
+  return dir;
+}
+const PYTHON3_ONLY_PATH = pythonOnlyPath();
+
+afterAll(() => {
+  if (pythonBinDir) rmSync(pythonBinDir, { recursive: true, force: true });
+});
 
 let root: string;
 
@@ -46,7 +72,7 @@ function fakeAgentToolsCheckout(opts: { rigOnPath: boolean; rigExitCode?: number
     join(pkgDir, '__main__.py'),
     [
       'import os, shutil, subprocess, sys',
-      'NO_RIG_EXIT = 3',
+      'NO_RIG_EXIT = 97',
       'def find_rig():',
       '    return shutil.which("rig")',
       'def main():',

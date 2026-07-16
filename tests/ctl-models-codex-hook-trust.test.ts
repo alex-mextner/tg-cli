@@ -60,6 +60,26 @@ test('applyCodexHookTrustBypass adds the flag for a codex spawn WHEN hooks are r
   ]);
 });
 
+test('applyCodexHookTrustBypass inserts the flag BEFORE the `--` prompt separator (task present)', () => {
+  // spawnArgvWithTask puts `--` before an initial task; the bypass is an OPTION and must land
+  // ahead of `--`, else codex parses it as part of the prompt and the trust gate still fires.
+  writeConfig(`${RIG_MARKER}\n[hooks]\nStop = []\n`);
+  const env = { HOME: home };
+  const argv = spawnArgvWithTask('codex-gpt-5.5', '/x', 'do it')!; // ['codex','--model','gpt-5.5','--','do it']
+  expect(applyCodexHookTrustBypass(argv, 'codex', env)).toEqual([
+    'codex', '--model', 'gpt-5.5', FLAG, '--', 'do it',
+  ]);
+});
+
+test('applyCodexHookTrustBypass is idempotent — never emits a duplicate bypass flag', () => {
+  writeConfig(`${RIG_MARKER}\n[hooks]\nStop = []\n`);
+  const env = { HOME: home };
+  const once = applyCodexHookTrustBypass(['codex', '--model', 'gpt-5.5', '--', 'do it'], 'codex', env);
+  // Applying again must be a no-op, not a second --dangerously-bypass-hook-trust.
+  expect(applyCodexHookTrustBypass(once, 'codex', env)).toEqual(once);
+  expect(once.filter((a) => a === FLAG)).toHaveLength(1);
+});
+
 test('applyCodexHookTrustBypass does NOT add the flag when codex hooks are not rig-managed', () => {
   const env = { HOME: home }; // no config.toml at all
   expect(applyCodexHookTrustBypass(['codex'], 'codex', env)).toEqual(['codex']);

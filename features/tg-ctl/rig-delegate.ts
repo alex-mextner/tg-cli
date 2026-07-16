@@ -87,6 +87,17 @@ export interface RigDelegateResult {
   stderr: string;
 }
 
+// The exit code the shared `agenttools_rig_delegate` CLI's `delegate` subcommand returns when it
+// finds NO rig — the "rig absent, run your own fallback" sentinel. Mirrors the Python library's
+// exported `agenttools_rig_delegate.NO_RIG_EXIT` (agent-tools#282). It MUST agree with that
+// value: #282 moved it OFF 3 (which collided with rig's own `EXIT_DRIFT=3`, making a real
+// `rig apply` drift indistinguishable from "rig absent") to 97 — clear of rig's whole 0-8 range
+// and the 126/127/128+ shell-reserved codes. A caller that treats this sentinel as a rig FAILURE
+// (propagate, no fallback) would wrongly refuse to self-install when rig is merely absent; one
+// that treats a REAL failure as the sentinel (fall back) would double-write. So branch on it
+// EXACTLY, never on "any nonzero".
+export const NO_RIG_EXIT = 97;
+
 // Best-effort `rig <rigArgs>` via the shared delegate CLI. Assumes the caller already confirmed
 // rig is present (detectRig) — this function only reports whether it managed to RUN rig and
 // rig's own exit code; it never decides fallback policy itself (the caller does, per tg#8672's
@@ -138,5 +149,13 @@ export function applyCodexHookTrustBypass(
 ): string[] {
   if (modelKind !== 'codex') return argv;
   if (!codexHooksRigManaged(env)) return argv;
-  return [...argv, '--dangerously-bypass-hook-trust'];
+  // Codex's CLI is `codex [OPTIONS] [PROMPT]`, and spawnArgvWithTask inserts a `--` before an
+  // initial task prompt. The bypass is an OPTION, so it MUST land before that `--` separator —
+  // appended after it, codex parses it as part of the prompt and the hook-trust gate still
+  // fires (codex review). No `--` (no task) -> append at the end.
+  const flag = '--dangerously-bypass-hook-trust';
+  if (argv.includes(flag)) return argv; // idempotent: never emit a duplicate bypass flag
+  const sep = argv.indexOf('--');
+  if (sep === -1) return [...argv, flag];
+  return [...argv.slice(0, sep), flag, ...argv.slice(sep)];
 }

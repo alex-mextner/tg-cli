@@ -143,7 +143,7 @@ import {
   withClaudeStatusLineTelemetry,
   withCodexUsageHook,
 } from "./features/tg-ctl/hook-install"
-import { applyCodexHookTrustBypass, detectRig, runRigDelegate } from "./features/tg-ctl/rig-delegate"
+import { applyCodexHookTrustBypass, detectRig, NO_RIG_EXIT, runRigDelegate } from "./features/tg-ctl/rig-delegate"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
@@ -1342,6 +1342,18 @@ function installCodexUsageTelemetry(codexHooksPath: string, codexRaw: string | n
     // rig binary present but the shared helper couldn't run (e.g. agent-tools not fully
     // deployed) — the delegation never happened, so honor the request via the direct write.
     console.log(`tg-ctl: rig detected (${rig.rigPath}) but the delegation helper could not run — writing the telemetry hook directly.`)
+    installCodexUsageTelemetryDirect(codexHooksPath, codexRaw, codexExisting)
+    return 0
+  }
+  if (delegated.exitCode === NO_RIG_EXIT) {
+    // The shared helper reports rig ABSENT via its sentinel (agent-tools#282: 97, moved off 3 so
+    // it can't be confused with rig's own EXIT_DRIFT=3). detectRig said present, but rig went
+    // away between detect and delegate (uninstalled mid-flight) — this is the "rig absent" case,
+    // NOT a rig failure, so honor the request with the direct write. Branch on the sentinel
+    // EXACTLY: a real rig failure (1/2/3/…) must fall through to the propagate path below.
+    // Checked BEFORE the "delegated … (exit N)" log so the absent path never claims provisioning
+    // happened.
+    console.log(`tg-ctl: rig reported absent (sentinel ${NO_RIG_EXIT}) at delegation time — writing the telemetry hook directly.`)
     installCodexUsageTelemetryDirect(codexHooksPath, codexRaw, codexExisting)
     return 0
   }

@@ -30,7 +30,7 @@ function fakeEnv() {
 // Fake agent-tools checkout with a minimal agenttools_rig_delegate CLI mirror (matches the real
 // detect/delegate contract from agent-tools PR #282) plus an optional fake `rig` binary that logs
 // its argv to `rig.log` and exits with `rigExitCode`.
-function fakeAgentToolsCheckout(root: string, opts: { withRig: boolean; rigExitCode?: number }): { source: string; binDir: string; rigLog: string } {
+function fakeAgentToolsCheckout(root: string, opts: { withRig: boolean; rigExitCode?: number; delegateSentinel?: boolean }): { source: string; binDir: string; rigLog: string } {
   const source = join(root, 'agent-tools');
   const pkgDir = join(source, 'lib', 'agenttools_rig_delegate');
   mkdirSync(pkgDir, { recursive: true });
@@ -43,11 +43,24 @@ function fakeAgentToolsCheckout(root: string, opts: { withRig: boolean; rigExitC
     writeFileSync(rigBin, `#!/bin/sh\necho "$@" >> ${JSON.stringify(rigLog)}\nexit ${opts.rigExitCode ?? 0}\n`);
     chmodSync(rigBin, 0o755);
   }
+  // `delegateSentinel` simulates rig going ABSENT between `detect` and `delegate` (a race, or a
+  // helper that resolves rig differently for the two calls): `detect` still finds `rig` on PATH,
+  // but `delegate` returns the NO_RIG_EXIT sentinel. Lets us assert the caller falls back on the
+  // sentinel (rig absent) rather than propagating it as a failure.
+  const delegateBody = opts.delegateSentinel
+    ? ['    if cmd == "delegate":', '        return NO_RIG_EXIT']
+    : [
+        '    if cmd == "delegate":',
+        '        rig = find_rig()',
+        '        if rig is None:',
+        '            return NO_RIG_EXIT',
+        '        return subprocess.run([rig, *rest]).returncode',
+      ];
   writeFileSync(
     join(pkgDir, '__main__.py'),
     [
       'import shutil, subprocess, sys',
-      'NO_RIG_EXIT = 3',
+      'NO_RIG_EXIT = 97',
       'def find_rig():',
       '    return shutil.which("rig")',
       'def main():',
@@ -61,11 +74,7 @@ function fakeAgentToolsCheckout(root: string, opts: { withRig: boolean; rigExitC
       '            return 1',
       '        print(rig)',
       '        return 0',
-      '    if cmd == "delegate":',
-      '        rig = find_rig()',
-      '        if rig is None:',
-      '            return NO_RIG_EXIT',
-      '        return subprocess.run([rig, *rest]).returncode',
+      ...delegateBody,
       '    return 2',
       'if __name__ == "__main__":',
       '    raise SystemExit(main())',
@@ -149,6 +158,47 @@ test('install-hooks: a PRESENT rig that FAILS surfaces the exit code and does NO
   expect(proc.exitCode).toBe(7);
   expect(proc.stderr.toString()).toContain('rig apply failed');
   expect(existsSync(join(home, '.codex', 'hooks.json'))).toBe(false);
+});
+
+test('install-hooks: a real rig failure with exit 3 PROPAGATES and does NOT fall back (3 is EXIT_DRIFT, not the sentinel)', () => {
+  // Guards the "branch on 97 EXACTLY, not any nonzero" invariant. Before agent-tools#282 the
+  // NO_RIG sentinel WAS 3, colliding with rig's own EXIT_DRIFT=3; a caller keying on 3 would
+  // wrongly fall back on a genuine rig drift/failure. Exit 3 must now propagate like any failure.
+  const root = mkdtempSync(join(tmpdir(), 'tgctl-rigdelegate-root-'));
+  const { home, cfg } = fakeEnv();
+  const { source, binDir } = fakeAgentToolsCheckout(root, { withRig: true, rigExitCode: 3 });
+
+  const proc = run(['install-hooks'], {
+    HOME: home,
+    TG_CTL_CONFIG_DIR: cfg,
+    RIG_AGENT_TOOLS_SOURCE: source,
+    PATH: `${binDir}:${BASE_PATH}`,
+  });
+  expect(proc.exitCode).toBe(3); // surfaced, NOT swallowed into a fallback
+  expect(proc.stderr.toString()).toContain('rig apply failed');
+  expect(existsSync(join(home, '.codex', 'hooks.json'))).toBe(false); // no direct write
+});
+
+test('install-hooks: delegate returns the NO_RIG_EXIT sentinel (97) — treated as rig ABSENT, falls back to the direct write', () => {
+  // agent-tools#282 moved the "rig absent" sentinel off 3 (collided with rig's EXIT_DRIFT) to 97.
+  // detectRig said present, but `delegate` reports rig gone (uninstalled mid-flight). The caller
+  // must recognize the sentinel as ABSENCE and self-install — NOT propagate 97 as a rig failure.
+  const root = mkdtempSync(join(tmpdir(), 'tgctl-rigdelegate-root-'));
+  const { home, cfg } = fakeEnv();
+  const { source, binDir } = fakeAgentToolsCheckout(root, { withRig: true, delegateSentinel: true });
+
+  const proc = run(['install-hooks'], {
+    HOME: home,
+    TG_CTL_CONFIG_DIR: cfg,
+    RIG_AGENT_TOOLS_SOURCE: source,
+    PATH: `${binDir}:${BASE_PATH}`,
+  });
+  expect(proc.exitCode).toBe(0); // sentinel is NOT surfaced as a failure
+  expect(proc.stdout.toString()).toContain('rig reported absent (sentinel 97)');
+
+  // Telemetry was written directly (the fallback ran) — never lost.
+  const codexHooks = JSON.parse(readFileSync(join(home, '.codex', 'hooks.json'), 'utf8'));
+  expect(codexUsageHookInstalled(codexHooks, CODEX_USAGE_CMD)).toBe(true);
 });
 
 test('install-hooks: rig absent (agent-tools package unresolvable) — falls back to the direct write, unaffected', () => {
