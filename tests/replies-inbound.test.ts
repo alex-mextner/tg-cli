@@ -165,10 +165,12 @@ test('inboundHistoryRecords: a media reply is stamped under the routed origin pa
   expect(recs.map((r) => r.pane)).toEqual(['%origin', '%origin']);
 });
 
-test('inboundHistoryRecords: a `!shell` text reply is NOT stamped under the origin — it routes to the default pane', () => {
-  // A `!` reply goes verbatim via the default auto-bind path (updates.ts excludes it from
-  // reply-route), so its `tg replies` history must be stamped under the DEFAULT pane, not the
-  // replied-to origin — else scoped recall shows the command in the wrong pane.
+test('inboundHistoryRecords: a `!shell` text reply IS stamped under the routed origin (codex #192)', () => {
+  // A `!` reply now reply-routes to its replied-to origin pane (updates.ts) — it
+  // keeps its raw `!…` text but is DELIVERED to that pane, so its `tg replies`
+  // history must be stamped there too, like prose/photo/voice replies. Otherwise
+  // scoped recall shows the command in the wrong (default) pane. The predicate
+  // mirrors the daemon: a text reply routes iff it is not a `/command`.
   const bangReply = msg({
     message_id: 202,
     text: '!git status',
@@ -176,7 +178,7 @@ test('inboundHistoryRecords: a `!shell` text reply is NOT stamped under the orig
   });
   const resolvePane = (m: TgMessage): string | null =>
     m.reply_to_message &&
-    ((m.text !== undefined && !m.text.startsWith('/') && !m.text.startsWith('!')) ||
+    ((m.text !== undefined && !m.text.startsWith('/')) ||
       (m.photo !== undefined && !isAgentCommand(m.caption ?? '')) ||
       (m.document !== undefined && !isAgentCommand(m.caption ?? '')) ||
       m.voice !== undefined ||
@@ -184,7 +186,7 @@ test('inboundHistoryRecords: a `!shell` text reply is NOT stamped under the orig
       ? '%origin'
       : null;
   const recs = inboundHistoryRecords([bangReply], { ...opts, pane: '%default', resolvePane });
-  expect(recs.map((r) => r.pane)).toEqual(['%default']);
+  expect(recs.map((r) => r.pane)).toEqual(['%origin']);
 });
 
 test('inboundHistoryRecords: a media reply with /agent caption is not stamped under the replied-to origin', () => {

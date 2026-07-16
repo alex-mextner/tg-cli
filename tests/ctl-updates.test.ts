@@ -452,12 +452,22 @@ test('multi-line `!cmd` is injected VERBATIM — full body, `!` still at column 
   expect(r.actions[0]).toEqual({ kind: 'inject-text', text: body, messageId: 1 });
 });
 
-test('`!cmd` sent as a REPLY is still VERBATIM — no quote-anchor prepended', () => {
+test('`!cmd` sent as a REPLY routes to the origin pane but stays VERBATIM (codex #192)', () => {
+  // A `!` shell reply must run in the REPLIED-TO agent's pane, not the default/
+  // last-message pane — so it goes through reply-route (origin routing) like any
+  // reply. But the quote-anchor is dropped: the raw `!…` is the injectText so `!`
+  // stays at column 0 for the harness passthrough.
   const r = stepUpdates(
     [upd(1, { text: '!ls', reply_to_message: { message_id: 55, chat: { id: CHAT_ID }, date: NOW, text: 'earlier' } })],
     makeOpts(),
   );
-  expect(r.actions[0]).toEqual({ kind: 'inject-text', text: '!ls', messageId: 1 });
+  expect(r.actions[0]).toEqual({
+    kind: 'reply-route',
+    replyToMessageId: 55,
+    injectText: '!ls',
+    from: 'Alex',
+    messageId: 1,
+  });
 });
 
 test('a leading space before `!` is NOT passthrough — wrapped like prose (strict column-0)', () => {

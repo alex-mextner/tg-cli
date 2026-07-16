@@ -379,10 +379,12 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         // A reply carrying prose forwards the quote anchor (items 2,3) via
         // reply-route — the daemon picks the recognized origin pane or a LRU/MRU
         // picker. A reply whose text is a /command still runs the command verbatim.
-        // A `!` shell-command reply is ALSO verbatim: a prepended quote-anchor would
-        // knock the `!` off column 0 and defeat the harness passthrough, so it must
-        // fall through to textAction (raw) — never reply-route.
+        // A `!` shell-command reply ALSO routes to the origin pane via reply-route
+        // (codex #192: otherwise it falls to the default/last-message pane), but
+        // with the RAW `!…` as injectText and NO quote anchor — a prepended anchor
+        // would knock the `!` off column 0 and defeat the harness passthrough.
         const isVerbatimText = m.text.startsWith('/') || m.text.startsWith('!');
+        const isBangReply = !!m.reply_to_message && m.text.startsWith('!');
         const postTimeoutRequestId = m.reply_to_message
           ? (opts.postTimeoutQuestionRequestIdForMessage?.(m.reply_to_message.message_id) ?? null)
           : null;
@@ -395,11 +397,13 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
               from: name,
               messageId: m.message_id,
             }
-          : m.reply_to_message && !isVerbatimText
+          : m.reply_to_message && (!isVerbatimText || isBangReply)
             ? {
                 kind: 'reply-route',
                 replyToMessageId: m.reply_to_message.message_id,
-                injectText: buildReplyInject(m, name, opts),
+                // A `!` reply keeps its raw text (verbatim, `!` at column 0); a
+                // prose reply gets the quote anchor + wrap.
+                injectText: isBangReply ? m.text : buildReplyInject(m, name, opts),
                 from: name,
                 messageId: m.message_id,
               }

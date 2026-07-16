@@ -4414,8 +4414,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
 
   // A reply: route to the recognized origin pane (routes map) or, when unknown,
-  // a session-grouped picker ordered LRU/MRU. injectText already carries the
-  // wrap + quote anchor, so it is injected verbatim everywhere here.
+  // a session-grouped picker ordered LRU/MRU. injectText is injected verbatim
+  // everywhere here — for a prose reply it already carries the wrap + quote
+  // anchor; for a `!shell` reply it is the RAW `!…` text (codex #192), so `!`
+  // stays at column 0 for the harness passthrough.
   const handleReplyRoute = async (
     action: Extract<Action, { kind: "reply-route" }>,
     relatedReactionMessageId: number | null = null,
@@ -6741,12 +6743,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           const replyId = m.reply_to_message?.message_id
           if (replyId === undefined) return null
           // ONLY the kinds that actually reply-route (updates.ts): a text reply
-          // whose body is NOT a /command AND NOT a `!shell` passthrough (both go
-          // verbatim via the default auto-bind path, never reply-route), a
-          // photo/document reply after download, or a voice/audio reply after
-          // transcription.
+          // whose body is NOT a /command (a /command reply runs verbatim in the
+          // default auto-bind pane, never reply-route). A `!shell` reply DOES
+          // reply-route to its origin pane (codex #192) — it keeps its raw text but
+          // is delivered to the recognized pane, so it must be stamped there too,
+          // matching the prose/photo/voice cases. Also a photo/document reply after
+          // download, or a voice/audio reply after transcription.
           const isRoutedReply =
-            (m.text !== undefined && !m.text.startsWith("/") && !m.text.startsWith("!")) ||
+            (m.text !== undefined && !m.text.startsWith("/")) ||
             (m.photo !== undefined && !isAgentCommand(m.caption ?? "")) ||
             (m.document !== undefined && !isAgentCommand(m.caption ?? "")) ||
             m.voice !== undefined ||
