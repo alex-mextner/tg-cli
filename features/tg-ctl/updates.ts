@@ -99,8 +99,9 @@ export function buildReplyInject(m: TgMessage, name: string, opts: StepOpts): st
 
 // A forum LIFECYCLE service message (topic created / renamed / closed / reopened)
 // carries no user instruction — it is Telegram reporting a topic-state change.
-// Unlike owner text/media, a stale one is still ignored by age (see the drop
-// below and the same-batch lifecycle pre-scan).
+// Unlike owner text/media, a stale TRANSITION (close/reopen/renamed) is ignored
+// by age (see the drop below and the same-batch lifecycle pre-scan); a stale
+// CREATION is the exception and is still processed so the topic gets tracked.
 function isForumServiceMessage(m: TgMessage): boolean {
   return !!(m.forum_topic_created || m.forum_topic_edited || m.forum_topic_closed || m.forum_topic_reopened);
 }
@@ -337,12 +338,15 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     // Owner text/media inbound is NOT dropped by age (#183): a message Telegram
     // delivered after daemon downtime or while agents were busy is still a real
     // request and must reach the agent, not vanish behind a "skipped N stale"
-    // notice. A stale forum LIFECYCLE service message (close/reopen/created/
-    // renamed) IS still ignored by age — consistent with the same-batch
-    // lifecycle pre-scan above (codex r22): an old topic-state event must not
-    // re-drive routing after downtime, and processing it here while the pre-scan
-    // ignores it would let a same-batch spawn tap orphan into a closing topic.
-    if (isForumServiceMessage(m) && opts.nowSec - m.date > opts.cfg.stalenessSec) continue;
+    // notice. A stale forum lifecycle TRANSITION (close/reopen/renamed) IS still
+    // ignored by age — consistent with the same-batch lifecycle pre-scan above
+    // (codex r22): an old topic-state event must not re-drive routing after
+    // downtime, and processing it here while the pre-scan ignores it would let a
+    // same-batch spawn tap orphan into a closing topic. CREATION is the exception
+    // (codex #195): a topic created while the daemon was down > stalenessSec must
+    // STILL reach topicActionFor so it emits topic-new and TRACKS the topic —
+    // else later messages in it are untracked and never bound to an agent.
+    if (isForumServiceMessage(m) && !m.forum_topic_created && opts.nowSec - m.date > opts.cfg.stalenessSec) continue;
 
     const name = m.from?.first_name || m.from?.username || 'tg';
 
