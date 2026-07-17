@@ -215,3 +215,138 @@ export function withClaudeStatusLineTelemetry(
     changed: true,
   };
 }
+
+// The three Claude Code hook channels installed together as one unit: the
+// q→buttons question hook, the StopFailure limit/error hook, and the statusLine
+// usage-telemetry command. Passed in (not hardcoded) so the CMD constants stay
+// owned by the daemon entrypoint.
+export interface ClaudeHookCommands {
+  question: string;
+  harness: string;
+  statusLine: string;
+}
+
+// True only when ALL THREE Claude hook channels are present. Used by the daemon
+// startup self-heal to decide whether a rewrite of settings.json (e.g. Claude
+// Code re-emitting the file with only its own managed keys, dropping our hooks)
+// needs the hooks re-merged.
+export function claudeHooksFullyInstalled(settings: Record<string, unknown>, cmds: ClaudeHookCommands): boolean {
+  return (
+    claudeHooksInstalled(settings, cmds.question) &&
+    harnessHooksInstalled(settings, cmds.harness) &&
+    claudeStatusLineTelemetryInstalled(settings, cmds.statusLine)
+  );
+}
+
+// Merge all three Claude hook channels in one pass. Single source of truth shared
+// by `install-hooks` and the daemon startup self-heal, so both converge on the
+// exact same desired settings. `changed` is true iff any channel was added.
+export function reconcileClaudeHooks(
+  settings: Record<string, unknown>,
+  cmds: ClaudeHookCommands,
+): { settings: Record<string, unknown>; changed: boolean } {
+  const q = withClaudeHooks(settings, cmds.question);
+  const h = withHarnessHooks(q.settings, cmds.harness);
+  const t = withClaudeStatusLineTelemetry(h.settings, cmds.statusLine);
+  return { settings: t.settings, changed: q.changed || h.changed || t.changed };
+}
+
+// The decision the daemon startup self-heal makes, made PURE (no I/O) so every
+// branch is testable. `skip` reasons: `not-opted-in` (the user never ran
+// `install-hooks`, so we never auto-install — preserves the opt-in contract),
+// `unparseable`/`not-object` (leave a hand-broken file alone), `already-installed`
+// (the common fast path — nothing to do). `write` carries the serialized settings
+// to persist and the prior text to back up (null when there was nothing on disk).
+export type ClaudeHookSelfHealPlan =
+  | { action: 'skip'; reason: 'not-opted-in' | 'unparseable' | 'not-object' | 'already-installed' }
+  | { action: 'write'; settingsJson: string; backup: string | null };
+
+export function planClaudeHookSelfHeal(
+  raw: string | null,
+  optedIn: boolean,
+  cmds: ClaudeHookCommands,
+): ClaudeHookSelfHealPlan {
+  // Only ever RESTORE what a prior `install-hooks` established — never first-time
+  // install on daemon start. A user who never opted in, or who deliberately
+  // stripped the hooks and removed the sentinel, is left untouched.
+  if (!optedIn) return { action: 'skip', reason: 'not-opted-in' };
+  let existing: Record<string, unknown> = {};
+  const hasContent = raw !== null && raw.trim() !== '';
+  if (hasContent) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw as string);
+    } catch {
+      return { action: 'skip', reason: 'unparseable' };
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { action: 'skip', reason: 'not-object' };
+    }
+    existing = parsed as Record<string, unknown>;
+  }
+  if (claudeHooksFullyInstalled(existing, cmds)) return { action: 'skip', reason: 'already-installed' };
+  const { settings } = reconcileClaudeHooks(existing, cmds);
+  return { action: 'write', settingsJson: `${JSON.stringify(settings, null, 2)}\n`, backup: hasContent ? raw : null };
+}
+
+// The filesystem seam the daemon startup self-heal drives, injected so the whole
+// orchestration (read → plan → backup → write) is unit-testable with an in-memory
+// fake. `read` returns null for BOTH a missing and an UNREADABLE file — the
+// orchestration disambiguates with `exists` so it never overwrites a file it
+// could not read.
+export interface HookSelfHealFs {
+  exists(path: string): boolean;
+  read(path: string): string | null;
+  backup(path: string, content: string): void;
+  writeAtomic(path: string, content: string): void;
+  ensureDir(dir: string): void;
+}
+
+export interface HookSelfHealPaths {
+  settingsPath: string;
+  settingsDir: string;
+  sentinelPath: string;
+}
+
+export type HookSelfHealSkipReason =
+  | 'not-opted-in'
+  | 'no-settings-file'
+  | 'unparseable'
+  | 'not-object'
+  | 'already-installed'
+  | 'unreadable';
+
+export type HookSelfHealOutcome =
+  | { outcome: 'skipped'; reason: HookSelfHealSkipReason }
+  | { outcome: 'healed' };
+
+// Orchestrate the startup self-heal over an injected fs. RESTORE-ONLY: it only
+// re-merges hooks into a settings.json that EXISTS and is READABLE — it never
+// first-time-creates the file (a user who deleted settings.json to reset Claude
+// Code keeps their reset) and never clobbers a file it could not read. Opt-in is
+// the presence of the sentinel `install-hooks` writes. The `.selfheal.bak` is
+// written ONCE (only when absent) so a second gutting can't replace the earliest
+// pre-heal snapshot with a later, already-gutted one.
+export function runClaudeHookSelfHeal(
+  fs: HookSelfHealFs,
+  paths: HookSelfHealPaths,
+  cmds: ClaudeHookCommands,
+): HookSelfHealOutcome {
+  // Opt-in is the FIRST gate (matches the documented precedence and avoids a
+  // needless read/stat of settings.json on every start for a user who never
+  // adopted the hooks).
+  if (!fs.exists(paths.sentinelPath)) return { outcome: 'skipped', reason: 'not-opted-in' };
+  // `exists` FIRST (no TOCTOU ambiguity), then read only when present.
+  if (!fs.exists(paths.settingsPath)) return { outcome: 'skipped', reason: 'no-settings-file' };
+  const raw = fs.read(paths.settingsPath);
+  if (raw === null) return { outcome: 'skipped', reason: 'unreadable' };
+  const plan = planClaudeHookSelfHeal(raw, true, cmds);
+  if (plan.action === 'skip') return { outcome: 'skipped', reason: plan.reason };
+  const backupPath = `${paths.settingsPath}.selfheal.bak`;
+  if (plan.backup !== null && !fs.exists(backupPath)) {
+    fs.backup(backupPath, plan.backup);
+  }
+  fs.ensureDir(paths.settingsDir);
+  fs.writeAtomic(paths.settingsPath, plan.settingsJson);
+  return { outcome: 'healed' };
+}
