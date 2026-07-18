@@ -92,21 +92,24 @@ test('inboundHistoryRecords: pane=null is preserved (logged outside a known pane
   expect(recs[0].pane).toBeNull();
 });
 
-test('inboundHistoryRecords: drops stale messages when nowSec + stalenessSec given (mirrors stepUpdates)', () => {
+test('inboundHistoryRecords: keeps old owner messages so tg replies can recover them after downtime (#183)', () => {
+  // Owner inbound is no longer dropped by age — recall keeps every allowed
+  // message Telegram delivered, mirroring stepUpdates.
   const old = msg({ text: 'ancient' }); // date 1700000000
   const recs = inboundHistoryRecords([old], {
     ...opts,
-    nowSec: 1700000000 + 1000, // 1000s later, staleness 300 → dropped
+    nowSec: 1700000000 + 1000, // 1000s later — legacy staleness would have dropped it
     stalenessSec: 300,
   });
-  expect(recs).toEqual([]);
+  expect(recs.length).toBe(1);
+  expect(recs[0].text).toContain('ancient');
 });
 
-test('inboundHistoryRecords: keeps fresh messages under the staleness window', () => {
+test('inboundHistoryRecords: keeps fresh messages', () => {
   const fresh = msg({ text: 'just now' });
   const recs = inboundHistoryRecords([fresh], {
     ...opts,
-    nowSec: 1700000000 + 100, // within 300s
+    nowSec: 1700000000 + 100,
     stalenessSec: 300,
   });
   expect(recs.length).toBe(1);

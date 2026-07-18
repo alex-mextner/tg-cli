@@ -3,6 +3,12 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.38.1
+
+**Fix: `tg-ctl` control-surface routing, subagent-name attribution, and #183 stale-inbound.**
+Control messages route to the right surface, subagent replies carry the correct agent name, and
+stale inbound messages are no longer replayed after a restart.
+
 ## 1.38.0
 
 **Feature: graceful `tg-ctl` reload preserves the defer-while-waiting backlog.** A reload no

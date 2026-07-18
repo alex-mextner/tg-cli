@@ -4424,9 +4424,35 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const m = matchWindows(action.selector, candidates)
       if (m.matches.length > 0) {
         if (!action.rest.trim()) {
-          const names = m.matches.map((c) => c.windowName).join(", ")
-          await sendMessage(ctx, `matched ${names} — add a message: /agent ${action.selector} <message>`, out)
-          return true
+          // `/agent <name>` with NO message: SELECT that agent as the routing
+          // target for the next ordinary message (repair of #158 — a named
+          // selection used to only print a hint and never arm a route). A
+          // confident single match arms directly; an ambiguous match shows the
+          // same select-only picker bare `/agent` uses (a tap arms the route).
+          //
+          // The one-shot route is a FLAT-CHAT concept: injectIntoSelectedAgent is
+          // only consulted on flat inject-text / media, never on a topic-route.
+          // A topic-originated `/agent <name>` (threadId set) therefore keeps the
+          // plain hint — arming a global route there would only leak into a later
+          // flat message and mislead ("send the next message here", codex review).
+          if (action.threadId != null) {
+            const names = m.matches.map((c) => c.windowName).join(", ")
+            await sendMessage(ctx, `matched ${names} — add a message: /agent ${action.selector} <message>`, out)
+            return true
+          }
+          if (m.confident) {
+            const target = m.matches[0]
+            const label = labelFor(target, candidates)
+            log(`agent-route: selector="${action.selector}" → select-only arm ${target.paneId}/${target.windowName}`)
+            const cardId = await sendMessage(ctx, `selected ${label}`, out)
+            const routeToken = armSelectedAgentRoute(target, label, cardId, null)
+            if (cardId !== null) {
+              void editMessageText(ctx, cardId, `selected ${label} — send the next message here`, selectedAgentCancelMarkup(routeToken))
+            }
+            return true
+          }
+          log(`agent-route: selector="${action.selector}" → ambiguous select-only picker over ${m.matches.length} matches`)
+          return postAgentPicker(m.matches, "", action.messageId, { armNextMessage: true, messageExtra: out })
         }
         if (m.confident) {
           const target = m.matches[0]
@@ -6886,9 +6912,6 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (step.newOffset !== offset) {
         offset = step.newOffset
         writeFileSync(ctx.paths.offset, `${offset}\n`)
-      }
-      if (step.skippedStale > 0) {
-        await sendMessage(ctx, `skipped ${step.skippedStale} stale messages`)
       }
 
       // Persist inbound history for `tg replies` recall — every message the CTO

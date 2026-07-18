@@ -339,14 +339,17 @@ test('topics ON: a DUPLICATE forum_topic_created for an in-flight/bound topic do
   expect(fresh.actions[0]).toEqual({ kind: 'topic-new', threadId: 51, name: 'new', from: 'Alex' });
 });
 
-test('topics ON: a STALE topic message yields NO topic action (never leaks to a live agent)', () => {
-  const stale: TgUpdate = {
+test('topics ON: an OLD topic message in a bound topic is still routed to its agent (#183)', () => {
+  // Owner inbound is no longer dropped by age: a message Telegram delivered
+  // after downtime still reaches the agent, topic-routed like any other.
+  const old: TgUpdate = {
     update_id: 20,
     message: { message_id: 20, from: { id: CHAT_ID, first_name: 'Alex' }, chat: { id: CHAT_ID }, date: NOW - 9999, text: 'old', message_thread_id: 50, is_topic_message: true },
   };
-  const r = stepUpdates([stale], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
-  expect(r.actions).toEqual([]);
-  expect(r.skippedStale).toBe(1);
+  const r = stepUpdates([old], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
+  expect(r.actions.length).toBeGreaterThan(0);
+  expect(r.actions.some((a) => a.kind === 'ack' && a.messageId === 20)).toBe(true);
+  expect(r.skippedStale).toBe(0);
 });
 
 test('topics ON: a topic message from a NON-allowed sender yields NO topic action', () => {

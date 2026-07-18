@@ -310,31 +310,77 @@ test("disallowed sender's /kill is ignored entirely", () => {
   expect(r.newOffset).toBe(2);
 });
 
-// --- staleness (spec §10) ---
+// --- staleness (#183): owner inbound is NEVER dropped by age ---
+// If Telegram delivered the update after daemon downtime, it is still a real
+// instruction and must reach the agent — the old "skipped N stale" drop lost
+// real requests sent while agents were busy or tg-ctl was paused.
 
-test('stale message is dropped and counted', () => {
-  const r = stepUpdates([upd(1, { text: 'old', date: NOW - 301 })], makeOpts());
-  expect(r.actions).toEqual([]);
-  expect(r.skippedStale).toBe(1);
+test('old owner message is still delivered, never dropped or counted stale', () => {
+  const r = stepUpdates([upd(1, { text: 'old', date: NOW - 9999 })], makeOpts());
+  expect(r.actions).toHaveLength(2); // delivery action + its ack
+  expect(r.actions[0]).toMatchObject({ kind: 'inject-text' });
+  expect(r.skippedStale).toBe(0);
   expect(r.newOffset).toBe(2);
 });
 
-test('message exactly stalenessSec old is NOT stale (strict >)', () => {
+test('message exactly stalenessSec old is delivered', () => {
   const r = stepUpdates([upd(1, { text: 'edge', date: NOW - 300 })], makeOpts());
   expect(r.actions).toHaveLength(2); // delivery action + its ack
   expect(r.skippedStale).toBe(0);
 });
 
-test('stale command is counted stale, never executed', () => {
+test('old owner command is still executed after downtime', () => {
   const r = stepUpdates([upd(1, { text: '/kill', date: NOW - 9999 })], makeOpts());
-  expect(r.actions).toEqual([]);
-  expect(r.skippedStale).toBe(1);
+  expect(r.actions.length).toBeGreaterThan(0);
+  expect(r.skippedStale).toBe(0);
 });
 
-test('stale message from a disallowed sender does not inflate the stale count', () => {
+test('message from a disallowed sender is dropped regardless of age', () => {
   const r = stepUpdates([upd(1, { text: 'x', date: NOW - 9999, from: { id: 666 } })], makeOpts());
+  expect(r.actions).toEqual([]);
   expect(r.skippedStale).toBe(0);
   expect(r.newOffset).toBe(2);
+});
+
+test('a STALE forum lifecycle service message is still ignored by age (#183 excludes service msgs)', () => {
+  // Owner text is delivered regardless of age, but a stale topic-state TRANSITION
+  // (close/reopen/renamed) carries no instruction and must not re-drive routing
+  // after downtime — consistent with the same-batch lifecycle pre-scan. Topic
+  // CREATION is the exception (see the test below): it must still be tracked.
+  const staleClose = upd(1, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, date: NOW - 9999 });
+  const r = stepUpdates([staleClose], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
+  expect(r.actions.some((a) => a.kind === 'topic-close')).toBe(false);
+  // A FRESH close of the same topic IS processed.
+  const freshClose = upd(2, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false });
+  const r2 = stepUpdates([freshClose], makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }));
+  expect(r2.actions.some((a) => a.kind === 'topic-close')).toBe(true);
+});
+
+test('a STALE forum_topic_created is STILL processed (creation is not age-dropped)', () => {
+  // A topic created while the daemon was down longer than stalenessSec must NOT
+  // be age-dropped: unlike close/reopen, creation is what makes topicActionFor
+  // emit topic-new and TRACK the topic. Dropping it leaves later messages in that
+  // topic untracked (only acked, never bound to an agent). Only close/reopen keep
+  // the age gate. (codex #195)
+  const staleCreate = upd(1, {
+    forum_topic_created: { name: 'api' },
+    message_thread_id: 50,
+    is_topic_message: false,
+    date: NOW - 9999,
+  });
+  const r = stepUpdates([staleCreate], makeOpts({ topicsEnabled: true, topicStatusOf: () => null }));
+  // The exact topic-new action must be emitted (thread id + name), so the
+  // entrypoint tracks the topic — not merely "some action".
+  expect(r.actions.find((a) => a.kind === 'topic-new')).toEqual({
+    kind: 'topic-new',
+    threadId: 50,
+    name: 'api',
+    from: 'Alex',
+  });
+  // Contrast: a stale close of the SAME (untracked) topic is still age-dropped.
+  const staleClose = upd(2, { forum_topic_closed: {}, message_thread_id: 50, is_topic_message: false, date: NOW - 9999 });
+  const rc = stepUpdates([staleClose], makeOpts({ topicsEnabled: true, topicStatusOf: () => null }));
+  expect(rc.actions.some((a) => a.kind === 'topic-close')).toBe(false);
 });
 
 // --- command split (spec §13) ---
@@ -771,12 +817,12 @@ test('voice from a disallowed sender is dropped entirely', () => {
 
 // --- batch combinations ---
 
-test('batch: ordered actions, stale counted, intruder dropped, offset correct', () => {
+test('batch: ordered actions, old message still delivered, intruder dropped, offset correct', () => {
   const updates: TgUpdate[] = [
     upd(10, { text: 'hello' }),
     upd(11, { text: '/status' }),
     { update_id: 12 }, // non-message update
-    upd(13, { text: 'late', date: NOW - 1000 }), // stale
+    upd(13, { text: 'late', date: NOW - 1000 }), // old (post-downtime) — still delivered (#183)
     upd(14, { text: '/kill', from: { id: 666 } }), // intruder
     upd(15, { text: 'world' }),
   ];
@@ -786,10 +832,12 @@ test('batch: ordered actions, stale counted, intruder dropped, offset correct', 
     { kind: 'ack', messageId: 10 },
     { kind: 'status' },
     { kind: 'ack', messageId: 11 },
+    { kind: 'inject-text', text: '[TG from Alex] late', messageId: 13 },
+    { kind: 'ack', messageId: 13 },
     { kind: 'inject-text', text: '[TG from Alex] world', messageId: 15 },
     { kind: 'ack', messageId: 15 },
   ]);
-  expect(r.skippedStale).toBe(1);
+  expect(r.skippedStale).toBe(0);
   expect(r.newOffset).toBe(16);
 });
 

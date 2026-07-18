@@ -7,8 +7,10 @@
 // template).
 //
 // Delivery semantics are at-most-once (spec §10): the offset advances over
-// EVERY update — rejected senders, stale messages and unsupported kinds
-// included — so nothing is ever replayed into a live agent session.
+// EVERY update — rejected senders and unsupported kinds included — so nothing
+// is ever replayed into a live agent session. Owner messages are NOT dropped by
+// age (#183): if Telegram delivered the update after daemon downtime, it is
+// still a real instruction and must reach the agent.
 
 import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatus } from './types';
 import { parseButtonCallback, parseQuestionCloseCallback } from './questions';
@@ -95,10 +97,18 @@ export function buildReplyInject(m: TgMessage, name: string, opts: StepOpts): st
   return `${buildReplyAnchor(m, opts)}\n${opts.wrap(name, m.text ?? '', m.message_id)}`;
 }
 
+// A forum LIFECYCLE service message (topic created / renamed / closed / reopened)
+// carries no user instruction — it is Telegram reporting a topic-state change.
+// Unlike owner text/media, a stale TRANSITION (close/reopen/renamed) is ignored
+// by age (see the drop below and the same-batch lifecycle pre-scan); a stale
+// CREATION is the exception and is still processed so the topic gets tracked.
+function isForumServiceMessage(m: TgMessage): boolean {
+  return !!(m.forum_topic_created || m.forum_topic_edited || m.forum_topic_closed || m.forum_topic_reopened);
+}
+
 export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   const callbackActions: Action[] = [];
   const actions: Action[] = [];
-  let skippedStale = 0;
   let maxId = -1;
 
   // PRE-SCAN for threads this batch undergoes a LIFECYCLE TRANSITION (close OR reopen): callbacks
@@ -108,8 +118,8 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   // topic (codex r21); for a REOPEN, markReopened drops the freshly-bound paneId → orphans it too
   // (codex r27). So suppress any topic spawn-flow callback (model/path/re-spawn) for a thread the
   // SAME batch closes OR reopens, letting the lifecycle transition win. Apply the SAME filters the
-  // message loop uses (codex r22): a STALE or UNAUTHORIZED service message is ignored there, so it
-  // must NOT suppress a valid same-batch tap here either. Only an allowed, fresh, TRACKED-topic one.
+  // message loop uses (codex r22): an UNAUTHORIZED service message is ignored there, so it
+  // must NOT suppress a valid same-batch tap here either. Only an allowed, TRACKED-topic one.
   // Map each such thread to the EARLIEST lifecycle update_id (codex r30): suppression is ORDER-AWARE
   // for text/media messages — only a message that came AFTER the transition (higher update_id) is
   // suppressed; one that came BEFORE it is processed normally (it happened before the close/reopen).
@@ -120,6 +130,10 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
       const t = m?.message_thread_id;
       if (!(m?.forum_topic_closed || m?.forum_topic_reopened) || t === undefined) continue;
       if (!senderAllowed(m.from?.id, opts)) continue;
+      // A stale-dated close/reopen is ignored HERE (codex r22): an old lifecycle
+      // service message must not suppress a valid same-batch tap. This is about
+      // lifecycle ORDERING within a batch, not owner-message delivery — owner
+      // text/media is never dropped by age (#183, main loop below).
       if (opts.nowSec - m.date > opts.cfg.stalenessSec) continue;
       if ((opts.topicStatusOf?.(t) ?? null) === null) continue;
       const prior = lifecycleInBatch.get(t);
@@ -318,14 +332,21 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
     if (!m) continue; // non-message/callback update → advance silently
 
     // Sender allowlist FIRST (spec §9: from.id, not chat id — a group member
-    // must not inject prompts). Rejected senders also never inflate the stale
-    // count, so the "skipped N stale" notice only reports the owner's backlog.
+    // must not inject prompts).
     if (!senderAllowed(m.from?.id, opts)) continue;
 
-    if (opts.nowSec - m.date > opts.cfg.stalenessSec) {
-      skippedStale += 1;
-      continue;
-    }
+    // Owner text/media inbound is NOT dropped by age (#183): a message Telegram
+    // delivered after daemon downtime or while agents were busy is still a real
+    // request and must reach the agent, not vanish behind a "skipped N stale"
+    // notice. A stale forum lifecycle TRANSITION (close/reopen/renamed) IS still
+    // ignored by age — consistent with the same-batch lifecycle pre-scan above
+    // (codex r22): an old topic-state event must not re-drive routing after
+    // downtime, and processing it here while the pre-scan ignores it would let a
+    // same-batch spawn tap orphan into a closing topic. CREATION is the exception
+    // (codex #195): a topic created while the daemon was down > stalenessSec must
+    // STILL reach topicActionFor so it emits topic-new and TRACKS the topic —
+    // else later messages in it are untracked and never bound to an agent.
+    if (isForumServiceMessage(m) && !m.forum_topic_created && opts.nowSec - m.date > opts.cfg.stalenessSec) continue;
 
     const name = m.from?.first_name || m.from?.username || 'tg';
 
@@ -432,7 +453,7 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
   return {
     actions: [...callbackActions, ...actions],
     newOffset: updates.length ? maxId + 1 : opts.currentOffset,
-    skippedStale,
+    skippedStale: 0, // legacy field; owner inbound is no longer skipped by age (#183)
   };
 }
 
