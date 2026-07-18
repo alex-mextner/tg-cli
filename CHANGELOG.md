@@ -3,6 +3,12 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.38.2
+
+**Fix: label the main session by project window/cwd, not version/subagent.** The main session's
+Telegram label now derives from the project window name / working directory instead of the tool
+version or subagent name, so reports are attributed to the right project.
+
 ## 1.38.1
 
 **Fix: `tg-ctl` control-surface routing, subagent-name attribution, and #183 stale-inbound.**
