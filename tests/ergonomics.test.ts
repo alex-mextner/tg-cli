@@ -242,6 +242,63 @@ test('--title guard is gated on the SAME autolink-msgrefs feature flag as the bo
   });
 });
 
+test('--title refuses a HYP-<id> ticket reference (must move into the body)', () => {
+  // A bare ticket code in the one-line header is inert (nothing linkifies it there) and
+  // duplicates a body reference the reader can actually follow — same rule task-cli/gh-ship
+  // enforce on a ticket/PR title (tg-cli#116, refs #6344-6350 "таски не размечены ссылками").
+  expect(parseArgs(['--title', 'HYP-1234 done', 'body'], dir, HOME)).toEqual({
+    action: 'error',
+    message: 'Refusing: --title contains a ticket reference (HYP-1234) — move it into the message body.',
+  });
+  // Detected mid-title too, and the FIRST detected code names the offender.
+  expect(parseArgs(['--title', 'fix ABC-7 then', 'body'], dir, HOME)).toEqual({
+    action: 'error',
+    message: 'Refusing: --title contains a ticket reference (ABC-7) — move it into the message body.',
+  });
+  // Compound list/range forms are caught too — the guard uses the SAME expanded detector the
+  // body linkifies with, so a `/`-list (which the plain detector reads as a path) can't leak.
+  expect(parseArgs(['--title', 'HYP-1/2/3 ship', 'body'], dir, HOME)).toEqual({
+    action: 'error',
+    message: 'Refusing: --title contains a ticket reference (HYP-1) — move it into the message body.',
+  });
+  expect(parseArgs(['--title', 'HYP-100..103 do', 'body'], dir, HOME)).toEqual({
+    action: 'error',
+    message: 'Refusing: --title contains a ticket reference (HYP-100) — move it into the message body.',
+  });
+  // GitHub-style `#N` is deliberately NOT a ticket code — a title `closes #42` is legitimate.
+  expect(parseArgs(['--title', 'closes #42', 'body'], dir, HOME).action).toBe('send');
+  // A path/line-spec token that merely contains a code shape is not a ticket mention.
+  expect(parseArgs(['--title', 'edit HYP-1.ts:10 here', 'body'], dir, HOME).action).toBe('send');
+  // The reference must still land in the BODY without complaint.
+  expect(parseArgs(['--title', 'Ship it', 'per HYP-1234 do X'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'per HYP-1234 do X',
+    format: 'plain',
+    title: 'Ship it',
+  });
+});
+
+test('--title HYP-<id> guard is gated on the autolink-tasks feature flag', () => {
+  // With autolink-tasks OFF, a ticket code in --title is inert plain text, exactly like the
+  // body (`tg` gates the body's detectTicketCodes call on the identical flag) — not banned in
+  // one place while freely allowed in the other. The 10th positional arg is ticketAutolink.
+  expect(
+    parseArgs(['--title', 'HYP-1234 done', 'body'], dir, HOME, true, () => [], true, true, undefined, true, false),
+  ).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'body',
+    format: 'plain',
+    title: 'HYP-1234 done',
+  });
+  // Default (flag omitted / on) still refuses.
+  expect(parseArgs(['--title', 'HYP-1234 done', 'body'], dir, HOME)).toEqual({
+    action: 'error',
+    message: 'Refusing: --title contains a ticket reference (HYP-1234) — move it into the message body.',
+  });
+});
+
 test('--tag rejects uppercase / Cyrillic / unknown with a 3-part error (lowercase-english only)', () => {
   for (const bad of ['ANSWER', 'Decision', 'ОТВЕТ', 'ПРОБЛЕМА', 'fixme']) {
     const r = parseArgs(['--tag', bad, 'body'], dir, HOME);

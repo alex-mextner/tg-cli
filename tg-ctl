@@ -85,6 +85,7 @@ import {
   matchPrsToTasks,
   parseTasksCommand,
   rollupCiState,
+  rollupReviewState,
   shortProjectName,
   taskKey,
   type TasksReplyMarkup,
@@ -2546,7 +2547,7 @@ function flattenTaskListJson(parsed: unknown): TaskItem[] {
 }
 
 async function loadPrRefs(scopeDir: string | null): Promise<PrRef[]> {
-  const argv = ["gh", "pr", "list", "--state", "all", "--limit", "100", "--json", "number,title,url,body,statusCheckRollup"]
+  const argv = ["gh", "pr", "list", "--state", "all", "--limit", "100", "--json", "number,title,url,body,statusCheckRollup,reviewDecision,isDraft"]
   const r = await spawnGuarded(argv, 20_000, scopeDir ? { cwd: scopeDir } : {})
   if (r.exitCode !== 0) {
     log(`/tasks: 'gh pr list' failed (${r.exitCode}): ${r.stderr.slice(0, 200)}`)
@@ -2565,6 +2566,7 @@ async function loadPrRefs(scopeDir: string | null): Promise<PrRef[]> {
           title: p.title ?? "",
           body: p.body ?? "",
           ci: rollupCiState(p.statusCheckRollup),
+          review: rollupReviewState(p.reviewDecision, p.isDraft),
           project: projectFromPrUrl(url),
         }
       })
