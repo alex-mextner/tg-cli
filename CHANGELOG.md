@@ -3,6 +3,27 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.41.0
+
+**Feature: the `cjk-guard` also blocks mixed-script "garbage word" tokens.**
+
+- The `cjk-guard` feature now catches a second garbled-token shape besides stray
+  CJK: a single CONTIGUOUS run of letters where a foreign alphabet (Latin, Greek,
+  …) is SANDWICHED inside Cyrillic — the homoglyph/mojibake signature an LLM
+  sometimes emits, e.g. `почčesна` where it meant `починена`. A message (or
+  `--title`) carrying such a token is now a HARD ERROR before send, naming the
+  offending token and its position so the sender re-sends clean.
+- The trigger is INTERLEAVING: the run's script must switch TWICE OR MORE. That
+  keeps legitimate two-segment tokens sending — both scripts across SEPARATE words
+  (`влил PR`, `gh ship готово`, `dev-cli`), a Latin acronym HYPHEN-joined to a
+  Cyrillic word (`PR-ревью`, `MCP-сервер`), a Latin acronym with a GLUED Cyrillic
+  case/diminutive suffix (`IDшник`, `PRы`, `APIшка`, `ORMка`), a pure-Cyrillic or
+  pure-Latin word, accented Latin, and Cyrillic mixed only with digits /
+  punctuation / emoji all pass untouched. CJK letters are their own class (the
+  shared `isCjk` predicate), so this stays orthogonal to the stray-CJK check.
+- Shares the existing `cjk-guard` toggle: `--no-feature cjk-guard` (or
+  `features.cjk-guard: false`) disables both checks.
+
 ## 1.40.1
 
 **Fix: `tg-ctl` self-heals the Claude hooks on daemon start.** If the Claude hook wiring is

@@ -129,9 +129,13 @@ File paths mentioned in the message text are detected and attached automatically
 
 Secret-looking files are **never** attached: `.env` family, SSH private keys, `*.pem`/`*.key`/`*.p12`/`*.pfx`/`*.ppk`, credential rc-files (`.netrc`, `.npmrc`, `.git-credentials`, …), shell histories, `*.tfvars`, `credentials.json`/`client_secret*.json`, `kubeconfig`. Auto-detected mentions are silently skipped; an explicit `--file prod.env` is a hard error. Override: `--no-feature attach-denylist`.
 
-### Stray-CJK guard
+### Garbled-token guard (`cjk-guard`)
 
-A message (or `--title`) whose dominant script is Latin/Cyrillic but that carries a **lone** CJK / ideographic codepoint stuck mid-word — the "hieroglyph in a normal word" garble an LLM occasionally emits (e.g. `ка<CJK>eat`, `<CJK>ляет`) — is a **hard error** before send, naming the offending character, its `U+XXXX` codepoint and position so you re-send clean. Precision over recall: a lone CJK codepoint is flagged only when a Latin/Cyrillic **letter immediately follows** it (the ideograph splits or prefixes a word). So a genuinely CJK message, a multi-character bilingual word (`Deploy到生产`, `3D打印`), a CJK suffix or particle that ends a token (`iOS版`, `React를 배포`), a space-delimited CJK quote, emoji, and accented Latin all pass. Override: `--no-feature cjk-guard`.
+One feature catches two "a garbled token slipped into the message" shapes on the final caption and `--title`, both a **hard error** before send. Override either with `--no-feature cjk-guard`.
+
+**Stray CJK.** A message whose dominant script is Latin/Cyrillic but that carries a **lone** CJK / ideographic codepoint stuck mid-word — the "hieroglyph in a normal word" garble an LLM occasionally emits (e.g. `ка<CJK>eat`, `<CJK>ляет`) — is blocked, naming the offending character, its `U+XXXX` codepoint and position so you re-send clean. Precision over recall: a lone CJK codepoint is flagged only when a Latin/Cyrillic **letter immediately follows** it (the ideograph splits or prefixes a word). So a genuinely CJK message, a multi-character bilingual word (`Deploy到生产`, `3D打印`), a CJK suffix or particle that ends a token (`iOS版`, `React를 배포`), a space-delimited CJK quote, emoji, and accented Latin all pass.
+
+**Mixed-script "garbage word".** A single **contiguous run of letters** where a foreign alphabet (Latin, Greek, …) is **sandwiched inside** Cyrillic — the homoglyph/mojibake signature (e.g. `почčesна`, meant `починена`) — is blocked, naming the offending token and its position. The trigger is **interleaving**: the run's script must switch **twice or more** (`…Cyr → Lat → Cyr…`). That is deliberately narrow so legitimate two-segment tokens pass — a message using both scripts across **separate words** (`влил PR`, `gh ship готово`, `dev-cli`), a Latin acronym **hyphen-joined** to a Cyrillic word (`PR-ревью`, `MCP-сервер`), a Latin acronym with a **glued** Cyrillic case/diminutive suffix (`IDшник`, `PRы`, `APIшка`), a pure-Cyrillic or pure-Latin word, accented Latin, and Cyrillic mixed only with digits/punctuation/emoji all pass. CJK letters are their own class, kept orthogonal to the stray-CJK check above.
 
 ### Autolinks
 
