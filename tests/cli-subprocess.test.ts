@@ -178,7 +178,7 @@ test('--topic without a value errors before the credential gate', () => {
   expect(err).not.toContain('TG_BOT_TOKEN');
 });
 
-// --- Tier-1 escalation-format gate: WARN-mode default vs ESCALATION_GATE_ENFORCE ---
+// --- Escalation-format gate: deny-by-default vs the ESCALATION_GATE_ENFORCE=0 escape ---
 
 function runWithEnv(args: string[], extraEnv: Record<string, string>) {
   return Bun.spawnSync(['bun', TG_SCRIPT, ...args], {
@@ -186,51 +186,66 @@ function runWithEnv(args: string[], extraEnv: Record<string, string>) {
   });
 }
 
-test('WARN-mode default: --tag decision with no table prints guidance but PROCEEDS past the escalation gate', () => {
+// A body satisfying every required section (see escalation-gate-args.test.ts).
+const COMPLIANT_BODY = [
+  '<h3>Context</h3><p>The resolver in features/foo.ts:42 picks the wrong click target on cold maps.</p><hr>',
+  '<h3>Options</h3><table><tr><th>Option</th><th>Pros</th><th>Cons</th></tr>',
+  '<tr><td>A</td><td>fast</td><td>risky</td></tr><tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>',
+  '<h3>Recommendation</h3><ul><li>I recommend A because it is faster</li></ul><hr>',
+  '<h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>',
+].join('\n');
+
+test('deny-by-default: --tag decision with plain prose hard-blocks (exit 1) before the credential gate', () => {
   const proc = run(['--tag', 'decision', 'ship it or not?']);
   const err = proc.stderr.toString();
-  // The core guidance is printed...
-  expect(err).toContain('--tag decision sends');
-  expect(err).toContain('| Option | Tradeoff | Recommendation |');
-  // ...with the WARN-mode framing (advisory, sending anyway)...
-  expect(err).toContain('Advisory only — sending anyway');
-  // ...but it did NOT hard-stop at the escalation gate: it fell through to the
-  // credential gate (no creds in this harness), proving the send proceeded.
+  expect(proc.exitCode).toBe(1);
+  // The core checklist is printed...
+  expect(err).toContain('--tag decision is an escalation');
+  expect(err).toContain('Missing:');
+  // ...with the deny-by-default block framing...
+  expect(err).toContain('Blocked:');
+  // ...and it never reached the credential gate (send did not proceed).
+  expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+test('--tag question with plain prose also hard-blocks by default, naming "question"', () => {
+  const proc = run(['--tag', 'question', 'which option?']);
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).toBe(1);
+  expect(err).toContain('--tag question is an escalation');
+  expect(err).toContain('Blocked:');
+  expect(err).not.toContain('TG_BOT_TOKEN');
+});
+
+test('ESCALATION_GATE_ENFORCE=0 (documented escape): a malformed --tag decision downgrades to advisory and PROCEEDS', () => {
+  const proc = runWithEnv(['--tag', 'decision', 'ship it or not?'], { ESCALATION_GATE_ENFORCE: '0' });
+  const err = proc.stderr.toString();
+  // Still prints the checklist, but as advisory...
+  expect(err).toContain('--tag decision is an escalation');
+  expect(err).toContain('Advisory only (ESCALATION_GATE_ENFORCE=0)');
+  // ...and falls through to the credential gate (no creds here), proving it sent.
   expect(err).toContain('TG_BOT_TOKEN');
-  // And it was NOT the enforced hard-block (no contradictory "Blocked" line).
-  expect(err).not.toContain('ESCALATION_GATE_ENFORCE is set');
   expect(err).not.toContain('Blocked:');
 });
 
-test('ESCALATION_GATE_ENFORCE=1: --tag decision with no table hard-blocks (exit 1) before the credential gate', () => {
-  const proc = runWithEnv(['--tag', 'decision', 'ship it or not?'], { ESCALATION_GATE_ENFORCE: '1' });
+test('--tag decision with a FULLY-COMPLIANT body: no block, proceeds to the credential gate', () => {
+  const proc = run(['--tag', 'decision', '--format', 'html', COMPLIANT_BODY]);
   const err = proc.stderr.toString();
-  expect(proc.exitCode).toBe(1);
-  expect(err).toContain('--tag decision sends'); // the same core guidance
-  expect(err).toContain('ESCALATION_GATE_ENFORCE is set'); // the hard-block reason
-  // The contradictory WARN framing must NOT appear in enforce mode (review
-  // finding): no "sending anyway", no "set the flag" (it's already set).
-  expect(err).not.toContain('Advisory only — sending anyway');
-  // Stopped at the escalation gate — never reached the credential gate.
-  expect(err).not.toContain('TG_BOT_TOKEN');
-});
-
-test('ESCALATION_GATE_ENFORCE=1: --tag question (not just decision) also hard-blocks, naming "question"', () => {
-  const proc = runWithEnv(['--tag', 'question', 'which option?'], { ESCALATION_GATE_ENFORCE: '1' });
-  const err = proc.stderr.toString();
-  expect(proc.exitCode).toBe(1);
-  // The guidance names the ACTUAL tag used through the entrypoint path too.
-  expect(err).toContain('--tag question sends');
-  expect(err).toContain('ESCALATION_GATE_ENFORCE is set');
-  expect(err).not.toContain('TG_BOT_TOKEN');
-});
-
-test('ESCALATION_GATE_ENFORCE=1 WITH a table: no block, proceeds to the credential gate', () => {
-  const body = '| Option | Tradeoff |\n| --- | --- |\n| A | slower |';
-  const proc = runWithEnv(['--tag', 'decision', body], { ESCALATION_GATE_ENFORCE: '1' });
-  const err = proc.stderr.toString();
-  // A table is present, so the enforce flag has nothing to block: it falls
-  // through to the credential gate (no creds here).
-  expect(err).not.toContain('ESCALATION_GATE_ENFORCE is set');
+  expect(err).not.toContain('Blocked:');
   expect(err).toContain('TG_BOT_TOKEN');
+});
+
+test('--table does NOT bypass the gate: a bare-table decision is validated on the final body and BLOCKS', () => {
+  // The parse-time gate skips --table (rows come from stdin), so the FINAL
+  // rendered body is validated in the entrypoint. A boxed table alone lacks a
+  // recommendation / context / file ref / structure → blocked. Creds are set so
+  // execution reaches the (post-credential) final-body validation; the block
+  // fires before any network send, so the unreachable API is never hit.
+  const proc = Bun.spawnSync(['bun', TG_SCRIPT, '--tag', 'decision', '--table'], {
+    env: { ...NO_CREDS_ENV, TG_BOT_TOKEN: '123:abc', TG_CHAT_ID: '1', TG_API_BASE: 'http://127.0.0.1:9' },
+    stdin: Buffer.from('Option\tCons\nA\tslow\nB\trisky'),
+  });
+  const err = proc.stderr.toString();
+  expect(proc.exitCode).toBe(1);
+  expect(err).toContain('Blocked:');
 });

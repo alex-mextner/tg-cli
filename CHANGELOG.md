@@ -3,6 +3,30 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.40.0
+
+**Feature: escalation-format enforcement for `--tag decision|question`, and markdown
+pipe tables now render.**
+
+- **Markdown pipe tables auto-convert to real Telegram `<table>` HTML.** A body typed as a
+  markdown grid (`| a | b |` / `| --- | --- |` / `| A | B |`) used to arrive as literal
+  plain text (Telegram renders no markdown tables). `tg` now detects that shape and rewrites
+  it to a `<table>` routed as a Rich Message, so it renders — surrounding prose is preserved
+  (and HTML-escaped for a plain-text send). See `pipeTableToHtml` in `features/render/table.ts`.
+- **`--tag decision` and `--tag question` now REQUIRE the decision-request format,
+  deny-by-default.** A malformed escalation is BLOCKED (exit 1) with a checklist of what's
+  missing. Required: Options as a real table/list with pros/cons, a Recommendation, Context,
+  a "where to look" `file:line`, AND readability structure — each section under its own
+  `<h3>`/`<h4>`, enumerations as short `<ul>`/`<li>` items (no inline comma-runs), `<hr>`
+  dividers, no wall-of-text run-ons — sent with `--format html`. Implemented in
+  `features/cli/escalation-format.ts` (pure validator) + the parse-time gate in
+  `features/cli/args.ts`.
+- **The `ESCALATION_GATE_ENFORCE` flag now defaults to ON** (deny-by-default). The one
+  documented escape for a genuine non-escalation / urgent edge case is
+  `ESCALATION_GATE_ENFORCE=0`, which downgrades the block to an advisory warning.
+- `report` / `answer` / `problem` tags are unaffected. `tg help format` and the installed
+  `tg` skill document the good-vs-bad structured shape.
+
 ## 1.39.0
 
 **Feature: `/tasks` gains a Review column, and `--title` bans bare ticket codes too.**
@@ -11,9 +35,8 @@ semantic versioning.
 - The `--title` guard already refused a `tg#<id>` message reference (inert in the one-line
   header, only duplicates a followable body reference). It now also refuses a bare ticket
   code (`HYP-1234`, any 3-uppercase-letter `TEAM-<n>`), naming the first offending code in
-  the error. A
-  compound list (`HYP-1/2/3`) is caught too; GitHub-style `#N` stays allowed since it is
-  not a code and `closes #42` is legitimate.
+  the error. A compound list (`HYP-1/2/3`) is caught too; GitHub-style `#N` stays allowed
+  since it is not a code and `closes #42` is legitimate.
 
 ## 1.38.2
 

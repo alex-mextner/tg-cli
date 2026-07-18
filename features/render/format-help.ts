@@ -60,6 +60,16 @@ Native table example (auto-sends a Rich Message):
   Cell align: align="left|center|right", valign="top|middle|bottom";
   colspan / rowspan supported; <caption> for a table title.
 
+Markdown pipe grids are AUTO-CONVERTED:
+  Telegram itself does not render a markdown grid — a body like
+      | Option | Cons |
+      | ---    | ---  |
+      | A      | slow |
+  would otherwise arrive as literal pipes and dashes. tg detects that shape and
+  rewrites it to a real <table> (routed as a Rich Message), so you can type a
+  quick pipe grid and still get a rendered table. For full control, author the
+  <table> yourself with --format html.
+
 HTML entities (tier-specific) — all NUMERIC entities work in both tiers. Named:
   BASIC send:  only &lt; < · &gt; > · &amp; & · &quot; "  (no others — a
                &nbsp; / &hellip; / &mdash; in a basic message is sent literally).
@@ -86,6 +96,35 @@ Header badge (--tag / --title), composes with BOTH basic and rich sends:
   --reply-to <id>    thread the message under an inbound Telegram message
                      (sendMessage: reply_to_message_id; sendRichMessage:
                      reply_parameters). The answer tag REQUIRES this.
+
+--tag decision | --tag question (ESCALATION) — REQUIRED format (deny-by-default):
+  An escalation asks the CTO to choose, so it MUST be a self-contained,
+  STRUCTURED Rich Message the human can answer in ~30s without opening the repo
+  AND without reading a wall of text. tg BLOCKS a malformed decision/question
+  send (exit 1) and lists what's missing. Required sections (skill:
+  decision-request-discipline):
+    • Context — one line: where the code is (file:line) and what it does.
+    • Options — a real <table> (or <ul>/<ol>) with pros/cons per option.
+    • Recommendation — which option you'd pick and why.
+    • Where to look — a file:line reference.
+  Plus STRUCTURE: each section under its own <h3>/<h4>, enumerations as short
+  <ul>/<li> items (never inline "плюсы: a, b, c"), <hr> dividers between
+  sections, short lines. Use --format html.
+
+  GOOD (renders as a clean, scannable Rich Message):
+    tg --tag decision --format html '<h3>Context</h3><p>foo.ts:42 does X.</p><hr>
+    <h3>Options</h3><table><tr><th>Option</th><th>Pros</th><th>Cons</th></tr>
+    <tr><td>A</td><td>fast</td><td>risky</td></tr>
+    <tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>
+    <h3>Recommendation</h3><ul><li>A — faster, risk is contained</li></ul><hr>
+    <h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>'
+
+  BAD (blocked): a dense prose paragraph — "Надо решить A или B. Плюсы A: быстро,
+  дешево; минусы: риск…" — no headings, no table/list, no dividers, one long
+  run-on line. Hard to read; rejected.
+
+  Escape hatch (genuine non-escalation / urgent edge case ONLY):
+  ESCALATION_GATE_ENFORCE=0 downgrades the block to an advisory warning.
 `;
 
 export function formatHelp(): string {

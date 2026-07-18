@@ -65,6 +65,8 @@ import { gateText } from "./features/hooks/run-text-hooks"
 import { runHooksCli } from "./features/hooks/cli"
 import { transmit } from "./features/auto-attach/transmitter"
 import { parseArgs, escalationGateEnforced, type Format } from "./features/cli/args"
+import { validateEscalationFormat, escalationFormatMessage } from "./features/cli/escalation-format"
+import { decodeTextEscapes } from "./features/cli/text-escapes"
 import {
   LONG_UNSTRUCTURED_MESSAGE_WARNING,
   shouldWarnLongUnstructuredPlainMessage,
@@ -79,7 +81,7 @@ import {
   parseEmojiHelpers,
 } from "./features/render/html"
 import { buildPrefix } from "./features/render/prefix"
-import { toTablePre } from "./features/render/table"
+import { toTablePre, detectTableKind, pipeTableToHtml } from "./features/render/table"
 import { formatHelp } from "./features/render/format-help"
 import { colorizeHelp, shouldColorize } from "./features/render/help-color"
 import { createTelegramTransport } from "./features/transport/telegram"
@@ -152,12 +154,15 @@ Options:
                          problem   🔴 PROBLEM   a blocker / problem
                          question  🟠 QUESTION  an open question needing input
                          report    🟢 REPORT    a status / result report
-                       decision/question SHOULD carry a literal table body (a
-                       markdown pipe table, tg --table, or an HTML <table>).
-                       A send with none is WARNED (advisory) but still sent;
-                       set ESCALATION_GATE_ENFORCE=1 to make a table required
-                       (hard error). An optional installed hook may also warn
-                       on subtler cases without blocking — see 'tg hooks'.
+                       decision/question are ESCALATIONS: they REQUIRE the
+                       decision-request format (deny-by-default) — options as a
+                       real table/list with pros/cons, a recommendation, context,
+                       a file:line "where to look", and readable structure
+                       (headings, bullet lists, <hr>) sent with --format html.
+                       A malformed send is BLOCKED (exit 1) with a checklist.
+                       Markdown pipe grids auto-convert to a <table>. The one
+                       documented escape is ESCALATION_GATE_ENFORCE=0 (downgrade
+                       to advisory). See 'tg help format' for a good example.
   --subagent <name>     a SUBAGENT self-label: adds a second bracket after the
                        window → "✳️ [window] [name] <title>", so the recipient can
                        tell WHICH subagent sent the message. The MAIN/orchestrator
@@ -328,15 +333,6 @@ function currentPaneAgentName(): string | null {
   } catch {
     return null // tmux missing / pane gone
   }
-}
-
-function decodeTextEscapes(value: string): string {
-  return value.replace(/\\([nrt\\])/g, (_match: string, escaped: string) => {
-    if (escaped === "n") return "\n"
-    if (escaped === "r") return "\r"
-    if (escaped === "t") return "\t"
-    return "\\"
-  })
 }
 
 // --- CLI entrypoint (only runs when executed directly, not when imported) ---
@@ -772,26 +768,30 @@ if (import.meta.main) {
     process.exit(0)
   }
 
-  // --- Tier-1 escalation-format gate (WARN-mode default) -----------------
+  // --- Escalation-format gate (DENY-BY-DEFAULT) --------------------------
   // parseArgs attaches `escalationWarning` when a --tag decision|question send
-  // carries no literal table. By DEFAULT this is advisory: print the guidance
-  // to stderr and let the send proceed. ONLY when ESCALATION_GATE_ENFORCE is
-  // set does it become a hard stop (exit 1). Placed BEFORE the credential gate
-  // so an enforced block reports the format problem first (and so the block
-  // path is observable in a no-creds subprocess test). See args.ts for the
-  // skill-first → warn → flip-to-block rollout rationale.
+  // does not follow the decision-request format. By DEFAULT this is a hard stop
+  // (exit 1): the escalation format is REQUIRED. ESCALATION_GATE_ENFORCE=0 is the
+  // one documented escape — it downgrades to advisory (warn + proceed). Placed
+  // BEFORE the credential gate so a block reports the format problem first (and
+  // so the block path is observable in a no-creds subprocess test). The --table
+  // path bypasses THIS parse-time gate (stdin unseen) and is validated on the
+  // final rendered body further below. See args.ts for the validator wiring.
   if (parsed.action === "send" && parsed.escalationWarning) {
     console.error(parsed.escalationWarning)
     if (escalationGateEnforced(env)) {
-      // Enforce mode: the flag is set, so a tableless decision/question send is
-      // a hard error. Do NOT print the "advisory / set the flag" framing here —
-      // that would contradict this branch.
-      console.error("Blocked: ESCALATION_GATE_ENFORCE is set and this --tag send has no table.")
+      // Enforce mode (DEFAULT): a --tag decision|question send that does not
+      // follow the decision-request format is a hard error. The checklist of
+      // what's missing was already printed above.
+      console.error(
+        "Blocked: --tag decision|question must follow the decision-request format " +
+          "(deny-by-default). Fix the sections listed above and resend. " +
+          "Genuine non-escalation / urgent edge case only: ESCALATION_GATE_ENFORCE=0 downgrades this to a warning.",
+      )
       process.exit(1)
     }
-    // Warn mode (default): advisory only — the send proceeds. Tell the caller
-    // how to turn it into a hard requirement.
-    console.error("Advisory only — sending anyway. Set ESCALATION_GATE_ENFORCE=1 to require a table.")
+    // Downgraded to advisory (ESCALATION_GATE_ENFORCE=0) — the send proceeds.
+    console.error("Advisory only (ESCALATION_GATE_ENFORCE=0) — sending anyway.")
   }
 
   const BOT_TOKEN = env.TG_BOT_TOKEN
@@ -882,6 +882,21 @@ if (import.meta.main) {
     effectiveFormat = "html"
   } else {
     caption = decodeTextEscapes(rawCaption)
+    // Auto-convert a markdown pipe table typed directly in the body to a real
+    // Telegram <table> (Telegram renders NO markdown tables — a `| a | b |` grid
+    // arrives as plain text). Escalation messages, and the escalation gate's own
+    // suggested example, use markdown pipes, so without this they arrive broken
+    // ("таблица сломана"). Non-table lines are HTML-escaped for a plain-text send
+    // (the resulting <table> forces HTML mode); left untouched when the caller
+    // already asked for --format html and owns their markup.
+    if (detectTableKind(caption) === "pipe") {
+      const escaper = format === "html" ? (s: string): string => s : escapeHtml
+      const conv = pipeTableToHtml(caption, escaper)
+      if (conv.converted) {
+        caption = conv.html
+        effectiveFormat = "html"
+      }
+    }
   }
 
   if (shouldWarnLongUnstructuredPlainMessage({ text: caption, format, table, items })) {
@@ -913,6 +928,27 @@ if (import.meta.main) {
         console.error(`Error: ${formatStrayCjkError(stray)}`)
         process.exit(1)
       }
+    }
+  }
+
+  // Close the --table bypass: the parse-time gate (features/cli/args.ts) skips a
+  // --table send because the rows arrive on stdin, which parseArgs never sees.
+  // So for an ESCALATION sent via --table, validate the FINAL rendered body here
+  // (a boxed table alone is not a decision-request: it still lacks a
+  // recommendation, context, a file ref, and the section structure).
+  if ((tag === "decision" || tag === "question") && table) {
+    const fin = validateEscalationFormat(caption)
+    if (fin.missing.length > 0) {
+      console.error(escalationFormatMessage(tag, fin.missing))
+      if (escalationGateEnforced(env)) {
+        console.error(
+          "Blocked: --tag decision|question must follow the decision-request format " +
+            "(deny-by-default). Fix the sections listed above and resend. " +
+            "Genuine non-escalation / urgent edge case only: ESCALATION_GATE_ENFORCE=0 downgrades this to a warning.",
+        )
+        process.exit(1)
+      }
+      console.error("Advisory only (ESCALATION_GATE_ENFORCE=0) — sending anyway.")
     }
   }
 
