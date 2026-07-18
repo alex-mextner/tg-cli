@@ -154,3 +154,57 @@ describe('driveFlush', () => {
     expect(out.reDeferred).toEqual([]);
   });
 });
+
+// --- snapshot / restore: durability across a daemon reload (graceful-reload) ---
+// The daemon persists the deferred backlog on mutation and restores it on
+// startup so a `tg-ctl restart` / launchd reload never drops queued messages.
+// snapshot() exposes the live per-pane queues; restore() rebuilds them.
+describe('DeferQueues snapshot/restore', () => {
+  test('snapshot exposes every pane with a non-empty backlog, FIFO preserved', () => {
+    const q = new DeferQueues<{ text: string }>();
+    q.enqueue('%1', { text: 'a' });
+    q.enqueue('%1', { text: 'b' });
+    q.enqueue('%2', { text: 'c' });
+    const snap = q.snapshot();
+    expect(snap).toEqual([
+      ['%1', [{ text: 'a' }, { text: 'b' }]],
+      ['%2', [{ text: 'c' }]],
+    ]);
+  });
+
+  test('snapshot omits panes whose queue was fully drained', () => {
+    const q = new DeferQueues<string>();
+    q.enqueue('%1', 'a');
+    q.take('%1'); // drained
+    q.enqueue('%2', 'b');
+    expect(q.snapshot()).toEqual([['%2', ['b']]]);
+  });
+
+  test('restore rebuilds the per-pane queues from a snapshot', () => {
+    const q = new DeferQueues<{ text: string }>();
+    q.restore([
+      ['%1', [{ text: 'a' }, { text: 'b' }]],
+      ['%2', [{ text: 'c' }]],
+    ]);
+    expect(q.peek('%1')).toEqual([{ text: 'a' }, { text: 'b' }]);
+    expect(q.peek('%2')).toEqual([{ text: 'c' }]);
+    expect(q.panesWithBacklog().sort()).toEqual(['%1', '%2']);
+  });
+
+  test('a snapshot survives a full round-trip through restore', () => {
+    const q = new DeferQueues<string>();
+    q.enqueue('%1', 'a');
+    q.enqueue('%1', 'b');
+    q.enqueue('%3', 'z');
+    const snap = q.snapshot();
+    const q2 = new DeferQueues<string>();
+    q2.restore(snap);
+    expect(q2.snapshot()).toEqual(snap);
+  });
+
+  test('restore skips empty item lists (never resurrects an empty backlog)', () => {
+    const q = new DeferQueues<string>();
+    q.restore([['%1', []], ['%2', ['x']]]);
+    expect(q.snapshot()).toEqual([['%2', ['x']]]);
+  });
+});

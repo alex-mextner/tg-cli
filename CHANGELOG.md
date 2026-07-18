@@ -3,6 +3,12 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.38.0
+
+**Feature: graceful `tg-ctl` reload preserves the defer-while-waiting backlog.** A reload no
+longer drops messages deferred while the daemon was waiting; the backlog carries across the
+reload so nothing queued is lost.
+
 ## 1.37.0
 
 **Feature: agent-scoped tg replies.** A reply is now attributed to and routed for the current

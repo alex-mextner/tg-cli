@@ -235,6 +235,30 @@ tests can pass fakes.
   Permissions + unscoped questions keep the single-attempt client path (resending would duplicate
   the card). `question-store.ts` owns the on-disk format (PURE); the entrypoint owns the I/O.
 
+- **Graceful reload — no dropped channel (`tg-ctl.<botid>.deferred.json` + cooperative SIGTERM):**
+  a reload (a deliberate `tg-ctl restart`, a launchd `bootout`/`bootstrap`, or a crash-relaunch)
+  used to drop the live channel two ways. (1) The **defer-while-waiting backlog** — inbound queued
+  behind an agent's open question so it is not typed INTO the prompt (spec tg#30) — lived ONLY in
+  memory, so a reload silently lost the human's queued messages. It is now persisted to this file
+  (path on `CtlPaths`, atomic temp+rename, on every enqueue/flush mutation) and restored on
+  bootstrap into the SAME per-pane `DeferQueues`; the restored question (in `abandonedButtons`)
+  flushes its restored backlog when it is answered — `lateDeliverAbandonedQuestion` now calls
+  `onQuestionReleased` on delivery (which also closes a latent gap: a socket-closed question's
+  backlog was never flushed on answer). `deferred-store.ts` owns the on-disk format (PURE, versioned,
+  fail-closed, pane-capped); the entrypoint owns the I/O. (2) **In-flight updates.** SIGTERM used to
+  `cleanExit(0)` immediately, which mid-batch dropped the current getUpdates batch's not-yet-executed
+  actions (offset is persisted BEFORE acting → at-most-once, so Telegram never redelivers them). It
+  now runs a **cooperative drain**: SIGTERM sets a flag and aborts only the IDLE long-poll
+  (`AbortSignal.any`), the loop finishes the in-flight batch's actions, then exits at the top of the
+  next iteration — so a batch that drains within `GRACEFUL_SHUTDOWN_MS` (default 8 s) loses no
+  update across the swap. That ceiling is the honest bound: a pathological batch whose remaining
+  actions take longer than 8 s (or a hung await) hits the hard-exit fallback mid-batch, and — since
+  the offset was persisted BEFORE acting — that tail is lost at-most-once (the normal, non-graceful
+  behaviour); in practice a batch is a few `tmux send-keys`, far under the ceiling. A second SIGTERM
+  also exits at once. Offset itself is already durable (persisted before acting + Telegram's 24 h
+  retention), so the successor resumes with no gap. SIGINT (interactive Ctrl-C) still exits
+  immediately — no drain.
+
 - **Inbound voice (STT):** a Telegram voice/audio note → `transcribe-voice` action (updates.ts).
   The daemon downloads the OGG, transcodes to WAV 16 kHz mono via `ffmpeg`, runs the configured
   local Whisper, cleans the transcript, then routes it through the SAME path a typed message uses
