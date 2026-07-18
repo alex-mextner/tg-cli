@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.35.0
+
+**Feature: stray-CJK guard blocks garbled hieroglyphs stuck into normal text.**
+
+- A message (or `--title`) whose dominant script is Latin/Cyrillic but that
+  carries a LONE CJK / ideographic codepoint stuck mid-word (e.g. a garbled
+  `ка<CJK>eat` or `<CJK>ляет`, the shape an LLM occasionally emits) is now a HARD
+  ERROR before send. The error names each offending character, its `U+XXXX`
+  codepoint, and its position so the sender re-sends clean.
+- Precision over recall: a lone CJK codepoint is flagged only when a
+  Latin/Cyrillic LETTER immediately FOLLOWS it (the ideograph splits or prefixes
+  a word). A genuinely CJK message (dominant script is CJK), a multi-character
+  bilingual word (`Deploy到生产`, `3D打印`, `Word文書`), a CJK suffix/particle that
+  ends a token (`iOS版`, `React를 배포`), a space-delimited CJK quote, emoji, and
+  accented Latin all pass untouched.
+- ON by default (feature `cjk-guard`); escape with `--no-feature cjk-guard` or
+  `features.cjk-guard: false` in `~/.config/tg-cli/config.yaml`.
+
 ## 1.34.7
 
 **Fix: flat `/new` spawns reliably, honors an inline directory, accepts args in any order, and never loops on a spawn failure.**

@@ -6,6 +6,7 @@ import { join, resolve } from "path"
 // doesn't depend on a runtime global being present — review: tg-cli#131 f/u.
 import { randomUUID } from "node:crypto"
 import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
+import { findStrayCjk, formatStrayCjkError } from "./features/cli/cjk-guard"
 import {
   applyFeatureFlags,
   parseFeatureConfig,
@@ -260,6 +261,15 @@ Never-attach denylist (feature, ON by default — toggle with --feature/--no-fea
   --photo/--file of such a file is an ERROR. Override consciously with
   --no-feature attach-denylist.
 
+Stray-CJK guard (feature, ON by default — toggle with --feature/--no-feature):
+  A message (or --title) with a LONE CJK / ideographic character stuck mid-word
+  into otherwise Latin/Cyrillic text (e.g. a garbled "ка<CJK>eat") is a HARD
+  ERROR: the offending character and its position are named so you re-send
+  clean. Only a lone CJK codepoint immediately FOLLOWED by a letter is flagged,
+  so a genuinely CJK message, a bilingual word (Deploy到生产), and a CJK suffix
+  (iOS版) pass untouched. Override with --no-feature cjk-guard or
+  features.cjk-guard: false.
+
 Unknown flags:
   Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
   stderr and the process exits non-zero. They are NOT sent as message text.
@@ -485,6 +495,9 @@ if (import.meta.main) {
   // — threaded into parseArgs so the --title guard honours a disabled feature identically
   // (tg-cli#138 review finding on PR #139: --title must not ban a literal the body allows).
   const msgrefAutolinkOn = features["autolink-msgrefs"] !== false
+  // Stray-CJK guard (feature `cjk-guard`, ON by default): checked below on the
+  // final decoded caption/title, right before send.
+  const cjkGuardOn = features["cjk-guard"] !== false
   const parsed = parseArgs(
     args,
     process.cwd(),
@@ -842,6 +855,34 @@ if (import.meta.main) {
 
   if (shouldWarnLongUnstructuredPlainMessage({ text: caption, format, table, items })) {
     console.error(LONG_UNSTRUCTURED_MESSAGE_WARNING)
+  }
+
+  // Stray-CJK guard (feature `cjk-guard`, ON by default): hard-block a send that
+  // carries a LONE CJK/ideographic codepoint stuck mid-word into otherwise
+  // Latin/Cyrillic text (the "hieroglyph in a normal word" bug). Runs HERE — on
+  // the caption (escapes resolved, --table body assembled) and the --title (as-
+  // is: buildPrefix renders it verbatim), i.e. the text the AGENT AUTHORED.
+  //
+  // SCOPE (deliberate, not an oversight): the bug originates in the agent's own
+  // typed message, so the guard checks exactly that. It intentionally runs
+  // BEFORE the autolink/line-spec pass appends externally-sourced excerpts
+  // (Linear/GitHub titles, tg# message quotes, file-sourced line-spec snippets);
+  // CJK in that external content is legitimate and must NOT be blocked. It also
+  // scans raw markup for a `--format html` message rather than the rendered
+  // visible text — an LLM garble is a raw codepoint in prose, which this covers;
+  // an HTML entity / tag-split hieroglyph is out of scope. Quoted/code content is
+  // NOT exempted (the guard can't tell a quoted garble from a real one) — use
+  // `--no-feature cjk-guard` for the rare legitimately-CJK message. See
+  // features/cli/cjk-guard.ts.
+  if (cjkGuardOn) {
+    for (const text of [caption, title ?? ""]) {
+      if (!text) continue
+      const stray = findStrayCjk(text)
+      if (stray) {
+        console.error(`Error: ${formatStrayCjkError(stray)}`)
+        process.exit(1)
+      }
+    }
   }
 
   // `--tag` is validated at parse time (features/cli/args.ts → validateTag):
