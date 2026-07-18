@@ -3,6 +3,12 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.36.0
+
+**Feature: `!shell` messages are injected verbatim for harness passthrough.** A `!shell`-prefixed
+message is passed through to the harness unchanged, and a `!shell` reply is routed back to the
+origin pane, so a shell command typed from Telegram reaches the intended session verbatim.
+
 ## 1.35.0
 
 **Feature: stray-CJK guard blocks garbled hieroglyphs stuck into normal text.**
