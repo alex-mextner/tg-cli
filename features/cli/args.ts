@@ -13,7 +13,8 @@ import { looksPathLike, resolveAcrossWorktrees } from '../auto-attach/worktree';
 import { ESCALATION_TAGS, validateTag } from '../render/tag';
 import { detectMsgRefs } from '../autolink-msgrefs/detect';
 import { detectTicketCodesExpanded } from '../autolink-tasks/detect';
-import { detectTableKind } from '../render/table';
+import { validateEscalationFormat, escalationFormatMessage } from './escalation-format';
+import { decodeTextEscapes } from './text-escapes';
 
 export interface ItemLineSpec {
   // The full original token as written (e.g. "src/a.ts:42-50"), kept so the
@@ -160,8 +161,8 @@ export function resolveExistingFile(token: string, cwd: string, home: string): s
   return null;
 }
 
-// --- TAG_GATES: per-tag parse-time checks (Tier 1 of the escalation-format
-// gate; see docs/specs escalation-format design). Each gate inspects the
+// --- TAG_GATES: per-tag parse-time checks (the escalation-format gate; the
+// pure validator lives in features/cli/escalation-format.ts). Each gate inspects the
 // already-parsed fields and returns a result with a SEVERITY, or null to let
 // it through. Kept as a registry (not a hardcoded `if` per tag) so a future
 // gated tag is one entry, not another branch to thread through.
@@ -178,7 +179,7 @@ export function resolveExistingFile(token: string, cwd: string, home: string): s
 //                set (see escalationGateEnforced below).
 interface TagGateContext {
   // The canonical lowercase tag that selected this gate (e.g. "decision",
-  // "question") — so a shared gate (escalationTableGate serves BOTH) can
+  // "question") — so a shared gate (escalationFormatGate serves BOTH) can
   // still report the ACTUAL tag the caller used, not a hardcoded list that
   // silently goes stale the moment a third escalation tag is added.
   tag: string;
@@ -186,6 +187,10 @@ interface TagGateContext {
   table?: true;
   replyTo?: number;
   terminalQuestion?: true;
+  // The parsed --format. A structured escalation must go out as a Rich Message,
+  // which requires --format html (raw <table>/<h3> tags are literal text under
+  // plain format), so the format gate requires it.
+  format: Format;
 }
 interface TagGateResult {
   message: string;
@@ -193,15 +198,17 @@ interface TagGateResult {
 }
 type TagGate = (ctx: TagGateContext) => TagGateResult | null;
 
-// Is the escalation-format Tier-1 gate in ENFORCE (hard-block) mode? OFF by
-// default — a missing table on a decision/question send is advisory (warn +
-// proceed). Set ESCALATION_GATE_ENFORCE=1 (or true/yes/on) to make it exit 1
-// instead. The later "flip to block" PR just changes this default once the tg
-// skill documents the table requirement and a warn period has passed.
-// Same trim+lowercase truthy parse as the AGENTS_HOOKS_TRUST guard.
+// Is the escalation-format gate in ENFORCE (hard-block) mode? ON by default now
+// (deny-by-default): a `--tag decision|question` send that does not follow the
+// decision-request format is a HARD ERROR (exit 1). This is the CTO's explicit
+// direction — the escalation format is REQUIRED, not opt-in. The documented
+// escape for a genuine non-escalation / urgent edge case is
+// ESCALATION_GATE_ENFORCE=0 (or false/no/off), which downgrades the gate to
+// advisory (warn + proceed). Any other value (unset, 1, true, …) means ENFORCE.
+// Same trim+lowercase parse family as the AGENTS_HOOKS_TRUST guard.
 export function escalationGateEnforced(env: NodeJS.ProcessEnv): boolean {
   const v = (env.ESCALATION_GATE_ENFORCE ?? '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+  return !(v === '0' || v === 'false' || v === 'no' || v === 'off');
 }
 
 // The `answer` tag means "I am answering THIS specific message", so it
@@ -229,54 +236,49 @@ const answerGate: TagGate = ({ replyTo, terminalQuestion }) => {
   };
 };
 
-// `decision` / `question` are ESCALATION tags — they ask the recipient to
-// choose or decide, and the standard escalation form for that is a literal
-// table (options / tradeoffs / recommendation), not a prose paragraph the
-// recipient has to re-derive. This is the CHEAP, obvious-case-only half of
-// the gate: it only catches a message that has NO table-ish content anywhere
-// (no <table>, no boxed --table output, no markdown pipe rows). A subtler
-// case (e.g. a table that doesn't actually answer the question) is left to
-// the advisory pre-send-text hook
-// (features/hooks/escalation-format-descriptor/pre_send_text_gate.ts),
-// which runs later and sees the FINAL body.
+// `decision` / `question` are ESCALATION tags — they ask the recipient (the
+// CTO) to choose or decide. The decision-request-discipline skill mandates a
+// self-contained request the human can answer in ~30s without opening the repo:
+// Context + Options with real pros/cons + a Recommendation + a "where to look"
+// file:line, presented as a REAL table or list. This gate runs the full
+// validateEscalationFormat check on the caption and, when a required section is
+// missing, returns the checklist of what's missing.
 //
-// SEVERITY IS 'advisory' — WARN-mode by default. This gate NEVER hard-blocks a
-// send on its own; parseArgs attaches its message as `escalationWarning` and
-// still returns a `send`. Only the entrypoint, and only under the off-by-
-// default ESCALATION_GATE_ENFORCE flag, upgrades it to exit 1. (Rollout: ship
-// the tg skill documenting the table requirement, run a warn period, THEN flip
-// the enforce default. Blocking on day one — before the skill even documents
-// it — would hard-break every existing decision/question send.)
+// SEVERITY IS 'advisory' at the PARSE layer — this gate never hard-exits inside
+// parseArgs; it attaches its message as `escalationWarning` and the ENTRYPOINT
+// decides block-vs-warn via escalationGateEnforced (now ON by default — a
+// malformed decision/question send is a hard error unless
+// ESCALATION_GATE_ENFORCE=0). Keeping the parse layer non-throwing lets tests
+// inspect the attached warning and lets the one documented escape downgrade to
+// warn cleanly.
 //
 // `--table` reads its rows from STDIN, which parseArgs never sees (the
 // entrypoint reads stdin after parsing) — a `--table` send WILL carry a
-// rendered table by construction, so this gate is a no-op for it.
-//
-// TODO(escalation-gate bypass): a future RIG_HATCH_REQUEST-style override is
-// meant to let a genuinely urgent send through this gate (once enforced)
-// without a table, pending live approval (see the design's "bypass may wait
-// up to 15 min for live approval" note). Not wired here yet — this is the hook
-// point for it: check the bypass signal FIRST and `return null` when present.
-const escalationTableGate: TagGate = ({ tag, caption, table }) => {
+// rendered table by construction, so the table requirement is satisfied for it;
+// the OTHER sections (recommendation / where-to-look / context) still can't be
+// verified pre-stdin, so a `--table` decision/question is not blocked here.
+const escalationFormatGate: TagGate = ({ tag, caption, table, format }) => {
   if (table) return null;
-  if (detectTableKind(caption) !== 'none') return null;
-  // The message is the CORE guidance only (what to do). The mode-specific
-  // framing — "advisory, sending anyway" vs "blocked" — is appended by the
-  // ENTRYPOINT, which is the only place that knows whether ESCALATION_GATE_
-  // ENFORCE is set. Baking a fixed "the send is proceeding / set the flag"
-  // tail here would contradict the enforce-mode output (send blocked, flag
-  // already set) — review finding.
+  // Validate the DECODED caption, not the raw argv text: a compliant multiline body
+  // supplied via tg's documented literal `\n`/`\r`/`\t` escapes (the convention for
+  // passing a real newline as one shell argument) is otherwise seen as a single
+  // long line, so the section/heading heuristics below false-positive-block it
+  // before the entrypoint's own decode ever runs (review finding).
+  const result = validateEscalationFormat(decodeTextEscapes(caption));
+  // A structured escalation only renders as a Rich Message under --format html;
+  // without it the headings/table/list tags arrive as literal text. Require it.
+  if (format !== 'html') {
+    result.missing.unshift(
+      'Send as a Rich Message: pass --format html so the headings/table/list render (raw tags are literal text under plain format)',
+    );
+  }
+  if (result.missing.length === 0) return null;
+  // The message is the CORE checklist only. The mode-specific framing
+  // ("advisory, sending anyway" vs "blocked") is appended by the ENTRYPOINT,
+  // the only place that knows whether ESCALATION_GATE_ENFORCE downgrades it.
   return {
     severity: 'advisory',
-    message:
-      `--tag ${tag} sends work best as a literal table (the escalation form) ` +
-      `so the recipient can answer without re-deriving the question. Fill one in and resend, ` +
-      `e.g.:\n` +
-      `| Option | Tradeoff | Recommendation |\n` +
-      `| --- | --- | --- |\n` +
-      `| A | ... | ... |\n` +
-      `| B | ... | ... |\n` +
-      `(Or send it as \`tg --table\`, or an HTML <table> with --format html.)`,
+    message: escalationFormatMessage(tag, result.missing),
   };
 };
 
@@ -285,7 +287,7 @@ const TAG_GATES: Record<string, TagGate> = {
   // Every ESCALATION_TAGS entry gets the same gate — built from the shared
   // list (features/render/tag.ts) instead of two hardcoded keys, so it can't
   // drift from the hook's own GATED_TAGS set.
-  ...Object.fromEntries(ESCALATION_TAGS.map((t) => [t, escalationTableGate])),
+  ...Object.fromEntries(ESCALATION_TAGS.map((t) => [t, escalationFormatGate])),
 };
 
 /**
@@ -730,7 +732,7 @@ export function parseArgs(
   if (tag !== undefined) {
     const gate = TAG_GATES[tag];
     if (gate) {
-      const result = gate({ tag, caption, table, replyTo, terminalQuestion });
+      const result = gate({ tag, caption, table, replyTo, terminalQuestion, format });
       if (result) {
         if (result.severity === 'block') return { action: 'error', message: result.message };
         escalationWarning = result.message;

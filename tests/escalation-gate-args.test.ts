@@ -1,67 +1,99 @@
-// Tier 1 of the escalation-format gate: the cheap, parse-time TAG_GATES check
-// in features/cli/args.ts. For --tag decision|question with no literal table
-// anywhere in the caption it is ADVISORY by default (WARN-mode): parseArgs
-// attaches `escalationWarning` and STILL returns a `send` — it does NOT block.
-// The entrypoint prints the warning and only hard-blocks under the off-by-
-// default ESCALATION_GATE_ENFORCE flag (escalationGateEnforced). The more
-// nuanced Tier 2 (the advisory pre-send-text hook) is covered in
-// tests/hooks-escalation-format-gate.test.ts.
+// Escalation-format gate (parse-time TAG_GATES in features/cli/args.ts). For
+// --tag decision|question the gate now runs the FULL decision-request-format
+// validator (features/cli/escalation-format.ts): a self-contained STRUCTURED
+// Rich Message — Context + Options-with-pros/cons + Recommendation + a
+// "where to look" file:line, laid out with headings / bullet lists / <hr>
+// dividers. A malformed send has `escalationWarning` attached; the ENTRYPOINT
+// hard-blocks it deny-by-default (escalationGateEnforced is ON by default),
+// downgraded to advisory only under ESCALATION_GATE_ENFORCE=0.
 import { expect, test } from 'bun:test';
 import { escalationGateEnforced, parseArgs } from '../features/cli/args';
 
 const HOME = '/home/tester';
 const CWD = '/tmp/no-such-cwd-for-tg-tests';
 
+// A body that satisfies EVERY required section: table with pros/cons, a
+// recommendation, a file:line "where to look", context prose, >=2 headings, a
+// <ul> list, and <hr> dividers — and no wall-of-text run-on.
+const COMPLIANT = [
+  '<h3>Context</h3><p>The resolver in features/foo.ts:42 picks the wrong click target on cold maps.</p><hr>',
+  '<h3>Options</h3><table><tr><th>Option</th><th>Pros</th><th>Cons</th></tr>',
+  '<tr><td>A</td><td>fast</td><td>risky</td></tr><tr><td>B</td><td>safe</td><td>slow</td></tr></table><hr>',
+  '<h3>Recommendation</h3><ul><li>I recommend A because it is faster</li></ul><hr>',
+  '<h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>',
+].join('\n');
+
 test('the "question" tag is accepted by --tag (parses, no validateTag rejection)', () => {
-  const body = '| Option | Rec |\n| --- | --- |\n| A | go |';
-  const r = parseArgs(['--tag', 'question', body], CWD, HOME);
+  const r = parseArgs(['--tag', 'question', '--format', 'html', COMPLIANT], CWD, HOME);
   expect(r.action).toBe('send');
   if (r.action === 'send') expect(r.tag).toBe('question');
 });
 
-test('--tag decision with NO table is WARN (still a send), warning attached and names the actual tag', () => {
+test('--tag decision with plain prose (no format) is WARN (still a send); names the actual tag', () => {
   const r = parseArgs(['--tag', 'decision', 'ship the thing or not?'], CWD, HOME);
-  // WARN-mode default: it SENDS, it does not error.
+  // Parse layer never throws: it SENDS with a warning; the entrypoint decides
+  // block-vs-warn via escalationGateEnforced (default block).
   expect(r.action).toBe('send');
   if (r.action === 'send') {
     expect(r.escalationWarning).toBeDefined();
-    // Names the ACTUAL tag used, not a hardcoded "decision/question" pair.
-    expect(r.escalationWarning).toContain('--tag decision sends');
-    expect(r.escalationWarning).toContain('| Option | Tradeoff | Recommendation |');
-    // The mode-specific framing (advisory-proceeding vs blocked, and the
-    // ESCALATION_GATE_ENFORCE mention) lives in the ENTRYPOINT, not here — the
-    // parse-time message is core guidance only (see cli-subprocess.test.ts).
+    // Names the ACTUAL tag used.
+    expect(r.escalationWarning).toContain('--tag decision is an escalation');
+    // Lists the missing sections as a checklist.
+    expect(r.escalationWarning).toContain('Missing:');
+    // The mode-specific framing (advisory vs blocked, ESCALATION_GATE_ENFORCE)
+    // lives in the ENTRYPOINT, not the parse-time message.
     expect(r.escalationWarning).not.toContain('ESCALATION_GATE_ENFORCE');
-    expect(r.escalationWarning).not.toContain('proceeding');
   }
 });
 
-test('--tag question with NO table is WARN (still a send); message names "question", not "decision"', () => {
+test('--tag question with plain prose is WARN (still a send); names "question"', () => {
   const r = parseArgs(['--tag', 'question', 'which one do we ship?'], CWD, HOME);
   expect(r.action).toBe('send');
   if (r.action === 'send') {
-    expect(r.escalationWarning).toContain('--tag question sends');
-    // "decision" the tag word must not leak into a question send's message
-    // (the generic prose says "re-deriving the question", never "decision").
-    expect(r.escalationWarning).not.toContain('decision');
+    expect(r.escalationWarning).toContain('--tag question is an escalation');
+    // The other escalation tag word must not leak into a question send.
+    expect(r.escalationWarning).not.toContain('--tag decision');
   }
 });
 
-test('--tag decision WITH a markdown pipe table: no warning attached', () => {
+test('--tag decision with a FULLY-COMPLIANT structured body (+ --format html): no warning attached', () => {
+  const r = parseArgs(['--tag', 'decision', '--format', 'html', COMPLIANT], CWD, HOME);
+  expect(r.action).toBe('send');
+  if (r.action === 'send') expect(r.escalationWarning).toBeUndefined();
+});
+
+test('--tag decision with a compliant body passed via literal \\n escapes (one shell argument): no warning attached', () => {
+  // tg's documented convention for a multiline caption as a single shell argument is
+  // literal `\n` escapes, decoded by the entrypoint right before send. The parse-time
+  // gate must validate the DECODED content, not the raw argv text with literal
+  // backslash-n sequences (review finding, tg-cli#202) — otherwise a fully compliant
+  // escalation body is seen as one long line and false-positive-blocked.
+  const escaped = COMPLIANT.replace(/\n/g, '\\n');
+  const r = parseArgs(['--tag', 'decision', '--format', 'html', escaped], CWD, HOME);
+  expect(r.action).toBe('send');
+  if (r.action === 'send') expect(r.escalationWarning).toBeUndefined();
+});
+
+test('--tag decision with a compliant body but NO --format html: still warns (raw tags would be literal)', () => {
+  const r = parseArgs(['--tag', 'decision', COMPLIANT], CWD, HOME);
+  expect(r.action).toBe('send');
+  if (r.action === 'send') {
+    expect(r.escalationWarning).toBeDefined();
+    expect(r.escalationWarning).toContain('--format html');
+  }
+});
+
+test('--tag decision with a BARE table only (no recommendation/context/structure): still WARNS', () => {
   const body = ['| Option | Tradeoff |', '| --- | --- |', '| A | slower |'].join('\n');
   const r = parseArgs(['--tag', 'decision', body], CWD, HOME);
   expect(r.action).toBe('send');
-  if (r.action === 'send') expect(r.escalationWarning).toBeUndefined();
+  if (r.action === 'send') expect(r.escalationWarning).toBeDefined();
 });
 
 test('--tag decision WITH --table (rows arrive on stdin, not argv): no warning attached', () => {
+  // --table short-circuits the gate: the rendered table arrives from stdin,
+  // which parseArgs never sees, so it cannot be validated here.
   const r = parseArgs(['--tag', 'decision', '--table'], CWD, HOME);
-  expect(r.action).toBe('send');
-  if (r.action === 'send') expect(r.escalationWarning).toBeUndefined();
-});
-
-test('--tag decision WITH an HTML <table> in the caption: no warning attached', () => {
-  const r = parseArgs(['--tag', 'decision', '<table><tr><td>a</td></tr></table>'], CWD, HOME);
   expect(r.action).toBe('send');
   if (r.action === 'send') expect(r.escalationWarning).toBeUndefined();
 });
@@ -74,7 +106,7 @@ test('non-escalation tags (problem/report) get no escalation warning', () => {
   }
 });
 
-test('the answer gate is a HARD block (severity block), unaffected by warn-mode', () => {
+test('the answer gate is a HARD block (severity block), unaffected by the format gate', () => {
   const noReply = parseArgs(['--tag', 'answer', 'here is the answer'], CWD, HOME);
   expect(noReply.action).toBe('error');
   if (noReply.action === 'error') expect(noReply.message).toContain('--reply-to');
@@ -86,17 +118,20 @@ test('the answer gate is a HARD block (severity block), unaffected by warn-mode'
   expect(terminal.action).toBe('send');
 });
 
-// --- ESCALATION_GATE_ENFORCE flag parse (the entrypoint upgrades an advisory
-// warning to a hard block only when this is truthy) ---
-test('escalationGateEnforced: truthy values enable enforcement', () => {
-  for (const v of ['1', 'true', 'yes', 'on', 'TRUE', ' On ']) {
-    expect(escalationGateEnforced({ ESCALATION_GATE_ENFORCE: v } as NodeJS.ProcessEnv)).toBe(true);
+// --- ESCALATION_GATE_ENFORCE flag parse. The gate is ON (deny-by-default); the
+// ONE documented escape is an explicit falsy value, which downgrades to advisory. ---
+test('escalationGateEnforced: absent value is ON by default (deny-by-default)', () => {
+  expect(escalationGateEnforced({} as NodeJS.ProcessEnv)).toBe(true);
+});
+
+test('escalationGateEnforced: only an explicit falsy value disables it (the documented escape)', () => {
+  for (const v of ['0', 'false', 'no', 'off', 'FALSE', ' Off ']) {
+    expect(escalationGateEnforced({ ESCALATION_GATE_ENFORCE: v } as NodeJS.ProcessEnv)).toBe(false);
   }
 });
 
-test('escalationGateEnforced: absent / falsy values keep it OFF (warn-mode default)', () => {
-  expect(escalationGateEnforced({} as NodeJS.ProcessEnv)).toBe(false);
-  for (const v of ['', '0', 'false', 'no', 'off', 'nope']) {
-    expect(escalationGateEnforced({ ESCALATION_GATE_ENFORCE: v } as NodeJS.ProcessEnv)).toBe(false);
+test('escalationGateEnforced: any other value (incl. truthy / unknown / empty) stays ON', () => {
+  for (const v of ['', '1', 'true', 'yes', 'on', 'nope']) {
+    expect(escalationGateEnforced({ ESCALATION_GATE_ENFORCE: v } as NodeJS.ProcessEnv)).toBe(true);
   }
 });

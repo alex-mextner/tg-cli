@@ -163,3 +163,102 @@ export function detectTableKind(body: string): TableKind {
   if (pipeRows.length >= 2 && hasSeparatorRow) return 'pipe';
   return 'none';
 }
+
+// --- Markdown pipe table → real Telegram <table> HTML ---
+//
+// Telegram has NO markdown table support: a body that types its options as a
+// GFM grid (`| Option | Tradeoff |` / `| --- | --- |` / `| A | slower |`)
+// arrives as PLAIN TEXT — literal pipes and dashes, no table. This is the
+// "таблица сломана" bug: escalation messages (and the escalation gate's own
+// suggested example) use markdown pipes, so they never render as a table. The
+// only body shape Telegram renders as a real bordered table is the rich-HTML
+// `<table>`/<tr>/<th>/<td> tag (routed to sendRichMessage by isRichHtml).
+//
+// This converter upgrades every contiguous markdown pipe-table block in a body
+// to a `<table>` HTML block, leaving all non-table lines untouched (each passed
+// through `escapeText` — HTML-escape when the send was plain text, identity when
+// the caller already owns HTML markup). The FIRST data row of each block becomes
+// the header (<th>); the markdown separator row (`--- | ---`) is dropped. A run
+// of pipe lines with NO separator row is left as-is (it is ordinary prose with
+// pipes, e.g. `a || b`, not a table). Pure — no I/O.
+//
+// A leading/trailing border pipe (`| a | b |`) yields empty edge cells on split;
+// those are dropped, interior empty cells are kept.
+const PIPE_SEP_LINE_RE = /^[\s|:-]+$/u;
+function isPipeLine(line: string): boolean {
+  return line.includes('|');
+}
+function isSeparatorLine(line: string): boolean {
+  return line.includes('-') && line.includes('|') && PIPE_SEP_LINE_RE.test(line);
+}
+function splitPipeRow(line: string): string[] {
+  const cells = line.split('|').map((c) => c.trim());
+  // Drop the empty leading/trailing cells produced by border pipes.
+  if (cells.length && cells[0] === '') cells.shift();
+  if (cells.length && cells[cells.length - 1] === '') cells.pop();
+  return cells;
+}
+function renderHtmlTable(rows: string[][]): string {
+  const cell = (tag: 'th' | 'td', v: string): string => `<${tag}>${escapeCell(v)}</${tag}>`;
+  const rowHtml = (cells: string[], tag: 'th' | 'td'): string =>
+    `<tr>${cells.map((c) => cell(tag, c)).join('')}</tr>`;
+  const [header, ...bodyRows] = rows;
+  const parts = [rowHtml(header, 'th'), ...bodyRows.map((r) => rowHtml(r, 'td'))];
+  return `<table>${parts.join('')}</table>`;
+}
+
+export function pipeTableToHtml(
+  body: string,
+  escapeText: (s: string) => string = (s) => s,
+): { html: string; converted: boolean } {
+  // Only touch bodies whose ONLY table-ish shape is a markdown pipe grid. A
+  // real <table>, our own boxed <pre>, or no table at all is left alone.
+  if (detectTableKind(body) !== 'pipe') return { html: escapeText(body), converted: false };
+
+  const lines = body.split('\n');
+  const out: string[] = [];
+  let block: string[] = [];
+  let converted = false;
+
+  const flushProse = (proseLines: string[]): void => {
+    if (proseLines.length) out.push(escapeText(proseLines.join('\n')));
+  };
+  const flushBlock = (): void => {
+    if (block.length === 0) return;
+    // A GFM table has the separator as the row DIRECTLY under the header, so the
+    // header is the line immediately before the first separator. Any pipe lines
+    // BEFORE that header are prose (e.g. a "Choose A | B" sentence just above the
+    // grid) — not table rows — and must not be absorbed as the header.
+    const sepIdx = block.findIndex(isSeparatorLine);
+    if (sepIdx >= 1) {
+      flushProse(block.slice(0, sepIdx - 1)); // pipe-prose above the header
+      const header = block[sepIdx - 1];
+      const dataRows = block.slice(sepIdx + 1).filter((l) => !isSeparatorLine(l));
+      out.push(renderHtmlTable([header, ...dataRows].map(splitPipeRow)));
+      converted = true;
+    } else {
+      // No separator in a valid header+separator position → prose, not a table.
+      flushProse(block);
+    }
+    block = [];
+  };
+
+  let prose: string[] = [];
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, '');
+    if (isPipeLine(line)) {
+      if (prose.length) {
+        flushProse(prose);
+        prose = [];
+      }
+      block.push(line);
+    } else {
+      flushBlock();
+      prose.push(line);
+    }
+  }
+  flushBlock();
+  if (prose.length) flushProse(prose);
+
+  return { html: out.join('\n'), converted };
+}

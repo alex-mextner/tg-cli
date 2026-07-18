@@ -95,13 +95,25 @@ dot + the English word:
 | question | 🟠 QUESTION | an open question needing the user's input |
 | report | 🟢 REPORT | a status / result report |
 
-\`decision\`/\`question\` SHOULD carry a literal table body — options / tradeoffs /
-recommendation — so the recipient can answer without re-deriving the ask. Send
-it as a markdown pipe table, \`tg --table\`, or an HTML \`<table>\` with
-\`--format html\`. A send with none is WARNED (advisory, printed to stderr) but
-still goes out; set \`ESCALATION_GATE_ENFORCE=1\` to make a table required (the
-send then hard-errors). An optional installed hook may additionally warn
-(without blocking) on a subtler case this cheap check can't catch.
+\`decision\` / \`question\` are ESCALATIONS — they ask the CTO to choose — and tg
+now REQUIRES the decision-request format on them, DENY-BY-DEFAULT (skill:
+decision-request-discipline). A malformed send is BLOCKED (exit 1) with a
+checklist of what's missing. The message must be a self-contained, STRUCTURED
+Rich Message the human can answer in ~30s without opening the repo AND without
+reading a wall of text. Required:
+- Context (one line: \`file:line\` + what it does),
+- Options as a real \`<table>\` (or \`<ul>\`/\`<ol>\`) with pros/cons per option,
+- a Recommendation (which option, why),
+- Where to look (a \`file:line\` reference),
+- STRUCTURE: each section under its own \`<h3>\`/\`<h4>\`, enumerations as short
+  \`<ul>\`/\`<li>\` items (never inline "плюсы: a, b, c"), \`<hr>\` dividers, short
+  lines — sent with \`--format html\`.
+Markdown pipe grids (\`| a | b |\`) are AUTO-CONVERTED to a real \`<table>\`, so an
+options grid renders even if typed as markdown. See \`tg help format\` for a
+copy-pasteable GOOD vs BAD example. The one documented escape, for a genuine
+non-escalation / urgent edge case, is \`ESCALATION_GATE_ENFORCE=0\` (downgrades
+the block to an advisory warning). \`report\` / \`answer\` / \`problem\` are NOT
+gated.
 
 Uppercase (\`ANSWER\`), Cyrillic (\`ОТВЕТ\`), and unknown tags are REJECTED with a
 clear error and a non-zero exit — use a lowercase-english tag from the table.

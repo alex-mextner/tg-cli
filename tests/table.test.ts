@@ -5,6 +5,7 @@ import {
   escapeCell,
   hasWideGlyph,
   parseTableRows,
+  pipeTableToHtml,
   renderTable,
   toTablePre,
 } from '../features/render/table';
@@ -199,4 +200,60 @@ test('detectTableKind: a borderless 2-column markdown table (one pipe per row) i
 test('detectTableKind: a pipe-less thematic break does NOT satisfy the separator requirement', () => {
   const body = 'if a || b\n---\nwhile c || d';
   expect(detectTableKind(body)).toBe('none');
+});
+
+// --- pipeTableToHtml: markdown pipe grid → real Telegram <table> ---
+test('pipeTableToHtml: a markdown pipe table becomes a <table> with <th> header + <td> rows', () => {
+  const body = ['| Option | Cons |', '| --- | --- |', '| A | slow |', '| B | risky |'].join('\n');
+  const { html, converted } = pipeTableToHtml(body);
+  expect(converted).toBe(true);
+  expect(html).toContain('<table>');
+  expect(html).toContain('<tr><th>Option</th><th>Cons</th></tr>');
+  expect(html).toContain('<tr><td>A</td><td>slow</td></tr>');
+  expect(html).toContain('<tr><td>B</td><td>risky</td></tr>');
+  // The markdown separator row is dropped, not rendered as a data row.
+  expect(html).not.toContain('---');
+});
+
+test('pipeTableToHtml: prose around the table is preserved (and escaped when asked)', () => {
+  const body = ['Ship A or B?', '| Opt | Note |', '| --- | --- |', '| A | 5 < 10 |', 'Done.'].join('\n');
+  const { html, converted } = pipeTableToHtml(body, (s) => s.replace(/</g, '&lt;'));
+  expect(converted).toBe(true);
+  expect(html.startsWith('Ship A or B?')).toBe(true);
+  expect(html.endsWith('Done.')).toBe(true);
+  // Non-table prose is escaped by the provided escaper; table cells are escaped
+  // by escapeCell (5 &lt; 10 lives inside a <td>).
+  expect(html).toContain('<td>A</td><td>5 &lt; 10</td>');
+});
+
+test('pipeTableToHtml: a body with no pipe table is returned unchanged (converted=false)', () => {
+  const { html, converted } = pipeTableToHtml('just prose, no table');
+  expect(converted).toBe(false);
+  expect(html).toBe('just prose, no table');
+});
+
+test('pipeTableToHtml: pipe lines with NO separator row are treated as prose, not a table', () => {
+  // `a || b` code prose must not become a table.
+  const { converted } = pipeTableToHtml('if a || b\nwhile c || d');
+  expect(converted).toBe(false);
+});
+
+test('pipeTableToHtml: an existing real <table> is left alone (not double-wrapped)', () => {
+  const body = '<table><tr><td>a</td></tr></table>';
+  const { html, converted } = pipeTableToHtml(body);
+  expect(converted).toBe(false);
+  expect(html).toBe(body);
+});
+
+test('pipeTableToHtml: a pipe-bearing prose line ABOVE the grid is not absorbed as the header', () => {
+  // "Choose A | B" precedes a real GFM table; it must stay prose, and the real
+  // header (Option/Cons) must not be displaced into a data row.
+  const body = ['Choose A | B', '| Option | Cons |', '| --- | --- |', '| A | slow |'].join('\n');
+  const { html, converted } = pipeTableToHtml(body, (s) => s);
+  expect(converted).toBe(true);
+  expect(html).toContain('<tr><th>Option</th><th>Cons</th></tr>');
+  expect(html).toContain('<tr><td>A</td><td>slow</td></tr>');
+  // The prose line is preserved as text, NOT turned into a <th>/<td> row.
+  expect(html).toContain('Choose A | B');
+  expect(html).not.toContain('<th>Choose A</th>');
 });
