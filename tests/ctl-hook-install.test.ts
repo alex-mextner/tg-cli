@@ -8,6 +8,9 @@ import {
   claudeStatusLineTelemetryInstalled,
   withCodexUsageHook,
   codexUsageHookInstalled,
+  reconcileClaudeHooks,
+  claudeHooksFullyInstalled,
+  planClaudeHookSelfHeal,
 } from '../features/tg-ctl/hook-install';
 
 const CMD = 'tg-ctl ask';
@@ -251,4 +254,220 @@ test('Codex usage hook: preserves unrelated hook groups', () => {
   const hooks = settings.hooks as Record<string, unknown[]>;
   expect(hooks.PermissionRequest).toEqual(existing.hooks.PermissionRequest);
   expect(hooks.Stop).toHaveLength(1);
+});
+
+// --- daemon startup self-heal (regression: settings.json rewritten to Claude
+// Code's own keys drops all three tg-ctl hook channels; the daemon kept running
+// but "question asked" / "tokens running low" stopped surfacing until a manual
+// `tg-ctl install-hooks`). reconcileClaudeHooks + claudeHooksFullyInstalled are
+// the shared engine the daemon calls on startup to re-merge them idempotently. ---
+const CLAUDE_CMDS = { question: CMD, harness: HARNESS_CMD, statusLine: STATUSLINE_TELEMETRY_CMD };
+
+test('reconcileClaudeHooks: gutted settings (only Claude-managed keys) → all three channels re-merged', () => {
+  // The exact shape a settings.json rewrite left behind: our hooks + statusLine gone.
+  const gutted = { permissions: { defaultMode: 'auto' }, skipWorkflowUsageWarning: true };
+  expect(claudeHooksFullyInstalled(gutted, CLAUDE_CMDS)).toBe(false);
+  const { settings, changed } = reconcileClaudeHooks(gutted, CLAUDE_CMDS);
+  expect(changed).toBe(true);
+  // Both question channels, the StopFailure limit channel, and the statusLine are back.
+  expect(claudeHooksInstalled(settings, CMD)).toBe(true);
+  expect(harnessHooksInstalled(settings, HARNESS_CMD)).toBe(true);
+  expect(claudeStatusLineTelemetryInstalled(settings, STATUSLINE_TELEMETRY_CMD)).toBe(true);
+  expect(claudeHooksFullyInstalled(settings, CLAUDE_CMDS)).toBe(true);
+  // The pre-existing Claude-managed keys are preserved untouched.
+  expect((settings.permissions as Record<string, unknown>).defaultMode).toBe('auto');
+  expect(settings.skipWorkflowUsageWarning).toBe(true);
+});
+
+test('reconcileClaudeHooks: fully-installed settings → no-op (changed=false)', () => {
+  const once = reconcileClaudeHooks({}, CLAUDE_CMDS).settings;
+  expect(claudeHooksFullyInstalled(once, CLAUDE_CMDS)).toBe(true);
+  const twice = reconcileClaudeHooks(once, CLAUDE_CMDS);
+  expect(twice.changed).toBe(false);
+});
+
+test('reconcileClaudeHooks: partial (only q→buttons present) is re-merged and flagged changed', () => {
+  const partial = withClaudeHooks({}, CMD).settings; // question channel only
+  expect(claudeHooksFullyInstalled(partial, CLAUDE_CMDS)).toBe(false);
+  const { settings, changed } = reconcileClaudeHooks(partial, CLAUDE_CMDS);
+  expect(changed).toBe(true);
+  expect(claudeHooksFullyInstalled(settings, CLAUDE_CMDS)).toBe(true);
+  // The already-present question channel is not duplicated.
+  expect((settings.hooks as Record<string, unknown[]>).PreToolUse.length).toBe(1);
+});
+
+test('reconcileClaudeHooks: partial (only StopFailure present) is completed, changed=true', () => {
+  const partial = withHarnessHooks({}, HARNESS_CMD).settings; // limit channel only
+  expect(claudeHooksFullyInstalled(partial, CLAUDE_CMDS)).toBe(false);
+  const { settings, changed } = reconcileClaudeHooks(partial, CLAUDE_CMDS);
+  expect(changed).toBe(true);
+  expect(claudeHooksFullyInstalled(settings, CLAUDE_CMDS)).toBe(true);
+  expect((settings.hooks as Record<string, unknown[]>).StopFailure.length).toBe(1);
+});
+
+test('reconcileClaudeHooks: partial (only statusLine telemetry present) is completed, changed=true', () => {
+  const partial = withClaudeStatusLineTelemetry({}, STATUSLINE_TELEMETRY_CMD).settings;
+  expect(claudeHooksFullyInstalled(partial, CLAUDE_CMDS)).toBe(false);
+  const { settings, changed } = reconcileClaudeHooks(partial, CLAUDE_CMDS);
+  expect(changed).toBe(true);
+  expect(claudeHooksFullyInstalled(settings, CLAUDE_CMDS)).toBe(true);
+  // Only one statusLine wrapper — the pre-existing telemetry is not re-wrapped.
+  const statusLine = settings.statusLine as { command: string };
+  expect(statusLine.command.match(/tg-ctl-statusline-usage/g)?.length).toBe(1);
+});
+
+test('reconcileClaudeHooks: preserves and wraps a user-supplied statusLine display command', () => {
+  const gutted = {
+    permissions: { defaultMode: 'auto' },
+    statusLine: { type: 'command', command: 'printf "my-prompt"' },
+  };
+  const { settings, changed } = reconcileClaudeHooks(gutted, CLAUDE_CMDS);
+  expect(changed).toBe(true);
+  const statusLine = settings.statusLine as { command: string };
+  // Telemetry added, but the user's own display command is still invoked (wrapped, not replaced).
+  expect(statusLine.command).toContain('tg-ctl-statusline-usage');
+  expect(statusLine.command).toContain("sh -c 'printf \"my-prompt\"'");
+  expect(claudeHooksFullyInstalled(settings, CLAUDE_CMDS)).toBe(true);
+});
+
+// --- planClaudeHookSelfHeal: the daemon startup decision, made pure so every
+// branch (opt-in gate, malformed file, no-op, restore) is testable without I/O. ---
+const GUTTED = JSON.stringify({ permissions: { defaultMode: 'auto' }, skipWorkflowUsageWarning: true });
+
+test('planClaudeHookSelfHeal: not opted in → skip, never auto-installs', () => {
+  const plan = planClaudeHookSelfHeal(GUTTED, false, CLAUDE_CMDS);
+  expect(plan).toEqual({ action: 'skip', reason: 'not-opted-in' });
+});
+
+test('planClaudeHookSelfHeal: opted in + gutted file → write with backup restoring all three channels', () => {
+  const plan = planClaudeHookSelfHeal(GUTTED, true, CLAUDE_CMDS);
+  expect(plan.action).toBe('write');
+  if (plan.action !== 'write') throw new Error('unreachable');
+  expect(plan.backup).toBe(GUTTED); // prior content preserved for recovery
+  const restored = JSON.parse(plan.settingsJson);
+  expect(claudeHooksFullyInstalled(restored, CLAUDE_CMDS)).toBe(true);
+  expect(restored.permissions.defaultMode).toBe('auto'); // pre-existing keys kept
+});
+
+test('planClaudeHookSelfHeal: opted in + already fully installed → skip (no needless write)', () => {
+  const full = JSON.stringify(reconcileClaudeHooks({}, CLAUDE_CMDS).settings);
+  expect(planClaudeHookSelfHeal(full, true, CLAUDE_CMDS)).toEqual({ action: 'skip', reason: 'already-installed' });
+});
+
+test('planClaudeHookSelfHeal: opted in + no file yet → write with null backup', () => {
+  const plan = planClaudeHookSelfHeal(null, true, CLAUDE_CMDS);
+  expect(plan.action).toBe('write');
+  if (plan.action !== 'write') throw new Error('unreachable');
+  expect(plan.backup).toBeNull();
+  expect(claudeHooksFullyInstalled(JSON.parse(plan.settingsJson), CLAUDE_CMDS)).toBe(true);
+});
+
+test('planClaudeHookSelfHeal: opted in + empty file → write with null backup (no clobbered backup)', () => {
+  const plan = planClaudeHookSelfHeal('', true, CLAUDE_CMDS);
+  expect(plan.action).toBe('write');
+  if (plan.action !== 'write') throw new Error('unreachable');
+  expect(plan.backup).toBeNull();
+});
+
+test('planClaudeHookSelfHeal: unparseable JSON → skip, leaves a hand-broken file alone', () => {
+  expect(planClaudeHookSelfHeal('{ not json', true, CLAUDE_CMDS)).toEqual({ action: 'skip', reason: 'unparseable' });
+});
+
+test('planClaudeHookSelfHeal: non-object JSON (array) → skip', () => {
+  expect(planClaudeHookSelfHeal('[]', true, CLAUDE_CMDS)).toEqual({ action: 'skip', reason: 'not-object' });
+});
+
+// --- runClaudeHookSelfHeal: the daemon IO orchestration, driven over an in-memory
+// fake fs so the sentinel gate, unreadable-file guard, backup-once, and
+// skip-means-no-write invariants are all covered without touching a real disk. ---
+import { runClaudeHookSelfHeal } from '../features/tg-ctl/hook-install';
+
+const SETTINGS = '/home/.claude/settings.json';
+const SETTINGS_DIR = '/home/.claude';
+const SENTINEL = '/cfg/claude-hooks-installed';
+const SELF_PATHS = { settingsPath: SETTINGS, settingsDir: SETTINGS_DIR, sentinelPath: SENTINEL };
+
+function fakeFs(seed: Record<string, string>, opts: { unreadable?: string[] } = {}) {
+  const files = new Map(Object.entries(seed));
+  const unreadable = new Set(opts.unreadable ?? []);
+  const dirs: string[] = [];
+  return {
+    files,
+    dirs,
+    fs: {
+      exists: (p: string) => files.has(p),
+      read: (p: string) => (unreadable.has(p) ? null : files.get(p) ?? null),
+      backup: (p: string, c: string) => { files.set(p, c); },
+      writeAtomic: (p: string, c: string) => { files.set(p, c); },
+      ensureDir: (d: string) => { dirs.push(d); },
+    },
+  };
+}
+
+test('runClaudeHookSelfHeal: no sentinel → skipped not-opted-in, nothing written', () => {
+  const { files, fs } = fakeFs({ [SETTINGS]: GUTTED });
+  const res = runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS);
+  expect(res).toEqual({ outcome: 'skipped', reason: 'not-opted-in' });
+  expect(files.get(SETTINGS)).toBe(GUTTED); // untouched
+  expect(files.has(`${SETTINGS}.selfheal.bak`)).toBe(false);
+});
+
+test('runClaudeHookSelfHeal: opted in + gutted → healed, backup written once, dir ensured', () => {
+  const { files, dirs, fs } = fakeFs({ [SENTINEL]: 'x', [SETTINGS]: GUTTED });
+  const res = runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS);
+  expect(res).toEqual({ outcome: 'healed' });
+  expect(claudeHooksFullyInstalled(JSON.parse(files.get(SETTINGS)!), CLAUDE_CMDS)).toBe(true);
+  expect(files.get(`${SETTINGS}.selfheal.bak`)).toBe(GUTTED);
+  expect(dirs).toContain(SETTINGS_DIR);
+});
+
+test('runClaudeHookSelfHeal: existing backup is NOT overwritten by a second heal', () => {
+  const priorBackup = JSON.stringify({ the: 'earliest good snapshot' });
+  const { files, fs } = fakeFs({ [SENTINEL]: 'x', [SETTINGS]: GUTTED, [`${SETTINGS}.selfheal.bak`]: priorBackup });
+  runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS);
+  expect(files.get(`${SETTINGS}.selfheal.bak`)).toBe(priorBackup); // preserved
+});
+
+test('runClaudeHookSelfHeal: opted in + already installed → skipped, file untouched', () => {
+  const full = JSON.stringify(reconcileClaudeHooks({}, CLAUDE_CMDS).settings);
+  const { files, fs } = fakeFs({ [SENTINEL]: 'x', [SETTINGS]: full });
+  const res = runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS);
+  expect(res).toEqual({ outcome: 'skipped', reason: 'already-installed' });
+  expect(files.get(SETTINGS)).toBe(full);
+});
+
+test('runClaudeHookSelfHeal: file EXISTS but unreadable → skipped unreadable, never clobbered', () => {
+  const { files, fs } = fakeFs({ [SENTINEL]: 'x', [SETTINGS]: 'secret' }, { unreadable: [SETTINGS] });
+  const res = runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS);
+  expect(res).toEqual({ outcome: 'skipped', reason: 'unreadable' });
+  expect(files.get(SETTINGS)).toBe('secret'); // NOT overwritten with a fresh install
+});
+
+test('runClaudeHookSelfHeal: restore-only — no settings file → skipped, never first-time-created', () => {
+  const { files, fs } = fakeFs({ [SENTINEL]: 'x' });
+  const res = runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS);
+  expect(res).toEqual({ outcome: 'skipped', reason: 'no-settings-file' });
+  expect(files.has(SETTINGS)).toBe(false); // the user's deletion is respected
+});
+
+test('runClaudeHookSelfHeal: unparseable settings → skipped, no write and no backup (hand-broken file left alone)', () => {
+  const { files, fs } = fakeFs({ [SENTINEL]: 'x', [SETTINGS]: '{ broken' });
+  const res = runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS);
+  expect(res).toEqual({ outcome: 'skipped', reason: 'unparseable' });
+  expect(files.get(SETTINGS)).toBe('{ broken'); // untouched
+  expect(files.has(`${SETTINGS}.selfheal.bak`)).toBe(false);
+});
+
+test('runClaudeHookSelfHeal: no sentinel takes precedence even over an unreadable file', () => {
+  const { fs } = fakeFs({ [SETTINGS]: 'secret' }, { unreadable: [SETTINGS] });
+  // sentinel absent → not-opted-in wins; the unreadable file is never even read.
+  expect(runClaudeHookSelfHeal(fs, SELF_PATHS, CLAUDE_CMDS)).toEqual({ outcome: 'skipped', reason: 'not-opted-in' });
+});
+
+test('planClaudeHookSelfHeal: whitespace-only settings → write with null backup', () => {
+  const plan = planClaudeHookSelfHeal('   \n', true, CLAUDE_CMDS);
+  expect(plan.action).toBe('write');
+  if (plan.action !== 'write') throw new Error('unreachable');
+  expect(plan.backup).toBeNull();
+  expect(claudeHooksFullyInstalled(JSON.parse(plan.settingsJson), CLAUDE_CMDS)).toBe(true);
 });

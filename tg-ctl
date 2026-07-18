@@ -138,10 +138,10 @@ import {
   claudeStatusLineTelemetryInstalled,
   codexUsageHookInstalled,
   harnessHooksInstalled,
-  withClaudeHooks,
+  reconcileClaudeHooks,
+  runClaudeHookSelfHeal,
   withClaudeStatusLineTelemetry,
   withCodexUsageHook,
-  withHarnessHooks,
 } from "./features/tg-ctl/hook-install"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
@@ -1230,6 +1230,71 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
   return lines.join("\n")
 }
 
+// The three Claude Code hook commands the daemon owns, as one unit. Shared by
+// `install-hooks` and the startup self-heal so both target the identical wiring.
+const CLAUDE_HOOK_COMMANDS = {
+  question: CLAUDE_QUESTION_HOOK_CMD,
+  harness: CLAUDE_HARNESS_HOOK_CMD,
+  statusLine: CLAUDE_STATUSLINE_TELEMETRY_CMD,
+}
+
+// The resolved tg-cli config dir. SINGLE source of truth so the sentinel that
+// `install-hooks` writes and the one the daemon self-heal reads resolve identically
+// under the same environment (a `TG_CTL_CONFIG_DIR` set in only one of the two
+// process contexts would still send them to different dirs — that is a launch-env
+// mismatch, not a code divergence). Absolute so `enable` can pin it into the
+// launchd/systemd unit.
+function resolveConfigDir(home: string): string {
+  return resolve(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"))
+}
+
+// Opt-in sentinel: `install-hooks` writes this so the daemon self-heal knows the
+// user has ADOPTED the Claude hooks and it may restore them if a rewrite drops
+// them. Its absence means "never opted in" → the daemon never first-time-installs
+// hooks or rewrites a statusLine behind the user's back.
+function claudeHooksSentinelPath(configDir: string): string {
+  return join(configDir, "claude-hooks-installed")
+}
+
+// Startup self-heal: re-merge the Claude Code hooks into ~/.claude/settings.json
+// when a rewrite dropped any of them — but ONLY for a user who previously ran
+// `install-hooks` (the opt-in sentinel). The merge is purely ADDITIVE (reconcile
+// appends missing hook groups and WRAPS any existing statusLine so the user's own
+// display output is preserved) and CONVERGES after one write. Idempotent (writes
+// only on an actual change) and fully best-effort — every failure is swallowed
+// with a log line so the daemon always proceeds to its poll loop. Heals only the
+// user-scope file; a shadowing project-scoped statusLine is left to the explicit
+// `install-hooks`. The backup uses a self-heal-specific suffix + atomicWrite so an
+// unattended heal can never clobber the manual `install-hooks` `.bak` nor truncate
+// settings.json into garbage that would wedge the next start.
+function ensureClaudeHooksOnStartup(ctx: Ctx): void {
+  try {
+    const claudeDir = join(ctx.home, ".claude")
+    const paths = {
+      settingsPath: join(claudeDir, "settings.json"),
+      settingsDir: claudeDir,
+      sentinelPath: claudeHooksSentinelPath(ctx.configDir),
+    }
+    const fs = {
+      exists: existsSync,
+      read: readFileOrNull,
+      backup: (p: string, content: string) => {
+        try {
+          writeFileSync(p, content)
+        } catch {}
+      },
+      writeAtomic: atomicWrite,
+      ensureDir: (dir: string) => mkdirSync(dir, { recursive: true }),
+    }
+    const res = runClaudeHookSelfHeal(fs, paths, CLAUDE_HOOK_COMMANDS)
+    if (res.outcome === "healed") {
+      log("ensureClaudeHooksOnStartup: re-merged dropped Claude Code hooks into settings.json")
+    }
+  } catch (err) {
+    log(`ensureClaudeHooksOnStartup failed: ${err}`)
+  }
+}
+
 // Idempotently install the q→buttons agent-question hooks into Claude Code's
 // user settings (backing the file up first), then print guidance for the other
 // harnesses. Pure JSON merge lives in features/tg-ctl/hook-install.ts.
@@ -1268,14 +1333,10 @@ function installHooks(home: string): void {
     }
     codexExisting = parsed as Record<string, unknown>
   }
-  const qButtons = withClaudeHooks(existing, CLAUDE_QUESTION_HOOK_CMD)
-  // Also provision harness limit/error channels in the SAME pass so a single
-  // `install-hooks` wires q→buttons, StopFailure notifications, and proactive
-  // Claude statusLine usage telemetry.
-  const harness = withHarnessHooks(qButtons.settings, CLAUDE_HARNESS_HOOK_CMD)
-  const telemetry = withClaudeStatusLineTelemetry(harness.settings, CLAUDE_STATUSLINE_TELEMETRY_CMD)
-  const settings = telemetry.settings
-  const changed = qButtons.changed || harness.changed || telemetry.changed
+  // Provision all three Claude channels in ONE pass (q→buttons, StopFailure
+  // notifications, and proactive statusLine usage telemetry) — the same shared
+  // engine the daemon startup self-heal uses, so both stay in lockstep.
+  const { settings, changed } = reconcileClaudeHooks(existing, CLAUDE_HOOK_COMMANDS)
   if (changed) {
     if (raw) {
       try {
@@ -1324,6 +1385,18 @@ function installHooks(home: string): void {
   console.log("Codex: trust the `tg-ctl codex-usage-hook` Stop hook via /hooks so quota telemetry can flow; add a PermissionRequest hook running `tg-ctl ask --agent codex` if you also want q→buttons.")
   console.log("opencode: native — the bot subscribes to question/permission SSE events; no hook file needed.")
   console.log("Restart any running agent session so it loads the new hooks.")
+  // Record opt-in so the daemon may RESTORE these hooks if a later settings.json
+  // rewrite drops them (ensureClaudeHooksOnStartup). Best-effort — never fail the
+  // install over the sentinel.
+  try {
+    const configDir = resolveConfigDir(home)
+    mkdirSync(configDir, { recursive: true })
+    writeFileSync(claudeHooksSentinelPath(configDir), `${new Date().toISOString()}\n`)
+    console.log(
+      `The daemon will restore these hooks if a settings.json rewrite drops them. ` +
+        `To stop that, delete ${claudeHooksSentinelPath(configDir)}.`,
+    )
+  } catch {}
 }
 
 // --- start: registration snapshot + detached daemon spawn, then exit ---
@@ -6808,6 +6881,16 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // No-op when topics mode is off (1:1 startup byte-identical) and fully guarded.
   reconcileTopicsOnStartup()
 
+  // Self-heal the Claude Code hooks on startup. Claude Code can re-emit
+  // ~/.claude/settings.json with only its own managed keys, silently dropping our
+  // q→buttons, StopFailure, and statusLine-telemetry channels — the daemon then
+  // keeps running but "question asked" / "tokens running low" never surface until
+  // a manual `tg-ctl install-hooks`. Re-merge idempotently here (same pattern as
+  // reconcileTopicsOnStartup): a no-op when the hooks are already present, so it
+  // only writes when a rewrite actually gutted them. Best-effort — a failure here
+  // must never block the daemon from entering its poll loop.
+  ensureClaudeHooksOnStartup(ctx)
+
   log(`daemon up — pid ${process.pid}, bot ${ctx.botId}, offset ${offset}`)
 
   for (;;) {
@@ -7043,7 +7126,7 @@ if (import.meta.main) {
   // login daemon from its own cwd (not the shell's) — a relative override would resolve against
   // the wrong directory and silently miss the .env it was enabled with. (The default branch is
   // already absolute, so this is a no-op there.)
-  const configDir = resolve(process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli"))
+  const configDir = resolveConfigDir(home)
   const fileEnv = loadEnv(join(configDir, ".env"))
   const env = { ...fileEnv, ...process.env }
 
