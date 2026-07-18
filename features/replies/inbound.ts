@@ -27,6 +27,13 @@ export interface InboundOpts {
   // against the routes map); returns the resolved pane, or null to use the
   // default `pane`. Omitted → every message gets the default `pane`.
   resolvePane?: (m: TgMessage) => string | null;
+  // Map the RESOLVED target pane (reply-origin pane, else the default `pane`) to
+  // the human AGENT NAME it belongs to (agentNameForPane over the daemon's live
+  // tmux snapshot). Stamped as `targetAgent` so `tg replies` can attribute + scope
+  // each message. The daemon injects this; omitted (or a null return) → the record
+  // carries no targetAgent (treated as untagged on read). Kept a param, not an
+  // import, so this module stays pure/testable.
+  resolveAgent?: (pane: string | null) => string | null;
 }
 
 function senderAllowed(sender: number | undefined, opts: InboundOpts): boolean {
@@ -56,6 +63,8 @@ export function inboundHistoryRecords(updates: TgUpdate[], opts: InboundOpts): H
     }
     const from = m.from?.first_name || m.from?.username || 'tg';
     const resolved = opts.resolvePane?.(m) ?? null;
+    const pane = resolved ?? opts.pane;
+    const targetAgent = opts.resolveAgent?.(pane) ?? undefined;
     out.push({
       ts: m.date,
       message_id: m.message_id,
@@ -63,7 +72,8 @@ export function inboundHistoryRecords(updates: TgUpdate[], opts: InboundOpts): H
       direction: 'user',
       from,
       text: historyText(m),
-      pane: resolved ?? opts.pane,
+      pane,
+      ...(targetAgent ? { targetAgent } : {}),
     });
   }
   return out;

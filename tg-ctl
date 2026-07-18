@@ -155,6 +155,7 @@ import {
 } from "./features/tg-ctl/routes"
 import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
 import { inboundHistoryRecords } from "./features/replies/inbound"
+import { agentNameForPane } from "./features/tg-ctl/agent-name"
 import { isLikelySlashCommand, stepUpdates } from "./features/tg-ctl/updates"
 import {
   appendTopic,
@@ -6739,6 +6740,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         const found = discover()
         const targetPane = found.ok ? found.target.pane.paneId : null
         const histRoutes = parseRoutes(readFileOrNull(ctx.paths.routes))
+        // Map a resolved target pane → the human AGENT NAME it belongs to, so
+        // each inbound record is attributed (targetAgent) and `tg replies` can
+        // scope to "this agent" (agentNameForPane over the live snapshot — the
+        // SAME derivation the reader uses for its own pane). One snapshot for
+        // the whole batch; a pane that's gone (or none) → null → untagged.
+        const agentPanes = snapshot().panes
+        const resolveAgent = (pane: string | null): string | null => {
+          if (pane === null) return null
+          const p = agentPanes.find((x) => x.paneId === pane)
+          return p ? agentNameForPane(p.windowName, p.panePath) : null
+        }
         const resolvePane = (m: TgMessage): string | null => {
           const replyId = m.reply_to_message?.message_id
           if (replyId === undefined) return null
@@ -6784,6 +6796,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             nowSec: Math.floor(Date.now() / 1000),
             stalenessSec: ctx.cfg.stalenessSec,
             resolvePane,
+            resolveAgent,
           }),
         )
       }

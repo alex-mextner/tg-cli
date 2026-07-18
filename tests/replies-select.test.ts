@@ -89,6 +89,7 @@ test('selectHistory: list, default user direction, scoped to pane-set [%1], olde
     sample,
     {
       kind: 'query',
+      agentScope: { mode: 'all' },
       direction: 'user',
       action: 'list',
       allSessions: false,
@@ -108,6 +109,7 @@ test('selectHistory: a multi-pane set (window→several panes) unions across the
     sample,
     {
       kind: 'query',
+      agentScope: { mode: 'all' },
       direction: 'user',
       action: 'list',
       allSessions: false,
@@ -126,6 +128,7 @@ test('selectHistory: limit keeps the LAST N but renders oldest→newest', () => 
   for (let i = 0; i < 10; i++) many.push(R({ ts: 1000 + i, message_id: i, direction: 'user', pane: '%1' }));
   const out = selectHistory(many, {
     kind: 'query',
+    agentScope: { mode: 'all' },
     direction: 'user',
     action: 'list',
     allSessions: true,
@@ -154,6 +157,7 @@ test('selectHistory: limit counts a multi-part send as ONE, never truncates it m
   ];
   const out = selectHistory(records, {
     kind: 'query',
+    agentScope: { mode: 'all' },
     direction: 'agent',
     action: 'list',
     allSessions: true,
@@ -172,6 +176,7 @@ test('selectHistory: limit counts a multi-part send as ONE, never truncates it m
 test('selectHistory: find applies the query after direction + pane scoping', () => {
   const out = selectHistory(sample, {
     kind: 'query',
+    agentScope: { mode: 'all' },
     direction: 'all',
     action: 'find',
     query: 'canary',
@@ -197,6 +202,7 @@ test('selectHistory: find keeps a matching multi-part group ATOMIC — every id 
   ];
   const out = selectHistory([...sample, ...albumSiblings], {
     kind: 'query',
+    agentScope: { mode: 'all' },
     direction: 'agent',
     action: 'find',
     query: 'photos',
@@ -216,7 +222,7 @@ test('formatLine: user line shape `[YYYY-MM-DD HH:MM] #id text` with no marker f
     full: false,
     fmtTime: () => '2026-06-15 10:00',
   });
-  expect(line).toBe('[2026-06-15 10:00] #10 hi');
+  expect(line).toBe('[2026-06-15 10:00] #10 [→ ?] hi');
 });
 
 test('formatLine: null message_id renders #? ', () => {
@@ -225,7 +231,7 @@ test('formatLine: null message_id renders #? ', () => {
     full: false,
     fmtTime: () => '2026-06-15 10:00',
   });
-  expect(line).toBe('[2026-06-15 10:00] #? hi');
+  expect(line).toBe('[2026-06-15 10:00] #? [→ ?] hi');
 });
 
 test('formatLine: all-mode prefixes ← for user, → for agent', () => {
@@ -239,8 +245,8 @@ test('formatLine: all-mode prefixes ← for user, → for agent', () => {
     full: false,
     fmtTime: () => 'T',
   });
-  expect(u).toBe('← [T] #10 hi');
-  expect(a).toBe('→ [T] #11 yo');
+  expect(u).toBe('← [T] #10 [→ ?] hi');
+  expect(a).toBe('→ [T] #11 [→ ?] yo');
 });
 
 test('formatLine: truncates to ~200 chars unless full', () => {
@@ -250,8 +256,8 @@ test('formatLine: truncates to ~200 chars unless full', () => {
     full: false,
     fmtTime: () => 'T',
   });
-  // body part after "#1 "
-  const body = truncated.split('#1 ')[1];
+  // body part after the "#1 [→ ?] " prefix (id + agent mark)
+  const body = truncated.split('[→ ?] ')[1];
   expect(body.length).toBe(201); // 200 + ellipsis
   expect(body.endsWith('…')).toBe(true);
 
@@ -260,7 +266,7 @@ test('formatLine: truncates to ~200 chars unless full', () => {
     full: true,
     fmtTime: () => 'T',
   });
-  expect(fullLine.split('#1 ')[1].length).toBe(500);
+  expect(fullLine.split('[→ ?] ')[1].length).toBe(500);
 });
 
 test('formatLine: collapses internal newlines to spaces so each record is one line', () => {
@@ -269,7 +275,7 @@ test('formatLine: collapses internal newlines to spaces so each record is one li
     full: false,
     fmtTime: () => 'T',
   });
-  expect(line).toBe('[T] #1 a b c');
+  expect(line).toBe('[T] #1 [→ ?] a b c');
 });
 
 test('formatLines: all-mode shows markers; single-direction omits them', () => {
@@ -289,7 +295,9 @@ test('buildJsonOutput: machine shape (ts ms, id, direction, from, text, pane)', 
   const json = buildJsonOutput([
     R({ ts: 1700000000, message_id: 10, direction: 'user', from: 'Alex', text: 'hi', pane: '%1' }),
   ]);
-  expect(json).toEqual([{ ts: 1700000000000, id: 10, direction: 'user', from: 'Alex', text: 'hi', pane: '%1' }]);
+  expect(json).toEqual([
+    { ts: 1700000000000, id: 10, direction: 'user', from: 'Alex', text: 'hi', pane: '%1', targetAgent: null },
+  ]);
 });
 
 test('buildJsonOutput: ts is epoch MS (history stores seconds)', () => {
@@ -423,6 +431,7 @@ test('selectHistory: --since and --until filter the window correctly', () => {
     sample,
     {
       kind: 'query',
+      agentScope: { mode: 'all' },
       direction: 'all',
       action: 'list',
       allSessions: true,

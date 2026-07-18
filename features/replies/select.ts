@@ -4,7 +4,7 @@
 // time while tests stay deterministic — the same pattern updates.ts uses.
 
 import type { HistoryRecord } from './history';
-import type { Direction, RepliesQuery } from './args';
+import type { AgentScope, Direction, RepliesQuery } from './args';
 
 export type { HistoryRecord } from './history';
 
@@ -14,6 +14,39 @@ export type { HistoryRecord } from './history';
 export function filterByDirection(records: HistoryRecord[], direction: Direction): HistoryRecord[] {
   if (direction === 'all') return records;
   return records.filter((r) => r.direction === direction);
+}
+
+// Case-insensitive agent-name match (window names are compared loosely so a
+// typed `--agent RIG` finds `rig`). An untagged record (no targetAgent) never
+// matches a concrete name.
+function agentMatches(rec: HistoryRecord, name: string): boolean {
+  return rec.targetAgent !== undefined && rec.targetAgent.toLowerCase() === name.toLowerCase();
+}
+
+// Scope the records to a set of AGENTS. `currentAgent` is the reader's own agent
+// name (resolved from its tmux pane), or null when it couldn't be determined.
+//   • all       → pass-through (every agent + untagged)
+//   • untagged  → only rows with NO targetAgent (legacy / broadcast / no target)
+//   • named     → only rows for that agent (case-insensitive)
+//   • current   → only rows for `currentAgent`; when that is null the scope
+//                 DEGRADES to `untagged` (the caller prints a note) so we never
+//                 pretend an unknown reader owns every tagged message.
+export function filterByAgent(
+  records: HistoryRecord[],
+  scope: AgentScope,
+  currentAgent: string | null,
+): HistoryRecord[] {
+  switch (scope.mode) {
+    case 'all':
+      return records;
+    case 'untagged':
+      return records.filter((r) => r.targetAgent === undefined);
+    case 'named':
+      return records.filter((r) => agentMatches(r, scope.name));
+    case 'current':
+      if (currentAgent === null) return records.filter((r) => r.targetAgent === undefined);
+      return records.filter((r) => agentMatches(r, currentAgent));
+  }
 }
 
 // Keep only records at or after a unix-seconds lower bound. Undefined = no filter.
@@ -109,8 +142,10 @@ export function selectHistory(
   records: HistoryRecord[],
   args: RepliesQuery,
   panes: string[] | null = null,
+  currentAgent: string | null = null,
 ): HistoryRecord[] {
   let out = filterByDirection(records, args.direction);
+  out = filterByAgent(out, args.agentScope, currentAgent);
   out = filterByPanes(out, panes);
   out = filterBySince(out, args.since);
   out = filterByUntil(out, args.until);
@@ -158,16 +193,25 @@ export interface FormatLineOpts {
   fmtTime: (unixSec: number) => string;
 }
 
-// One record → one line: `[<time>] #<id> <text>`, optionally prefixed with a
-// direction marker (← user / → agent) for `all` mode. Internal newlines are
-// collapsed to spaces so each record stays one grep-able line; long text is
-// truncated with an ellipsis unless `full`.
+// The agent-attribution mark: `[→ <agent>]`, or `[→ ?]` for an untagged row
+// (legacy history, a broadcast, or a send whose target couldn't be resolved).
+// Shown on EVERY line, in every scope, so a reader always sees which agent each
+// message belongs to.
+export function agentMark(rec: HistoryRecord): string {
+  return `[→ ${rec.targetAgent ?? '?'}]`;
+}
+
+// One record → one line: `[<time>] #<id> [→ <agent>] <text>`, optionally prefixed
+// with a direction marker (← user / → agent) for `all` mode. The `[→ <agent>]`
+// mark names the routed-to / sent-from agent and is ALWAYS present. Internal
+// newlines are collapsed to spaces so each record stays one grep-able line; long
+// text is truncated with an ellipsis unless `full`.
 export function formatLine(rec: HistoryRecord, opts: FormatLineOpts): string {
   const time = opts.fmtTime(rec.ts);
   const id = rec.message_id === null ? '?' : String(rec.message_id);
   const oneLine = rec.text.replace(/\s*\n\s*/g, ' ');
   const body = !opts.full && oneLine.length > TEXT_TRUNCATE ? `${oneLine.slice(0, TEXT_TRUNCATE)}…` : oneLine;
-  const core = `[${time}] #${id} ${body}`;
+  const core = `[${time}] #${id} ${agentMark(rec)} ${body}`;
   if (!opts.showMarker) return core;
   const marker = rec.direction === 'agent' ? '→' : '←';
   return `${marker} ${core}`;
@@ -195,6 +239,7 @@ export interface HistoryJson {
   from: string;
   text: string;
   pane: string | null;
+  targetAgent: string | null; // routed-to / sent-from agent; null when untagged
 }
 
 export function buildJsonOutput(records: HistoryRecord[]): HistoryJson[] {
@@ -205,5 +250,6 @@ export function buildJsonOutput(records: HistoryRecord[]): HistoryJson[] {
     from: r.from,
     text: r.text,
     pane: r.pane,
+    targetAgent: r.targetAgent ?? null,
   }));
 }

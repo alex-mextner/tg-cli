@@ -294,13 +294,15 @@ with timestamps and `#message-ids` — without scrolling the pane.
 tg replies [user|agent|all] [list | find <query>] [flags]
 ```
 
-By default it shows the messages **you** sent in **this tmux session**, oldest
-first:
+By default it shows the messages **you** sent to **this agent** (resolved from
+the current tmux pane's window / project), oldest first, each line marked with
+the agent it went to (`[→ <agent>]`, or `[→ ?]` for an untagged / legacy / no-target
+row):
 
 ```
 $ tg replies
-[2026-06-15 10:42] #4821 deploy the canary and watch error rates
-[2026-06-15 10:58] #4827 roll it back, latency spiked
+[2026-06-15 10:42] #4821 [→ rig] deploy the canary and watch error rates
+[2026-06-15 10:58] #4827 [→ rig] roll it back, latency spiked
 ```
 
 - **Direction** (1st positional, default `user`): `user` (what you sent),
@@ -308,8 +310,18 @@ $ tg replies
   `→` agent).
 - **Action** (2nd positional, default `list`): `list`, or `find <query>` for a
   case-insensitive substring search (`--regex` for a regular expression).
-- **Scope** defaults to the current pane's session; `--all-sessions` searches
-  everywhere, `--session <window|paneId>` targets one scope — either a tmux
+- **Agent scope** (default: the **current agent** — this pane's window / project
+  name). Every inbound and outbound history row is stamped with the agent it was
+  routed to / sent from (`targetAgent`); the default view shows only the current
+  agent's. `--agent <name>` shows one named agent (case-insensitive), `--all`
+  shows every agent (tagged and untagged), `--untagged` shows only untagged /
+  legacy / no-target rows. The three are mutually exclusive. When the current
+  agent can't be resolved (e.g. outside tmux) the default degrades to untagged
+  only, with a note on stderr. Old history written before this field is treated
+  as untagged and is reachable via `--all` / `--untagged`.
+- **Pane scope**: by default the current pane (in the default agent scope only —
+  `--all`/`--agent`/`--untagged` search across panes). `--all-sessions` searches
+  every pane, `--session <window|paneId>` targets one scope — either a tmux
   **window name** (`--session ext`: exact match, all panes of every window named
   `ext` across sessions) or a raw pane id (`--session %7`).
 - **Date range**: `--since <date>` / `--until <date>` keep only messages at or
@@ -319,15 +331,18 @@ $ tg replies
 - `-n/--limit N` (default 20, counts SENDS not raw rows — a >4096-char split
   or a media-group album is one send, never truncated mid-send), `--full`
   (no truncation), `--json` (a machine-readable array: `ts` ms, `id`,
-  `direction`, `from`, `text`, `pane` — one row per Telegram message_id, so
-  a multi-part send is several rows and `--json -n N` can return more than N
-  rows), `--help`.
+  `direction`, `from`, `text`, `pane`, `targetAgent` — one row per Telegram
+  message_id, so a multi-part send is several rows and `--json -n N` can return
+  more than N rows), `--help`.
 
 ```
-tg replies all                  # the full back-and-forth in this session
+tg replies all                  # the full back-and-forth for this agent
+tg replies --all                # every agent's inbound messages
+tg replies --agent rig          # messages routed to the "rig" agent
+tg replies --untagged           # legacy / no-target messages only
 tg replies --session ext        # messages in the tmux window named "ext"
 tg replies user find deploy     # your messages mentioning "deploy"
-tg replies agent --all-sessions # everything the agent has sent, anywhere
+tg replies agent --all --all-sessions # everything the agents have sent, anywhere
 tg replies user --since 3d      # your messages in the last 3 days
 tg replies all --since 2026-06-28 --until 2026-06-30  # a date range
 tg replies --json -n 5          # the last 5 sends, as JSON

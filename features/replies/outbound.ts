@@ -64,6 +64,13 @@ export function outboundHistoryText(body: string, attach: OutboundAttachments): 
 // rather than generating it here with crypto.randomUUID() — keeps this
 // function pure and deterministic for tests. A single-record send gets no
 // groupId — nothing to group it with, so the token is simply unused.
+// `targetAgent` (optional) is the SENDING session's own agent name
+// (agentNameForPane over its tmux pane) — the SAME namespace tg-ctl stamps on
+// inbound, so a session's outbound and the inbound routed to it share one label
+// and the default agent-scoped `tg replies` view groups them together. Absent
+// (undefined) when the sender's agent name couldn't be resolved → untagged on
+// read. Stamped on EVERY sibling record of a multi-part send (they are one
+// logical send from one agent).
 export function buildOutboundHistoryRecords(
   outboundIds: number[],
   text: string,
@@ -71,6 +78,7 @@ export function buildOutboundHistoryRecords(
   pane: string,
   groupToken: string,
   chatId?: number,
+  targetAgent?: string,
 ): HistoryRecord[] {
   const uniqueIds = [...new Set(outboundIds)];
   const ids: (number | null)[] = uniqueIds.length > 0 ? uniqueIds : [null];
@@ -83,6 +91,7 @@ export function buildOutboundHistoryRecords(
   // passing an empty string by mistake shouldn't silently create a false
   // grouping key.
   const groupId = uniqueIds.length > 1 && groupToken !== '' ? groupToken : undefined;
+  const agent = targetAgent && targetAgent.trim() !== '' ? targetAgent.trim() : undefined;
   return ids.map((message_id) => ({
     ts,
     message_id,
@@ -92,5 +101,6 @@ export function buildOutboundHistoryRecords(
     text,
     pane,
     ...(groupId !== undefined ? { groupId } : {}),
+    ...(agent !== undefined ? { targetAgent: agent } : {}),
   }));
 }
