@@ -289,6 +289,31 @@ test('HAPPY PATH: a reply to agent-B (%5) routes to %5, never to the registratio
   expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
 }, 15_000);
 
+test('a `!shell` reply routes to the origin pane %5 (not the default %2) and stays raw (codex #192)', async () => {
+  const h = makeHarness();
+  const tg = startFakeTg();
+  h.setMode('normal');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  // Reply `!git status` to message 500 (origin = the [3d] agent %5). It must run
+  // in %5 (reply-route to origin), NOT the registration pane %2, and be injected
+  // VERBATIM — the raw `!git status`, no `[TG from …]` wrap or quote anchor — so
+  // the harness runs it as an in-session shell command (`!` at column 0).
+  tg.pushReply(600, 10, 500, '!git status');
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.length > 0);
+  await Bun.sleep(300);
+
+  const lines = injectedLines(h.injectLog);
+  // Landed in %5 (origin), raw text, and NOT in %2 (registration pane).
+  expect(lines).toContain(`${PANE_3D}\t!git status`);
+  expect(lines.some((l) => l.startsWith(`${PANE_RIG}\t`))).toBe(false);
+  // No `[TG from` wrap leaked into the inject, and no picker was posted.
+  expect(lines.some((l) => l.includes('[TG from'))).toBe(false);
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
+  daemon.kill();
+}, 15_000);
+
 test('THE MISROUTE (#53): origin %5 recognized but only %2 visible → picker, NEVER injects into %2', async () => {
   const h = makeHarness();
   const tg = startFakeTg();

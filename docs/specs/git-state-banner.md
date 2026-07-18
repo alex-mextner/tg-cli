@@ -64,14 +64,16 @@ message lands on a discovered pane with nothing else choosing it for it:
 - a non-reply photo/document notice (`download-media`),
 - a standalone (non-reply) voice transcript (`transcribe-voice`).
 
-**Slash-command passthrough guard (review catch on PR #153):** the flat `inject-text` action also
-carries an unrecognized `/command` (e.g. `/compact`, `/clear`) **verbatim, unwrapped** — not the
-normal wrapped-prose case — so the harness TUI can execute it as a real slash command. Prepending
-the banner ahead of it would push the leading `/` off the first character, so the harness would
-read the whole thing as plain prompt text instead of a command. `withGitStateBanner` therefore
-skips the banner whenever `text` already starts with `/` — the wrapped-prose case never does (the
-`injectWrap` template always renders first), so this only ever catches a real passthrough. Covered
-by `tests/ctl-git-state-banner-integration.test.ts`'s dirty-pane passthrough test.
+**Command passthrough guard (review catch on PR #153):** the flat `inject-text` action also
+carries a command **verbatim, unwrapped** — not the normal wrapped-prose case — so the harness TUI
+can execute it. Two shapes qualify: an unrecognized `/command` (e.g. `/compact`, `/clear`), and a
+`!shell` command (a message starting with `!` — the harness `!` convention runs the rest as a
+shell command in-session). Prepending the banner ahead of either would push the leading `/` or `!`
+off the first character, so the harness would read the whole thing as plain prompt text instead of
+a command. `withGitStateBanner` therefore skips the banner whenever `text` starts with `/` **or**
+`!` — the wrapped-prose case never does (the `injectWrap` template always renders first), so this
+only ever catches a real passthrough. Covered by
+`tests/ctl-git-state-banner-integration.test.ts`'s dirty-pane slash and `!shell` passthrough tests.
 
 Deliberately **excluded**, with the reasoning at each call site:
 - **reply-route** — anchored to a specific prior message; on-topic by construction.

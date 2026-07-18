@@ -291,6 +291,18 @@ test('git-state banner: never prepended to a slash-command passthrough, even on 
   expect(text.startsWith('/')).toBe(true);
 }, 15_000);
 
+// Same invariant for a `!shell` passthrough (harness `!` convention): a message starting with `!`
+// is injected VERBATIM so the harness runs it as an in-session shell command. The banner would push
+// the `!` off column 0 and defeat the convention, so even on a DIRTY pane it must reach the pane
+// untouched, banner-free.
+test('git-state banner: never prepended to a `!shell` passthrough, even on a dirty pane', async () => {
+  const fixture = gitFixture('dirty-feature-branch');
+  const text = await injectedTextFor(fixture, '!git status');
+  expect(text).toBe('!git status');
+  expect(text).not.toContain('⚠');
+  expect(text.startsWith('!')).toBe(true);
+}, 15_000);
+
 // Locks in the invariant withGitStateBanner's slash-guard depends on (review follow-up): at the
 // FLAT (non-topic) level, updates.ts's textAction gates on a bare `startsWith('/')` — a path-like
 // message that merely LOOKS like a command (`/etc/hosts is broken`, no recognized verb) is

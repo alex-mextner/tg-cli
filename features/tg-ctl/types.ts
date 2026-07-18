@@ -154,7 +154,7 @@ export type SpawnHarness = 'claude' | 'codex' | 'opencode';
 
 // Actions are data; the entrypoint executes them in order.
 export type Action =
-  | { kind: 'inject-text'; text: string; messageId: number } // already wrapped (or verbatim /cmd passthrough)
+  | { kind: 'inject-text'; text: string; messageId: number } // already wrapped, OR verbatim passthrough (`/cmd` or `!shell`)
   | { kind: 'inject-key'; key: 'Escape' } // /stop
   | { kind: 'kill-agent' } // /kill — SIGINT to the registered pane's agent pid
   | { kind: 'status'; threadId?: number | null } // /status — entrypoint composes the reply
@@ -195,8 +195,10 @@ export type Action =
   // A tap on the Cancel button shown after a bare `/agent` selection.
   | { kind: 'agent-cancel'; callbackQueryId: string; token: string; messageId: number | null }
   // A reply: route by the recognized origin pane (routes map) when known, else
-  // a session-grouped picker ordered LRU/MRU. injectText is already wrapped +
-  // carries the quote anchor (items 2,3); it is injected verbatim.
+  // a session-grouped picker ordered LRU/MRU. injectText is injected verbatim.
+  // For a prose reply it is wrapped + carries the quote anchor (items 2,3); for a
+  // `!shell` reply it is the RAW `!…` text with no wrap/anchor (codex #192) so `!`
+  // stays at column 0 for the harness passthrough while still routing to origin.
   | { kind: 'reply-route'; replyToMessageId: number; injectText: string; from: string; messageId: number }
   | { kind: 'reply'; text: string } // sendMessage back to the chat
   | { kind: 'answer-callback'; callbackQueryId: string; text: string }
@@ -285,8 +287,9 @@ export type Action =
   // A tap on a re-spawn button (tgr:<threadId>) for a topic whose pane died → re-launch the
   // agent with the retained path + model and re-bind. callbackQueryId answers the tap.
   | { kind: 'topic-respawn'; callbackQueryId: string; threadId: number; messageId: number | null }
-  // A user message inside a BOUND topic → inject into that topic's pane. injectText is
-  // already wrapped; the entrypoint maps threadId→paneId and threads the ack with threadId.
+  // A user message inside a BOUND topic → inject into that topic's pane. injectText is already
+  // wrapped for prose, OR verbatim for a `/cmd`/`!shell` passthrough (never re-decorate it); the
+  // entrypoint maps threadId→paneId and threads the ack with threadId.
   | { kind: 'topic-route'; threadId: number; injectText: string; from: string; messageId: number }
   // A user message inside a CLOSED topic (its pane died earlier) → the entrypoint offers a
   // one-tap re-spawn (retained path + model) instead of a silent dead-end (increment 4). Carries

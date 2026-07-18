@@ -54,6 +54,14 @@ In `stepUpdates`, a text message that **is a reply** and whose text is **not a
 the `buildReplyInject` text; a reply whose text starts with `/` still runs the
 command verbatim (so you can reply `/stop` to a message).
 
+A **`!shell` reply is a special case** (codex #192): it also becomes a
+`reply-route` (so it runs in the replied-to origin pane, not the default
+last-message pane), but its `injectText` is the **raw `!…` text** — no wrap, no
+quote anchor — so `!` stays at column 0 for the harness passthrough. The daemon's
+history-stamping predicate (`isRoutedReply` in `tg-ctl`) mirrors this: a text
+reply is stamped under its origin pane iff it is **not a `/command`** (which
+includes `!shell`).
+
 Photo/document replies first become `download-media` actions because the daemon
 must fetch the file before it knows the local path to inject. The action still
 carries the same `replyToMessageId` + `replyAnchor`; after download the executor

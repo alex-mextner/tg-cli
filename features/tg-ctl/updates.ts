@@ -379,10 +379,16 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
         // A reply carrying prose forwards the quote anchor (items 2,3) via
         // reply-route — the daemon picks the recognized origin pane or a LRU/MRU
         // picker. A reply whose text is a /command still runs the command verbatim.
+        // A `!` shell-command reply ALSO routes to the origin pane via reply-route
+        // (codex #192: otherwise it falls to the default/last-message pane), but
+        // with the RAW `!…` as injectText and NO quote anchor — a prepended anchor
+        // would knock the `!` off column 0 and defeat the harness passthrough.
+        const isVerbatimText = m.text.startsWith('/') || m.text.startsWith('!');
+        const isBangReply = !!m.reply_to_message && m.text.startsWith('!');
         const postTimeoutRequestId = m.reply_to_message
           ? (opts.postTimeoutQuestionRequestIdForMessage?.(m.reply_to_message.message_id) ?? null)
           : null;
-        action = postTimeoutRequestId && !m.text.startsWith('/')
+        action = postTimeoutRequestId && !isVerbatimText
           ? {
               kind: 'post-timeout-question-reply',
               requestId: postTimeoutRequestId,
@@ -391,11 +397,13 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
               from: name,
               messageId: m.message_id,
             }
-          : m.reply_to_message && !m.text.startsWith('/')
+          : m.reply_to_message && (!isVerbatimText || isBangReply)
             ? {
                 kind: 'reply-route',
                 replyToMessageId: m.reply_to_message.message_id,
-                injectText: buildReplyInject(m, name, opts),
+                // A `!` reply keeps its raw text (verbatim, `!` at column 0); a
+                // prose reply gets the quote anchor + wrap.
+                injectText: isBangReply ? m.text : buildReplyInject(m, name, opts),
                 from: name,
                 messageId: m.message_id,
               }
@@ -459,6 +467,12 @@ function textAction(
   replyToMessageId: number | null,
   threadId: number | null = null,
 ): Action {
+  // `!` passthrough (harness `!` convention): a message STARTING with `!` reaches
+  // the harness VERBATIM — no `[TG from …]` wrap — so it runs the rest as an
+  // in-session shell command. The harness only honours a `!` at column 0, so the
+  // text must be injected raw (no wrap, no reply quote-anchor). Owner-gated by
+  // `senderAllowed` upstream — a non-owner never reaches here.
+  if (text.startsWith('!')) return { kind: 'inject-text', text, messageId };
   if (text.startsWith('/')) {
     const verb = text.split(/\s+/, 1)[0];
     const cmd = verb.replace(/@\w+$/, ''); // tolerate /cmd@botname in groups
@@ -562,6 +576,10 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit']);
     const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
     if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null, threadId)];
+    // A `!shell` passthrough is VERBATIM into the topic pane (harness `!` convention): no wrap and
+    // no reply quote-anchor, so the `!` stays at column 0 — same rule as the flat path. Checked
+    // before the reply-anchor branch so a `!` reply is verbatim too.
+    if (text.startsWith('!')) return [{ kind: 'topic-route', threadId, injectText: text, from: name, messageId: m.message_id }];
     // §11 deferral 1: a prose reply carries the same ↩ «…» quote-anchor as flat-chat replies.
     // A /command reply still goes verbatim (the startsWith('/') guard above already passed it
     // through to the injectText path below).
@@ -577,7 +595,8 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // Carry the wrapped text so a SAME-BATCH re-spawn (which re-binds before this runs) can route
     // it to the now-live pane rather than dropping it (codex r9 #1). Never leaks to a flat agent.
     const deadText = m.text ?? '';
-    const deadInject = deadText ? (isLikelySlashCommand(deadText) ? deadText : opts.wrap(name, deadText, m.message_id)) : '';
+    const deadVerbatim = deadText.startsWith('!') || isLikelySlashCommand(deadText);
+    const deadInject = deadText ? (deadVerbatim ? deadText : opts.wrap(name, deadText, m.message_id)) : '';
     return [{ kind: 'topic-dead', threadId, injectText: deadInject, messageId: m.message_id }];
   }
   // awaiting-path / awaiting-model: a text answer to the /new flow. A path message advances the

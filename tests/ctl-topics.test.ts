@@ -232,6 +232,29 @@ test('topics ON: a slash-command in a BOUND topic injects VERBATIM (reaches the 
   expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '/compact', from: 'Alex', messageId: 11 });
 });
 
+test('topics ON: a `!shell` command in a BOUND topic injects VERBATIM (no wrap, `!` at column 0)', () => {
+  const r = stepUpdates(
+    [upd(15, { text: '!git status', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '!git status', from: 'Alex', messageId: 15 });
+});
+
+test('topics ON: a `!shell` REPLY in a BOUND topic is VERBATIM — no quote-anchor prepended', () => {
+  const r = stepUpdates(
+    [
+      upd(16, {
+        text: '!ls',
+        message_thread_id: 50,
+        is_topic_message: true,
+        reply_to_message: { message_id: 90, chat: { id: CHAT_ID }, date: NOW, text: 'earlier' },
+      }),
+    ],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]).toEqual({ kind: 'topic-route', threadId: 50, injectText: '!ls', from: 'Alex', messageId: 16 });
+});
+
 test('topics ON: media (no text) in a BOUND topic is ACKED only — never leaks to a flat agent', () => {
   const r = stepUpdates(
     [upd(12, { photo: [{ file_id: 'f' }], message_thread_id: 50, is_topic_message: true })],
