@@ -3,6 +3,12 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.37.0
+
+**Feature: agent-scoped tg replies.** A reply is now attributed to and routed for the current
+agent, with `--agent` / `--all` / `--untagged` selection, so multi-agent sessions no longer cross
+their inbound replies.
+
 ## 1.36.0
 
 **Feature: `!shell` messages are injected verbatim for harness passthrough.** A `!shell`-prefixed
