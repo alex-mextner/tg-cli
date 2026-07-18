@@ -391,36 +391,41 @@ See [docs/custom-emoji-system.md](docs/custom-emoji-system.md) for the full spec
 
 ---
 
-## Subagent identification (`--agent`)
+## Agent / subagent identification
 
-Agent branding (above) identifies which MODEL is talking. It cannot tell apart an
-orchestrator from the several subagents it fans work out to (Claude Code's Task tool
-and equivalents) — a recipient sees a message with no way to know WHICH subagent sent
-it, only that some AI did.
+The header carries the sender's identity in up to two brackets: `✳️ [window] [subagent]`.
+
+**`[window]` — the project, automatic, no flag.** The first bracket is the pane's tmux
+window name. When that name is a bare auto-rename default — a numeric window index, a
+shell/launcher name (`node`/`zsh`), or Claude Code's version string (`2.1.207`, which
+tmux `automatic-rename` stamps as the window name because the cc process reports its
+version as its command) — it carries no project signal, so `tg` falls back to the pane's
+**cwd project basename**. An orchestrator working in `~/xp/rig-cli` therefore auto-labels
+`[rig-cli]` with no flag, whatever the window is named. This is the MAIN/orchestrator
+agent's identity; it never needs a flag. Check what the current shell resolves to:
+`tg --detect-agent`.
+
+**`[subagent]` — a subagent self-label, explicit.** Agent branding (above) identifies
+which MODEL is talking; it cannot tell apart the several subagents an orchestrator fans
+work out to (Claude Code's Task tool and equivalents). A subagent adds a second bracket
+by passing its name explicitly:
 
 ```bash
-tg --agent hyperide-fixer "fixed the layout bug, PR #123 open"
+tg --subagent hyperide-fixer "fixed the layout bug, PR #123 open"
 # → ✳️ [window] [hyperide-fixer]
 #   fixed the layout bug, PR #123 open
 ```
 
-`--agent <label>` renders its own `[label]` bracket right after `[window]`, styled the
+`--subagent <label>` renders its own `[label]` bracket right after `[window]`, styled the
 same way (Sans-Serif Bold, `<b>` fallback for Cyrillic). `TG_AGENT` is the env
-equivalent — same precedence as `TG_AI_MODEL`: an explicit `--agent` flag wins, then
-`TG_AGENT`, then auto-detection.
+equivalent (same effect as the flag; the explicit flag wins). The deprecated `--agent`
+alias still parses to the same field.
 
-**Auto-detection today: Claude Code only.** A Claude Code Task-tool subagent's own
-process carries `CLAUDE_CODE_CHILD_SESSION=1` — present ONLY in a subagent, never in
-the top-level session — so `tg` can identify that a message came from a subagent when
-no `--agent`/`TG_AGENT` is given. When Claude sidechain metadata is readable under
-`~/.claude/projects/<project>/<session>/subagents/*.meta.json`, `tg` uses the
-subagent `description` as the label. It matches by agent id, by `toolUseId`, or by a
-single unambiguous fresh metadata record; if the match is ambiguous or unavailable, it
-falls back to `[subagent]`. **An orchestrator dispatching several subagents should
-still pass a descriptive `--agent <name>` when identity matters** — auto-detection is
-best-effort. Codex CLI (checked: 0.142.4) and opencode (checked: 1.17.10) expose no
-equivalent child/parent signal today; `--agent` is the only path there. Check what the
-current shell would auto-detect: `tg --detect-agent`.
+**No env-based auto-detection.** Earlier versions tried to auto-detect a subagent from
+`CLAUDE_CODE_CHILD_SESSION` / Claude sidechain metadata, but that env is NOT a reliable
+main-vs-subagent signal (it appears on subprocesses of the main session too), so it
+mislabelled the orchestrator itself as a generic `[subagent]`. That path was removed: a
+subagent bracket now comes ONLY from an explicit `--subagent`/`TG_AGENT`.
 
 Note: `tg-ctl`'s OWN `--agent <name>` (used by `tg-ctl ask --agent codex` / `tg-ctl
 harness-event`) is a DIFFERENT flag on a DIFFERENT binary — a closed harness-kind

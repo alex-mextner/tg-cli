@@ -59,14 +59,15 @@ export type ParseResult =
       // Explicit message tag (`--tag`). Rendered as a wordmark pill (custom-emoji
       // cells + readable word): `✳️ [window] 🔵 ANSWER`. Composes with `--title`.
       tag?: string;
-      // Explicit subagent/sender label (`--agent <name>`). Appears as its own
-      // `[agent]` bracket right after `[window]`: `✳️ [window] [agent] <title>`.
-      // Wins over the entrypoint's env-based auto-detection (see
-      // `features/agent-detect/detect.ts`) — an orchestrator dispatching many
-      // subagents should pass a descriptive name here (e.g. `--agent
-      // hyperide-fixer`) since metadata-based auto-detection is best-effort
-      // and may fall back to "some subagent".
-      agent?: string;
+      // Explicit SUBAGENT self-label (`--subagent <name>`; the deprecated
+      // `--agent` alias still parses). Appears as its own `[name]` bracket right
+      // after `[window]`: `✳️ [window] [name] <title>`. The MAIN/orchestrator
+      // agent needs NO flag — its `[window]` bracket already carries the project
+      // (resolveWindowAgentLabel derives it from the tmux window / cwd). This
+      // flag is for a Task-tool SUBAGENT to identify WHICH subagent sent the
+      // message (e.g. `--subagent hyperide-fixer`); there is no reliable env
+      // signal to auto-detect that, so it is explicit.
+      subagent?: string;
       // code-as-pdf: also attach the raw original file alongside the rendered
       // PDF (`--with-original`). Default is PDF-only for code/config files.
       withOriginal?: boolean;
@@ -356,7 +357,7 @@ export function parseArgs(
   let format: Format = 'plain';
   let title: string | undefined;
   let tag: string | undefined;
-  let agent: string | undefined;
+  let subagent: string | undefined;
   // Left undefined when the flag is absent so a no-flag parse result stays
   // byte-identical to before (the test suite asserts the send object with
   // toEqual and omits unset optional fields — same convention as title/tag).
@@ -437,25 +438,23 @@ export function parseArgs(
       i += 2;
       continue;
     }
-    // Explicit subagent/sender label: `--agent <name>`. Same "require a value,
-    // a `--`-prefixed next token is a missing value" contract as --title/--tag
-    // (a single-dash token like `-x` IS accepted as a literal value, same
-    // parity as those flags) — so `--agent --tag X` errors rather than
-    // swallowing `--tag` as the label. No content restriction (unlike --tag's
-    // lowercase-english set): the label is a free-form identifier an
-    // orchestrator picks per dispatch — it reaches Telegram HTML-escaped via
-    // styleWindowName (features/prefix-style/style.ts), same as `[window]`. A
-    // whitespace-only value (`--agent "   "`) is REJECTED the same as a
-    // missing one (review finding, tg#6254) — trimming it silently to '' would
-    // otherwise fall through to env/auto-detection below, breaking the
-    // documented "explicit flag always wins" invariant for what looks like an
-    // explicit choice.
-    if (arg === '--agent') {
+    // Explicit SUBAGENT self-label: `--subagent <name>` (the deprecated
+    // `--agent` alias is still accepted so in-flight callers don't break). Same
+    // "require a value, a `--`-prefixed next token is a missing value" contract
+    // as --title/--tag (a single-dash token like `-x` IS accepted as a literal
+    // value, same parity as those flags) — so `--subagent --tag X` errors rather
+    // than swallowing `--tag` as the label. No content restriction (unlike
+    // --tag's lowercase-english set): the label is a free-form identifier a
+    // subagent picks — it reaches Telegram HTML-escaped via styleWindowName
+    // (features/prefix-style/style.ts), same as `[window]`. A whitespace-only
+    // value (`--subagent "   "`) is REJECTED the same as a missing one — trimming
+    // it silently to '' would break the "explicit flag always wins" invariant.
+    if (arg === '--subagent' || arg === '--agent') {
       const nextArg = args[i + 1];
       if (!nextArg || nextArg.startsWith('--') || !nextArg.trim()) {
-        return { action: 'error', message: '--agent requires a value' };
+        return { action: 'error', message: `${arg} requires a value` };
       }
-      agent = nextArg.trim();
+      subagent = nextArg.trim();
       i += 2;
       continue;
     }
@@ -722,7 +721,7 @@ export function parseArgs(
   // A bare `--title`/`--tag`/`--table`/`--reply-to` still sends (a header-only
   // or table or reply message), so none of those is an empty invocation. The
   // `--table` body arrives on stdin, read by the entrypoint after parsing.
-  if (items.length === 0 && !caption && !title && !tag && !agent && !table && replyTo === undefined) {
+  if (items.length === 0 && !caption && !title && !tag && !subagent && !table && replyTo === undefined) {
     return { action: 'help' };
   }
   return {
@@ -732,7 +731,7 @@ export function parseArgs(
     format,
     title,
     tag,
-    agent,
+    subagent,
     withOriginal,
     noPdf,
     pdfDevice,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
-import { homedir, tmpdir } from "os"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs"
+import { tmpdir } from "os"
 import { join, resolve } from "path"
 // Explicit import (not the global `crypto`) so the multi-part groupId token
 // doesn't depend on a runtime global being present — review: tg-cli#131 f/u.
@@ -55,7 +55,7 @@ import { runReplies } from "./features/replies/cli"
 import { resolveWindowPanes } from "./features/replies/window"
 import { agentNameFromDisplayLine } from "./features/tg-ctl/agent-name"
 import { detectAgentViaAncestry, isProcessRunning } from "./features/branding/detect"
-import { detectAgentLabel } from "./features/agent-detect/detect"
+import { resolveWindowAgentLabel } from "./features/tg-ctl/agent-match"
 import { installSkill } from "./features/install-skill/install"
 import { shouldAutoStart } from "./features/tg-ctl/lock"
 import { planLineSpecs } from "./features/auto-attach/line-spec"
@@ -111,7 +111,7 @@ export const USAGE = `Usage:
   tg voice setup                # configure inbound voice→text (local Whisper STT)
   tg --ls-emoji-helpers
 
-The global options (--format, --tag, --title, --agent, --reply-to, --topic, the feature
+The global options (--format, --tag, --title, --subagent, --reply-to, --topic, the feature
 toggles) apply to ANY of the above forms — see Options below.
 
 Help topics (\`tg help <topic>\`):
@@ -158,19 +158,16 @@ Options:
                        set ESCALATION_GATE_ENFORCE=1 to make a table required
                        (hard error). An optional installed hook may also warn
                        on subtler cases without blocking — see 'tg hooks'.
-  --agent <name>        label the sender: "✳️ [window] [name] <title>". An
-                       orchestrator dispatching several subagents should pass a
-                       descriptive name here so the recipient can tell WHICH
-                       subagent sent a message (not just that some subagent
-                       did). When running as a Claude Code Task-tool subagent
-                       and no --agent is given, tg reads Claude sidechain
-                       metadata when available; otherwise it falls back to the
-                       generic "subagent" label (env:
-                       CLAUDE_CODE_CHILD_SESSION). No equivalent auto-detection
-                       exists for Codex CLI / opencode today. Also: TG_AGENT env
-                       (same precedence as TG_AI_MODEL: explicit flag wins,
-                       then env, then auto-detection). Check what would be
-                       auto-detected in the current shell: --detect-agent.
+  --subagent <name>     a SUBAGENT self-label: adds a second bracket after the
+                       window → "✳️ [window] [name] <title>", so the recipient can
+                       tell WHICH subagent sent the message. The MAIN/orchestrator
+                       agent needs NO flag — its [window] bracket already carries
+                       the project (the tmux window name, or its cwd basename when
+                       the window is auto-renamed to a version/shell). There is NO
+                       env-based subagent auto-detection: pass this flag to
+                       identify a subagent. Also: TG_AGENT env (same effect as the
+                       flag). Deprecated alias: --agent. Check the auto [window]
+                       label for the current shell: --detect-agent.
   --reply-to <id>      thread the outbound message UNDER an inbound Telegram
                        message (sets reply_to_message_id). The id is the inbound
                        message's Telegram message_id — the tg-ctl daemon surfaces
@@ -698,23 +695,34 @@ if (import.meta.main) {
 
   const AI_EMOJI = detectAiEmoji()
 
-  // --- Subagent/sender label (`[agent]` bracket, tg#6254) ---
-  // `--agent` (parsed below, in `parsed.agent`) wins when given; otherwise
-  // fall back to env-based auto-detection. See features/agent-detect/detect.ts
-  // for what IS and ISN'T auto-detectable per harness today.
-  const AGENT_LABEL_AUTO = detectAgentLabel(env, {
-    exists: existsSync,
-    readdir: (path) => readdirSync(path, { withFileTypes: true }),
-    readFile: (path) => readFileSync(path, "utf8"),
-    stat: (path) => {
-      try {
-        return statSync(path)
-      } catch {
-        return null
+  // --- Tmux context → the `[window]` header label ---
+  // The agent identity for the header bracket. Reads the pane's tmux window name
+  // AND its cwd, then resolveWindowAgentLabel picks the meaningful one: a real
+  // user-chosen window name leads; a bare auto-rename default (a numeric index, a
+  // shell/launcher name, or Claude Code's "2.1.207" version string that tmux
+  // auto-rename stamps as the window name) falls back to the cwd project basename
+  // → `rig-cli`, not `2.1.207`. buildPrefix wraps the result in [] and styles it.
+  const getTmuxWindow = (): string => {
+    if (!process.env.TMUX) return ""
+    try {
+      const pane = process.env.TMUX_PANE
+      const result = Bun.spawnSync(
+        ["tmux", "display-message", "-p", "-t", pane, "#{window_name}\t#{pane_current_path}"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      if (result.exitCode === 0) {
+        const raw = new TextDecoder().decode(result.stdout).replace(/\r?\n$/, "")
+        const tab = raw.indexOf("\t")
+        const windowName = tab >= 0 ? raw.slice(0, tab) : raw
+        const panePath = tab >= 0 ? raw.slice(tab + 1) : ""
+        return resolveWindowAgentLabel(windowName, panePath)
       }
-    },
-    homedir,
-  })
+    } catch {
+      // ignore — tmux not available or not in a pane
+    }
+    return ""
+  }
 
   // --- Emoji helpers listing ---
   const listEmojiHelpers = (): string => {
@@ -747,8 +755,16 @@ if (import.meta.main) {
     console.log(`${MODEL || "(none)"}\t${AI_EMOJI || "(none)"}`)
     process.exit(0)
   }
+  // Resolve the tmux window label only from here on: the `--detect-agent` info
+  // action and the real send need it, but the emoji/model info flags above must
+  // NOT pay for a `tmux display-message` subprocess they never read.
+  const tmuxWindow = getTmuxWindow()
   if (parsed.action === "detectAgent") {
-    console.log(AGENT_LABEL_AUTO || "(none)")
+    // The auto `[window]` label this session's messages get with no flag — the
+    // resolved tmux window name (or its cwd-basename fallback), or "(none)"
+    // outside tmux. There is NO env-based subagent auto-detection anymore; a
+    // subagent self-labels with `--subagent <name>`.
+    console.log(tmuxWindow || "(none)")
     process.exit(0)
   }
 
@@ -788,36 +804,16 @@ if (import.meta.main) {
   // harness can point the OUTBOUND sender at a mock Bot-API server (review qa bot harness).
   const API = `${process.env.TG_API_BASE || "https://api.telegram.org"}/bot${BOT_TOKEN}`
 
-  // --- Tmux context ---
-  // The raw tmux window name (no brackets). buildPrefix wraps it in [] and
-  // styles it (item 5: Mathematical Sans-Serif Bold, with a <b> fallback for
-  // Cyrillic/non-Latin names the math block can't represent).
-  const getTmuxWindow = (): string => {
-    if (!process.env.TMUX) return ""
-    try {
-      const pane = process.env.TMUX_PANE
-      const result = Bun.spawnSync(
-        ["tmux", "display-message", "-p", "-t", pane, "#{window_name}"], {
-        stdout: "pipe",
-        stderr: "pipe",
-      })
-      if (result.exitCode === 0) {
-        const name = new TextDecoder().decode(result.stdout).trim()
-        if (name) return name
-      }
-    } catch {
-      // ignore — tmux not available or not in a pane
-    }
-    return ""
-  }
+  const { items, caption: rawCaption, format, title, tag, subagent, withOriginal, noPdf, pdfDevice, replyTo, topic, table } = parsed
 
-  const tmuxWindow = getTmuxWindow()
-
-  const { items, caption: rawCaption, format, title, tag, agent, withOriginal, noPdf, pdfDevice, replyTo, topic, table } = parsed
-
-  // `--agent` wins over the env-based auto-detection computed above; an empty
-  // result from both means no `[agent]` bracket at all (unchanged default).
-  const AGENT_LABEL = agent || AGENT_LABEL_AUTO || undefined
+  // The optional SECOND `[name]` bracket is a SUBAGENT self-label — explicit
+  // only. `--subagent <name>` (parsed to `subagent`) wins; the `TG_AGENT` env is
+  // the same-precedence fallback for a subagent that sets it once in its shell.
+  // The MAIN/orchestrator agent passes neither and gets NO second bracket — its
+  // identity is the `[window]` label (tmuxWindow) above. There is deliberately NO
+  // env-based auto-detection: `CLAUDE_CODE_CHILD_SESSION` is not a reliable
+  // main-vs-subagent signal, so a guessed `[subagent]` bracket is never emitted.
+  const AGENT_LABEL = subagent || env.TG_AGENT?.trim() || undefined
 
   // Forum-topic thread id (docs/specs/tg-forum-topics.md §8): the explicit
   // `--topic <id>` flag wins; otherwise fall back to the TG_TOPIC env (merged

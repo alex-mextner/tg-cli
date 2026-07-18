@@ -116,13 +116,21 @@ test("main's real flags are all recognized (no unknown-flag regression)", () => 
     caption: '',
     format: 'plain',
   });
-  // --agent is matched and consumes a value, same as --title/--tag.
+  // --subagent (and its deprecated --agent alias) is matched and consumes a
+  // value, same as --title/--tag.
+  expect(parseArgs(['--subagent', 'sub-1', 'hi'], dir, HOME)).toEqual({
+    action: 'send',
+    items: [],
+    caption: 'hi',
+    format: 'plain',
+    subagent: 'sub-1',
+  });
   expect(parseArgs(['--agent', 'sub-1', 'hi'], dir, HOME)).toEqual({
     action: 'send',
     items: [],
     caption: 'hi',
     format: 'plain',
-    agent: 'sub-1',
+    subagent: 'sub-1',
   });
 });
 

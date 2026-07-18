@@ -200,7 +200,7 @@ export function groupBySession(candidates: AgentCandidate[], preserveOrder = fal
 
 // The basename of a cwd path (the project dir). Trailing slashes are stripped so
 // `/Users/u/xp/rig/` → `rig`. An empty/root path yields ''.
-function cwdBasename(path: string | undefined): string {
+function cwdBasename(path: string | null | undefined): string {
   if (!path) return '';
   const trimmed = path.replace(/\/+$/, '');
   if (!trimmed) return '';
@@ -238,6 +238,32 @@ export function isBareWindowName(name: string): boolean {
   if (/^\d+$/.test(t)) return true; // session/window index fallback
   if (/^\d+(\.\d+)+$/.test(t)) return true; // dotted version string (cc command)
   return DEFAULT_SHELL_NAMES.has(t);
+}
+
+// The AGENT LABEL for a pane's `[window]` bracket in an OUTBOUND `tg` header —
+// the tmux window name, EXCEPT when that name is a bare auto-rename default
+// (isBareWindowName: empty, a numeric window index, a dotted version string like
+// Claude Code's "2.1.207" pane_current_command, or a shell/launcher name). In
+// that case the window name carries no project signal, so fall back to the cwd
+// project basename — the SAME tier the `/agent` picker's distinctLabels uses, so
+// a message a session sends is labelled with the project the recipient would see
+// in the picker. Returns '' only when NEITHER signal is usable (empty window in a
+// root/empty cwd).
+//
+// This is the source fix for the `[2.1.207]` header leak: tmux's automatic-rename
+// sets a cc pane's window name to the version string it reports as its command;
+// leaning on the cwd basename here yields `[rig-cli]` regardless of the pane's
+// auto-rename setting. (Overlaps agentNameForPane on the unmerged
+// feat/replies-agent-scope branch — converge the two when that lands.)
+export function resolveWindowAgentLabel(
+  windowName: string | null | undefined,
+  panePath: string | null | undefined,
+): string {
+  const win = (windowName ?? '').trim();
+  if (win && !isBareWindowName(win)) return win;
+  const project = cwdBasename(panePath);
+  if (project) return project;
+  return win;
 }
 
 // Distinct, human-meaningful labels — one per candidate, SAME index order.

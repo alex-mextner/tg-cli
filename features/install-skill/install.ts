@@ -116,19 +116,22 @@ yet) or the message body itself distinguishes them. The tag word is not in the
 badge (any text after the dots is your \`--title\`/body). In-app, premium
 clients still see the full wordmark pill for the four tags that have one.
 
-## Subagent identification (\`--agent <label>\`) — REQUIRED when dispatching subagents
-If you are an orchestrator dispatching subagents (Claude Code Task tool or equivalent),
-and a subagent may call \`tg\` itself, ALWAYS pass \`--agent <descriptive-name>\` from that
-subagent so the recipient can tell WHICH subagent sent a message, not just that some AI
-did: \`tg --agent hyperide-fixer "done, PR #123 open"\` → \`✳️ [window] [hyperide-fixer] …\`.
+## Subagent identification (\`--subagent <label>\`) — REQUIRED when dispatching subagents
+The header shows the sender as \`✳️ [window] [subagent]\`. The MAIN/orchestrator agent
+needs NO flag: the \`[window]\` bracket already carries the project — it is the tmux window
+name, or the pane's cwd basename when the window is auto-renamed to a version/shell (so a
+session in \`~/xp/rig-cli\` shows \`[rig-cli]\`, never \`[2.1.207]\`).
 
-Auto-detection exists ONLY for Claude Code. It reads Claude sidechain metadata when available
-and otherwise falls back to the generic label \`subagent\` (env:
-\`CLAUDE_CODE_CHILD_SESSION\`). Codex CLI and opencode have no equivalent signal today. So:
-**don't rely on auto-detection** for anything that must be exact — pass \`--agent\` explicitly
-whenever the identity matters. \`TG_AGENT\` env is the same-precedence override as
-\`TG_AI_MODEL\` (flag wins, then env, then auto-detect).
-Check what the current shell would auto-detect: \`tg --detect-agent\`.
+If you are an orchestrator dispatching subagents (Claude Code Task tool or equivalent),
+and a subagent may call \`tg\` itself, ALWAYS pass \`--subagent <descriptive-name>\` from that
+subagent so the recipient can tell WHICH subagent sent a message, not just that some AI
+did: \`tg --subagent hyperide-fixer "done, PR #123 open"\` → \`✳️ [window] [hyperide-fixer] …\`.
+
+There is NO env-based auto-detection of a subagent (\`CLAUDE_CODE_CHILD_SESSION\` is not a
+reliable main-vs-subagent signal), so the subagent bracket is explicit-only: pass
+\`--subagent\` whenever the identity matters. \`TG_AGENT\` env has the same effect (flag wins).
+The deprecated alias \`--agent\` still works. Check the resolved \`[window]\` label for the
+current shell: \`tg --detect-agent\`.
 
 (Not the same flag as \`tg-ctl\`'s own \`--agent <name>\` — that one selects a closed
 harness kind for inbound telemetry, on a different binary.)
@@ -225,9 +228,9 @@ const SKILL_BLURB =
   'shows up in the injected `[TG from … #<id>]` wrap); the answer tag ' +
   'requires it. ' +
   'If you are an ORCHESTRATOR dispatching subagents that may call `tg` themselves, ' +
-  'ALWAYS pass `--agent <descriptive-name>` from each subagent so the recipient can ' +
-  'tell WHICH subagent sent a message — auto-detection is Claude Code only and may ' +
-  'fall back to "some subagent" when metadata is unavailable or ambiguous. ' +
+  'ALWAYS pass `--subagent <descriptive-name>` from each subagent so the recipient can ' +
+  'tell WHICH subagent sent a message — there is no env-based auto-detection, and the ' +
+  'main agent auto-labels `[window]` from its tmux window/cwd with no flag. ' +
   '`--format html` auto-sends a native Rich Message (tables, ' +
   'headings, lists, LaTeX formulas) when the body has a rich tag like `<table>`/' +
   '`<h1>`/`<ul>` — same flag, tg routes by content. `tg --table` is the plain ' +
