@@ -3,6 +3,12 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.40.1
+
+**Fix: `tg-ctl` self-heals the Claude hooks on daemon start.** If the Claude hook wiring is
+missing or stale when the daemon starts, it is repaired automatically instead of silently
+staying broken.
+
 ## 1.40.0
 
 **Feature: escalation-format enforcement for `--tag decision|question`, and markdown
