@@ -51,7 +51,10 @@ export interface StrayCjkFinding {
   chars: StrayCjkChar[];
 }
 
-function isCjk(ch: string): boolean {
+// Exported so the sibling mixed-script guard shares ONE definition of "CJK"
+// (features/cli/mixed-script-guard.ts) — the two guards' orthogonality depends on
+// them agreeing on which scripts are CJK, so they must not drift apart.
+export function isCjk(ch: string): boolean {
   return CJK_RE.test(ch);
 }
 

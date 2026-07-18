@@ -33,9 +33,13 @@ export const DEFAULT_FEATURES: FeatureMap = {
   'code-as-pdf': true,
   'attach-denylist': true,
   'recursive-attach': true,
-  // cjk-guard rejects a message with isolated CJK/ideographic codepoints stuck
-  // mid-word into otherwise Latin/Cyrillic text (the "hieroglyph in a normal
-  // word" bug); a genuinely CJK message passes. `--no-feature cjk-guard` off.
+  // cjk-guard rejects two "a garbled token slipped in" shapes: (1) an isolated
+  // CJK/ideographic codepoint stuck mid-word into otherwise Latin/Cyrillic text
+  // (the "hieroglyph in a normal word" bug); (2) a homoglyph/mojibake garbage
+  // word that mixes Cyrillic with a foreign alphabet in ONE token (e.g.
+  // "почčesна"). A genuinely CJK message and separate Cyrillic/Latin WORDS pass.
+  // `--no-feature cjk-guard` disables both. See features/cli/cjk-guard.ts and
+  // features/cli/mixed-script-guard.ts.
   'cjk-guard': true,
   // pre-send-photo hooks (agents-hooks/v1). ON by default, but it is a TRUE
   // no-op unless ~/.agents/hooks/tg/ exists (one `stat`), so default-ON costs

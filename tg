@@ -7,6 +7,7 @@ import { join, resolve } from "path"
 import { randomUUID } from "node:crypto"
 import { BOM_MAX_BYTES, maybeAddBom } from "./features/auto-attach/encoding"
 import { findStrayCjk, formatStrayCjkError } from "./features/cli/cjk-guard"
+import { findMixedScriptTokens, formatMixedScriptError } from "./features/cli/mixed-script-guard"
 import {
   applyFeatureFlags,
   parseFeatureConfig,
@@ -264,14 +265,20 @@ Never-attach denylist (feature, ON by default — toggle with --feature/--no-fea
   --photo/--file of such a file is an ERROR. Override consciously with
   --no-feature attach-denylist.
 
-Stray-CJK guard (feature, ON by default — toggle with --feature/--no-feature):
+Stray-CJK / mixed-script guard (feature cjk-guard, ON by default — toggle with
+--feature/--no-feature):
   A message (or --title) with a LONE CJK / ideographic character stuck mid-word
   into otherwise Latin/Cyrillic text (e.g. a garbled "ка<CJK>eat") is a HARD
   ERROR: the offending character and its position are named so you re-send
   clean. Only a lone CJK codepoint immediately FOLLOWED by a letter is flagged,
   so a genuinely CJK message, a bilingual word (Deploy到生产), and a CJK suffix
-  (iOS版) pass untouched. Override with --no-feature cjk-guard or
-  features.cjk-guard: false.
+  (iOS版) pass untouched.
+  The SAME feature flag also hard-blocks a mixed-script "garbage word" token —
+  a single contiguous run of letters where a foreign alphabet (Latin, Greek, …)
+  is sandwiched inside Cyrillic (e.g. "почčesна"), the homoglyph/mojibake shape
+  an LLM occasionally emits. Two SEPARATE words (влил PR), a hyphen-joined
+  compound (PR-ревью), and a glued acronym+suffix (IDшник) pass untouched.
+  Override either check with --no-feature cjk-guard or features.cjk-guard: false.
 
 Unknown flags:
   Unknown dashed tokens (e.g. --foo) are an ERROR: this help is printed to
@@ -926,6 +933,14 @@ if (import.meta.main) {
       const stray = findStrayCjk(text)
       if (stray) {
         console.error(`Error: ${formatStrayCjkError(stray)}`)
+        process.exit(1)
+      }
+      // Same feature, same gate: a homoglyph/mojibake "garbage word" that mixes
+      // Cyrillic with a foreign alphabet in ONE token (e.g. "почčesна") is the
+      // same "garbled token slipped in" class. See features/cli/mixed-script-guard.ts.
+      const mixed = findMixedScriptTokens(text)
+      if (mixed) {
+        console.error(`Error: ${formatMixedScriptError(mixed)}`)
         process.exit(1)
       }
     }
