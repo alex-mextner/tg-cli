@@ -33,6 +33,15 @@ export interface ParsedNewCommand {
   name: string;
   // The optional initial task to inject once the agent is up. Empty when omitted.
   task: string;
+  // Whether the `dir` token was consumed AFTER the name (an inline dir in the task
+  // region) rather than before it. The parser can't tell a real path from a bare
+  // harness command like `/compact` (both are absolute-looking, and existence is
+  // an fs check the pure parser must not do), so when the entrypoint later rejects
+  // an inline dir as non-existent it uses this to PREPEND the raw token back onto
+  // the task instead of dropping it — preserving `/new api /compact first` →
+  // task `/compact first` (codex #187). False for a dir given before the name (a
+  // leading bad path is a dir attempt, not task text) or when there is no dir.
+  dirAfterName: boolean;
 }
 
 // A few human-friendly aliases for the catalog model ids so a phone-typed `/new opus foo`
@@ -94,93 +103,121 @@ function resolvePostNameModelToken(token: string): string | null {
   return aliased && findModel(aliased) ? aliased : null;
 }
 
-// Parse the text of a `/new …` message into its parts. Tolerant of extra whitespace and of
-// the optional model/dir appearing in either order before the name. Never throws: a `/new`
-// with no name yields name === '' so the caller can show the usage hint.
+// One consumed selector token, tracked so the LAST one can be RECLAIMED as the name if selectors
+// swallowed every token (review #1: `/new opus` should NAME the session `opus`, not pick a model
+// and leave no name).
+type ConsumedSelector =
+  | { kind: 'harness'; raw: string; harness: SpawnHarness }
+  | { kind: 'model'; raw: string; model: string }
+  | { kind: 'dir'; raw: string; dir: string };
+
+// Working slots the parser fills token by token. Order-independent: a dir/harness/model fills its
+// (empty) slot wherever it appears, before OR after the name.
+interface ParseSlots {
+  harness: SpawnHarness | null;
+  model: string | null;
+  dir: string | null;
+  consumed: ConsumedSelector[];
+}
+
+// Try to consume `tok` into an empty selector slot (dir/harness/model), mutating `slots`. Returns
+// true when consumed. `nameSeen` gates model recognition: BEFORE the name any model alias resolves;
+// AFTER the name only a CONCRETE model-looking token does (a bare soft alias like `default`/`spark`
+// in the task must stay task text). An absolute-path token is a dir in ANY position (issue: an
+// inline dir arg after the name must be used, not treated as task text).
+function consumeSelector(tok: string, slots: ParseSlots, nameSeen: boolean): boolean {
+  const asHarness = resolveHarnessToken(tok);
+  if (asHarness && slots.harness === null) {
+    slots.harness = asHarness;
+    slots.consumed.push({ kind: 'harness', raw: tok, harness: asHarness });
+    return true;
+  }
+  const asModel = nameSeen ? resolvePostNameModelToken(tok) : resolveModelToken(tok);
+  if (asModel && slots.model === null) {
+    const entry = findModel(asModel);
+    // A model whose harness contradicts an already-chosen harness is NOT a selector (it stays task
+    // text / becomes the name) — `/new codex opus` keeps codex and names the session `opus`.
+    if (entry && (slots.harness === null || slots.harness === entry.kind)) {
+      slots.harness = entry.kind;
+      slots.model = asModel;
+      slots.consumed.push({ kind: 'model', raw: tok, model: asModel });
+      return true;
+    }
+  }
+  if (tok.startsWith('/') && slots.dir === null) {
+    slots.dir = tok;
+    slots.consumed.push({ kind: 'dir', raw: tok, dir: tok });
+    return true;
+  }
+  return false;
+}
+
+// Replay a run of consumed selectors into fresh slots, using the SAME assignment rules
+// consumeSelector applies (a model forces its harness). Single source so the reclaim path (below)
+// can never drift from the main scan if those rules change.
+function applyConsumed(consumed: ConsumedSelector[]): Pick<ParsedNewCommand, 'harness' | 'model' | 'dir'> {
+  let harness: SpawnHarness | null = null;
+  let model: string | null = null;
+  let dir: string | null = null;
+  for (const c of consumed) {
+    if (c.kind === 'model') {
+      model = c.model;
+      harness = findModel(c.model)?.kind ?? harness;
+    } else if (c.kind === 'harness') {
+      harness = c.harness;
+    } else {
+      dir = c.dir;
+    }
+  }
+  return { harness, model, dir };
+}
+
+// Parse the text of a `/new …` message into its parts. Order-tolerant: the dir/harness/model
+// selectors are recognized by SHAPE in any position (before or after the name); the first token
+// that fills no slot is the name, and everything after the name that fills no slot is the task.
+// Never throws: a `/new` with no name yields name === '' so the caller can show the usage hint.
 export function parseNewCommand(text: string): ParsedNewCommand {
   // Drop the leading verb (`/new` or `/new@botname`) and split the remainder on whitespace.
   const rest = text.replace(/^\/new(@\w+)?\s*/, '');
   const tokens = rest.length > 0 ? rest.split(/\s+/) : [];
-  let harness: SpawnHarness | null = null;
-  let model: string | null = null;
-  let dir: string | null = null;
-  // Track what each consumed prefix token was, so the last one can be RECLAIMED as the name if the
-  // prefix swallowed every token (review #1: `/new opus` should NAME the session `opus`, not pick a
-  // model and leave no name).
-  const consumed: Array<
-    | { kind: 'harness'; raw: string; harness: SpawnHarness }
-    | { kind: 'model'; raw: string; model: string }
-    | { kind: 'dir'; raw: string; dir: string }
-  > = [];
+  const slots: ParseSlots = { harness: null, model: null, dir: null, consumed: [] };
   let i = 0;
   let name = '';
   let nameSeen = false;
-  let postNameSelectorConsumed = false;
-  // Consume selectors before OR immediately after the name. The first non-selector, or the first
-  // token after one post-name selector, starts the task tail. This lets the harness/name order swap
-  // without making the entire task tail magical.
-  for (; i < tokens.length;) {
+  // Whether the dir slot was filled while the name was already seen (an inline dir
+  // AFTER the name). Used by the entrypoint to preserve a rejected inline token
+  // as task text (codex #187).
+  let dirAfterName = false;
+  // Consume selectors wherever they appear. Once the name is set, the first token that fills NO
+  // slot begins the task tail (so a task word that merely looks like a selector of the wrong
+  // harness, or a soft alias, stays in the task rather than being silently swallowed).
+  for (; i < tokens.length; i++) {
     const tok = tokens[i];
-    if (!nameSeen || !postNameSelectorConsumed) {
-      const asHarness = resolveHarnessToken(tok);
-      if (asHarness && harness === null) {
-        harness = asHarness;
-        consumed.push({ kind: 'harness', raw: tok, harness: asHarness });
-        if (nameSeen) postNameSelectorConsumed = true;
-        i++;
-        continue;
-      }
-      const asModel = nameSeen ? resolvePostNameModelToken(tok) : resolveModelToken(tok);
-      if (asModel && model === null) {
-        const entry = findModel(asModel);
-        if (entry && (harness === null || harness === entry.kind)) {
-          harness = entry.kind;
-          model = asModel;
-          consumed.push({ kind: 'model', raw: tok, model: asModel });
-          if (nameSeen) postNameSelectorConsumed = true;
-          i++;
-          continue;
-        }
-      }
-      if (!nameSeen && tok.startsWith('/') && dir === null) {
-        dir = tok;
-        consumed.push({ kind: 'dir', raw: tok, dir: tok });
-        i++;
-        continue;
-      }
+    const dirWasEmpty = slots.dir === null;
+    if (consumeSelector(tok, slots, nameSeen)) {
+      if (dirWasEmpty && slots.dir !== null && nameSeen) dirAfterName = true;
+      continue;
     }
     if (!nameSeen) {
       name = tok;
       nameSeen = true;
-      i++;
       continue;
     }
     break;
   }
+  const { harness, model, dir, consumed } = slots;
   // The prefix consumed EVERY token → there's no name. Reclaim the LAST consumed token as the name
   // (review #1): a bare `/new opus` / `/new sonnet` then NAMES the session after that word instead
   // of resolving it to a model with an empty name (which would only print the usage hint). Selector
   // slots each appear at most once, so replaying the remaining consumed selectors is unambiguous.
   if (!nameSeen && consumed.length > 0) {
     const last = consumed[consumed.length - 1];
-    harness = null;
-    model = null;
-    dir = null;
-    for (const c of consumed.slice(0, -1)) {
-      if (c.kind === 'model') {
-        const entry = findModel(c.model);
-        model = c.model;
-        harness = entry?.kind ?? harness;
-      } else if (c.kind === 'harness') {
-        harness = c.harness;
-      } else {
-        dir = c.dir;
-      }
-    }
-    return { harness, model, dir, name: last.raw, task: '' };
+    const replayed = applyConsumed(consumed.slice(0, -1));
+    // No name was ever seen, so any surviving dir came before it → not inline.
+    return { ...replayed, name: last.raw, task: '', dirAfterName: false };
   }
   const task = tokens.slice(i).join(' ');
-  return { harness, model, dir, name, task };
+  return { harness, model, dir, name, task, dirAfterName };
 }
 
 // --- parents-aware LRU/MRU directory ranker (issue #27 acceptance) ---
@@ -268,6 +305,21 @@ export function nameCollides(slug: string, existingWindowNames: ReadonlyArray<st
 export const NEW_MODEL_CALLBACK_PREFIX = 'tnm';
 export const NEW_DIR_CALLBACK_PREFIX = 'tnp';
 export const NEW_HARNESS_CALLBACK_PREFIX = 'tnh';
+// tnr:<token> — a "Retry spawn" tap after a spawn FAILURE. No extra field: the pending session
+// already holds name+dir+harness+model, so a retry re-runs the spawn WITHOUT re-asking anything.
+export const NEW_RETRY_CALLBACK_PREFIX = 'tnr';
+
+// Build the `tmux new-window` SESSION-TARGET argv fragment for a spawn. Returns `[]` when no
+// session is known (tmux then targets the current/only session). Otherwise returns
+// `['-a', '-t', `=${session}:`]`. The trailing `:` makes tmux treat the target as a SESSION rather
+// than a window index — CRITICAL when the session is named numerically (e.g. `1`): a bare `-t 1`
+// is misparsed as WINDOW INDEX 1 and fails with `create window failed: index 1 in use`. The `=`
+// forces an exact-name match and `-a` appends at the next free index. PURE — the single source both
+// the flat `/new` and forum-topic spawns use, so a numeric session name can never collide again.
+export function sessionTargetArgs(session: string | undefined): string[] {
+  if (!session) return [];
+  return ['-a', '-t', `=${session}:`];
+}
 
 export interface ParsedNewHarnessCallback {
   token: string;
@@ -290,6 +342,26 @@ export function parseNewHarnessCallback(data: string | undefined): ParsedNewHarn
   if (parts.length !== 3 || parts[0] !== NEW_HARNESS_CALLBACK_PREFIX || !parts[1] || !parts[2]) return null;
   const harness = resolveHarnessToken(parts[2]);
   return harness ? { token: parts[1], harness } : null;
+}
+
+export interface ParsedNewRetryCallback {
+  token: string;
+}
+
+// Parse `tnr:<token>` → {token}, or null on mismatch. A retry tap carries only the pending
+// session's token; the session still holds every prior answer, so no other field is needed.
+export function parseNewRetryCallback(data: string | undefined): ParsedNewRetryCallback | null {
+  if (!data) return null;
+  const parts = data.split(':');
+  if (parts.length !== 2 || parts[0] !== NEW_RETRY_CALLBACK_PREFIX || !parts[1]) return null;
+  return { token: parts[1] };
+}
+
+// The single-button "Retry spawn" keyboard offered after a spawn FAILURE. The callback carries the
+// session token so a tap re-runs the spawn with the already-chosen name/dir/harness/model — the
+// flow NEVER re-enters the questionnaire on failure (it reports the error once and offers retry).
+export function buildNewRetryKeyboard(token: string): Array<Array<{ text: string; callback_data: string }>> {
+  return [[{ text: 'Retry spawn', callback_data: `${NEW_RETRY_CALLBACK_PREFIX}:${token}` }]];
 }
 
 // Parse `tnm:<token>:<modelId>` → {token, modelId}, or null on mismatch. The modelId is NOT
@@ -353,7 +425,9 @@ export function buildNewDirKeyboard(
 //   awaiting-dir   — have a name; asked for the working directory (buttons + free text)
 //   awaiting-harness — have name + dir; asked for the harness (buttons)
 //   awaiting-model   — have name + dir + harness; asked for that harness's model (buttons)
-export type NewSessionStatus = 'awaiting-dir' | 'awaiting-harness' | 'awaiting-model';
+//   awaiting-retry   — have EVERY answer but the spawn FAILED; offered a single Retry button (a
+//                      failure never re-enters the questionnaire — the answers are all preserved)
+export type NewSessionStatus = 'awaiting-dir' | 'awaiting-harness' | 'awaiting-model' | 'awaiting-retry';
 
 // One in-flight flat `/new` session, held in memory by the entrypoint (NOT persisted: a `/new`
 // that a daemon restart interrupts is simply abandoned — the user re-runs `/new`, far simpler

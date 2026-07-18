@@ -106,6 +106,38 @@ exit 0
 `;
 }
 
+// A fake tmux that models the REAL "session named `1`" collision: list-panes reports the agent in
+// a session literally named `1`, and new-window emulates tmux's target parsing — a BARE numeric
+// `-t` target is read as a WINDOW INDEX and fails `create window failed: index 1 in use`, while a
+// `=1:` session target (trailing colon) succeeds. Proves the daemon targets the session
+// unambiguously (BUG 1: numeric session name must not be misparsed as a window index).
+function fakeTmuxNumericSession(cwd: string, spawnLog: string): string {
+  return `#!/bin/sh
+sub="$1"; shift
+case "$sub" in
+  list-panes) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '1' '1' '%1' '4241' 'claude' 'w1' '' '${cwd}' ;;
+  display-message) printf '1\\n' ;;
+  new-window)
+    printf 'new-window %s\\n' "$*" >> '${spawnLog}'
+    target=''; prev=''
+    for a in "$@"; do
+      if [ "$prev" = "-t" ]; then target="$a"; fi
+      prev="$a"
+    done
+    case "$target" in
+      *:) : ;;            # session target (trailing colon) — ok
+      '') : ;;            # no target — ok
+      *[!0-9]*) : ;;      # non-numeric bare name — tmux would resolve the session — ok
+      *) echo 'create window failed: index 1 in use' >&2; exit 1 ;;  # bare number = window index
+    esac
+    printf '%s\\n' '${SPAWNED_PANE}'
+    ;;
+  set-option) : ;; send-keys) : ;; load-buffer) cat > /dev/null ;;
+esac
+exit 0
+`;
+}
+
 function makeCfgDir(topics: boolean): { cfgDir: string; spawnLog: string } {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-new-'));
   cfgDirs.push(cfgDir);
@@ -241,6 +273,113 @@ test('full /new flow: command → dir tap → harness tap → model tap spawns o
 
   await waitFor(() => sent(sends, 'spawned `claude-opus`'));
   expect(sent(sends, 'spawned `claude-opus`')).toBe(true);
+  daemon.kill();
+});
+
+test('BUG 1: a NUMERIC tmux session name spawns successfully (no `index 1 in use` collision)', async () => {
+  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-new-'));
+  cfgDirs.push(cfgDir);
+  const spawnLog = join(cfgDir, 'spawn.log');
+  writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
+  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: false\n');
+  writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ paneId: '%1', cwd: cfgDir }));
+  mkdirSync(join(cfgDir, 'bin'));
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmuxNumericSession(cfgDir, spawnLog), { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'ps'), fakePs(), { mode: 0o755 });
+
+  // model+dir+name all inline → immediate spawn into the numeric session.
+  const { server, sends } = makeServer([[textMsg(150, `/new opus ${cfgDir} numsess`)]]);
+  const daemon = await startDaemon(cfgDir, server.port);
+
+  await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+  const argv = spawnArgvLog(spawnLog);
+  expect(argv.length).toBe(1);
+  // Session targeted unambiguously as a session (=1:), never a bare `-t 1`.
+  expect(argv[0]).toContain('-t =1:');
+  expect(argv[0]).not.toMatch(/-t 1(\s|$)/);
+  // The spawn SUCCEEDED — no collision error, no retry offered.
+  await waitFor(() => sent(sends, 'spawned `claude-opus`'));
+  expect(sent(sends, 'spawned `claude-opus`')).toBe(true);
+  expect(sent(sends, 'index 1 in use')).toBe(false);
+  expect(sent(sends, "couldn't start the agent")).toBe(false);
+  daemon.kill();
+});
+
+test('BUG 2: an inline absolute dir AFTER the name is used and skips the dir prompt', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  // `/new <name> <dir>` — the dir comes AFTER the name (the exact shape the CTO reported broken).
+  const queue: unknown[][] = [[textMsg(160, `/new hyperos ${cfgDir}`)]];
+  const { server, sends } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  // The dir prompt must be SKIPPED — the flow goes straight to the harness pick.
+  await waitFor(() => sent(sends, 'Which harness should `hyperos` use?'));
+  expect(sent(sends, 'Which harness should `hyperos` use?')).toBe(true);
+  expect(sent(sends, 'Pick a recent project')).toBe(false);
+  expect(sent(sends, 'Which directory should')).toBe(false);
+  // Finish the flow and confirm it spawns in the inline dir.
+  queue.push([harnessTap(161, 'n1', 'claude')]);
+  await waitFor(() => sent(sends, 'Which Claude model should `hyperos` run?'));
+  queue.push([modelTap(162, 'n1', 'claude-default')]);
+  await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+  expect(spawnArgvLog(spawnLog)[0]).toContain(`-c ${cfgDir}`);
+  daemon.kill();
+});
+
+test('an inline /command after the name is preserved as task text, not a dropped dir (codex #187)', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  // `/new api /compact first`: `/compact` looks like a dir (absolute) but is a
+  // harness passthrough, not a real directory. It must NOT raise the bad-dir error
+  // and must NOT be dropped — it is preserved at the FRONT of the task, and the dir
+  // prompt is asked normally. The whole task reaches the spawned agent as
+  // `/compact first`.
+  const queue: unknown[][] = [[textMsg(200, '/new api /compact first')]];
+  const { server, sends } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'Pick a recent project') || sent(sends, 'is not an absolute existing directory'));
+  expect(sent(sends, 'is not an absolute existing directory')).toBe(false);
+  expect(sent(sends, 'Pick a recent project')).toBe(true);
+  // Complete the flow: tap the recent dir (cfgDir), harness, model → spawn.
+  queue.push([dirTap(201, 'n1', 0)]);
+  await waitFor(() => sent(sends, 'Which harness should `api` use?'));
+  queue.push([harnessTap(202, 'n1', 'claude')]);
+  await waitFor(() => sent(sends, 'Which Claude model should `api` run?'));
+  queue.push([modelTap(203, 'n1', 'claude-default')]);
+  await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+  // The preserved task is the trailing positional prompt, after the `--` separator.
+  expect(spawnArgvLog(spawnLog)[0]).toContain('-- /compact first');
+  daemon.kill();
+});
+
+test('an inline single-component absolute dir after the name is used, not treated as a command (codex #187)', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  // Guards the P1 regression: a single-segment path like /tmp is a REAL directory,
+  // so it must be used as the dir (skip the prompt), never mistaken for a command.
+  const queue: unknown[][] = [[textMsg(210, '/new svc /tmp keep running')]];
+  const { server, sends } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'Which harness should `svc` use?'));
+  expect(sent(sends, 'Which harness should `svc` use?')).toBe(true);
+  expect(sent(sends, 'Pick a recent project')).toBe(false);
+  expect(sent(sends, 'is not an absolute existing directory')).toBe(false);
+  queue.push([harnessTap(211, 'n1', 'claude')]);
+  await waitFor(() => sent(sends, 'Which Claude model should `svc` run?'));
+  queue.push([modelTap(212, 'n1', 'claude-default')]);
+  await waitFor(() => spawnArgvLog(spawnLog).length > 0);
+  expect(spawnArgvLog(spawnLog)[0]).toContain('-c /tmp');
+  expect(spawnArgvLog(spawnLog)[0]).toContain('-- keep running');
+  daemon.kill();
+});
+
+test('an inline nonexistent MULTI-component path after the name still errors, not preserved as task (codex #187)', async () => {
+  const { cfgDir } = makeCfgDir(false);
+  // `/does/not/exist` is not command-shaped (a second slash) — it is a genuine
+  // dir typo, so it must raise the invalid-directory error, NOT be silently
+  // buried in the task. Mirrors the typed-path flow's isLikelySlashCommand gate.
+  const queue: unknown[][] = [[textMsg(220, '/new proj /does/not/exist fix the bug')]];
+  const { server, sends } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'is not an absolute existing directory'));
+  expect(sent(sends, 'is not an absolute existing directory')).toBe(true);
   daemon.kill();
 });
 
@@ -473,7 +612,14 @@ test('/new with no harness/model asks harness first, then models for that harnes
   daemon.kill();
 });
 
-test('a spawn FAILURE leaves the session retryable and re-posts the model keyboard (review #3/#5)', async () => {
+function retryTap(id: number, token: string): unknown {
+  return {
+    update_id: id,
+    callback_query: { id: `cb${id}`, from: { id: 1, first_name: 'Alex' }, message: { message_id: id, chat: { id: 1 }, date: 0 }, data: `tnr:${token}` },
+  };
+}
+
+test('a spawn FAILURE offers a Retry button and does NOT re-ask the model (BUG 1: no loop)', async () => {
   const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-new-'));
   cfgDirs.push(cfgDir);
   const spawnLog = join(cfgDir, 'spawn.log');
@@ -493,20 +639,91 @@ test('a spawn FAILURE leaves the session retryable and re-posts the model keyboa
   await waitFor(() => sent(sends, 'Which Codex model should `retryme` run?'));
   queue.push([modelTap(111, 'n1', 'codex-gpt-5.5')]);
 
-  // The spawn fails → an error posts AND a fresh model keyboard is re-offered (session retryable).
+  // The spawn fails → the error posts ONCE and a Retry button is offered (session preserved).
   await waitFor(() => sent(sends, "couldn't start the agent"));
   expect(sent(sends, "couldn't start the agent")).toBe(true);
-  // The model prompt re-appears (count >= 2: the first ask + the re-ask after failure).
+  await Bun.sleep(200);
+  // BUG 1 regression guard: the model question is asked exactly ONCE (the initial ask) — the
+  // failure must NOT re-enter the questionnaire.
   const modelPrompts = sends.filter((s) => String(s.text ?? '').includes('Which Codex model should `retryme` run?'));
-  expect(modelPrompts.length).toBeGreaterThanOrEqual(2);
+  expect(modelPrompts.length).toBe(1);
+  // A Retry button was offered (tnr:<token>), carrying the preserved session.
+  const retryPrompt = sends.find((s) => {
+    const kb = (s.reply_markup as { inline_keyboard?: Array<Array<{ callback_data?: string }>> } | undefined)?.inline_keyboard ?? [];
+    return kb.some((row) => row.some((b) => String(b.callback_data ?? '').startsWith('tnr:')));
+  });
+  expect(retryPrompt).toBeDefined();
 
-  // Now clear the failure and re-tap → it spawns.
+  // Now clear the failure and tap Retry → it spawns with the preserved answers (no re-ask).
   rmSync(failFlag, { force: true });
-  queue.push([modelTap(112, 'n1', 'codex-gpt-5.5')]);
+  queue.push([retryTap(112, 'n1')]);
   await waitFor(() => spawnArgvLog(spawnLog).length > 0);
   expect(spawnArgvLog(spawnLog).length).toBe(1);
+  expect(spawnArgvLog(spawnLog)[0]).toContain('codex --model gpt-5.5');
   await waitFor(() => sent(sends, 'spawned `codex-gpt-5.5`'));
   expect(sent(sends, 'spawned `codex-gpt-5.5`')).toBe(true);
+  daemon.kill();
+});
+
+test('a forged/expired Retry tap (no pending session) is refused and does NOT spawn', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  // No /new was ever run, so token `n1` has no pending session — the tap must be refused.
+  const { server, callbacks } = makeServer([[retryTap(170, 'n1')]]);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => callbacks.some((c) => String(c.text ?? '').includes('run /new again')));
+  expect(callbacks.some((c) => String(c.text ?? '').includes('run /new again'))).toBe(true);
+  await Bun.sleep(150);
+  expect(spawnArgvLog(spawnLog)).toEqual([]); // never spawned
+  daemon.kill();
+});
+
+test('a Retry tap on a session that never failed (awaiting-model) is refused (wrong state)', async () => {
+  const { cfgDir, spawnLog } = makeCfgDir(false);
+  // harness+dir supplied → session sits at awaiting-model (no failure yet). A retry tap here is
+  // out-of-state and must be refused, not spawn.
+  const queue: unknown[][] = [[textMsg(180, `/new codex ${cfgDir} wrongstate`)]];
+  const { server, sends, callbacks } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'Which Codex model should `wrongstate` run?'));
+  queue.push([retryTap(181, 'n1')]);
+  await waitFor(() => callbacks.some((c) => String(c.text ?? '').includes('nothing to retry')));
+  expect(callbacks.some((c) => String(c.text ?? '').includes('nothing to retry'))).toBe(true);
+  await Bun.sleep(150);
+  expect(spawnArgvLog(spawnLog)).toEqual([]);
+  daemon.kill();
+});
+
+test('a Retry after the working dir vanished re-asks for a dir and does NOT spawn into nothing', async () => {
+  const cfgDir = mkdtempSync(join(tmpdir(), 'tgctl-new-'));
+  cfgDirs.push(cfgDir);
+  const spawnLog = join(cfgDir, 'spawn.log');
+  const failFlag = join(cfgDir, 'FAIL_SPAWN');
+  const workdir = join(cfgDir, 'workdir'); // a real dir we delete before the retry
+  mkdirSync(workdir);
+  writeFileSync(failFlag, '1');
+  writeFileSync(join(cfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
+  writeFileSync(join(cfgDir, 'config.yaml'), 'control:\n  enabled: true\n  topics: false\n');
+  writeFileSync(join(cfgDir, 'tg-ctl.123.registration.json'), JSON.stringify({ paneId: '%1', cwd: cfgDir }));
+  mkdirSync(join(cfgDir, 'bin'));
+  writeFileSync(join(cfgDir, 'bin', 'tmux'), fakeTmuxFailable(cfgDir, spawnLog, failFlag), { mode: 0o755 });
+  writeFileSync(join(cfgDir, 'bin', 'ps'), fakePs(), { mode: 0o755 });
+
+  const queue: unknown[][] = [[textMsg(190, `/new codex ${workdir} vanish`)]];
+  const { server, sends } = makeServer(queue);
+  const daemon = await startDaemon(cfgDir, server.port);
+  await waitFor(() => sent(sends, 'Which Codex model should `vanish` run?'));
+  queue.push([modelTap(191, 'n1', 'codex-gpt-5.5')]);
+  await waitFor(() => sent(sends, "couldn't start the agent"));
+
+  // Delete the working dir, then clear the spawn failure and tap Retry: the dir is now gone, so the
+  // flow must re-ask for a directory rather than spawn into a vanished cwd.
+  rmSync(workdir, { recursive: true, force: true });
+  rmSync(failFlag, { force: true });
+  queue.push([retryTap(192, 'n1')]);
+  await waitFor(() => sent(sends, 'is not an absolute existing directory'));
+  expect(sent(sends, 'is not an absolute existing directory')).toBe(true);
+  await Bun.sleep(150);
+  expect(spawnArgvLog(spawnLog)).toEqual([]); // never spawned into the vanished dir
   daemon.kill();
 });
 
