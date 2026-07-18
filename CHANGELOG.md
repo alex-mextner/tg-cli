@@ -10,7 +10,8 @@ semantic versioning.
 - `/tasks` (the lifecycle board) now shows a Review column alongside the existing ones.
 - The `--title` guard already refused a `tg#<id>` message reference (inert in the one-line
   header, only duplicates a followable body reference). It now also refuses a bare ticket
-  code (`HYP-1234`, any `TEAM-<n>`), naming the first offending code in the error. A
+  code (`HYP-1234`, any 3-uppercase-letter `TEAM-<n>`), naming the first offending code in
+  the error. A
   compound list (`HYP-1/2/3`) is caught too; GitHub-style `#N` stays allowed since it is
   not a code and `closes #42` is legitimate.
 
