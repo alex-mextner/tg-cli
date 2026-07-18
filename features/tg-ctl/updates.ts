@@ -14,7 +14,7 @@ import type { Action, ControlConfig, StepResult, TgMessage, TgUpdate, TopicStatu
 import { parseButtonCallback, parseQuestionCloseCallback } from './questions';
 import { isAgentCommand, parseAgentCallback, parseAgentCancelCallback, parseAgentCommand } from './agent-match';
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
-import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback } from './new-command';
+import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback, parseNewRetryCallback } from './new-command';
 import { parseTasksCallback, parseTasksCommand } from './tasks-command';
 import { parseContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
@@ -219,6 +219,16 @@ export function stepUpdates(updates: TgUpdate[], opts: StepOpts): StepResult {
           callbackQueryId: cb.id,
           token: newDirCb.token,
           index: newDirCb.index,
+          messageId: cb.message?.message_id ?? null,
+        });
+        continue;
+      }
+      const newRetryCb = parseNewRetryCallback(cb.data);
+      if (newRetryCb) {
+        callbackActions.push({
+          kind: 'new-retry',
+          callbackQueryId: cb.id,
+          token: newRetryCb.token,
           messageId: cb.message?.message_id ?? null,
         });
         continue;
@@ -470,7 +480,7 @@ function textAction(
     }
     if (cmd === '/new') {
       const p = parseNewCommand(text);
-      return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, from: name, ...topic };
+      return { kind: 'new-command', harness: p.harness, model: p.model, dir: p.dir, name: p.name, task: p.task, dirAfterName: p.dirAfterName, from: name, ...topic };
     }
     return { kind: 'inject-text', text, messageId };
   }
