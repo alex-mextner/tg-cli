@@ -236,13 +236,18 @@ const QUESTION = {
 
 // Permission fixture — uses PermissionRequest so no toolInput round-trip is needed.
 // callbackRequestId('p_durable') === 'p_durable' (short, clean string), so the
-// callback_data values are the literal strings constructed below.
+// callback_data values are the literal strings constructed below. `promptTurnId`
+// is the turn-level identity proof (hook-normalize.ts's invocationSeed, carried
+// through as ButtonRequest.promptTurnId) that a QUEUED decision's automatic,
+// no-time-bound delivery on reconnect now requires — this fixture stands in for
+// a modern harness payload that actually carries prompt_id/turn_id.
 const PERMISSION = {
   requestId: 'p_durable',
   agent: 'claude',
   kind: 'permission',
   question: 'Allow bash command: rm -rf /tmp/test?',
   permissionEvent: 'PermissionRequest',
+  promptTurnId: 'turn_durable',
 };
 
 const RESTORE_WAIT_MS = 15_000;
@@ -264,6 +269,53 @@ function hasPersistedQuestion(cfgDir: string, requestId: string): boolean {
   };
   return Boolean(state.questions?.some((q) => q.req?.requestId === requestId));
 }
+
+test('INTRA-TURN IDENTITY (tg#9982 follow-up): two DISTINCT tool invocations with byte-identical raw payload + prompt_id in the SAME turn get DIFFERENT requestIds, never collide', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  const daemon = await startDaemon(cfgDir, tg.port);
+
+  // A RAW harness-shaped payload (no explicit requestId — this exercises
+  // hook-normalize.ts's actual hashing, unlike the already-normalized PERMISSION
+  // fixture used elsewhere in this file). Two SEPARATE `tg-ctl ask` processes
+  // send the identical session_id + prompt_id + tool + tool_input — modeling the
+  // agent calling the exact same command twice within ONE prompt turn (prompt_id
+  // is stable for the whole turn, not per tool call). Each process generates its
+  // OWN env.invocationNonce, which is what must keep them from colliding.
+  const rawPermission = {
+    session_id: 'sess_intraturn',
+    hook_event_name: 'PermissionRequest',
+    tool_name: 'Bash',
+    tool_input: { command: 'echo hi' },
+    prompt_id: 'prompt-same-turn',
+  };
+
+  const ask1 = startAsk(cfgDir, tg.port, rawPermission);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  const approveData = tg.optionData(0)!; // row 0, first button = Approve
+  ask1.kill(9);
+  await ask1.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
+
+  // Tap Approve on invocation #1 — queued (no live hook to deliver to).
+  tg.push([tap(approveData, 825, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+
+  // Invocation #2: a SEPARATE process, byte-identical payload. If it collided
+  // with #1's requestId, this would either auto-deliver the queued "Approve"
+  // (WRONG — the human never saw or decided on THIS invocation) or reconnect to
+  // the SAME card. Instead it must be treated as a genuinely new, unrelated
+  // request: a SECOND card.
+  const ask2 = startAsk(cfgDir, tg.port, rawPermission);
+  expect(await until(() => tg.cards().length === 2, 5000)).toBe(true);
+  expect(daemonLog(cfgDir)).not.toContain('ask-forward queued-decision-delivered');
+
+  ask2.kill(9);
+  await ask2.exited;
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
 
 test('persist: a forwarded scoped question is written to the durable state file', async () => {
   const cfgDir = makeCfgDir();
@@ -614,9 +666,16 @@ test('LONG OUTAGE (queued permission): a queued decision that never reconnects g
 
   // No reconnect ever comes. Even with a QUEUED decision sitting on the entry, the
   // daemon must still eventually give up and say so plainly — a queued card is not
-  // exempt from the "long silence must be reported" guarantee.
+  // exempt from the "long silence must be reported" guarantee. The give-up text
+  // must NAME the queued decision ("Approve") rather than implying nothing was
+  // ever chosen — that's the whole point of threading queuedDecisionLabel through
+  // abandonedLongOutageText (a tapped decision that never got delivered is a
+  // materially different situation from a card nobody ever touched).
   expect(await until(() => tg.edits().some((e) => e.includes('still no connection')), 6000)).toBe(true);
   expect(daemonLog(cfgDir)).toContain('ask-abandoned-long-outage');
+  const giveUpEdit = tg.edits().find((e) => e.includes('still no connection'));
+  expect(giveUpEdit).toContain('queued "Approve"');
+  expect(giveUpEdit).toContain('never delivered');
 }, 25_000);
 
 test('LONG OUTAGE (daemon down across the window): the notice still fires on restore, never silently discarded', async () => {
@@ -664,6 +723,130 @@ test('LONG OUTAGE (daemon down across the window): the notice still fires on res
 
   daemon3.kill('SIGTERM');
   await daemon3.exited;
+}, 35_000);
+
+test('LONG OUTAGE (both thresholds crossed while the daemon was DOWN): the restore path gives up and names the queued decision, no "still waiting" notice', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  // Both thresholds tiny and equal-ish, so the daemon-down gap below crosses BOTH
+  // before restore even runs — this exercises the RESTORE-loop give-up branch
+  // (tg-ctl's bootstrap block, `nowRestore - rec.at > ABANDONED_RETAIN_MS`), which
+  // never adds the entry to `abandonedButtons` at all, so `noticeStaleQueuedDecisions`
+  // never sees it. It's a DIFFERENT code path from the live-sweep skip guard (see
+  // "LONG OUTAGE (live sweep crosses both thresholds together)" below) — this one
+  // proves the restore path's own give-up correctly threads queuedDecision through
+  // to notifyAbandonedLongOutage (a real bug this diff also fixed: the restore-time
+  // give-up used to construct an AbandonedButton with no queuedDecision at all).
+  const daemon1 = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_QUEUED_DECISION_NOTICE_MS: '300' });
+
+  const ask = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  ask.kill(9);
+  await ask.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
+
+  tg.push([tap('tgq:p_durable:allow', 820, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+
+  // Kill the daemon RIGHT after the tap (notifiedAt still unset) and wait past
+  // BOTH thresholds with the daemon fully down.
+  daemon1.kill(9);
+  await daemon1.exited;
+  await Bun.sleep(900);
+
+  const daemon2 = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '600', TG_CTL_QUEUED_DECISION_NOTICE_MS: '300' });
+  expect(await until(() => tg.edits().some((e) => e.includes('still no connection')), 8000)).toBe(true);
+
+  // The give-up notice must name the queued decision, and the "still waiting to
+  // reconnect" notice must NEVER have fired for this entry (it's being pruned in
+  // the very same sweep that would have fired it).
+  const lastEdit = tg.edits().at(-1);
+  expect(lastEdit).toContain('queued "Approve"');
+  expect(daemonLog(cfgDir)).not.toContain('ask-permission-decision-queue-still-waiting-notice');
+  expect(daemonLog(cfgDir)).toContain('ask-abandoned-long-outage');
+
+  daemon2.kill('SIGTERM');
+  await daemon2.exited;
+}, 35_000);
+
+test('LONG OUTAGE (live sweep crosses both thresholds together): the running daemon\'s own poll-loop sweep skips the "still waiting" notice for an entry it is about to give up on', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  // NOTICE_MS === RETAIN_MS (not merely "tiny and close"): with a single value,
+  // the FIRST live sweep to observe the entry past that shared threshold sees
+  // BOTH `now - qd.at > NOTICE_MS` (notice-eligible) AND `now - entry.at >=
+  // RETAIN_MS` (skip-guard-active) true at once — this is the actual
+  // noticeStaleQueuedDecisions skip-guard race (no daemon restart involved),
+  // proving the LIVE sweep — not just the restore path — never lets a
+  // since-pruned card keep claiming "still waiting … will still be delivered"
+  // with a live keyboard.
+  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_ABANDONED_RETAIN_MS: '500', TG_CTL_QUEUED_DECISION_NOTICE_MS: '500' });
+
+  const ask = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  ask.kill(9);
+  await ask.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
+
+  tg.push([tap('tgq:p_durable:allow', 822, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+
+  // No reconnect, no further tap — the daemon stays UP and running the whole
+  // time, so its own poll-loop sweep (not a restart/restore) is what has to get
+  // this right.
+  expect(await until(() => daemonLog(cfgDir).includes('ask-abandoned-long-outage'), 8000)).toBe(true);
+  expect(daemonLog(cfgDir)).not.toContain('ask-permission-decision-queue-still-waiting-notice');
+  const lastEdit = tg.edits().at(-1);
+  expect(lastEdit).toContain('queued "Approve"');
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 25_000);
+
+test('QUEUED DECISION NOTICE survives a daemon restart (notifiedAt persisted): the notice never re-fires after a bounce', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+  // A generous retention window (the notice must survive well within it) but a
+  // tiny notice threshold, so the notice fires while the daemon is still up.
+  const daemon1 = await startDaemon(cfgDir, tg.port, { TG_CTL_QUEUED_DECISION_NOTICE_MS: '300' });
+
+  const ask = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  ask.kill(9);
+  await ask.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
+
+  tg.push([tap('tgq:p_durable:allow', 821, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+  expect(await until(() => daemonLog(cfgDir).includes('ask-permission-decision-queue-still-waiting-notice'), 4000)).toBe(true);
+
+  // Bounce the daemon RIGHT after the notice fired — `notifiedAt` must have been
+  // persisted immediately (not only on the next unrelated mutation), the same
+  // durability guarantee the queue itself gets.
+  daemon1.kill(9);
+  await daemon1.exited;
+
+  const daemon2 = await startDaemon(cfgDir, tg.port, { TG_CTL_QUEUED_DECISION_NOTICE_MS: '300' });
+  expect(await until(() => daemonLog(cfgDir).includes('questions restored'), RESTORE_WAIT_MS)).toBe(true);
+
+  // Give the poll-loop sweep a chance to run — the notice must NOT re-fire.
+  await Bun.sleep(600);
+  const noticeCount = (daemonLog(cfgDir).match(/ask-permission-decision-queue-still-waiting-notice/g) ?? []).length;
+  expect(noticeCount).toBe(1);
+
+  // And the queued decision itself must still be fully alive and deliverable.
+  const ask2 = startAsk(cfgDir, tg.port, PERMISSION);
+  const out = await new Response(ask2.stdout).text();
+  await ask2.exited;
+  expect(JSON.parse(out)).toMatchObject({
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
+  });
+
+  daemon2.kill('SIGTERM');
+  await daemon2.exited;
 }, 35_000);
 
 test('RESTORE→TAP→LATE-DELIVER (headline): a SIGKILLed daemon restores a pending question and a tap after restart injects it into the pane', async () => {
@@ -1180,16 +1363,118 @@ test('PERM QUEUE MISMATCH GUARD (toolInput): a reconnect with the SAME question 
   await daemon.exited;
 }, 30_000);
 
-test('PERM QUEUE DELIVERY WINDOW: a reconnect long after the tap is treated as an unrelated later request, not auto-approved', async () => {
+test('PERM QUEUE MISMATCH GUARD (no promptTurnId): a reconnect with the SAME requestId AND matching payload but NO turn-level identity proof never auto-approves', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
 
-  // Tiny delivery window (distinct from ABANDONED_RETAIN_MS): a genuine reconnect
-  // lands within seconds, so a "reconnect" arriving after this window is presumed
-  // to be a later, only-coincidentally-identical request, not the human's earlier
-  // tap reapplied — it must NOT be silently rubber-stamped onto it.
-  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_QUEUED_DECISION_DELIVERY_MS: '500' });
+  // Without prompt_id/turn_id (an older Claude Code, a harness with no
+  // equivalent field, or a manual/back-compat caller), requestId is only
+  // SESSION-scoped -- a same-session re-run of an identical command is a
+  // routine, non-malicious occurrence, so auto-delivery must be refused
+  // entirely, not merely time-bounded. This must NOT be a silent drop either:
+  // the card is restored to a LIVE, freshly-buttoned prompt (not left dead, not
+  // left falsely claiming "queued") -- visibly pending again so the human can
+  // explicitly re-decide, rather than a stale tap being silently reapplied.
+  const { promptTurnId, ...noTurnId } = PERMISSION;
+  void promptTurnId;
+
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const ask1 = startAsk(cfgDir, tg.port, noTurnId);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  ask1.kill(9);
+  await ask1.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
+
+  tg.push([tap('tgq:p_durable:allow', 817, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+
+  // Byte-identical payload "reconnects" immediately -- exact requestId match,
+  // exact payload match -- yet must NOT auto-deliver: there is no proof this is
+  // the SAME invocation rather than a routine same-session re-run.
+  const ask2 = startAsk(cfgDir, tg.port, noTurnId);
+  expect(await until(() => daemonLog(cfgDir).includes('no promptTurnId'), 6000)).toBe(true);
+  expect(daemonLog(cfgDir)).not.toContain('ask-forward queued-decision-delivered');
+
+  // The card must come back LIVE with fresh buttons (buildButtonMessage's own
+  // text, no "queued"/"disconnected" wording) -- proving the tap wasn't just
+  // silently thrown away with no visible trace.
+  expect(await until(() => daemonLog(cfgDir).includes('ask-forward reattached'), 4000)).toBe(true);
+  const lastEdit = tg.edits().at(-1);
+  expect(lastEdit).not.toContain('queued');
+  expect(lastEdit).not.toContain('hook disconnected');
+  expect(lastEdit).toContain('Allow bash command: rm -rf /tmp/test?');
+
+  // And it must be genuinely re-tappable: a fresh Approve on THIS live prompt
+  // still resolves the reconnecting hook's own request normally (not stuck,
+  // not silently ignored).
+  tg.push([tap('tgq:p_durable:allow', 823, 1)]);
+  const out = await new Response(ask2.stdout).text();
+  await ask2.exited;
+  expect(JSON.parse(out)).toMatchObject({
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
+  });
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('PERM QUEUE NOTICE (no promptTurnId): a queued decision with no turn-level identity proof gets NO "still be delivered automatically" notice — that promise would be false for it', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  // The "still waiting to reconnect ... will still be delivered automatically"
+  // notice must never fire for an entry that CAN'T actually auto-deliver on
+  // reconnect (the promptTurnId gate in handleHookSocketLine refuses it) --
+  // saying so anyway would tell the human to sit on their hands about a
+  // decision that, in fact, needs a fresh re-tap (review finding).
+  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_QUEUED_DECISION_NOTICE_MS: '300' });
+  const { promptTurnId, ...noTurnId } = PERMISSION;
+  void promptTurnId;
+
+  const ask = startAsk(cfgDir, tg.port, noTurnId);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  ask.kill(9);
+  await ask.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
+
+  tg.push([tap('tgq:p_durable:allow', 824, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+
+  // The TAP-TIME text itself (queuedPermissionDecisionText) must not make the
+  // unconditional "delivered automatically once the hook reconnects" promise
+  // either — that's exactly as false at tap time as it is at notice time for a
+  // no-promptTurnId entry (review finding: the notice text was fixed but the
+  // tap-time text made the same overclaim).
+  const tapTimeEdit = tg.edits().find((e) => e.includes('queued') && e.includes('Approve'));
+  expect(tapTimeEdit).not.toContain('delivered automatically once the hook reconnects');
+  expect(tapTimeEdit).toContain("won't auto-deliver");
+
+  // Well past the notice threshold — give the poll loop several chances to fire
+  // the notice, and confirm it never does for this entry.
+  await Bun.sleep(900);
+  expect(daemonLog(cfgDir)).not.toContain('ask-permission-decision-queue-still-waiting-notice');
+  const lastEdit = tg.edits().at(-1);
+  expect(lastEdit).toContain('queued') ; // still the original tap-time edit, untouched
+  expect(lastEdit).not.toContain('will still be delivered automatically');
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('PERM QUEUE NO EXPIRY (tg#9982): a reconnect with the SAME requestId is still delivered no matter how long it takes — never silently demoted on a timer', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  // Tiny NOTICE threshold (distinct from ABANDONED_RETAIN_MS) — proves the
+  // threshold is notice-only now: crossing it must NOT clear the queue or block
+  // a later genuine reconnect from delivering it. Safety no longer comes from a
+  // timer; it comes from requestId itself being scoped to the prompt TURN
+  // (hook-normalize.ts's invocationSeed) — this test uses the SAME requestId
+  // throughout, i.e. the "genuine reconnect" case.
+  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_QUEUED_DECISION_NOTICE_MS: '500' });
   const ask1 = startAsk(cfgDir, tg.port, PERMISSION);
   expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
   ask1.kill(9);
@@ -1199,23 +1484,52 @@ test('PERM QUEUE DELIVERY WINDOW: a reconnect long after the tap is treated as a
   tg.push([tap('tgq:p_durable:allow', 818, 1)]);
   expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
 
-  await Bun.sleep(800); // past the tiny delivery window, well within ABANDONED_RETAIN_MS
+  // Well past the notice threshold — the proactive "still waiting" notice should
+  // have fired by now, but the queue itself must survive it.
+  expect(await until(() => daemonLog(cfgDir).includes('ask-permission-decision-queue-still-waiting-notice'), 4000)).toBe(true);
 
-  // Same exact payload reconnects — but too late to trust as a genuine reconnect.
-  // Two mechanisms race to enforce this (both prove the same invariant): the
-  // periodic sweep may have already proactively DEMOTED the stale queue (see the
-  // PERM QUEUE DEMOTED test below) before this reconnect even lands, or — if it
-  // hasn't yet — the reconnect branch itself DISCARDS it at delivery time. Either
-  // way the outcome must hold: never auto-delivered.
+  // The SAME payload reconnects, long after the notice — still a genuine
+  // reconnect (identical requestId + matching payload), so it MUST deliver.
   const ask2 = startAsk(cfgDir, tg.port, PERMISSION);
-  expect(
-    await until(
-      () =>
-        daemonLog(cfgDir).includes('QUEUED_DECISION_DELIVERY_MS') ||
-        daemonLog(cfgDir).includes('ask-permission-decision-queue-demoted'),
-      6000,
-    ),
-  ).toBe(true);
+  const out = await new Response(ask2.stdout).text();
+  await ask2.exited;
+  expect(JSON.parse(out)).toMatchObject({
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
+  });
+  expect(daemonLog(cfgDir)).toContain('ask-forward queued-decision-delivered');
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('PERM QUEUE LATER UNRELATED REQUEST: a DIFFERENT requestId (a materially later, unrelated turn) never receives the stale queued decision', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  // In production a later, unrelated turn gets a DIFFERENT requestId because
+  // requestId is scoped to the prompt turn (hook-normalize.ts's invocationSeed:
+  // Claude's prompt_id / Codex's turn_id) — even when it asks an identical
+  // question with identical toolInput. Modeled here directly at the daemon
+  // level: PERMISSION_LATER is byte-identical to PERMISSION except its
+  // requestId, standing in for "the same-looking command in a new turn".
+  const PERMISSION_LATER = { ...PERMISSION, requestId: 'p_durable_later' };
+
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const ask1 = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  ask1.kill(9);
+  await ask1.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
+
+  tg.push([tap('tgq:p_durable:allow', 818, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+
+  // A DIFFERENT requestId "reconnects" immediately — it must never see the
+  // queued decision at all: it doesn't even reach the reconnect/matching branch
+  // (no retained entry under this key), so it just posts an ordinary fresh card.
+  const ask2 = startAsk(cfgDir, tg.port, PERMISSION_LATER);
+  expect(await until(() => tg.cards().length === 2, 5000)).toBe(true);
   expect(daemonLog(cfgDir)).not.toContain('ask-forward queued-decision-delivered');
 
   ask2.kill(9);
@@ -1224,17 +1538,48 @@ test('PERM QUEUE DELIVERY WINDOW: a reconnect long after the tap is treated as a
   await daemon.exited;
 }, 30_000);
 
-test('PERM QUEUE DEMOTED: the card stops claiming "delivered automatically" once the delivery window lapses with no reconnect', async () => {
+test('PERM QUEUE MISMATCH GUARD (promptTurnId): a reconnect with the SAME requestId AND matching payload but a DIFFERENT promptTurnId does not auto-approve', async () => {
   const cfgDir = makeCfgDir();
   const tg = mockTelegram();
   servers.push(tg);
 
-  // A queued decision's promise ("delivered automatically once the hook
-  // reconnects") must not outlive the window in which that's actually true — once
-  // QUEUED_DECISION_DELIVERY_MS lapses with no reconnect, the card must demote
-  // back to the plain disconnected text (still tappable — a fresh tap re-queues)
-  // instead of silently lying forever.
-  const daemon2 = await startDaemon(cfgDir, tg.port, { TG_CTL_QUEUED_DECISION_DELIVERY_MS: '500' });
+  // requestId alone (djb2, a SHORT hash) is not collision-proof — the actual
+  // defense against a hash collision (or a manual/back-compat caller reusing a
+  // requestId with a mutated identity) is permissionPayloadMatches's explicit
+  // promptTurnId comparison, independent of the requestId match. Model that
+  // directly: same requestId, same everything else, but a DIFFERENT promptTurnId.
+  const daemon = await startDaemon(cfgDir, tg.port);
+  const ask1 = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  ask1.kill(9);
+  await ask1.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
+
+  tg.push([tap('tgq:p_durable:allow', 828, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+
+  const mismatchedTurnId = { ...PERMISSION, promptTurnId: 'turn_different' };
+  const ask2b = startAsk(cfgDir, tg.port, mismatchedTurnId);
+  expect(await until(() => daemonLog(cfgDir).includes('promptTurnId does not match'), 6000)).toBe(true);
+  expect(daemonLog(cfgDir)).not.toContain('ask-forward queued-decision-delivered');
+
+  ask2b.kill(9);
+  await ask2b.exited;
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 30_000);
+
+test('PERM QUEUE STILL WAITING NOTICE: past the notice threshold with no reconnect, the human gets a proactive notice but the queue is NEVER cleared', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  // A queued decision must stay queued past QUEUED_DECISION_NOTICE_MS — the
+  // threshold only triggers a proactive "still waiting to reconnect" notice
+  // (Alex tg#9982: report a long outage, never silently drop the tap), and the
+  // card must keep claiming the decision is still deliverable, not "hook
+  // disconnected" with no memory of the tap.
+  const daemon2 = await startDaemon(cfgDir, tg.port, { TG_CTL_QUEUED_DECISION_NOTICE_MS: '500' });
   const ask3 = startAsk(cfgDir, tg.port, PERMISSION);
   expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
   ask3.kill(9);
@@ -1246,14 +1591,76 @@ test('PERM QUEUE DEMOTED: the card stops claiming "delivered automatically" once
     await until(() => tg.edits().some((e) => e.includes('delivered automatically once the hook reconnects')), 4000),
   ).toBe(true);
 
-  // No reconnect, no further tap — just wait past the delivery window. The daemon's
-  // own poll-loop sweep must proactively demote it (same cadence as the long-outage
-  // sweep), not merely on a would-be reconnect that never comes.
-  expect(await until(() => daemonLog(cfgDir).includes('ask-permission-decision-queue-demoted'), 6000)).toBe(true);
-  const editsAfterDemotion = tg.edits();
-  expect(editsAfterDemotion.at(-1)).not.toContain('delivered automatically once the hook reconnects');
-  expect(editsAfterDemotion.at(-1)).toContain('hook disconnected');
+  // No reconnect, no further tap — just wait past the notice threshold. The
+  // daemon's own poll-loop sweep must proactively NOTIFY (same cadence as the
+  // long-outage sweep) — but the card must still say the decision is queued and
+  // deliverable, NOT fall back to the plain "hook disconnected" text with no
+  // memory of the tap.
+  expect(await until(() => daemonLog(cfgDir).includes('ask-permission-decision-queue-still-waiting-notice'), 6000)).toBe(true);
+  const editsAfterNotice = tg.edits();
+  expect(editsAfterNotice.at(-1)).toContain('still waiting to reconnect');
+  expect(editsAfterNotice.at(-1)).toContain('NOT been discarded');
+  expect(editsAfterNotice.at(-1)).toContain('Approve');
+
+  // The notice must fire only ONCE (idempotent via queuedDecision.notifiedAt),
+  // not spam on every subsequent sweep.
+  await Bun.sleep(600);
+  const noticeCount = (daemonLog(cfgDir).match(/ask-permission-decision-queue-still-waiting-notice/g) ?? []).length;
+  expect(noticeCount).toBe(1);
+
+  // A genuine reconnect AFTER the notice must still deliver the queued decision —
+  // the notice is informational only, it never disables delivery.
+  const ask4 = startAsk(cfgDir, tg.port, PERMISSION);
+  const out = await new Response(ask4.stdout).text();
+  await ask4.exited;
+  expect(JSON.parse(out)).toMatchObject({
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
+  });
 
   daemon2.kill('SIGTERM');
   await daemon2.exited;
+}, 30_000);
+
+test('PERM QUEUE RE-TAP RESETS NOTICE: after the still-waiting notice fires, a re-tap (last tap wins) gets its OWN fresh notice cycle for the NEW decision', async () => {
+  const cfgDir = makeCfgDir();
+  const tg = mockTelegram();
+  servers.push(tg);
+
+  // The tap handler builds a FRESH queuedDecision object on every tap (never
+  // mutates the existing one in place), so notifiedAt is implicitly cleared —
+  // this proves that end-to-end: tap Approve, let the notice fire and consume
+  // its one-shot, then re-tap Reject and confirm the notice fires AGAIN for
+  // the NEW decision (not permanently suppressed by the first notice).
+  const daemon = await startDaemon(cfgDir, tg.port, { TG_CTL_QUEUED_DECISION_NOTICE_MS: '500' });
+  const ask = startAsk(cfgDir, tg.port, PERMISSION);
+  expect(await until(() => tg.cards().length === 1, 5000)).toBe(true);
+  ask.kill(9);
+  await ask.exited;
+  expect(await until(() => tg.edits().some((e) => e.includes('hook disconnected')), 5000)).toBe(true);
+
+  tg.push([tap('tgq:p_durable:allow', 826, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+
+  expect(await until(() => daemonLog(cfgDir).includes('ask-permission-decision-queue-still-waiting-notice'), 4000)).toBe(true);
+  expect(tg.edits().at(-1)).toContain('queued "Approve"');
+  const noticeCountAfterFirst = (daemonLog(cfgDir).match(/ask-permission-decision-queue-still-waiting-notice/g) ?? []).length;
+  expect(noticeCountAfterFirst).toBe(1);
+
+  // Re-tap: the human changes their mind to Reject. This also refreshes
+  // retained.at (PERM QUEUE LAST-TAP-WINS's fresh-activity semantics), so the
+  // notice threshold is measured again from THIS tap.
+  tg.push([tap('tgq:p_durable:deny', 827, 1)]);
+  expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Reject')), 4000)).toBe(true);
+
+  // A SECOND still-waiting notice must fire, naming the NEW decision — proving
+  // notifiedAt was reset by the re-tap, not stuck from the first notice.
+  expect(
+    await until(() => (daemonLog(cfgDir).match(/ask-permission-decision-queue-still-waiting-notice/g) ?? []).length >= 2, 6000),
+  ).toBe(true);
+  const lastEdit = tg.edits().at(-1);
+  expect(lastEdit).toContain('still waiting to reconnect');
+  expect(lastEdit).toContain('queued "Reject"');
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
 }, 30_000);

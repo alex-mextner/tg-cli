@@ -13,6 +13,7 @@ import {
   parseButtonCallback,
   parseQuestionCloseCallback,
   questionCapability,
+  queuedDecisionStillWaitingText,
   queuedPermissionDecisionText,
   registrationAllowsHook,
   repairClaudeQuestionReply,
@@ -148,6 +149,18 @@ test('queuedPermissionDecisionText names the queued choice and the pane, without
   expect(text).toContain('rm -rf /tmp/test');
 });
 
+test('queuedPermissionDecisionText: with promptTurnId, promises automatic delivery on reconnect (that promise is true for this case)', () => {
+  const text = queuedPermissionDecisionText({ ...PERMISSION, promptTurnId: 'turn-a' }, 'rig', 'Approve');
+  expect(text).toContain('delivered automatically once the hook reconnects');
+});
+
+test('queuedPermissionDecisionText: WITHOUT promptTurnId, does NOT promise automatic delivery — that would be false (review finding)', () => {
+  const text = queuedPermissionDecisionText(PERMISSION, 'rig', 'Approve');
+  expect(text).not.toContain('delivered automatically once the hook reconnects');
+  expect(text.toLowerCase()).toContain("won't auto-deliver");
+  expect(text).toContain('queued "Approve"');
+});
+
 test('abandonedMultiText identifies which pane disconnected, points at the terminal without promising reconnect, and keeps the original prompt visible', () => {
   const text = abandonedMultiText(QUESTION, 'ext');
   expect(text).toContain('ext');
@@ -163,6 +176,25 @@ test('abandonedLongOutageText reports the persisted uncertainty instead of leavi
   expect(text.toLowerCase()).toContain('long wait');
   expect(text).toContain('terminal');
   expect(text).toContain('rm -rf /tmp/test');
+});
+
+test('abandonedLongOutageText names the queued decision when one was pending instead of implying nothing was ever chosen', () => {
+  const text = abandonedLongOutageText(PERMISSION, 'rig', 'Approve');
+  expect(text).toContain('queued "Approve"');
+  expect(text).toContain('never delivered');
+  expect(text).toContain('rig');
+});
+
+test('queuedDecisionStillWaitingText keeps the queue alive and visible, and does NOT overpromise unbounded delivery', () => {
+  const text = queuedDecisionStillWaitingText(PERMISSION, 'rig', 'Approve');
+  expect(text).toContain('still waiting to reconnect for rig');
+  expect(text).toContain('queued "Approve"');
+  expect(text).toContain('NOT been discarded');
+  // Must not promise delivery with no bound at all — the daemon still gives up
+  // at ABANDONED_RETAIN_MS and sends a SEPARATE notice when it does (review
+  // finding: "however long that takes" overpromised past that point).
+  expect(text).not.toContain('however long that takes');
+  expect(text.toLowerCase()).toContain('separate notice');
 });
 
 test('buildAnsweredQuestionText keeps the prompt context with the selected answer', () => {

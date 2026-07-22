@@ -36,7 +36,11 @@ export interface RetainedQuestionRecord {
   // already drops the whole queue rather than admit one with no valid decision — a
   // typed write surface that ALLOWED decision:undefined would let state onto disk
   // that the read side can never actually deliver (review finding).
-  queuedDecision?: { value: string; label: string; decision: PermissionDecision; at: number };
+  // `notifiedAt`: when the one-time "still waiting to reconnect" notice
+  // (tg-ctl's noticeStaleQueuedDecisions, QUEUED_DECISION_NOTICE_MS) fired for
+  // this queued tap — undefined until it does. Persisted so a restart between
+  // the notice and the eventual reconnect doesn't re-fire it.
+  queuedDecision?: { value: string; label: string; decision: PermissionDecision; at: number; notifiedAt?: number };
 }
 
 export interface RetainedAnswerRecord {
@@ -169,7 +173,15 @@ function parseQueuedDecision(value: unknown, now: number): RetainedQuestionRecor
   // decision while the card displays the other's label — drop it wholesale rather
   // than deliver a decision that contradicts what the human sees (review finding).
   if (rec.value !== rec.decision) return undefined;
-  return { value: rec.value, label: rec.label, decision: rec.decision, at: rec.at };
+  // `notifiedAt` is optional and best-effort: a malformed or future-dated value
+  // just means the one-time notice may fire again (harmless — a duplicate notice
+  // is not a lost decision), so it degrades to undefined rather than dropping the
+  // whole queuedDecision the way a bad `at`/`decision` does.
+  const notifiedAt =
+    typeof rec.notifiedAt === 'number' && Number.isFinite(rec.notifiedAt) && rec.notifiedAt <= now
+      ? rec.notifiedAt
+      : undefined;
+  return { value: rec.value, label: rec.label, decision: rec.decision, at: rec.at, ...(notifiedAt !== undefined ? { notifiedAt } : {}) };
 }
 
 function parseAnswered(value: unknown, now: number, maxAgeMs: number): RetainedAnswerRecord[] {

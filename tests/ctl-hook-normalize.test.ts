@@ -8,6 +8,7 @@ const env: HookEnv = {
   sessionName: 'work',
   windowName: 'ext',
   subagent: 'review-worker',
+  invocationNonce: 'env-nonce-1',
 };
 
 test('Claude AskUserQuestion (single, options) → question request', () => {
@@ -304,4 +305,145 @@ test('garbage → null', () => {
   expect(normalizeHookPayload(null, env)).toBeNull();
   expect(normalizeHookPayload({ hook_event_name: 'SessionStart' }, env)).toBeNull();
   expect(normalizeHookPayload('nope', env)).toBeNull();
+});
+
+// requestId must be scoped to the PROMPT TURN (Claude Code's `prompt_id`, Codex's
+// `turn_id`), not just the session — otherwise two DIFFERENT turns in the same
+// long-running session that happen to ask an identical permission/question collide
+// on the same requestId, which is what let a QUEUED permission decision be
+// auto-delivered onto a materially later, unrelated request (the bug this hardens
+// against — tg-ctl no longer time-bounds queued-decision delivery, so the identity
+// check alone must be airtight).
+test('PermissionRequest: same session/tool/command but a DIFFERENT prompt_id (a later, unrelated turn) gets a DIFFERENT requestId', () => {
+  const base = { session_id: 'sid12345', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'npm test' } };
+  const first = normalizeHookPayload({ ...base, prompt_id: 'prompt-a' }, env);
+  const later = normalizeHookPayload({ ...base, prompt_id: 'prompt-b' }, env);
+  expect(first!.requestId).not.toBe(later!.requestId);
+});
+
+test('PermissionRequest: the SAME prompt_id AND the SAME invocationNonce (a genuine hook reconnect-and-resend, same process) gets the SAME requestId', () => {
+  const payload = { session_id: 'sid12345', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'npm test' }, prompt_id: 'prompt-a' };
+  const first = normalizeHookPayload(payload, env);
+  const resent = normalizeHookPayload(payload, env); // same shared `env` object → same invocationNonce
+  expect(first!.requestId).toBe(resent!.requestId);
+});
+
+// The core fix for the intra-turn hazard (review finding, tg#9982 follow-up):
+// prompt_id alone scopes to the whole TURN, not the individual tool call — two
+// DISTINCT invocations of the identical command in the SAME turn must still get
+// DIFFERENT requestIds. env.invocationNonce (one per `tg-ctl ask` PROCESS, i.e.
+// one per hook event in production) is what actually guarantees this.
+test('PermissionRequest: SAME prompt_id but a DIFFERENT invocationNonce (two distinct tool calls in ONE turn) gets a DIFFERENT requestId', () => {
+  const payload = { session_id: 'sid12345', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'npm test' }, prompt_id: 'prompt-a' };
+  const first = normalizeHookPayload(payload, { ...env, invocationNonce: 'nonce-1' });
+  const secondCallSameTurn = normalizeHookPayload(payload, { ...env, invocationNonce: 'nonce-2' });
+  expect(first!.requestId).not.toBe(secondCallSameTurn!.requestId);
+});
+
+test('Codex PermissionRequest: turn_id scopes the requestId the same way prompt_id does for claude', () => {
+  const codexEnv = { ...env, agent: 'codex' as const };
+  const base = { session_id: 'sid12345', hook_event_name: 'PermissionRequest', tool_name: 'shell', tool_input: { command: 'ls' } };
+  const first = normalizeHookPayload({ ...base, turn_id: 'turn-a' }, codexEnv);
+  const later = normalizeHookPayload({ ...base, turn_id: 'turn-b' }, codexEnv);
+  expect(first!.requestId).not.toBe(later!.requestId);
+});
+
+test('ExitPlanMode: a DIFFERENT prompt_id for the identical plan text gets a DIFFERENT requestId', () => {
+  const base = { session_id: 'sid12345', hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', tool_input: { plan: 'Do the thing' } };
+  const first = normalizeHookPayload({ ...base, prompt_id: 'prompt-a' }, env);
+  const later = normalizeHookPayload({ ...base, prompt_id: 'prompt-b' }, env);
+  expect(first!.requestId).not.toBe(later!.requestId);
+});
+
+test('ExitPlanMode: SAME prompt_id but a DIFFERENT invocationNonce still gets a DIFFERENT requestId', () => {
+  const payload = { session_id: 'sid12345', hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', tool_input: { plan: 'Do the thing' }, prompt_id: 'prompt-a' };
+  const first = normalizeHookPayload(payload, { ...env, invocationNonce: 'nonce-1' });
+  const second = normalizeHookPayload(payload, { ...env, invocationNonce: 'nonce-2' });
+  expect(first!.requestId).not.toBe(second!.requestId);
+});
+
+test('a payload with no prompt_id/turn_id (older harness) still normalizes — env.invocationNonce alone still scopes it correctly', () => {
+  const req = normalizeHookPayload(
+    { session_id: 'sid12345', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'ls' } },
+    env,
+  );
+  expect(req).toMatchObject({ kind: 'permission', question: 'Allow Bash? ls' });
+});
+
+// ButtonRequest.promptTurnId is the identity PROOF tg-ctl's reconnect branch
+// requires before auto-delivering a queued permission decision with no time
+// bound — it now comes from env.invocationNonce (always a fresh, non-empty
+// string per `tg-ctl ask` process), so it is ALWAYS set for anything normalized
+// from a raw harness payload, regardless of whether the harness itself sends
+// prompt_id/turn_id (see AGENTS.md's "Queued permission decisions" entry).
+test('promptTurnId is always set to env.invocationNonce for a raw harness payload, regardless of prompt_id/turn_id presence', () => {
+  const withPromptId = normalizeHookPayload(
+    { session_id: 'sid12345', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'ls' }, prompt_id: 'prompt-a' },
+    env,
+  );
+  expect(withPromptId!.promptTurnId).toBe('env-nonce-1');
+
+  const withoutPromptId = normalizeHookPayload(
+    { session_id: 'sid12345', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'ls' } },
+    env,
+  );
+  expect(withoutPromptId!.promptTurnId).toBe('env-nonce-1');
+});
+
+test('promptTurnId is set on ExitPlanMode from env.invocationNonce', () => {
+  const req = normalizeHookPayload(
+    { session_id: 'sid12345', hook_event_name: 'PreToolUse', tool_name: 'ExitPlanMode', tool_input: { plan: 'Do the thing' } },
+    env,
+  );
+  expect(req!.promptTurnId).toBe('env-nonce-1');
+});
+
+// The "already normalized" manual/back-compat pass-through is DELIBERATELY NOT
+// force-overridden with env.invocationNonce (unlike the raw-harness branches
+// above) — it's not real harness traffic (a genuine Claude Code/Codex hook
+// always sends raw JSON, never an already-shaped ButtonRequest), so it stays
+// free to explicitly omit promptTurnId. This is the one remaining way to model
+// "no identity proof" in tests (see ctl-question-durable-integration.test.ts's
+// "no promptTurnId" tests) — standing in for a genuinely pre-upgrade on-disk
+// record from before this field existed.
+test('an already-normalized ButtonRequest carries an explicit promptTurnId through unchanged (NOT overridden by env.invocationNonce)', () => {
+  const req = normalizeHookPayload(
+    { requestId: 'r9', agent: 'claude', kind: 'permission', question: 'ok?', promptTurnId: 'prompt-z' },
+    env,
+  );
+  expect(req!.promptTurnId).toBe('prompt-z');
+});
+
+test('an already-normalized ButtonRequest with NO promptTurnId stays undefined (not backfilled from env.invocationNonce)', () => {
+  const req = normalizeHookPayload(
+    { requestId: 'r10', agent: 'claude', kind: 'permission', question: 'ok?' },
+    env,
+  );
+  expect(req!.promptTurnId).toBeUndefined();
+});
+
+// DELIBERATE ASYMMETRY (regression guard): a QUESTION does NOT fold
+// env.invocationNonce into its hash — only prompt_id/turn_id (invocationSeed).
+// A question has no queuedDecision auto-delivery hazard, and the existing,
+// TESTED multi-question retry contract (ctl-multi-question-abandon-integration
+// .test.ts) needs a re-asked question from a genuinely NEW `tg-ctl ask` process
+// (same content, same prompt_id) to hash IDENTICALLY so it re-attaches to its
+// retained card instead of duplicating. This was tried the other way (folding
+// the nonce into every kind uniformly) and broke that exact test — this guard
+// pins the correct, asymmetric behavior so it can't regress silently again.
+test('AskUserQuestion: SAME prompt_id but a DIFFERENT invocationNonce (a retry from a new process) gets the SAME requestId — no nonce folded in for questions', () => {
+  const tool_input = { questions: [{ question: 'Where to deploy?', options: [{ label: 'Staging' }] }] };
+  const payload = { session_id: 'sid12345', hook_event_name: 'PreToolUse', tool_name: 'AskUserQuestion', tool_input, prompt_id: 'prompt-a' };
+  const first = normalizeHookPayload(payload, { ...env, invocationNonce: 'nonce-1' });
+  const retriedFromNewProcess = normalizeHookPayload(payload, { ...env, invocationNonce: 'nonce-2' });
+  expect(first!.requestId).toBe(retriedFromNewProcess!.requestId);
+});
+
+test('AskUserQuestion: promptTurnId comes from prompt_id/turn_id, NOT env.invocationNonce', () => {
+  const tool_input = { questions: [{ question: 'Where to deploy?', options: [{ label: 'Staging' }] }] };
+  const req = normalizeHookPayload(
+    { session_id: 'sid12345', hook_event_name: 'PreToolUse', tool_name: 'AskUserQuestion', tool_input, prompt_id: 'prompt-a' },
+    env,
+  );
+  expect(req!.promptTurnId).toBe('prompt-a');
 });

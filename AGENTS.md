@@ -237,20 +237,55 @@ tests can pass fakes.
   requests (no `paneId` — no card to late-deliver/re-attach to) keep the single-attempt client path,
   since resending those would post a duplicate card. `question-store.ts` owns the on-disk format
   (PURE); the entrypoint owns the I/O.
-- **Queued permission decisions (never drop a tap on a disconnected permission):** a permission has
-  no pane-text-injection fallback (the hook needs a structured JSON reply, not terminal text), so a
-  Telegram tap that lands while its hook is disconnected can't be delivered immediately. It is
-  QUEUED on the retained entry (`AbandonedButton.queuedDecision`, persisted immediately — survives a
-  daemon crash between the tap and the reconnect) and delivered automatically the instant a
-  reconnecting hook re-attaches to the same requestId AND its full payload (question text +
-  `toolInput`, `permissionPayloadMatches`) still matches — guarding against a stale requestId reused
-  against a materially different action. Auto-delivery is further bounded by
-  `TG_CTL_QUEUED_DECISION_DELIVERY_MS` (default 10 min, tighter than the 30-min
-  `ABANDONED_RETAIN_MS`): a genuine reconnect lands within seconds, so a "reconnect" arriving later
-  is treated as an unrelated later request, not the human's earlier tap reapplied. A later tap
-  overwrites the queue (last tap wins). An entry that never reconnects within `ABANDONED_RETAIN_MS`
-  gets a proactive "still no connection" notice — both from the daemon's poll-loop sweep while it is
-  up, and on restore if the window elapsed while the daemon was down.
+- **Queued permission decisions (never drop a tap on a disconnected permission, and NEVER expire it
+  on a timer — Alex tg#9982):** a permission has no pane-text-injection fallback (the hook needs a
+  structured JSON reply, not terminal text), so a Telegram tap that lands while its hook is
+  disconnected can't be delivered immediately. It is QUEUED on the retained entry
+  (`AbandonedButton.queuedDecision`, persisted immediately — survives a daemon crash between the tap
+  and the reconnect) and delivered automatically the instant a reconnecting hook re-attaches to the
+  same requestId AND its full payload (question text + `toolInput`, `permissionPayloadMatches`) still
+  matches — guarding against a stale requestId reused against a materially different action. This
+  delivery is **not time-bounded**: while a decision is pending, its Telegram card stays pending, and
+  it is never silently cleared without 100% confirmation it was actually delivered. What makes an
+  unbounded wait safe is the identity check upstream in `hook-normalize.ts`, applied ONLY to
+  `permission`/plan-approval requests (never `question`-kind — see below): `env.invocationNonce`
+  (`HookEnv`), a random id `askDaemon` generates ONCE PER `tg-ctl ask` PROCESS. The harness spawns a
+  fresh process for every hook event, so this is a true per-INVOCATION identity, folded into a
+  permission's requestId hash and carried as `ButtonRequest.promptTurnId`. This is stronger than (and
+  does not depend on) Claude Code's `prompt_id` / Codex's `turn_id` (`hook-normalize.ts`'s
+  `invocationSeed`, kept only as extra hash entropy for permissions): those scope to the whole prompt
+  TURN, not the individual tool call, so two DISTINCT permission invocations of an identical command in
+  the SAME turn would still share a requestId under `prompt_id`/`turn_id` alone — a real gap found in
+  review (tg#9982 follow-up) that the per-process nonce closes completely. A genuine reconnect is the
+  SAME process's own reconnect-and-resend loop (`requestHookAnswerWithReconnect`), which resends the
+  identical serialized request (same nonce), so it still matches; a materially later invocation is
+  always a NEW process with a NEW nonce and can never collide, no matter how much wall-clock time
+  passes. `permissionPayloadMatches` remains as defense-in-depth against the narrower residual risk of
+  a lossy `summarizeInput` digest collision, not a stand-in for identity. **`question`-kind requests
+  deliberately keep the OLDER, looser `prompt_id`/`turn_id`-only scoping** (no `env.invocationNonce`):
+  a question has no queuedDecision auto-delivery hazard (only pane late-delivery on an explicit human
+  tap, or reconnect re-attach), and the existing, tested multi-question retry contract
+  (`ctl-multi-question-abandon-integration.test.ts`) requires a re-asked question from a genuinely new
+  process (the harness always spawns one per hook event) to hash IDENTICALLY so it re-attaches to its
+  retained card instead of duplicating — folding the nonce into a question's hash breaks that (tried
+  once during review, reverted). `promptTurnId` rides through as an explicit field, and a permission's
+  auto-delivery REQUIRES it on the retained request: the ONE remaining case it can be absent is a
+  manual/back-compat caller that hand-builds an already-normalized ButtonRequest JSON (not real harness
+  traffic — a genuine Claude Code/Codex hook always sends raw JSON, which always gets a nonce for a
+  permission) or a retained record persisted to disk before this field existed (a one-time
+  1.41.1→1.41.2 upgrade transient). Either way the queue stays alive and re-tappable, but a reconnect
+  just shows an ordinary fresh live prompt instead of risking a stale approval on unproven identity — a
+  human who taps that fresh prompt again is never mistold their earlier tap will still auto-apply
+  (`queuedPermissionDecisionText` and `queuedDecisionStillWaitingText` both skip the "delivered
+  automatically" promise for a `promptTurnId`-less entry). A later tap overwrites
+  the queue (last tap wins). Past `TG_CTL_QUEUED_DECISION_NOTICE_MS` (default 10 min) with no
+  reconnect, the human gets a ONE-TIME proactive "still waiting to reconnect" notice
+  (`queuedDecision.notifiedAt` makes it idempotent) — the queue is NOT cleared by this notice, only
+  reported. An entry that never reconnects within the full `ABANDONED_RETAIN_MS` (default 30 min,
+  refreshed by every tap) is the daemon's genuine give-up point and gets its own proactive "still no
+  connection" notice (mentioning the queued decision by name if one was pending) — both from the
+  daemon's poll-loop sweep while it is up, and on restore if the window elapsed while the daemon was
+  down.
 
 - **Graceful reload — no dropped channel (`tg-ctl.<botid>.deferred.json` + cooperative SIGTERM):**
   a reload (a deliberate `tg-ctl restart`, a launchd `bootout`/`bootstrap`, or a crash-relaunch)

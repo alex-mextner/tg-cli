@@ -3,6 +3,70 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.41.2
+
+**Fix: a queued permission tap is never silently expired/demoted on a timer
+again (tg#9982).** 1.41.1 introduced a 10-minute `TG_CTL_QUEUED_DECISION_DELIVERY_MS`
+window after which a QUEUED Telegram decision on a disconnected permission was
+silently discarded (the card fell back to plain "hook disconnected" text, with no
+proactive notice) — a real violation of the standing rule that a pending question
+must stay pending in Telegram until there's 100% confirmation it was resolved, and
+that a long outage must be *reported*, never silently dropped.
+
+- The queue no longer expires. A reconnecting hook that matches the queued
+  decision's requestId and full payload (`permissionPayloadMatches`) gets it
+  delivered no matter how long the reconnect takes.
+- What made the old timer necessary is fixed at the root, for PERMISSIONS
+  specifically: `requestId` for a `permission`/plan-approval is now scoped to
+  the exact INVOCATION, not just the session or even the prompt turn. `tg-ctl
+  ask` generates a random nonce ONCE PER PROCESS (`HookEnv.invocationNonce`) —
+  the harness spawns a fresh process for every tool/permission hook event — and
+  folds it into the requestId hash. A first attempt at this used only Claude
+  Code's `prompt_id` / Codex's `turn_id`, but those scope to the whole prompt
+  TURN, not the individual tool call: two DISTINCT permission invocations of an
+  identical command in the SAME turn would still have shared a requestId under
+  that scheme (caught in review before shipping). The per-process nonce closes
+  that gap completely for permissions — a materially later, unrelated request
+  (whether a later turn or a second identical call within the same turn)
+  always gets a DIFFERENT requestId and can never be mistaken for a reconnect
+  of an earlier one, timer or not; `prompt_id`/`turn_id` are still folded in as
+  extra hash entropy but are no longer relied on for safety. Auto-delivery
+  additionally REQUIRES this identity proof (`ButtonRequest.promptTurnId`) to
+  be present on the retained request at all — the ONE remaining case it can be
+  absent is a manual/back-compat caller that hand-builds an already-normalized
+  request (not real harness traffic) or a pre-upgrade on-disk record; either
+  way the tap still stays queued and re-tappable, a reconnect there just shows
+  a fresh live prompt instead, and the tap-time/notice text never claims
+  automatic delivery for it (`queuedPermissionDecisionText`,
+  `queuedDecisionStillWaitingText`).
+- `question`-kind requests (`AskUserQuestion`, and anything routed through
+  `ExitPlanMode`'s sibling question path) DELIBERATELY do NOT get the
+  per-process nonce — a question has no queuedDecision auto-delivery hazard,
+  and the existing multi-question retry contract needs a re-asked question
+  from a genuinely new process (same content) to hash IDENTICALLY so it
+  re-attaches to its retained card instead of duplicating. Only `prompt_id`/
+  `turn_id` scope a question's requestId, same as before this release; a
+  question re-asked in a NEW turn still gets a fresh card either way.
+- `TG_CTL_QUEUED_DECISION_DELIVERY_MS` is renamed `TG_CTL_QUEUED_DECISION_NOTICE_MS`
+  and repurposed: past that threshold with no reconnect, the human gets a
+  ONE-TIME proactive "still waiting to reconnect" notice — the queue itself is
+  never cleared by it.
+- The existing full-retention "still no connection" give-up notice now names the
+  queued decision when one was pending, instead of implying nothing was ever
+  chosen.
+- Upgrade note: a `permission`'s `requestId` hash SEED changed (it now folds in
+  `env.invocationNonce`), so a permission card retained across the
+  1.41.1→1.41.2 daemon upgrade won't requestId-match a subsequent reconnect
+  and won't auto-deliver — it falls through to an ordinary fresh live prompt
+  instead (a one-time transient on upgrade, not a regression in steady state).
+  A `question`'s hash seed ALSO changed (it now folds in `prompt_id`/`turn_id`
+  when the harness sends one), so a question card retained across the upgrade
+  and re-asked with a `prompt_id`/`turn_id` present may likewise fail to
+  re-attach — for a question this means a duplicate card rather than a missed
+  auto-delivery (a question never auto-delivers anything), same one-time
+  transient severity.
+
+
 ## 1.41.1
 
 **Fix: `tg-ctl` no longer sends an unidentifiable, overclaiming "hook disconnected"
