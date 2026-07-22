@@ -3,6 +3,30 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.41.1
+
+**Fix: `tg-ctl` no longer sends an unidentifiable, overclaiming "hook disconnected"
+card, and never silently drops a Telegram tap on a disconnected permission.**
+
+- The abandoned-hook card now names the pane (reusing the same resolver the
+  outbound `[window]` header uses) and never promises a reconnect it can't
+  guarantee, while keeping the original question/permission text visible and
+  preserving the inline keyboard on every such edit (a real pre-existing gap
+  this release also closes).
+- A tap on a disconnected PERMISSION is now QUEUED instead of silently
+  discarded, and delivered automatically the instant a reconnecting hook
+  re-attaches with a matching payload — bounded by a short delivery window so
+  a coincidentally-identical later request is never auto-approved from a stale
+  tap. The queue survives a daemon restart and demotes back to the plain
+  disconnected text if it never gets delivered.
+- An entry that never reconnects within the retention window now gets a
+  proactive "still no connection" notice instead of sitting silently forever.
+
+**Fix: the usage-limit "banked/earned reset — redeem via `/usage`" advice no
+longer appears for every harness.** That mechanic is Codex-specific; other
+agents (including Claude) now get a plain "plan around it / switch agents"
+line with no redemption claim.
+
 ## 1.41.0
 
 **Feature: the `cjk-guard` also blocks mixed-script "garbage word" tokens.**

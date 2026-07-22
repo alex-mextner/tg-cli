@@ -161,6 +161,62 @@ export function buildPostTimeoutQuestionMessage(chatId: number, req: ButtonReque
   };
 }
 
+// The hook socket for a SCOPED permission closed — either a daemon restart (fully
+// reconnectable: the reconnecting hook re-attaches to this exact card) OR the
+// harness's own ~120s hook budget elapsing, in which case the harness has likely
+// already fallen back to prompting in the terminal and there may be no live hook
+// left to reconnect. The daemon can't tell the two apart from a bare socket close,
+// so the text never PROMISES a reconnect — it states what IS true either way: the
+// card restores automatically if a reconnect happens, and a tap right now is
+// QUEUED (see queuedPermissionDecisionText) rather than silently dropped, so the
+// choice is never lost even when reconnect never comes. `label` identifies WHICH
+// pane (the caller resolves it with resolveWindowAgentLabel,
+// features/tg-ctl/agent-match.ts) so a fleet with several agents can tell which one
+// needs attention instead of a bare, unidentifiable card. The ORIGINAL prompt
+// (buildQuestionText) rides along too — the status line alone would invite a tap
+// on Approve/Reject buttons with no visible clue what they're approving, which is
+// worse than the socket never having closed at all (review finding).
+export function abandonedPermissionText(req: ButtonRequest, label: string): string {
+  const status = `hook disconnected for ${label} — if it reconnects, this card restores automatically. A tap now is queued and delivered the moment that happens; you can also answer directly in the terminal.`;
+  return [buildQuestionText(req), status].join('\n\n');
+}
+
+// A Telegram tap landed while a permission's hook was disconnected (see
+// abandonedPermissionText): the decision can't be delivered yet (no live socket to
+// write the hook's JSON reply to), so it is QUEUED on the retained entry and
+// flushed automatically the instant a reconnecting hook re-attaches to the same
+// requestId (features/tg-ctl/questions.ts callers: tg-ctl's RECONNECT re-attach
+// branch). Re-tappable: a later tap overwrites the queued decision (last tap
+// wins) in case of a misclick, up until it is actually delivered. Keeps the
+// original prompt visible for the same reason as abandonedPermissionText.
+export function queuedPermissionDecisionText(req: ButtonRequest, label: string, decisionLabel: string): string {
+  const status = `queued "${decisionLabel}" for ${label} — delivered automatically once the hook reconnects. Tap again to change it, or answer in the terminal now.`;
+  return [buildQuestionText(req), status].join('\n\n');
+}
+
+// Same socket-close event, but for a multi-question SET MEMBER: a lone late answer
+// must NOT be delivered (the local dialog may be showing a DIFFERENT question of
+// the set, see ButtonRequest.multiQuestion) and, unlike a permission, there is no
+// safe single-value queue for a set — so the terminal is the only path until (or
+// unless) the hook reconnects and the card restores itself. Keeps the original
+// prompt visible for the same reason as abandonedPermissionText.
+export function abandonedMultiText(req: ButtonRequest, label: string): string {
+  const status = `hook disconnected for ${label} — if it reconnects, this card restores automatically. Until then this question can't be delivered from here; answer all questions in the terminal.`;
+  return [buildQuestionText(req), status].join('\n\n');
+}
+
+// Reconnect never happened within the retention window (ABANDONED_RETAIN_MS,
+// tg-ctl): the daemon is giving up on this entry (see pruneAbandonedButtons's
+// notify callback) rather than leaving the human staring at a stale "queued" or
+// "hook disconnected" card forever with no further signal (Alex tg requirement:
+// a long-running uncertainty must eventually be reported, not left silent). The
+// keyboard is cleared for this one (see tg-ctl's notifyAbandonedLongOutage) — the
+// original prompt still rides along so the human knows what was never delivered.
+export function abandonedLongOutageText(req: ButtonRequest, label: string): string {
+  const status = `still no connection for ${label} after a long wait — this was never delivered over Telegram; answer directly in the terminal.`;
+  return [buildQuestionText(req), status].join('\n\n');
+}
+
 export function buildAnsweredQuestionText(req: ButtonRequest, answer: string): string {
   return [
     buildQuestionText(req),

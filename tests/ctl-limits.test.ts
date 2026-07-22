@@ -686,8 +686,8 @@ test('usage notification: stale reset suppresses like the StopFailure path', () 
   expect(buildUsageLimitNotification(usageEv({ percent: 95, resetAt: NOW - 1 }), NOW)).toBeNull();
 });
 
-test('usage notification: Russian and English copy', () => {
-  const ru = buildUsageLimitNotification(usageEv({ agent: 'claude', language: 'ru', percent: 92 }), NOW)!;
+test('usage notification: Russian and English copy for codex (the harness with real banked/earned resets)', () => {
+  const ru = buildUsageLimitNotification(usageEv({ agent: 'codex', language: 'ru', percent: 92 }), NOW)!;
   expect(ru.text).toContain('использовано');
   expect(ru.text).toContain('92%');
   expect(ru.text).toContain('основного лимита');
@@ -695,7 +695,7 @@ test('usage notification: Russian and English copy', () => {
   expect(ru.text).toContain('/usage');
   expect(ru.text).toContain('не тратит');
 
-  const en = buildUsageLimitNotification(usageEv({ language: 'en', percent: 93 }), NOW)!;
+  const en = buildUsageLimitNotification(usageEv({ agent: 'codex', language: 'en', percent: 93 }), NOW)!;
   expect(en.text).toContain('is at');
   expect(en.text).toContain('93%');
   expect(en.text).toContain('Resets');
@@ -703,6 +703,24 @@ test('usage notification: Russian and English copy', () => {
   expect(en.text).toContain('banked/earned reset');
   expect(en.text).toContain('/usage');
   expect(en.text).toContain('does not auto-spend');
+});
+
+// The "banked/earned reset — redeem via /usage" advice is a CODEX-SPECIFIC mechanic
+// (Codex genuinely has redeemable resets). Claude (and any other non-codex harness)
+// has no such thing, so showing that sentence there is misleading — the advice must
+// drop it entirely for a non-codex agent, keeping only the plan-around-it line.
+test('usage notification: non-codex agents (e.g. claude) get plain advice with no banked-reset claim', () => {
+  const ruClaude = buildUsageLimitNotification(usageEv({ agent: 'claude', language: 'ru', percent: 92 }), NOW)!;
+  expect(ruClaude.text).toContain('использовано');
+  expect(ruClaude.text).toContain('Запланируй паузу');
+  expect(ruClaude.text).not.toContain('накопленный сброс');
+  expect(ruClaude.text).not.toContain('/usage');
+
+  const enClaude = buildUsageLimitNotification(usageEv({ agent: 'claude', language: 'en', percent: 93 }), NOW)!;
+  expect(enClaude.text).toContain('is at');
+  expect(enClaude.text).toContain('Plan around it or switch agents before the hard stop.');
+  expect(enClaude.text).not.toContain('banked/earned reset');
+  expect(enClaude.text).not.toContain('/usage');
 });
 
 test('usage notification: short Russian reset delta is HTML-escaped', () => {

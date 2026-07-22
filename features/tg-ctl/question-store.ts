@@ -25,6 +25,18 @@ export interface RetainedQuestionRecord {
   req: Record<string, unknown>; // a scoped question ButtonRequest (entrypoint re-validates)
   messageId: number | null; // the Telegram card id (edit/answer target)
   at: number; // ms epoch when posted/abandoned (age window + overflow ordering)
+  // A PERMISSION decision already tapped in Telegram while the hook was
+  // disconnected, awaiting delivery to a reconnecting hook (tg-ctl's
+  // AbandonedButton.queuedDecision). MUST be persisted: a daemon restart between
+  // the tap and the reconnect would otherwise silently lose the human's decision
+  // while the card still claims it is "queued … delivered automatically" — the
+  // agent then hangs forever waiting for a tap the text says already happened.
+  // `decision` is REQUIRED (not optional): the delivery path (formatAgentHookOutput)
+  // needs a real 'allow'|'deny' to build the hook's reply, and parseQueuedDecision
+  // already drops the whole queue rather than admit one with no valid decision — a
+  // typed write surface that ALLOWED decision:undefined would let state onto disk
+  // that the read side can never actually deliver (review finding).
+  queuedDecision?: { value: string; label: string; decision: PermissionDecision; at: number };
 }
 
 export interface RetainedAnswerRecord {
@@ -124,10 +136,40 @@ function parseQuestions(value: unknown, now: number, maxAgeMs: number): Retained
     if (!withinWindow(rec.at, now, maxAgeMs)) continue;
     const messageId = typeof rec.messageId === 'number' ? rec.messageId : rec.messageId === null ? null : undefined;
     if (messageId === undefined) continue; // a number|null is required; anything else is corrupt
-    out.push({ req: rec.req as Record<string, unknown>, messageId, at: rec.at });
+    const queuedDecision = parseQueuedDecision(rec.queuedDecision, now);
+    out.push({ req: rec.req as Record<string, unknown>, messageId, at: rec.at, ...(queuedDecision ? { queuedDecision } : {}) });
   }
   // Newest first, capped: on overflow keep the freshest (most likely still tappable).
   return capByRecency(out);
+}
+
+// A malformed queuedDecision must never corrupt the whole retained-question record
+// (the req/messageId/at are still worth restoring) — drop just the queue, same
+// fail-soft posture as every other field here. `decision` is REQUIRED (not
+// defaulted to undefined like the answered-record's optional `decision`): a
+// queuedDecision only ever exists for a permission, and the reconnect delivery
+// path (formatAgentHookOutput) needs a real 'allow'|'deny' to build the hook's
+// {behavior} reply — a corrupt/legacy record with no valid decision must be
+// dropped wholesale, not survive to be auto-delivered as a malformed or silently
+// wrong permission reply.
+function parseQueuedDecision(value: unknown, now: number): RetainedQuestionRecord['queuedDecision'] {
+  if (!value || typeof value !== 'object') return undefined;
+  const rec = value as Record<string, unknown>;
+  if (typeof rec.value !== 'string' || typeof rec.label !== 'string') return undefined;
+  if (typeof rec.at !== 'number' || !Number.isFinite(rec.at)) return undefined;
+  // A future-dated `at` would make `now - at` negative — always "within" any
+  // delivery/retention window, so tg-ctl's demote/expire sweeps would treat a
+  // corrupted future timestamp as permanently fresh. Reject it outright rather
+  // than let a bad clock value defeat both TTLs (review finding).
+  if (rec.at > now) return undefined;
+  if (rec.decision !== 'allow' && rec.decision !== 'deny') return undefined;
+  // For a permission, `value` IS `decision` — resolveButtonCallback always sets
+  // them identically ('allow'/'allow' or 'deny'/'deny'). A record where they
+  // DISAGREE (e.g. {value:'deny', decision:'allow'}) would deliver the hook one
+  // decision while the card displays the other's label — drop it wholesale rather
+  // than deliver a decision that contradicts what the human sees (review finding).
+  if (rec.value !== rec.decision) return undefined;
+  return { value: rec.value, label: rec.label, decision: rec.decision, at: rec.at };
 }
 
 function parseAnswered(value: unknown, now: number, maxAgeMs: number): RetainedAnswerRecord[] {

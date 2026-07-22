@@ -23,6 +23,7 @@ import {
   isBareWindowName,
   isAgentCommand,
   matchWindows,
+  resolveWindowAgentLabel,
   suggestSelector,
   type AgentCandidate,
   type ParsedAgentCommand,
@@ -106,6 +107,9 @@ import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
 import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, readPidFile } from "./features/tg-ctl/lock"
 import {
+  abandonedLongOutageText,
+  abandonedMultiText,
+  abandonedPermissionText,
   buildAnsweredQuestionText,
   buildButtonMessage,
   buildClaudeQuestionAnswerOutput,
@@ -114,6 +118,7 @@ import {
   collectQuestionAnswers,
   formatAgentHookOutput,
   questionCapability,
+  queuedPermissionDecisionText,
   registrationSetAllowsHook,
   repairClaudeQuestionReply,
   resolveButtonCallback,
@@ -1820,6 +1825,22 @@ interface AbandonedButton {
   req: ButtonRequest
   messageId: number | null
   at: number
+  // A PERMISSION decision the user already tapped while the hook was disconnected
+  // (queued because, unlike a question, a permission has no pane-text-injection
+  // fallback — the hook needs a structured JSON reply, not terminal text). Never
+  // silently dropped: this is delivered down the socket the instant a reconnecting
+  // hook re-attaches to the same requestId AND its payload still matches
+  // (permissionPayloadMatches — the RECONNECT re-attach branch in
+  // handleHookSocketLine). PERSISTED: `persistQuestions` writes it and the restore
+  // path re-reads it (see question-store.ts's RetainedQuestionRecord.queuedDecision),
+  // and it is persisted IMMEDIATELY on tap (not only on the next unrelated
+  // mutation) — a daemon crash between the tap and the reconnect must not lose the
+  // human's decision while the card still claims it is "delivered automatically"
+  // (PERM QUEUE RESTART proves this). The card stays visibly "queued" until actually
+  // delivered so a re-tap (last tap wins) or a terminal answer both stay available.
+  // `decision` is REQUIRED — see question-store.ts's matching RetainedQuestionRecord
+  // field for why (review finding: the two types must agree).
+  queuedDecision?: { value: string; label: string; decision: PermissionDecision; at: number }
 }
 
 // A question that has already been ANSWERED, kept briefly so a re-forward of the
@@ -1874,11 +1895,43 @@ const ABANDONED_RETAIN_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60_000
 })()
 
+// How long a QUEUED permission decision stays eligible for AUTOMATIC delivery to
+// a reconnecting hook, measured from the tap — deliberately much tighter than the
+// full ABANDONED_RETAIN_MS. permissionPayloadMatches only proves the reconnecting
+// request LOOKS identical (same question + toolInput); it can't prove it's really
+// the SAME hook process reconnecting rather than a later, unrelated re-invocation
+// of the identical action (e.g. the agent retrying the same command in a fresh
+// turn, long after the human's Telegram tap). A genuine reconnect — the daemon
+// restarting, or the hook's own reconnect-and-resend loop finding the daemon back
+// up — lands within seconds under ASK_RECONNECT_BACKOFF_MS/ASK_TOTAL_TIMEOUT_MS,
+// not minutes later, so bounding the auto-deliver window narrows that ambiguity
+// window without weakening the core "never drop a tap" guarantee: past this bound
+// the queue is discarded and a fresh live prompt is shown instead (review
+// finding) — the human's earlier tap is not silently rubber-stamped onto a
+// materially later, only-coincidentally-identical request. Env-overridable for
+// tests; production never sets it.
+const QUEUED_DECISION_DELIVERY_MS = (() => {
+  const raw = Number(process.env.TG_CTL_QUEUED_DECISION_DELIVERY_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60_000
+})()
+
 // Drop abandoned entries past the retention window. Called before every persist so
-// the durable file (and the in-memory map) stay bounded to the recent window.
-function pruneAbandonedButtons(abandoned: Map<string, AbandonedButton>, now: number): void {
+// the durable file (and the in-memory map) stay bounded to the recent window. The
+// optional `onExpire` fires for each entry AT THE MOMENT it is dropped — this is
+// the daemon giving up on ever reconnecting it, so it is also the one honest place
+// to surface the "still no connection after a long wait" notice (Alex tg
+// requirement: a long-running uncertainty must eventually be reported, never left
+// silent). Called with the entry BEFORE it is deleted from the map.
+function pruneAbandonedButtons(
+  abandoned: Map<string, AbandonedButton>,
+  now: number,
+  onExpire?: (key: string, entry: AbandonedButton) => void,
+): void {
   for (const [key, entry] of abandoned) {
-    if (now - entry.at > ABANDONED_RETAIN_MS) abandoned.delete(key)
+    if (now - entry.at > ABANDONED_RETAIN_MS) {
+      onExpire?.(key, entry)
+      abandoned.delete(key)
+    }
   }
 }
 
@@ -2010,16 +2063,39 @@ interface QuestionRuntime {
 // A genuinely dead card: an UNSCOPED question (no pane to late-deliver to) that
 // timed out, or a send-failed forward. Its keyboard is cleared so it can't be tapped.
 const EXPIRED_TERMINAL_TEXT = "expired — answer in terminal"
-// A SCOPED permission whose hook socket closed (daemon restart mid-block): the
-// keyboard stays live so the user can tap once the agent reconnects and the
-// reconnect re-attach delivers the answer down the new socket.
-const ABANDONED_PERMISSION_TEXT = "hook disconnected — tap after the agent reconnects"
-// A multi-question SET MEMBER whose hook socket closed: a lone late answer must
-// NOT inject into the pane (the local multi-question dialog may be on a
-// DIFFERENT question — all-or-nothing, see ButtonRequest.multiQuestion), so the
-// card says the terminal took over. The keyboard stays for reconnect re-attach;
-// a tap without a live socket answers "expired".
-const ABANDONED_MULTI_TEXT = "window closed — answer all questions in the terminal"
+// abandonedPermissionText / abandonedMultiText (features/tg-ctl/questions.ts) cover
+// a SCOPED permission or multi-question SET MEMBER whose hook socket closed (daemon
+// restart mid-block, or the hook's 120s budget elapsed): the keyboard stays live so
+// the user can tap once the agent reconnects, and the reconnect re-attach delivers
+// the answer down the new socket. A multi-question set member additionally can't be
+// late-delivered (the local dialog may be on a DIFFERENT question of the set — see
+// ButtonRequest.multiQuestion), so its text points at the terminal instead. Both are
+// built at the call site with the pane's resolved label (resolveWindowAgentLabel) so
+// the card identifies WHICH agent disconnected instead of a bare, unidentifiable
+// message — and phrased as a transient reconnect, not agent death (tg-cli UX fix).
+
+// Whether two permission ButtonRequests represent the SAME approved action —
+// the guard a queued decision must pass before it is auto-delivered to a
+// reconnecting hook (see handleHookSocketLine). Compares both the displayed
+// question text AND the raw toolInput: the text alone is not enough, since
+// toolInput can carry content (an edit's diff, a write's body, structured args)
+// the question string never shows.
+function permissionPayloadMatches(a: ButtonRequest, b: ButtonRequest): boolean {
+  // `a` (the retained request) is always a permission — only a permission ever
+  // carries a queuedDecision (see AbandonedButton.queuedDecision). `b` (the
+  // reconnecting request) is NOT guaranteed to be one: `requestId` equality alone
+  // (the caller's outer gate) doesn't prove kind/agent/pane/hook-event also match
+  // — a reused or hash-colliding requestId across a DIFFERENT kind/agent/pane/event
+  // must never have a permission decision auto-delivered onto it (review finding:
+  // "not bound to request provenance"). `permissionEvent` matters too — the reply
+  // SHAPE differs between PreToolUse and PermissionRequest.
+  if (a.kind !== "permission" || b.kind !== "permission") return false
+  if (a.agent !== b.agent) return false
+  if (a.paneId !== b.paneId) return false
+  if ((a.permissionEvent ?? "PermissionRequest") !== (b.permissionEvent ?? "PermissionRequest")) return false
+  if (a.question !== b.question) return false
+  return JSON.stringify(a.toolInput ?? null) === JSON.stringify(b.toolInput ?? null)
+}
 
 // A SCOPED question (with options) or a SCOPED permission can survive socket close:
 // a question still injects into its pane (late-delivery); a permission re-attaches
@@ -2076,9 +2152,21 @@ function armPendingSocketClose(
         }
       } else {
         rt.onRelease(entry.req.paneId as string)
-        const abandonedText = entry.req.kind === "permission" ? ABANDONED_PERMISSION_TEXT : ABANDONED_MULTI_TEXT
-        if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText)
-        else entry.finalText = abandonedText
+        const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
+        const abandonedText =
+          entry.req.kind === "permission" ? abandonedPermissionText(entry.req, label) : abandonedMultiText(entry.req, label)
+        // The keyboard MUST ride along explicitly (see editMessageText's own doc
+        // comment: omitting reply_markup DETACHES the current keyboard, it is not
+        // preserved) — otherwise this very edit removes the buttons the text just
+        // invited a tap on, breaking the whole abandoned-tap/queue feature at the
+        // moment it's needed (review finding). Mirrors the question branch above,
+        // which already passes `abandoned.reply_markup` for the same reason.
+        const abandonedMarkup = buildButtonMessage(ctx.chatId, entry.req).reply_markup
+        if (entry.messageId !== null) void editMessageText(ctx, entry.messageId, abandonedText, abandonedMarkup)
+        else {
+          entry.finalText = abandonedText
+          entry.finalReplyMarkup = abandonedMarkup
+        }
       }
     } else {
       if (entry.req.paneId) rt.onRelease(entry.req.paneId)
@@ -2314,6 +2402,68 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   if (retained) {
     if (retained.req.requestId === req.requestId) {
       rt.abandoned.delete(pendingKey)
+      // A Telegram tap already chose a permission decision WHILE this hook was
+      // disconnected (queued by lateDeliverAbandonedQuestion, since a permission has
+      // no pane-text fallback). Deliver it down THIS reconnecting socket right away
+      // instead of re-showing a live prompt the human already answered — this is
+      // what makes abandonedPermissionText's "delivered the moment it reconnects"
+      // claim true rather than aspirational.
+      // Only auto-deliver when the reconnecting request is PROVABLY the same prompt
+      // the human read and decided on — requestId alone is a hash of session+question
+      // text (tg-cli#97) and normally can't collide across different prompts, but a
+      // harness that reused a stale requestId against a MUTATED payload must not
+      // have that old decision silently rubber-stamped onto a request the human
+      // never actually saw (review finding). This must compare the FULL approved
+      // surface, not just the displayed question text: `toolInput` can carry
+      // content (an edit's diff, a write's contents, structured args) the question
+      // string never shows, so two requests can read identically to the human while
+      // asking for materially different actions. A mismatch on EITHER is treated as
+      // "no queued decision": fall through to the ordinary re-attach so the human is
+      // shown a fresh live prompt and taps it explicitly.
+      //
+      // ALSO bounded by QUEUED_DECISION_DELIVERY_MS (tighter than ABANDONED_RETAIN_MS,
+      // unlike every OTHER consumer of a retained entry, which uses the full
+      // retention window) — permissionPayloadMatches only proves the reconnecting
+      // request LOOKS identical, not that it's really the SAME hook process
+      // reconnecting rather than a later, unrelated re-invocation of the identical
+      // action. A genuine reconnect lands within seconds (the hook's own
+      // reconnect-and-resend loop, or a daemon crash-relaunch); past this bound the
+      // "reconnect" is presumed to be a coincidence, not the human's earlier tap
+      // reapplied to a materially later request (review finding).
+      const queuedStillFresh =
+        retained.queuedDecision && Date.now() - retained.queuedDecision.at <= QUEUED_DECISION_DELIVERY_MS
+      if (retained.queuedDecision && queuedStillFresh && permissionPayloadMatches(retained.req, req)) {
+        const qd = retained.queuedDecision
+        const answer: ButtonAnswer = {
+          status: "answered",
+          requestId: req.requestId,
+          label: qd.label,
+          value: qd.value,
+          decision: qd.decision,
+        }
+        const output = formatAgentHookOutput(req, answer)
+        socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
+        // Deliberately NOT added to `rt.answered` (the question-only replay cache —
+        // see the "Scoped to questions on purpose" comment in the live-tap handler
+        // below): silently replaying a permission decision to a LATER unrelated
+        // re-fire that happens to reuse the same key would be exactly the
+        // behavioral/security change that cache was built to avoid (review
+        // finding). The entry is already gone from `rt.abandoned` above, so a
+        // genuinely fresh re-fire of this requestId just forwards as a normal new
+        // prompt — no double-delivery risk without the cache.
+        rt.persist()
+        if (retained.messageId !== null) {
+          void clearMessageKeyboard(ctx, retained.messageId)
+          void editMessageText(ctx, retained.messageId, buildAnsweredQuestionText(req, qd.label))
+        }
+        log(`ask-forward queued-decision-delivered: ${describeAskRequest(req)} key=${pendingKey} label=${qd.label}`)
+        return
+      }
+      if (retained.queuedDecision && !queuedStillFresh) {
+        log(`ask-forward queued-decision-discarded: reconnecting past QUEUED_DECISION_DELIVERY_MS since the tap — treating as an unrelated later request, not a reconnect. key=${pendingKey}`)
+      } else if (retained.queuedDecision) {
+        log(`ask-forward queued-decision-discarded: reconnecting request's question text or toolInput no longer matches the queued decision's (permissionPayloadMatches) — showing a fresh live prompt instead. key=${pendingKey}`)
+      }
       rt.activeKeys.add(pendingKey)
       const entry: PendingButton = { req, socket, messageId: retained.messageId, at: Date.now() }
       rt.pending.set(pendingKey, entry)
@@ -3603,15 +3753,70 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // chosen answer can still reach the pane it asked from. NOT in `pendingButtons`, so
   // it never defers its pane's inbound. Keyed by callbackRequestId, like the others.
   const abandonedButtons = new Map<string, AbandonedButton>()
+  // The daemon is giving up on a retained entry (its retention window elapsed with
+  // no reconnect and no delivery) — surface that instead of leaving the card
+  // silently stuck on "hook disconnected"/"queued" forever (Alex tg requirement:
+  // long uncertainty must eventually be reported). Best-effort, like every other
+  // card edit in this file: a failed edit just means the card stays as it was.
+  const notifyAbandonedLongOutage = (key: string, entry: AbandonedButton): void => {
+    const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
+    if (entry.messageId !== null) {
+      void clearMessageKeyboard(ctx, entry.messageId)
+      void editMessageText(ctx, entry.messageId, abandonedLongOutageText(entry.req, label))
+    }
+    log(`ask-abandoned-long-outage: ${describeAskRequest(entry.req)} key=${key}`)
+  }
+  // A QUEUED permission decision past QUEUED_DECISION_DELIVERY_MS is no longer
+  // eligible for AUTOMATIC delivery (see the bounded reconnect branch in
+  // handleHookSocketLine) — demote the card back to the plain disconnected text so
+  // it stops promising a delivery that will not happen, instead of saying "queued
+  // … delivered automatically" indefinitely after that has stopped being true
+  // (review finding: the card's promise must not outlive its own eligibility). The
+  // entry itself stays retained (still tappable — a fresh tap re-queues; still
+  // eligible for the full ABANDONED_RETAIN_MS long-outage notice) — only the STALE
+  // queue is cleared. Returns whether anything changed, so callers know whether a
+  // persist is warranted.
+  const demoteStaleQueuedDecisions = (): boolean => {
+    let changed = false
+    const now = Date.now()
+    for (const entry of abandonedButtons.values()) {
+      if (!entry.queuedDecision || now - entry.queuedDecision.at <= QUEUED_DECISION_DELIVERY_MS) continue
+      // Skip an entry that pruneAbandonedButtons (called right after this, same
+      // sweep) is about to delete anyway: two independent fire-and-forget
+      // editMessageText calls on the SAME card (this "demoted" edit + the
+      // long-outage edit) could otherwise land at Telegram out of order, leaving
+      // the card showing the wrong one of two texts (review finding — only
+      // reachable if QUEUED_DECISION_DELIVERY_MS were misconfigured >=
+      // ABANDONED_RETAIN_MS; both texts are safe either way, but let ONE edit win
+      // deterministically). Let pruneAbandonedButtons's own notify own this entry.
+      if (now - entry.at > ABANDONED_RETAIN_MS) continue
+      entry.queuedDecision = undefined
+      changed = true
+      const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
+      if (entry.messageId !== null) {
+        void editMessageText(
+          ctx,
+          entry.messageId,
+          abandonedPermissionText(entry.req, label),
+          buildButtonMessage(ctx.chatId, entry.req).reply_markup,
+        )
+      }
+      log(`ask-permission-decision-queue-demoted: ${describeAskRequest(entry.req)}`)
+    }
+    return changed
+  }
   // Durable question state (this PR): persist pending + abandoned + answered to disk
   // on every mutation (atomic) so a daemon restart loses nothing — a late tap still
   // late-delivers and a reconnecting hook re-attaches instead of duplicating its card.
   const persistQuestions = (): void => {
     try {
       const now = Date.now()
+      // Demote any queue past its delivery-eligibility window BEFORE writing, so a
+      // persisted record never claims "queued" past the point it's actually true.
+      demoteStaleQueuedDecisions()
       // Prune BOTH maps by age before writing: parse re-filters answered on restore,
       // but pruning here too keeps the on-disk file tight and symmetric with abandoned.
-      pruneAbandonedButtons(abandonedButtons, now)
+      pruneAbandonedButtons(abandonedButtons, now, notifyAbandonedLongOutage)
       pruneAnsweredButtons(answeredButtons, now)
       const data: QuestionStoreData = {
         questions: [
@@ -3626,6 +3831,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
             req: e.req as unknown as Record<string, unknown>,
             messageId: e.messageId,
             at: e.at,
+            // A queued permission decision MUST survive a restart (see
+            // AbandonedButton.queuedDecision) — otherwise the card keeps claiming
+            // "delivered automatically once the hook reconnects" for a decision
+            // that a restart just silently threw away.
+            ...(e.queuedDecision ? { queuedDecision: e.queuedDecision } : {}),
           })),
         ],
         answered: [...answeredButtons].map(([key, e]) => ({
@@ -3650,25 +3860,54 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // re-attach to its existing card instead of posting a duplicate. Re-normalize each
   // `req` through the AUTHORITATIVE validator and drop anything that isn't scoped (and
   // for questions: carrying options). Answered entries restore the replay cache.
-  // Bounded to the retention/replay windows by parseQuestionStore.
+  //
+  // Read with an EFFECTIVELY UNBOUNDED question window (not ABANDONED_RETAIN_MS) —
+  // deliberately wider than what we actually RESTORE to `abandonedButtons` below.
+  // An entry whose retention window elapsed WHILE THE DAEMON WAS DOWN is invisible
+  // to both the sweep and the persist-time prune (they only run while the daemon is
+  // alive), so without this a card frozen on "hook disconnected"/"queued …
+  // delivered automatically" would silently never get its long-outage notice —
+  // exactly the failure this whole notice mechanism exists to prevent (review
+  // finding). Answered entries still use the real ANSWERED_REPLAY_MS window; only
+  // the question side is widened. Bound note: parseQuestionStore still caps to
+  // MAX_RETAINED_QUESTIONS (question-store.ts) — the oldest (most-expired) records
+  // are dropped first on overflow, before this loop can notify them. The on-disk
+  // WRITE side is capped the same way, so the file can't normally exceed that count
+  // in practice; this only matters if it somehow does.
   {
-    const restored = parseQuestionStore(
-      readFileOrNull(ctx.paths.questions),
-      Date.now(),
-      ABANDONED_RETAIN_MS,
-      ANSWERED_REPLAY_MS,
-    )
-    for (const rec of restored.questions) {
+    const nowRestore = Date.now()
+    const raw = parseQuestionStore(readFileOrNull(ctx.paths.questions), nowRestore, Number.MAX_SAFE_INTEGER, ANSWERED_REPLAY_MS)
+    let expiredOnRestore = false
+    for (const rec of raw.questions) {
       const req = normalizeButtonRequest(rec.req)
       if (!req || !req.paneId || (req.kind === "question" && !req.options?.length)) continue
-      abandonedButtons.set(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at })
+      if (nowRestore - rec.at > ABANDONED_RETAIN_MS) {
+        notifyAbandonedLongOutage(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at })
+        expiredOnRestore = true
+        continue
+      }
+      // Only a PERMISSION can carry a queued decision (see AbandonedButton.queuedDecision) —
+      // a stray one on a non-permission record (corrupt/foreign write) is dropped rather
+      // than silently auto-answering a question it was never meant for.
+      const queuedDecision = req.kind === "permission" ? rec.queuedDecision : undefined
+      abandonedButtons.set(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at, queuedDecision })
     }
+    const restored = raw
     for (const a of restored.answered) {
       answeredButtons.set(a.key, { value: a.value, label: a.label, decision: a.decision, at: a.at, delivery: a.delivery })
     }
     if (abandonedButtons.size || answeredButtons.size) {
       log(`questions restored: ${abandonedButtons.size} retained, ${answeredButtons.size} answered`)
     }
+    // A record notified-and-dropped above was never added to `abandonedButtons`,
+    // so it is gone from MEMORY — but the on-disk file still holds it (this block
+    // never wrote back). Left alone that stale record would: re-fire the identical
+    // (no-op) card edit on every subsequent restart until something else happens to
+    // mutate and persist, AND count against MAX_RETAINED_QUESTIONS on a future
+    // write, which could starve an actually-recent entry — or even a DIFFERENT
+    // still-expired-but-not-yet-notified entry — of its own notice (review
+    // finding). Persist once now so the file matches memory immediately.
+    if (expiredOnRestore) persistQuestions()
   }
   // /agent (and unrecognized-reply) selection awaiting a button tap: token →
   // message + candidate list. `prewrapped` = inject the message verbatim (a reply
@@ -6450,16 +6689,28 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   ): Promise<boolean> => {
     const retained = abandonedButtons.get(action.requestId)
     if (!retained || !retained.req.paneId) return false
-    // Permissions are retained for RECONNECT re-attach (hook reconnects within budget),
-    // not for pane-text injection: hook JSON is required, not text. A tap on a retained
-    // permission with no live socket falls through to the "expired" toast below so the
-    // user knows to wait for the agent's reconnect window to pass.
-    if (retained.req.kind === "permission") return false
+    // A tap must come from THIS retained entry's OWN Telegram message — mirrors the
+    // live-prompt path's same guard (case "answer-question" below). Without it, a
+    // stale card reusing a deterministic callback key (callbackRequestId is a
+    // stable hash of session+question) could queue or overwrite the decision for a
+    // DIFFERENT, newer retained entry that happens to hash-collide (review
+    // finding). Skipped only while the card's own messageId is still unknown
+    // (send in flight) — same as the live path.
+    if (
+      retained.messageId !== null &&
+      action.messageId !== null &&
+      action.messageId !== retained.messageId
+    ) {
+      await answerCallbackQuery(ctx, action.callbackQueryId, "expired")
+      return true
+    }
     // Enforce the retention window at DELIVERY time, not only on persist/restore. On a
     // QUIET daemon (no mutation since the abandon) pruneAbandonedButtons never runs, so
     // without this check an arbitrarily-stale answer would still be injected into a pane
     // whose agent has long since moved on. Past the window → drop the entry, retire the
-    // now-dead card, and fall through to the "expired" toast.
+    // now-dead card, and fall through to the "expired" toast. Applies uniformly to every
+    // kind (question, permission, multi-question member) — a permission's QUEUING below
+    // must not queue against an entry the daemon has already given up on.
     if (Date.now() - retained.at > ABANDONED_RETAIN_MS) {
       abandonedButtons.delete(action.requestId)
       persistQuestions()
@@ -6470,6 +6721,55 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       log(`ask-late-deliver-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
       return false
+    }
+    // A permission has no pane-text-injection fallback (the hook needs a structured
+    // JSON reply, not terminal text), so a tap can't be delivered right now. It must
+    // NOT be silently dropped either (Alex tg requirement: never lose a tapped
+    // decision) — QUEUE it on the retained entry so a reconnecting hook delivers it
+    // automatically the instant it re-attaches (see handleHookSocketLine's RECONNECT
+    // re-attach branch). A later re-tap overwrites the queued value (last tap wins,
+    // covers a misclick).
+    if (retained.req.kind === "permission") {
+      // `resolveButtonCallback` (features/tg-ctl/questions.ts) always sets a real
+      // 'allow'|'deny' `decision` when it returns status:"answered" for a
+      // permission — there is no answered-but-undefined-decision case — so
+      // `answer.decision` below is never undefined here (verified: PermissionDecision
+      // is exactly 'allow'|'deny', and both permission branches of
+      // resolveButtonCallback set it alongside status:"answered"). This is the same
+      // invariant question-store.ts's parseQueuedDecision enforces for the on-disk
+      // path (review finding: the two paths must agree), so the queue is never
+      // created with a decision the restore-time validator would reject.
+      const answer = resolveButtonCallback(retained.req, { requestId: action.requestId, value: action.value })
+      if (answer.status !== "answered") return false
+      const label = resolveWindowAgentLabel(retained.req.windowName, retained.req.cwd)
+      const queuedAt = Date.now()
+      retained.queuedDecision = { value: answer.value, label: answer.label, decision: answer.decision, at: queuedAt }
+      // A fresh tap is itself activity worth restarting the retention clock for —
+      // without this, a tap made near the end of the window would still expire on
+      // the very next sweep seconds later, flipping the card from "queued …
+      // delivered automatically" to "never delivered" despite the human just having
+      // acted (review finding). Accepted (not a bug, review finding): a human who
+      // keeps RE-tapping (last tap wins) keeps postponing the window indefinitely —
+      // that's fine, each tap is genuine fresh activity re-confirming the decision,
+      // the same way any other mutation legitimately resets other windows in this
+      // file (e.g. ANSWERED_REPLAY_MS on a fresh answer).
+      retained.at = queuedAt
+      persistQuestions() // durable NOW — a restart before any other mutation must not lose this tap
+      const cardId = retained.messageId ?? action.messageId
+      // The keyboard MUST ride along explicitly here too (see the disconnect-edit
+      // comment in armPendingSocketClose) — "tap again to change it" is a lie if
+      // THIS edit is what removes the buttons (review finding).
+      if (cardId !== null) {
+        void editMessageText(
+          ctx,
+          cardId,
+          queuedPermissionDecisionText(retained.req, label, answer.label),
+          buildButtonMessage(ctx.chatId, retained.req).reply_markup,
+        )
+      }
+      log(`ask-permission-decision-queued: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label}`)
+      await answerCallbackQuery(ctx, action.callbackQueryId, "queued — will send once the hook reconnects")
+      return true
     }
     // A multi-question SET MEMBER is retained ONLY for reconnect re-attach. Its
     // lone answer must never inject into the pane: the local multi-question
@@ -6910,6 +7210,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       if (Date.now() - lastAgentSeenMs > ctx.cfg.idleExitMin * 60_000) {
         log(`no agent pane for ${ctx.cfg.idleExitMin} min — idle exit`)
         cleanExit(0)
+      }
+
+      // Sweep the retention window every loop iteration (roughly once per ~50s
+      // long-poll, sooner if messages keep arriving) so an entry past
+      // ABANDONED_RETAIN_MS gets its long-outage notice promptly even on an
+      // otherwise-idle bot — persistQuestions only runs on a mutation, and on a
+      // quiet channel nothing else may mutate for a long time. Prune directly
+      // (cheap: an in-memory Map scan) rather than calling the full persistQuestions
+      // every iteration (an atomic serialize+rename) — only persist when the sweep
+      // actually dropped something, e.g. under a fast-returning long-poll with
+      // nothing pending expiry this would otherwise be a disk write per batch
+      // (review finding).
+      if (abandonedButtons.size > 0) {
+        const before = abandonedButtons.size
+        const demoted = demoteStaleQueuedDecisions()
+        pruneAbandonedButtons(abandonedButtons, Date.now(), notifyAbandonedLongOutage)
+        if (demoted || abandonedButtons.size !== before) persistQuestions()
       }
 
       // The idle long-poll is abortable by SIGTERM (beginGracefulShutdown) so a

@@ -397,6 +397,17 @@ message to "expired — answer in terminal". Late button taps get
 The daemon must also expire the TG message when the hook process dies (local
 Esc abort), not only on timeout.
 
+**SUPERSEDED for scoped requests (a `paneId` is present) by the durable
+forwarded-question state** (see AGENTS.md's "Durable forwarded-question state" and
+"Queued permission decisions" entries): a SCOPED question or SCOPED permission is
+retained on socket close instead of immediately expiring — a question late-delivers
+into its pane, a permission's decision is QUEUED and delivered automatically on a
+matching reconnect (bounded by `TG_CTL_QUEUED_DECISION_DELIVERY_MS`), and only past
+`ABANDONED_RETAIN_MS` with no delivery does the card actually expire/give up (with a
+proactive "still no connection" notice, not a silent drop). The plain "expire on
+timeout, reject a late tap" behavior described just above still applies UNSCOPED
+(no `paneId` — no pane to late-deliver to, no card worth retaining).
+
 **Shipped core path (user request 2026-06-10):** UDS protocol, inline buttons,
 callback routing, expiry editing, Claude/Codex hook output formatting, opencode
 adapter helpers, and `pi` limited-status handling. Deferred: idempotent hook
