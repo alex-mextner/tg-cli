@@ -232,9 +232,25 @@ tests can pass fakes.
   `tg-ctl ask` client for a SCOPED question reconnect-and-resends the same requestId across a
   mid-block socket drop; the restored daemon re-attaches the pending entry (no duplicate card) or
   replays the stored answer (#98, now persisted). (c) **dead-card UX** — a genuinely-dead card (an
-  unscoped question, or a send-failed forward) has its inline keyboard cleared on expiry.
-  Permissions + unscoped questions keep the single-attempt client path (resending would duplicate
-  the card). `question-store.ts` owns the on-disk format (PURE); the entrypoint owns the I/O.
+  unscoped question, or a send-failed forward) has its inline keyboard cleared on expiry. A SCOPED
+  permission is reconnectable the same as a scoped question (`askDaemonOnce`); only UNSCOPED
+  requests (no `paneId` — no card to late-deliver/re-attach to) keep the single-attempt client path,
+  since resending those would post a duplicate card. `question-store.ts` owns the on-disk format
+  (PURE); the entrypoint owns the I/O.
+- **Queued permission decisions (never drop a tap on a disconnected permission):** a permission has
+  no pane-text-injection fallback (the hook needs a structured JSON reply, not terminal text), so a
+  Telegram tap that lands while its hook is disconnected can't be delivered immediately. It is
+  QUEUED on the retained entry (`AbandonedButton.queuedDecision`, persisted immediately — survives a
+  daemon crash between the tap and the reconnect) and delivered automatically the instant a
+  reconnecting hook re-attaches to the same requestId AND its full payload (question text +
+  `toolInput`, `permissionPayloadMatches`) still matches — guarding against a stale requestId reused
+  against a materially different action. Auto-delivery is further bounded by
+  `TG_CTL_QUEUED_DECISION_DELIVERY_MS` (default 10 min, tighter than the 30-min
+  `ABANDONED_RETAIN_MS`): a genuine reconnect lands within seconds, so a "reconnect" arriving later
+  is treated as an unrelated later request, not the human's earlier tap reapplied. A later tap
+  overwrites the queue (last tap wins). An entry that never reconnects within `ABANDONED_RETAIN_MS`
+  gets a proactive "still no connection" notice — both from the daemon's poll-loop sweep while it is
+  up, and on restore if the window elapsed while the daemon was down.
 
 - **Graceful reload — no dropped channel (`tg-ctl.<botid>.deferred.json` + cooperative SIGTERM):**
   a reload (a deliberate `tg-ctl restart`, a launchd `bootout`/`bootstrap`, or a crash-relaunch)

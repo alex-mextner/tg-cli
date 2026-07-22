@@ -1,5 +1,8 @@
 import { expect, test } from 'bun:test';
 import {
+  abandonedLongOutageText,
+  abandonedMultiText,
+  abandonedPermissionText,
   buildAnsweredQuestionText,
   buildButtonMessage,
   buildClaudeQuestionAnswerOutput,
@@ -10,6 +13,7 @@ import {
   parseButtonCallback,
   parseQuestionCloseCallback,
   questionCapability,
+  queuedPermissionDecisionText,
   registrationAllowsHook,
   repairClaudeQuestionReply,
   resolveButtonCallback,
@@ -26,6 +30,13 @@ const QUESTION: ButtonRequest = {
     { label: 'Staging', description: 'Safe validation environment' },
     { label: 'Production', description: 'Customer-facing environment' },
   ],
+};
+
+const PERMISSION: ButtonRequest = {
+  requestId: 'p_123',
+  agent: 'claude',
+  kind: 'permission',
+  question: 'Allow bash command: rm -rf /tmp/test?',
 };
 
 test('registrationAllowsHook: paneId match wins, paneId contradiction rejects despite cwd match', () => {
@@ -110,6 +121,48 @@ test('buildPostTimeoutQuestionMessage preserves the original question and accept
   expect(payload.reply_markup).toEqual({
     inline_keyboard: [[{ text: 'Close', callback_data: 'tgqc:q_123' }]],
   });
+});
+
+test('abandonedPermissionText identifies which pane disconnected, never promises a reconnect, says a tap is queued, and keeps the original prompt visible', () => {
+  const text = abandonedPermissionText(PERMISSION, 'rig');
+  expect(text).toContain('rig');
+  expect(text).toContain('hook disconnected');
+  // Must read as a transient, uncertain socket close — not agent death, and NOT a
+  // false promise that reconnect WILL happen (tg-cli UX complaint: "текст
+  // дурацкий" — the old wording sounded terminal AND overclaimed reconnect).
+  expect(text).toContain('if it reconnects');
+  expect(text).toContain('queued');
+  expect(text.toLowerCase()).not.toContain('dead');
+  // The original permission prompt must still be visible — a bare status line
+  // inviting a tap on generic Approve/Reject buttons with no clue what they
+  // authorize is worse than the socket never closing at all (review finding).
+  expect(text).toContain('rm -rf /tmp/test');
+});
+
+test('queuedPermissionDecisionText names the queued choice and the pane, without claiming it was delivered, and keeps the original prompt visible', () => {
+  const text = queuedPermissionDecisionText(PERMISSION, 'rig', 'Approve');
+  expect(text).toContain('rig');
+  expect(text).toContain('Approve');
+  expect(text).toContain('queued');
+  expect(text.toLowerCase()).not.toContain('sent to the agent');
+  expect(text).toContain('rm -rf /tmp/test');
+});
+
+test('abandonedMultiText identifies which pane disconnected, points at the terminal without promising reconnect, and keeps the original prompt visible', () => {
+  const text = abandonedMultiText(QUESTION, 'ext');
+  expect(text).toContain('ext');
+  expect(text).toContain('hook disconnected');
+  expect(text).toContain('answer all questions in the terminal');
+  expect(text).toContain('if it reconnects');
+  expect(text).toContain('Where should I deploy?');
+});
+
+test('abandonedLongOutageText reports the persisted uncertainty instead of leaving it silent, and keeps the original prompt visible', () => {
+  const text = abandonedLongOutageText(PERMISSION, 'rig');
+  expect(text).toContain('rig');
+  expect(text.toLowerCase()).toContain('long wait');
+  expect(text).toContain('terminal');
+  expect(text).toContain('rm -rf /tmp/test');
 });
 
 test('buildAnsweredQuestionText keeps the prompt context with the selected answer', () => {
