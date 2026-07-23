@@ -118,6 +118,8 @@ import {
   collectQuestionAnswers,
   formatAgentHookOutput,
   questionCapability,
+  queuedDecisionCanAutoDeliver,
+  queuedDecisionStillWaitingText,
   queuedPermissionDecisionText,
   registrationSetAllowsHook,
   repairClaudeQuestionReply,
@@ -1840,7 +1842,12 @@ interface AbandonedButton {
   // delivered so a re-tap (last tap wins) or a terminal answer both stay available.
   // `decision` is REQUIRED — see question-store.ts's matching RetainedQuestionRecord
   // field for why (review finding: the two types must agree).
-  queuedDecision?: { value: string; label: string; decision: PermissionDecision; at: number }
+  // `notifiedAt`: when the ONE-TIME "still waiting to reconnect" notice
+  // (noticeStaleQueuedDecisions, QUEUED_DECISION_NOTICE_MS) fired for this queued
+  // tap — undefined until it does. Persisted so a daemon restart doesn't re-fire
+  // the notice for an entry that already got one (would read as spam / a false
+  // "still no connection" repeat right after a bounce).
+  queuedDecision?: { value: string; label: string; decision: PermissionDecision; at: number; notifiedAt?: number }
 }
 
 // A question that has already been ANSWERED, kept briefly so a re-forward of the
@@ -1895,23 +1902,28 @@ const ABANDONED_RETAIN_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60_000
 })()
 
-// How long a QUEUED permission decision stays eligible for AUTOMATIC delivery to
-// a reconnecting hook, measured from the tap — deliberately much tighter than the
-// full ABANDONED_RETAIN_MS. permissionPayloadMatches only proves the reconnecting
-// request LOOKS identical (same question + toolInput); it can't prove it's really
-// the SAME hook process reconnecting rather than a later, unrelated re-invocation
-// of the identical action (e.g. the agent retrying the same command in a fresh
-// turn, long after the human's Telegram tap). A genuine reconnect — the daemon
-// restarting, or the hook's own reconnect-and-resend loop finding the daemon back
-// up — lands within seconds under ASK_RECONNECT_BACKOFF_MS/ASK_TOTAL_TIMEOUT_MS,
-// not minutes later, so bounding the auto-deliver window narrows that ambiguity
-// window without weakening the core "never drop a tap" guarantee: past this bound
-// the queue is discarded and a fresh live prompt is shown instead (review
-// finding) — the human's earlier tap is not silently rubber-stamped onto a
-// materially later, only-coincidentally-identical request. Env-overridable for
-// tests; production never sets it.
-const QUEUED_DECISION_DELIVERY_MS = (() => {
-  const raw = Number(process.env.TG_CTL_QUEUED_DECISION_DELIVERY_MS)
+// How long a QUEUED permission decision can wait with no reconnect before the
+// human gets a PROACTIVE "still waiting to reconnect" notice — a NOTICE
+// threshold, not an expiry (Alex tg#9982: a queued tap must never be silently
+// dropped/demoted on a timer; while it's pending it stays pending in Telegram
+// until there's 100% confirmation it's resolved, or the daemon genuinely gives
+// up after the full ABANDONED_RETAIN_MS with its own proactive notice). Past
+// this threshold the queue is NOT cleared and stays fully eligible for
+// automatic delivery — see noticeStaleQueuedDecisions and the reconnect branch
+// in handleHookSocketLine, neither of which time-bounds delivery anymore.
+//
+// The identity check that makes an UNBOUNDED wait safe lives upstream, in
+// hook-normalize.ts's `invocationSeed`: requestId is now scoped to the prompt
+// TURN (Claude Code's `prompt_id`, Codex's `turn_id`), not just the session, so
+// a materially later, only-coincidentally-identical-looking request (the agent
+// re-running the same command in a NEW turn) gets a fresh requestId and can
+// never satisfy the reconnect branch's exact-requestId gate in the first
+// place — permissionPayloadMatches (full toolInput/agent/pane/event/question
+// equality) is defense-in-depth on top of that for the residual, much narrower
+// risk of a lossy `summarizeInput` digest collision, not a time bound.
+// Env-overridable for tests; production never sets it.
+const QUEUED_DECISION_NOTICE_MS = (() => {
+  const raw = Number(process.env.TG_CTL_QUEUED_DECISION_NOTICE_MS)
   return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60_000
 })()
 
@@ -1998,6 +2010,12 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     // into the pane (all-or-nothing — see ButtonRequest.multiQuestion). Parsed
     // here so it survives BOTH the socket boundary and the disk restore.
     multiQuestion: rec.multiQuestion === true ? true : undefined,
+    // The per-turn identity proof (see ButtonRequest.promptTurnId) MUST survive
+    // BOTH the socket boundary and the disk restore — it's what the reconnect
+    // branch requires before auto-delivering a queued permission decision with
+    // no time bound (handleHookSocketLine). Dropping it here would silently
+    // degrade every restored/reconnected request to the untrusted case.
+    promptTurnId: typeof rec.promptTurnId === "string" ? rec.promptTurnId : undefined,
   }
 }
 
@@ -2094,6 +2112,16 @@ function permissionPayloadMatches(a: ButtonRequest, b: ButtonRequest): boolean {
   if (a.paneId !== b.paneId) return false
   if ((a.permissionEvent ?? "PermissionRequest") !== (b.permissionEvent ?? "PermissionRequest")) return false
   if (a.question !== b.question) return false
+  // `promptTurnId` (review finding): the caller's outer `requestId` equality
+  // isn't itself proof of invocation identity — requestId is a SHORT djb2 hash
+  // (hook-normalize.ts), and the whole "a different invocation can't reach this
+  // branch" argument for dropping the delivery timer rests on env.invocationNonce
+  // being folded into that hash, not on the hash being collision-free. Comparing
+  // the raw `promptTurnId` values here closes that gap directly instead of
+  // trusting the hash alone. A genuine reconnect (the SAME process's own
+  // reconnect-and-resend loop) resends the identical serialized request — same
+  // nonce — so this never rejects a real reconnect.
+  if (a.promptTurnId !== b.promptTurnId) return false
   return JSON.stringify(a.toolInput ?? null) === JSON.stringify(b.toolInput ?? null)
 }
 
@@ -2421,18 +2449,40 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       // "no queued decision": fall through to the ordinary re-attach so the human is
       // shown a fresh live prompt and taps it explicitly.
       //
-      // ALSO bounded by QUEUED_DECISION_DELIVERY_MS (tighter than ABANDONED_RETAIN_MS,
-      // unlike every OTHER consumer of a retained entry, which uses the full
-      // retention window) — permissionPayloadMatches only proves the reconnecting
-      // request LOOKS identical, not that it's really the SAME hook process
-      // reconnecting rather than a later, unrelated re-invocation of the identical
-      // action. A genuine reconnect lands within seconds (the hook's own
-      // reconnect-and-resend loop, or a daemon crash-relaunch); past this bound the
-      // "reconnect" is presumed to be a coincidence, not the human's earlier tap
-      // reapplied to a materially later request (review finding).
-      const queuedStillFresh =
-        retained.queuedDecision && Date.now() - retained.queuedDecision.at <= QUEUED_DECISION_DELIVERY_MS
-      if (retained.queuedDecision && queuedStillFresh && permissionPayloadMatches(retained.req, req)) {
+      // NOT time-bounded (Alex tg#9982): a genuinely QUEUED decision stays eligible
+      // for automatic delivery no matter how long the reconnect takes, because the
+      // identity check itself is now airtight for permissions — requestId folds in
+      // `env.invocationNonce` (hook-normalize.ts), a random id generated ONCE PER
+      // `tg-ctl ask` PROCESS. Claude's `prompt_id` / Codex's `turn_id` alone are
+      // NOT sufficient here (they scope to the whole prompt TURN, not the
+      // individual tool call — two distinct calls in the same turn could still
+      // share a requestId under turn-id-only scoping; caught in review), so a
+      // materially later, only-coincidentally-identical-looking request (whether a
+      // later turn OR a second call within the same turn) can never reach this
+      // branch at all — it's always a NEW process with a NEW nonce, hashing to a
+      // DIFFERENT requestId that never matches `retained.req.requestId ===
+      // req.requestId` above. permissionPayloadMatches remains as defense-in-depth
+      // against the narrower residual risk of a lossy `summarizeInput` digest
+      // collision (two DIFFERENT toolInputs summarizing to the same short string)
+      // — not a stand-in for a time bound.
+      //
+      // `retained.req.promptTurnId` is REQUIRED (not just permissionPayloadMatches):
+      // it's the proof that THIS retained request was actually captured with
+      // turn-level identity in the first place. Without it (an older Claude Code
+      // <v2.1.196, a harness with no turn_id equivalent, or a manual/back-compat
+      // caller), requestId is only session-scoped, and a same-session re-run of an
+      // identical command is a routine, non-malicious occurrence — auto-delivering
+      // onto it would be exactly the "different prompt, same-looking request"
+      // hazard this whole check exists to prevent (review finding). Refusing
+      // auto-delivery there does NOT silently drop the tap: the fallthrough below
+      // restores the card to a LIVE, freshly-buttoned prompt (buildButtonMessage)
+      // — visibly pending again, not a dead/expired card and not a false "queued"
+      // claim — so the human sees exactly what's happening and can re-decide. The
+      // OLD queued value itself is NOT carried forward into that fresh prompt
+      // (PendingButton has no queuedDecision slot): once identity can't be proven,
+      // presenting a genuinely fresh choice is the honest, safe behavior, not a
+      // stale tap silently reapplied.
+      if (retained.queuedDecision && queuedDecisionCanAutoDeliver(retained.req) && permissionPayloadMatches(retained.req, req)) {
         const qd = retained.queuedDecision
         const answer: ButtonAnswer = {
           status: "answered",
@@ -2459,8 +2509,14 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
         log(`ask-forward queued-decision-delivered: ${describeAskRequest(req)} key=${pendingKey} label=${qd.label}`)
         return
       }
-      if (retained.queuedDecision && !queuedStillFresh) {
-        log(`ask-forward queued-decision-discarded: reconnecting past QUEUED_DECISION_DELIVERY_MS since the tap — treating as an unrelated later request, not a reconnect. key=${pendingKey}`)
+      if (retained.queuedDecision && !queuedDecisionCanAutoDeliver(retained.req)) {
+        log(`ask-forward queued-decision-discarded: retained request has no promptTurnId (no per-invocation identity proof) — refusing auto-delivery, showing a fresh live prompt instead. key=${pendingKey}`)
+      } else if (retained.queuedDecision && retained.req.promptTurnId !== req.promptTurnId) {
+        // Distinct from the generic permissionPayloadMatches mismatch below (review
+        // finding: this log used to blame "question text or toolInput" even when the
+        // REAL mismatch was promptTurnId — e.g. a manual/back-compat caller reusing
+        // the same requestId while omitting or changing the field).
+        log(`ask-forward queued-decision-discarded: reconnecting request's promptTurnId does not match the queued decision's (permissionPayloadMatches) — showing a fresh live prompt instead. key=${pendingKey}`)
       } else if (retained.queuedDecision) {
         log(`ask-forward queued-decision-discarded: reconnecting request's question text or toolInput no longer matches the queued decision's (permissionPayloadMatches) — showing a fresh live prompt instead. key=${pendingKey}`)
       }
@@ -2613,6 +2669,22 @@ async function askDaemon(ctx: Ctx): Promise<void> {
   // env. A claude AskUserQuestion with 2-4 questions yields one request PER
   // question; everything else yields exactly one. null → unsupported shape;
   // emit nothing so the local agent UI takes over.
+  //
+  // `invocationNonce`: a random id generated ONCE per `tg-ctl ask` PROCESS —
+  // the harness spawns a fresh process for EVERY tool/permission/question hook
+  // event, so this is a true per-INVOCATION identity, stronger than (and not
+  // dependent on) any field the harness itself may or may not send
+  // (Claude Code's `prompt_id` / Codex's `turn_id` identify the whole prompt
+  // TURN, not the individual tool call — two distinct tool invocations with
+  // byte-identical input in the SAME turn would otherwise share a requestId;
+  // review finding, tg#9982 follow-up). Threaded into every requestId hash
+  // (hook-normalize.ts) and into ButtonRequest.promptTurnId, so a queued
+  // permission decision's no-time-bound auto-delivery (see AGENTS.md's "Queued
+  // permission decisions") is scoped to THIS exact invocation: the SAME
+  // process's own reconnect-and-resend loop reuses this same requestLine/nonce
+  // (requestHookAnswerWithReconnect resends the identical serialized `req`), so
+  // a genuine reconnect still matches; a genuinely later invocation is always a
+  // NEW process with a NEW nonce and can never collide.
   const env: HookEnv = {
     agent: hookAgentFromArgv(),
     paneId: process.env.TMUX_PANE || undefined,
@@ -2620,6 +2692,7 @@ async function askDaemon(ctx: Ctx): Promise<void> {
     sessionName: tmuxSessionName(),
     windowName: tmuxWindowName(),
     subagent: detectAgentLabel(process.env) || undefined,
+    invocationNonce: crypto.randomUUID(),
   }
   const reqs = normalizeHookRequests(payload, env)
   if (!reqs) {
@@ -3762,58 +3835,115 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
     if (entry.messageId !== null) {
       void clearMessageKeyboard(ctx, entry.messageId)
-      void editMessageText(ctx, entry.messageId, abandonedLongOutageText(entry.req, label))
+      void editMessageText(ctx, entry.messageId, abandonedLongOutageText(entry.req, label, entry.queuedDecision?.label))
     }
     log(`ask-abandoned-long-outage: ${describeAskRequest(entry.req)} key=${key}`)
   }
-  // A QUEUED permission decision past QUEUED_DECISION_DELIVERY_MS is no longer
-  // eligible for AUTOMATIC delivery (see the bounded reconnect branch in
-  // handleHookSocketLine) — demote the card back to the plain disconnected text so
-  // it stops promising a delivery that will not happen, instead of saying "queued
-  // … delivered automatically" indefinitely after that has stopped being true
-  // (review finding: the card's promise must not outlive its own eligibility). The
-  // entry itself stays retained (still tappable — a fresh tap re-queues; still
-  // eligible for the full ABANDONED_RETAIN_MS long-outage notice) — only the STALE
-  // queue is cleared. Returns whether anything changed, so callers know whether a
-  // persist is warranted.
-  const demoteStaleQueuedDecisions = (): boolean => {
+  // A QUEUED permission decision past QUEUED_DECISION_NOTICE_MS with no reconnect
+  // gets a ONE-TIME proactive "still waiting to reconnect" notice (Alex tg#9982:
+  // a long-running uncertainty must be reported, but the queued tap itself must
+  // NEVER be silently dropped/demoted on a timer). Unlike the pre-fix behavior
+  // this replaces, the queue is NOT cleared — it stays fully eligible for
+  // automatic delivery (see the reconnect branch in handleHookSocketLine, which
+  // is no longer time-bounded) for as long as the entry itself is retained
+  // (ABANDONED_RETAIN_MS, refreshed by every tap). `notifiedAt` makes this
+  // idempotent: a sweep that finds an already-notified entry does nothing.
+  // Returns whether anything changed, so callers know whether a persist is
+  // warranted. `now` is caller-supplied (not sampled internally) and MUST be the
+  // exact same value the caller then passes to `pruneAbandonedButtons` right
+  // after — two independent `Date.now()` reads a few instructions apart can
+  // straddle an entry's exact retention boundary, defeating the skip guard
+  // below for that narrow window (review finding: one clock reading in, not two).
+  const noticeStaleQueuedDecisions = (now: number): boolean => {
     let changed = false
-    const now = Date.now()
     for (const entry of abandonedButtons.values()) {
-      if (!entry.queuedDecision || now - entry.queuedDecision.at <= QUEUED_DECISION_DELIVERY_MS) continue
-      // Skip an entry that pruneAbandonedButtons (called right after this, same
-      // sweep) is about to delete anyway: two independent fire-and-forget
-      // editMessageText calls on the SAME card (this "demoted" edit + the
-      // long-outage edit) could otherwise land at Telegram out of order, leaving
-      // the card showing the wrong one of two texts (review finding — only
-      // reachable if QUEUED_DECISION_DELIVERY_MS were misconfigured >=
-      // ABANDONED_RETAIN_MS; both texts are safe either way, but let ONE edit win
-      // deterministically). Let pruneAbandonedButtons's own notify own this entry.
-      if (now - entry.at > ABANDONED_RETAIN_MS) continue
-      entry.queuedDecision = undefined
+      const qd = entry.queuedDecision
+      if (!qd || qd.notifiedAt !== undefined || now - qd.at <= QUEUED_DECISION_NOTICE_MS) continue
+      // An entry with no `promptTurnId` never auto-delivers on reconnect (see the
+      // gate in handleHookSocketLine) — queuedDecisionStillWaitingText's "will
+      // still be delivered automatically if it reconnects" would be a straight-up
+      // lie for it (review finding: the notice text overpromised for exactly the
+      // case the delivery gate carves out). Skip the still-waiting notice
+      // entirely here; the entry still gets the accurate, decision-naming give-up
+      // notice at ABANDONED_RETAIN_MS (notifyAbandonedLongOutage), which never
+      // claims automatic delivery in the first place.
+      if (!queuedDecisionCanAutoDeliver(entry.req)) continue
+      // Skip an entry that pruneAbandonedButtons (called right after this with the
+      // SAME `now`, same sweep — both persistQuestions and the poll loop run them
+      // back to back) is about to delete anyway: two independent fire-and-forget
+      // editMessageText calls on the SAME card (this "still waiting" edit + the
+      // long-outage give-up edit, which also clears the keyboard) could otherwise
+      // land at Telegram out of order, leaving a since-deleted entry's card
+      // claiming "still waiting … will still be delivered" with a live keyboard
+      // that resolves to nothing (review finding). Let pruneAbandonedButtons's own
+      // notify own this entry — reachable in normal production (not just
+      // misconfiguration): the daemon can be down from shortly after the tap until
+      // past the full ABANDONED_RETAIN_MS, so `notifiedAt` is still unset on
+      // restore and both thresholds are crossed in the very first post-restore
+      // sweep. `>=` (not pruneAbandonedButtons's own strict `>`), deliberately
+      // ASYMMETRIC with the shared `now`: this must skip everything the prune is
+      // about to take (the double-edit hazard, never allowed), even though that
+      // means the exact boundary tick (`now - entry.at === ABANDONED_RETAIN_MS`)
+      // gets neither notice nor prune this ONE sweep (prune's `>` doesn't take it
+      // yet either) — resolved trivially on the very next sweep. A stale "neither
+      // fired for one tick" beats a card showing two contradictory edits.
+      if (now - entry.at >= ABANDONED_RETAIN_MS) continue
+      qd.notifiedAt = now
       changed = true
       const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
       if (entry.messageId !== null) {
         void editMessageText(
           ctx,
           entry.messageId,
-          abandonedPermissionText(entry.req, label),
+          queuedDecisionStillWaitingText(entry.req, label, qd.label),
           buildButtonMessage(ctx.chatId, entry.req).reply_markup,
         )
       }
-      log(`ask-permission-decision-queue-demoted: ${describeAskRequest(entry.req)}`)
+      log(`ask-permission-decision-queue-still-waiting-notice: ${describeAskRequest(entry.req)}`)
     }
     return changed
   }
   // Durable question state (this PR): persist pending + abandoned + answered to disk
   // on every mutation (atomic) so a daemon restart loses nothing — a late tap still
   // late-delivers and a reconnecting hook re-attaches instead of duplicating its card.
-  const persistQuestions = (): void => {
+  // `nowOverride`: when the caller already ran its OWN notice+prune sweep against
+  // a specific clock reading moments ago (the poll loop, which sweeps directly
+  // for cheapness and only calls persistQuestions() to write out what changed —
+  // see the call site below), pass that SAME reading through so this internal
+  // re-sweep doesn't sample a NEW `Date.now()` and re-run notice+prune with two
+  // different clocks in one iteration. Two different clocks reopened the exact
+  // out-of-order double-edit hazard noticeStaleQueuedDecisions's shared-`now`
+  // parameter was added to close — an entry whose retention deadline falls
+  // between the two reads got a "still waiting" edit from the FIRST sweep and a
+  // give-up edit from the SECOND, independent fire-and-forget calls that can
+  // land at Telegram out of order (review finding). Every other call site has no
+  // preceding sweep in the same tick, so they omit it and get a fresh clock.
+  // CAUTION (review finding, checked — currently safe): every call site in this
+  // file invokes `persistQuestions()`/`persistQuestions(sweepNow)` directly, and
+  // `rt.persist` (the one place this is exposed by reference, as an object
+  // property) is likewise only ever invoked as `rt.persist()` with zero args
+  // (grep confirms no `.then(rt.persist)` / event-handler / array-callback usage
+  // that would forward an incidental first argument as a bogus `nowOverride`).
+  // If a new such reference-passing call site is ever added, it MUST wrap it in
+  // an arrow (`() => persistQuestions()`), never pass the function bare.
+  const persistQuestions = (nowOverride?: number): void => {
     try {
-      const now = Date.now()
-      // Demote any queue past its delivery-eligibility window BEFORE writing, so a
-      // persisted record never claims "queued" past the point it's actually true.
-      demoteStaleQueuedDecisions()
+      // `typeof … === "number"` (not a bare `??`): a positional optional param is
+      // exactly the shape a bare-reference callback (`.then(rt.persist)`, an event
+      // handler, `arr.forEach(rt.persist)`) would corrupt by forwarding its own
+      // first argument — a Promise value, an array index, an event object — as
+      // `nowOverride`. Every current call site passes either nothing or a real
+      // `number` (see the CAUTION comment above), so this typeof guard is
+      // currently a no-op in practice; it exists so a FUTURE bare-reference usage
+      // fails safe (falls back to a fresh, correct clock) instead of silently
+      // writing disk state — or disabling both sweeps — against a bogus "now"
+      // (review finding).
+      const now = typeof nowOverride === "number" ? nowOverride : Date.now()
+      // Fire the still-waiting notice for any queue past its notice threshold
+      // BEFORE writing, so `notifiedAt` is durable the instant it fires (a restart
+      // right after must not re-send the notice). Same `now` as the prune call
+      // right below — see noticeStaleQueuedDecisions's own doc comment for why.
+      noticeStaleQueuedDecisions(now)
       // Prune BOTH maps by age before writing: parse re-filters answered on restore,
       // but pruning here too keeps the on-disk file tight and symmetric with abandoned.
       pruneAbandonedButtons(abandonedButtons, now, notifyAbandonedLongOutage)
@@ -3882,7 +4012,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const req = normalizeButtonRequest(rec.req)
       if (!req || !req.paneId || (req.kind === "question" && !req.options?.length)) continue
       if (nowRestore - rec.at > ABANDONED_RETAIN_MS) {
-        notifyAbandonedLongOutage(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at })
+        // Carry the queuedDecision through (same rule as the live-abandonedButtons
+        // restore below): a tap that was never delivered before the daemon went
+        // down for the whole retention window must still be NAMED in the give-up
+        // notice (abandonedLongOutageText's queuedDecisionLabel), not silently
+        // treated as if nothing was ever chosen.
+        const queuedDecision = req.kind === "permission" ? rec.queuedDecision : undefined
+        notifyAbandonedLongOutage(callbackRequestId(req), { req, messageId: rec.messageId, at: rec.at, queuedDecision })
         expiredOnRestore = true
         continue
       }
@@ -6763,12 +6899,24 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         void editMessageText(
           ctx,
           cardId,
+          // Card text reads `retained.req` — the toast below MUST read the SAME
+          // object (never the incoming `req`/`action`), or queuedDecisionCanAutoDeliver's
+          // "single source of truth" guarantee is only nominal (review finding).
           queuedPermissionDecisionText(retained.req, label, answer.label),
           buildButtonMessage(ctx.chatId, retained.req).reply_markup,
         )
       }
       log(`ask-permission-decision-queued: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label}`)
-      await answerCallbackQuery(ctx, action.callbackQueryId, "queued — will send once the hook reconnects")
+      // The ephemeral toast must make the SAME promise as the card text — both
+      // now branch on the SAME shared predicate (queuedDecisionCanAutoDeliver)
+      // instead of independently re-deriving the same truthiness check, so they
+      // can never silently drift apart again (Codex review finding + follow-up
+      // review finding on this fix itself).
+      await answerCallbackQuery(
+        ctx,
+        action.callbackQueryId,
+        queuedDecisionCanAutoDeliver(retained.req) ? "queued — will send once the hook reconnects" : "queued — tap again once it reconnects",
+      )
       return true
     }
     // A multi-question SET MEMBER is retained ONLY for reconnect re-attach. Its
@@ -7224,9 +7372,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // (review finding).
       if (abandonedButtons.size > 0) {
         const before = abandonedButtons.size
-        const demoted = demoteStaleQueuedDecisions()
-        pruneAbandonedButtons(abandonedButtons, Date.now(), notifyAbandonedLongOutage)
-        if (demoted || abandonedButtons.size !== before) persistQuestions()
+        const sweepNow = Date.now()
+        const noticed = noticeStaleQueuedDecisions(sweepNow)
+        pruneAbandonedButtons(abandonedButtons, sweepNow, notifyAbandonedLongOutage)
+        if (noticed || abandonedButtons.size !== before) persistQuestions(sweepNow)
       }
 
       // The idle long-poll is abortable by SIGTERM (beginGracefulShutdown) so a
