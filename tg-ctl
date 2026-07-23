@@ -118,6 +118,7 @@ import {
   collectQuestionAnswers,
   formatAgentHookOutput,
   questionCapability,
+  queuedDecisionCanAutoDeliver,
   queuedDecisionStillWaitingText,
   queuedPermissionDecisionText,
   registrationSetAllowsHook,
@@ -2112,13 +2113,14 @@ function permissionPayloadMatches(a: ButtonRequest, b: ButtonRequest): boolean {
   if ((a.permissionEvent ?? "PermissionRequest") !== (b.permissionEvent ?? "PermissionRequest")) return false
   if (a.question !== b.question) return false
   // `promptTurnId` (review finding): the caller's outer `requestId` equality
-  // isn't itself proof of turn-level identity — requestId is a SHORT djb2 hash
-  // (hook-normalize.ts), and the whole "a different turn can't reach this
-  // branch" argument for dropping the delivery timer rests on invocationSeed
+  // isn't itself proof of invocation identity — requestId is a SHORT djb2 hash
+  // (hook-normalize.ts), and the whole "a different invocation can't reach this
+  // branch" argument for dropping the delivery timer rests on env.invocationNonce
   // being folded into that hash, not on the hash being collision-free. Comparing
   // the raw `promptTurnId` values here closes that gap directly instead of
-  // trusting the hash alone. A genuine reconnect resends the identical
-  // prompt_id/turn_id, so this never rejects a real reconnect.
+  // trusting the hash alone. A genuine reconnect (the SAME process's own
+  // reconnect-and-resend loop) resends the identical serialized request — same
+  // nonce — so this never rejects a real reconnect.
   if (a.promptTurnId !== b.promptTurnId) return false
   return JSON.stringify(a.toolInput ?? null) === JSON.stringify(b.toolInput ?? null)
 }
@@ -2449,15 +2451,20 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       //
       // NOT time-bounded (Alex tg#9982): a genuinely QUEUED decision stays eligible
       // for automatic delivery no matter how long the reconnect takes, because the
-      // identity check itself is now airtight — requestId is scoped to the prompt
-      // TURN (hook-normalize.ts's invocationSeed: Claude's `prompt_id`, Codex's
-      // `turn_id`), so a materially later, only-coincidentally-identical-looking
-      // request can never reach this branch at all (it hashes to a DIFFERENT
-      // requestId and never matches `retained.req.requestId === req.requestId`
-      // above). permissionPayloadMatches remains as defense-in-depth against the
-      // narrower residual risk of a lossy `summarizeInput` digest collision (two
-      // DIFFERENT toolInputs summarizing to the same short string) — not a stand-in
-      // for a time bound.
+      // identity check itself is now airtight for permissions — requestId folds in
+      // `env.invocationNonce` (hook-normalize.ts), a random id generated ONCE PER
+      // `tg-ctl ask` PROCESS. Claude's `prompt_id` / Codex's `turn_id` alone are
+      // NOT sufficient here (they scope to the whole prompt TURN, not the
+      // individual tool call — two distinct calls in the same turn could still
+      // share a requestId under turn-id-only scoping; caught in review), so a
+      // materially later, only-coincidentally-identical-looking request (whether a
+      // later turn OR a second call within the same turn) can never reach this
+      // branch at all — it's always a NEW process with a NEW nonce, hashing to a
+      // DIFFERENT requestId that never matches `retained.req.requestId ===
+      // req.requestId` above. permissionPayloadMatches remains as defense-in-depth
+      // against the narrower residual risk of a lossy `summarizeInput` digest
+      // collision (two DIFFERENT toolInputs summarizing to the same short string)
+      // — not a stand-in for a time bound.
       //
       // `retained.req.promptTurnId` is REQUIRED (not just permissionPayloadMatches):
       // it's the proof that THIS retained request was actually captured with
@@ -2475,7 +2482,7 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       // (PendingButton has no queuedDecision slot): once identity can't be proven,
       // presenting a genuinely fresh choice is the honest, safe behavior, not a
       // stale tap silently reapplied.
-      if (retained.queuedDecision && retained.req.promptTurnId && permissionPayloadMatches(retained.req, req)) {
+      if (retained.queuedDecision && queuedDecisionCanAutoDeliver(retained.req) && permissionPayloadMatches(retained.req, req)) {
         const qd = retained.queuedDecision
         const answer: ButtonAnswer = {
           status: "answered",
@@ -2502,8 +2509,8 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
         log(`ask-forward queued-decision-delivered: ${describeAskRequest(req)} key=${pendingKey} label=${qd.label}`)
         return
       }
-      if (retained.queuedDecision && !retained.req.promptTurnId) {
-        log(`ask-forward queued-decision-discarded: retained request has no promptTurnId (no turn-level identity proof) — refusing auto-delivery, showing a fresh live prompt instead. key=${pendingKey}`)
+      if (retained.queuedDecision && !queuedDecisionCanAutoDeliver(retained.req)) {
+        log(`ask-forward queued-decision-discarded: retained request has no promptTurnId (no per-invocation identity proof) — refusing auto-delivery, showing a fresh live prompt instead. key=${pendingKey}`)
       } else if (retained.queuedDecision && retained.req.promptTurnId !== req.promptTurnId) {
         // Distinct from the generic permissionPayloadMatches mismatch below (review
         // finding: this log used to blame "question text or toolInput" even when the
@@ -3860,7 +3867,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // entirely here; the entry still gets the accurate, decision-naming give-up
       // notice at ABANDONED_RETAIN_MS (notifyAbandonedLongOutage), which never
       // claims automatic delivery in the first place.
-      if (!entry.req.promptTurnId) continue
+      if (!queuedDecisionCanAutoDeliver(entry.req)) continue
       // Skip an entry that pruneAbandonedButtons (called right after this with the
       // SAME `now`, same sweep — both persistQuestions and the poll loop run them
       // back to back) is about to delete anyway: two independent fire-and-forget
@@ -6892,12 +6899,24 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         void editMessageText(
           ctx,
           cardId,
+          // Card text reads `retained.req` — the toast below MUST read the SAME
+          // object (never the incoming `req`/`action`), or queuedDecisionCanAutoDeliver's
+          // "single source of truth" guarantee is only nominal (review finding).
           queuedPermissionDecisionText(retained.req, label, answer.label),
           buildButtonMessage(ctx.chatId, retained.req).reply_markup,
         )
       }
       log(`ask-permission-decision-queued: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label}`)
-      await answerCallbackQuery(ctx, action.callbackQueryId, "queued — will send once the hook reconnects")
+      // The ephemeral toast must make the SAME promise as the card text — both
+      // now branch on the SAME shared predicate (queuedDecisionCanAutoDeliver)
+      // instead of independently re-deriving the same truthiness check, so they
+      // can never silently drift apart again (Codex review finding + follow-up
+      // review finding on this fix itself).
+      await answerCallbackQuery(
+        ctx,
+        action.callbackQueryId,
+        queuedDecisionCanAutoDeliver(retained.req) ? "queued — will send once the hook reconnects" : "queued — tap again once it reconnects",
+      )
       return true
     }
     // A multi-question SET MEMBER is retained ONLY for reconnect re-attach. Its

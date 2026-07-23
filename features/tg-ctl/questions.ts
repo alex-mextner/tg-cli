@@ -199,8 +199,15 @@ export function buildPostTimeoutQuestionMessage(chatId: number, req: ButtonReque
 // (buildQuestionText) rides along too — the status line alone would invite a tap
 // on Approve/Reject buttons with no visible clue what they're approving, which is
 // worse than the socket never having closed at all (review finding).
+// The "queued and delivered the moment that happens" promise below is only
+// true when queuedDecisionCanAutoDeliver(req) — same predicate, same rule as
+// queuedPermissionDecisionText and the tap-time toast (review finding: this
+// INITIAL disconnect card, shown before any tap even happens, made the same
+// overclaim for a no-promptTurnId request).
 export function abandonedPermissionText(req: ButtonRequest, label: string): string {
-  const status = `hook disconnected for ${label} — if it reconnects, this card restores automatically. A tap now is queued and delivered the moment that happens; you can also answer directly in the terminal.`;
+  const status = queuedDecisionCanAutoDeliver(req)
+    ? `hook disconnected for ${label} — if it reconnects, this card restores automatically. A tap now is queued and delivered the moment that happens; you can also answer directly in the terminal.`
+    : `hook disconnected for ${label} — if it reconnects, this card restores automatically. A tap now is queued, but this daemon can't prove a later reconnect is the SAME request, so it won't auto-deliver; you'll need to tap again once it reconnects, or answer directly in the terminal.`;
   return [buildQuestionText(req), status].join('\n\n');
 }
 
@@ -212,18 +219,43 @@ export function abandonedPermissionText(req: ButtonRequest, label: string): stri
 // branch). Re-tappable: a later tap overwrites the queued decision (last tap
 // wins) in case of a misclick, up until it is actually delivered. Keeps the
 // original prompt visible for the same reason as abandonedPermissionText.
+// THE single source of truth for "can a queued decision on this request ever
+// auto-deliver on reconnect" — every UI surface that promises (or refuses to
+// promise) automatic delivery MUST branch on this, not re-derive the same
+// truthiness check independently (review finding: two independently-written
+// conditions — even identical ones today — silently drift the moment either
+// is edited, reintroducing the exact toast/card disagreement bug this predicate
+// exists to prevent). tg-ctl's reconnect-branch delivery gate CALLS this
+// directly (`queuedDecisionCanAutoDeliver(retained.req) &&`) rather than
+// re-deriving the truthiness check inline — see ButtonRequest.promptTurnId's
+// own doc comment for why permission vs question source it differently. Note:
+// necessary, not sufficient — the reconnect branch additionally requires
+// `permissionPayloadMatches` (which itself compares raw `promptTurnId`
+// equality, not just presence) before actually delivering.
+export function queuedDecisionCanAutoDeliver(req: ButtonRequest): boolean {
+  return Boolean(req.promptTurnId);
+}
+
 // The "delivered automatically once the hook reconnects" promise is only TRUE
-// when `req.promptTurnId` is set (Claude's `prompt_id` / Codex's `turn_id`) —
-// tg-ctl's reconnect branch REQUIRES it before auto-delivering (see the field's
-// doc comment). Without it (an older Claude Code, a harness with no equivalent
-// field, or a manual/back-compat caller) a reconnect always falls through to a
-// fresh live prompt instead, so the auto-delivery promise would be false —
-// exactly the same overclaim queuedDecisionStillWaitingText and
-// noticeStaleQueuedDecisions were fixed to avoid for the notice text (review
-// finding: this was the one remaining place that still made the unconditional
-// promise, at TAP time).
+// when `queuedDecisionCanAutoDeliver(req)` — for a PERMISSION (the only kind
+// that ever carries a queuedDecision), `promptTurnId` is `env.invocationNonce`
+// (a per-process nonce, hook-normalize.ts), NOT `prompt_id`/`turn_id` — a
+// turn-level id alone is NOT sufficient (it can't distinguish two invocations
+// in the same turn); see ButtonRequest.promptTurnId's own doc comment for the
+// full per-kind sourcing. tg-ctl's reconnect branch REQUIRES it before
+// auto-delivering. Without it (a request persisted to disk before this field
+// existed, or a manual/back-compat caller that hand-builds an already-normalized
+// request) a reconnect always falls through to a fresh live prompt instead, so
+// the auto-delivery promise would be false — the SAME predicate tg-ctl's
+// tap-time callback TOAST uses (review finding: the toast was the one
+// remaining place that still made the unconditional promise).
+// `queuedDecisionStillWaitingText` (below) ALSO self-gates on this predicate
+// now (defense-in-depth) — its CALLER (tg-ctl's noticeStaleQueuedDecisions)
+// already skips a no-proof entry before ever calling it, so today this is
+// belt-and-suspenders, not a behavior change; it just means a FUTURE direct
+// caller can't reintroduce the overclaim by bypassing that caller-side gate.
 export function queuedPermissionDecisionText(req: ButtonRequest, label: string, decisionLabel: string): string {
-  const status = req.promptTurnId
+  const status = queuedDecisionCanAutoDeliver(req)
     ? `queued "${decisionLabel}" for ${label} — delivered automatically once the hook reconnects. Tap again to change it, or answer in the terminal now.`
     : `queued "${decisionLabel}" for ${label} — this daemon can't prove a later reconnect is the SAME request, so it won't auto-deliver; you'll need to tap again (or answer in the terminal) once it reconnects.`;
   return [buildQuestionText(req), status].join('\n\n');
@@ -274,9 +306,18 @@ export function abandonedLongOutageText(req: ButtonRequest, label: string, queue
 // guarantee (review finding). This says only what's true right now: not
 // discarded YET, still queued, will keep trying until reconnect OR the
 // retention window runs out (at which point the human gets a SEPARATE,
-// explicit notice — this text is never the last word on it).
+// explicit notice — this text is never the last word on it). Self-gates on
+// queuedDecisionCanAutoDeliver like abandonedPermissionText and
+// queuedPermissionDecisionText — the CALLER (tg-ctl's noticeStaleQueuedDecisions)
+// already gates before ever calling this, so this is defense-in-depth, not a
+// change in current behavior: a FUTURE caller that skips that gate must not be
+// able to reintroduce the overclaim just by calling this function directly
+// (two review models independently flagged this as the one builder relying
+// solely on its caller's discipline instead of its own).
 export function queuedDecisionStillWaitingText(req: ButtonRequest, label: string, decisionLabel: string): string {
-  const status = `still waiting to reconnect for ${label} — your queued "${decisionLabel}" has NOT been discarded and will still be delivered automatically if it reconnects. If the connection stays down much longer you'll get a separate notice. Tap again to change it, or answer in the terminal now.`;
+  const status = queuedDecisionCanAutoDeliver(req)
+    ? `still waiting to reconnect for ${label} — your queued "${decisionLabel}" has NOT been discarded and will still be delivered automatically if it reconnects. If the connection stays down much longer you'll get a separate notice. Tap again to change it, or answer in the terminal now.`
+    : `still waiting to reconnect for ${label} — your queued "${decisionLabel}" has NOT been discarded, but this daemon can't prove a later reconnect is the SAME request, so it won't auto-deliver; you'll need to tap again once it reconnects. If the connection stays down much longer you'll get a separate notice. You can also answer in the terminal now.`;
   return [buildQuestionText(req), status].join('\n\n');
 }
 

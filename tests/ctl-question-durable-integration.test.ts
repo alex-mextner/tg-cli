@@ -237,10 +237,12 @@ const QUESTION = {
 // Permission fixture — uses PermissionRequest so no toolInput round-trip is needed.
 // callbackRequestId('p_durable') === 'p_durable' (short, clean string), so the
 // callback_data values are the literal strings constructed below. `promptTurnId`
-// is the turn-level identity proof (hook-normalize.ts's invocationSeed, carried
-// through as ButtonRequest.promptTurnId) that a QUEUED decision's automatic,
-// no-time-bound delivery on reconnect now requires — this fixture stands in for
-// a modern harness payload that actually carries prompt_id/turn_id.
+// is the per-invocation identity proof (for a real raw-harness payload, sourced
+// from hook-normalize.ts's env.invocationNonce — a per-process nonce, not just
+// prompt_id/turn_id) that a QUEUED decision's automatic, no-time-bound delivery
+// on reconnect now requires — this fixture (an already-normalized ButtonRequest
+// JSON, the manual/back-compat path) stands in for a real invocation that got
+// one.
 const PERMISSION = {
   requestId: 'p_durable',
   agent: 'claude',
@@ -1172,6 +1174,14 @@ test('PERM QUEUE: a tap on a retained-but-disconnected permission card is queued
   tg.push([tap('tgq:p_durable:allow', 802, 1)]);
   expect(await until(() => tg.answeredCbs().some((c) => c.text.includes('queued')), 6000)).toBe(true);
   expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+  // PERMISSION carries promptTurnId, so this is the case where auto-delivery is
+  // genuinely possible -- the toast AND the card must BOTH make the "will
+  // deliver automatically" promise, and they must AGREE with each other
+  // (mirror of the no-promptTurnId disagreement review finding, positive path).
+  const toast = tg.answeredCbs().findLast((c) => c.text.includes('queued'));
+  expect(toast?.text).toContain('will send once the hook reconnects');
+  const cardEdit = tg.edits().find((e) => e.includes('queued') && e.includes('Approve'));
+  expect(cardEdit).toContain('delivered automatically once the hook reconnects');
   // Still nothing injected into the pane (no text-inject path for permissions).
   expect(injected(cfgDir).length).toBe(0);
   daemon2.kill('SIGTERM');
@@ -1388,6 +1398,20 @@ test('PERM QUEUE MISMATCH GUARD (no promptTurnId): a reconnect with the SAME req
 
   tg.push([tap('tgq:p_durable:allow', 817, 1)]);
   expect(await until(() => tg.edits().some((e) => e.includes('queued') && e.includes('Approve')), 4000)).toBe(true);
+
+  // BOTH the CARD text (queuedPermissionDecisionText) and the ephemeral tap
+  // TOAST (answerCallbackQuery) must make the SAME honest promise -- neither
+  // may claim "will send once the hook reconnects" / "delivered automatically"
+  // when this exact entry can never auto-deliver (Codex review finding on the
+  // PR: the toast and the card text must not disagree with each other).
+  const cardEdit = tg.edits().find((e) => e.includes('queued') && e.includes('Approve'));
+  expect(cardEdit).not.toContain('delivered automatically once the hook reconnects');
+  expect(cardEdit).toContain("won't auto-deliver");
+
+  expect(await until(() => tg.answeredCbs().some((c) => c.text.includes('queued')), 4000)).toBe(true);
+  const tapToast = tg.answeredCbs().findLast((c) => c.text.includes('queued'));
+  expect(tapToast?.text).not.toContain('will send once the hook reconnects');
+  expect(tapToast?.text).toContain('tap again');
 
   // Byte-identical payload "reconnects" immediately -- exact requestId match,
   // exact payload match -- yet must NOT auto-deliver: there is no proof this is

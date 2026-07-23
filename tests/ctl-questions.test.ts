@@ -13,6 +13,7 @@ import {
   parseButtonCallback,
   parseQuestionCloseCallback,
   questionCapability,
+  queuedDecisionCanAutoDeliver,
   queuedDecisionStillWaitingText,
   queuedPermissionDecisionText,
   registrationAllowsHook,
@@ -138,6 +139,23 @@ test('abandonedPermissionText identifies which pane disconnected, never promises
   // inviting a tap on generic Approve/Reject buttons with no clue what they
   // authorize is worse than the socket never closing at all (review finding).
   expect(text).toContain('rm -rf /tmp/test');
+  // PERMISSION has no promptTurnId, so the "delivered the moment that happens"
+  // promise must NOT appear — a tap on THIS card can never auto-deliver
+  // (Codex review finding: this initial disconnect card overclaimed the same
+  // way queuedPermissionDecisionText's tap-time text used to).
+  expect(text).not.toContain('delivered the moment that happens');
+  expect(text).toContain("won't auto-deliver");
+});
+
+test('abandonedPermissionText: WITH promptTurnId, the "delivered the moment that happens" promise is honest and appears', () => {
+  const text = abandonedPermissionText({ ...PERMISSION, promptTurnId: 'turn-a' }, 'rig');
+  expect(text).toContain('delivered the moment that happens');
+});
+
+test('queuedDecisionCanAutoDeliver: true only when promptTurnId is a non-empty string', () => {
+  expect(queuedDecisionCanAutoDeliver({ ...PERMISSION, promptTurnId: 'turn-a' })).toBe(true);
+  expect(queuedDecisionCanAutoDeliver(PERMISSION)).toBe(false);
+  expect(queuedDecisionCanAutoDeliver({ ...PERMISSION, promptTurnId: '' })).toBe(false);
 });
 
 test('queuedPermissionDecisionText names the queued choice and the pane, without claiming it was delivered, and keeps the original prompt visible', () => {
@@ -185,15 +203,26 @@ test('abandonedLongOutageText names the queued decision when one was pending ins
   expect(text).toContain('rig');
 });
 
-test('queuedDecisionStillWaitingText keeps the queue alive and visible, and does NOT overpromise unbounded delivery', () => {
-  const text = queuedDecisionStillWaitingText(PERMISSION, 'rig', 'Approve');
+test('queuedDecisionStillWaitingText: WITH promptTurnId, keeps the queue alive and visible, and does NOT overpromise unbounded delivery', () => {
+  const text = queuedDecisionStillWaitingText({ ...PERMISSION, promptTurnId: 'turn-a' }, 'rig', 'Approve');
   expect(text).toContain('still waiting to reconnect for rig');
   expect(text).toContain('queued "Approve"');
   expect(text).toContain('NOT been discarded');
+  expect(text).toContain('will still be delivered automatically');
   // Must not promise delivery with no bound at all — the daemon still gives up
   // at ABANDONED_RETAIN_MS and sends a SEPARATE notice when it does (review
   // finding: "however long that takes" overpromised past that point).
   expect(text).not.toContain('however long that takes');
+  expect(text.toLowerCase()).toContain('separate notice');
+});
+
+test('queuedDecisionStillWaitingText: WITHOUT promptTurnId, self-gates and does NOT promise automatic delivery (defense-in-depth, review finding)', () => {
+  const text = queuedDecisionStillWaitingText(PERMISSION, 'rig', 'Approve');
+  expect(text).toContain('still waiting to reconnect for rig');
+  expect(text).toContain('queued "Approve"');
+  expect(text).toContain('NOT been discarded');
+  expect(text).not.toContain('will still be delivered automatically');
+  expect(text.toLowerCase()).toContain("won't auto-deliver");
   expect(text.toLowerCase()).toContain('separate notice');
 });
 
