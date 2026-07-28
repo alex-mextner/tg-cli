@@ -96,6 +96,16 @@ export type ParseResult =
       // monospace table, and send it (composes with --tag/--title). The flag is
       // a boolean; the rows come from stdin, not argv. Absent when not given.
       table?: true;
+      // `--dry-run`: validate and render the message through every LOCAL guard
+      // (escalation-format gate, cjk/mixed-script guard, table/pipe-table
+      // conversion) and print the outcome, but perform NO network call and
+      // require NO credentials. Lets an agent iterate against the strict
+      // `--tag decision|question` structural gate without leaking
+      // scaffold/placeholder drafts to the real chat — see the entrypoint's
+      // dry-run short-circuit (features/cli comment "dry-run short-circuit")
+      // for the exact cutoff (text guards run; photo/document/PDF plan
+      // building and any send do not). Absent when not given.
+      dryRun?: true;
       // `--terminal-question`: the HIDDEN escape for the `answer`-requires-
       // `--reply-to` gate. The answered question originated in the TERMINAL (the
       // Claude/agent harness) where there is no inbound Telegram message_id to
@@ -377,6 +387,9 @@ export function parseArgs(
   let replyTo: number | undefined;
   let topic: number | undefined;
   let table: true | undefined;
+  // `--dry-run` — validate/render locally, never send. See the flag comment
+  // below and the `dryRun` field on the `send` action type.
+  let dryRun: true | undefined;
   // Hidden escape for the answer-gate (see the gate below + the type comment on
   // `terminalQuestion`). Never advertised in USAGE/--help.
   let terminalQuestion: true | undefined;
@@ -541,6 +554,18 @@ export function parseArgs(
     // `--table` is a boolean — the rows are read from stdin by the entrypoint.
     if (arg === '--table') {
       table = true;
+      i += 1;
+      continue;
+    }
+    // `--dry-run` is a boolean — validate/render the message LOCALLY (every
+    // guard: escalation-format gate, cjk-guard, table conversion) and print the
+    // result, but never touch credentials or the network (tg-cli#incident:
+    // agents iterating against the strict --tag decision|question gate had no
+    // way to test structural compliance except a REAL send, which leaked
+    // scaffold/placeholder text to the live chat 6 times in one incident). See
+    // the entrypoint's dry-run short-circuit for what it does and does not cover.
+    if (arg === '--dry-run') {
+      dryRun = true;
       i += 1;
       continue;
     }
@@ -761,6 +786,7 @@ export function parseArgs(
     replyTo,
     topic,
     table,
+    dryRun,
     terminalQuestion,
     escalationWarning,
   };

@@ -193,6 +193,14 @@ Options:
                        as a Rich Message). Composes with --tag/--title; any argv
                        text becomes a heading above the table. Keep cells
                        ASCII/Cyrillic (double-width emoji/CJK misalign columns).
+  --dry-run             validate/render the message through every local guard
+                       (escalation-format gate, cjk-guard, table conversion) and
+                       print the outcome — NO network call, NO credentials
+                       required, NOTHING is sent. Use this to iterate against
+                       the strict --tag decision|question format instead of
+                       testing it with real sends (a real send that happens to
+                       pass structurally still delivers to the live chat, even
+                       if the content is a placeholder draft).
   -v, --version        print version and exit
   -h, --help           print this help and exit
 
@@ -806,7 +814,10 @@ if (import.meta.main) {
   const CHAT_ID_NUMBER = Number(CHAT_ID)
   const currentChatId = Number.isFinite(CHAT_ID_NUMBER) ? CHAT_ID_NUMBER : undefined
 
-  if (!BOT_TOKEN || !CHAT_ID) {
+  // --dry-run needs no credentials at all: it never reaches the network, so an
+  // agent can iterate against the escalation-format gate (or any other guard
+  // below) without TG_BOT_TOKEN/TG_CHAT_ID configured.
+  if (!parsed.dryRun && (!BOT_TOKEN || !CHAT_ID)) {
     console.error("Error: TG_BOT_TOKEN and TG_CHAT_ID must be set in ~/.config/tg-cli/.env")
     process.exit(1)
   }
@@ -815,7 +826,7 @@ if (import.meta.main) {
   // harness can point the OUTBOUND sender at a mock Bot-API server (review qa bot harness).
   const API = `${process.env.TG_API_BASE || "https://api.telegram.org"}/bot${BOT_TOKEN}`
 
-  const { items, caption: rawCaption, format, title, tag, subagent, withOriginal, noPdf, pdfDevice, replyTo, topic, table } = parsed
+  const { items, caption: rawCaption, format, title, tag, subagent, withOriginal, noPdf, pdfDevice, replyTo, topic, table, dryRun } = parsed
 
   // The optional SECOND `[name]` bracket is a SUBAGENT self-label — explicit
   // only. `--subagent <name>` (parsed to `subagent`) wins; the `TG_AGENT` env is
@@ -965,6 +976,51 @@ if (import.meta.main) {
       }
       console.error("Advisory only (ESCALATION_GATE_ENFORCE=0) — sending anyway.")
     }
+  }
+
+  // --- dry-run short-circuit --------------------------------------------
+  // Everything above this point is LOCAL validation/rendering: the escalation-
+  // format gate (parse-time + the --table final check just above), the
+  // cjk/mixed-script guard, and the pipe-table→<table> conversion have all
+  // already run against the FINAL assembled `caption`. A failing gate above
+  // already exits(1) without ever reaching here or touching the network — the
+  // gap this flag closes is the PASSING case: a structurally-compliant message
+  // (right tags/table/pros-cons/file-ref) used to fall straight through to the
+  // real send below, which is exactly how scaffold/placeholder drafts (an
+  // agent testing whether its markup satisfies the strict gate) reached the
+  // live chat — 6 real messages in one incident, one of them still carrying
+  // the literal "foo bar baz test" / "Option A" / "ok"/"bad" placeholder text
+  // from escalationFormatMessage's own example. --dry-run stops here: no
+  // credential check, no autolink/network lookups below, no transport, no
+  // send.
+  //
+  // Attachments (photo/file/PDF) are explicitly OUT OF SCOPE — the plan that
+  // builds/converts them lives further below and is not exercised here. A
+  // silent "OK" that only validated the text half of a photo+caption send
+  // would be a false positive (review finding), so --dry-run with an
+  // attachment is a hard error naming exactly what's unsupported, rather than
+  // a partial, misleadingly-labeled pass.
+  if (dryRun && items.length > 0) {
+    console.error(
+      `Error: --dry-run does not support attachments (${items.length} item(s): ` +
+        `${items.map((it) => it.type).join(', ')}) — it only validates the TEXT body. ` +
+        "Drop --photo/--file (or the auto-attached path in the text) to dry-run just the caption.",
+    )
+    process.exit(1)
+  }
+  if (dryRun) {
+    console.log(
+      `tg --dry-run: OK — message is well-formed (tag=${tag ?? "(none)"}, format=${effectiveFormat}). ` +
+        "No network call was made and nothing was sent.",
+    )
+    // NOTE: this is the body as assembled so far (post table/pipe-table
+    // conversion, pre-autolink) — autolink-tasks/autolink-msgrefs run AFTER
+    // this point and can still rewrite it before a real send. It is the exact
+    // text every guard above just validated, but it is not a byte-exact
+    // preview of the final wire body.
+    console.log("--- rendered body (pre-autolink) ---")
+    console.log(caption)
+    process.exit(0)
   }
 
   // `--tag` is validated at parse time (features/cli/args.ts → validateTag):

@@ -3,6 +3,28 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.42.0
+
+**Feature: `--dry-run` — validate/render a message locally, never send it.**
+
+- `tg --dry-run [...]` runs every LOCAL guard on the fully assembled message
+  (the `--tag decision|question` escalation-format gate, the `--table` final
+  check, the cjk/mixed-script guard, markdown-pipe→`<table>` conversion) and
+  prints the outcome — but makes NO network call and requires NO
+  `TG_BOT_TOKEN`/`TG_CHAT_ID`. On success it prints `tg --dry-run: OK` plus the
+  rendered body; a malformed `--tag decision|question` still hard-blocks
+  exactly as it would for a real send (deny-by-default), just without ever
+  touching the network.
+- Fixes a real incident: an agent iterating against the strict escalation
+  gate had no way to test structural compliance except a REAL send. A
+  structurally-valid-but-still-placeholder draft (the gate's own
+  `foo.ts:42` / `Option A: fast/risky` example, half-edited) passed the gate
+  and went out for real — six live messages in one incident, two of them
+  still carrying literal placeholder text ("foo bar baz test.", "Option A"
+  pros "ok" cons "bad"). `--dry-run` removes the reason to ever test a
+  decision/question format against the live chat.
+
+
 ## 1.41.2
 
 **Fix: a queued permission tap is never silently expired/demoted on a timer
