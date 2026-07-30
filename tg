@@ -620,64 +620,89 @@ if (import.meta.main) {
   }
 
   // --- AI model detection ---
+
+  // The opencode session's actual model name, read from `opencode debug
+  // config` (single provider model wins; a '*router*' id preferred over an
+  // arbitrary first). null when unreadable — the caller decides the fallback.
+  const opencodeModelFromConfig = (): string | null => {
+    try {
+      const result = Bun.spawnSync(["opencode", "debug", "config"], {
+        stdout: "pipe",
+        stderr: "pipe",
+        // Branding-only read: a wedged opencode binary must never block a
+        // send — on timeout the kill makes exitCode non-zero → null below.
+        timeout: 2000,
+        killSignal: "SIGKILL",
+      })
+      if (result.exitCode !== 0) return null
+      const cfg = JSON.parse(new TextDecoder().decode(result.stdout))
+      const providers = cfg.provider || {}
+      for (const [_name, p] of Object.entries(providers)) {
+        const prov = p as { models?: Record<string, unknown> }
+        if (!prov.models) continue
+        const ids = Object.keys(prov.models)
+        const short = (fullId: string) => (fullId.includes('/') ? (fullId.split('/').pop() || fullId) : fullId)
+        if (ids.length === 1) return short(ids[0])
+        const router = ids.find((id) => id.includes("router"))
+        if (router) return short(router)
+        return short(ids[0])
+      }
+    } catch {
+      // ignore — unreadable config
+    }
+    return null
+  }
+
+  // Precedence: explicit env override → process LINEAGE (the agent that
+  // actually launched this tg) → env-marker fallbacks (CLAUDECODE → OPENCODE
+  // → CODEX) → pgrep fallbacks. Lineage leads because env vars are
+  // INHERITABLE: an agent spawned inside another agent's pane carries the
+  // outer agent's markers (omp exports CLAUDECODE=1 via its pi heritage —
+  // #246; a claude session inside an opencode pane inherits OPENCODE). The
+  // nearest recognizable ancestor is the truth in those topologies. The env
+  // markers remain the fallback for detached spawns whose launcher is not in
+  // the process tree. Runs once per process (MODEL below), so the ps walk is
+  // paid once per send, not per message part.
   const detectAiModel = (): string => {
     // 1. Explicit env var wins
     if (env.TG_AI_MODEL) return env.TG_AI_MODEL
 
-    // 1b. Claude Code sets CLAUDECODE=1 (and CLAUDE_CODE_* vars) in the agent's
-    // environment. Check this BEFORE the pgrep fallbacks below: a background
-    // `ollama` daemon (common on macOS) would otherwise be matched first and
-    // mislabel a Claude Code session as ollama.
-    if (env.CLAUDECODE || env.CLAUDE_CODE_ENTRYPOINT) return "claude"
-
-    // 2. Opencode (current agent) — read model from config
-    if (process.env.OPENCODE) {
-      try {
-        const result = Bun.spawnSync(["opencode", "debug", "config"], {
-          stdout: "pipe",
-          stderr: "pipe",
-        })
-        if (result.exitCode === 0) {
-          const cfg = JSON.parse(new TextDecoder().decode(result.stdout))
-          const providers = cfg.provider || {}
-          for (const [_name, p] of Object.entries(providers)) {
-            const prov = p as { models?: Record<string, unknown> }
-            if (prov.models) {
-              const ids = Object.keys(prov.models)
-              if (ids.length === 1) {
-                const fullId = ids[0]
-                const shortName = fullId.includes('/') ? (fullId.split('/').pop() || fullId) : fullId
-                return shortName
-              }
-              const router = ids.find((id) => id.includes("router"))
-              if (router) {
-                const shortName = router.includes('/') ? (router.split('/').pop() || router) : router
-                return shortName
-              }
-              const first = ids[0]
-              const shortName = first.includes('/') ? (first.split('/').pop() || first) : first
-              return shortName
-            }
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    // 3. Detect Codex CLI (only via explicit env, not pgrep — codex is often background)
-    if (process.env.CODEX) return "codex"
-
-    // 3a. Walk the ancestor process tree. An agent that launched `tg` as a
-    // subprocess (codex, aider, pi, opencode, omp) is the real sender even when it
-    // exports no env marker — codex notably sets neither CODEX nor CODEX_HOME
-    // for the shell commands it runs. This MUST run before the pgrep fallbacks:
-    // otherwise a background `ollama` daemon (common on macOS) wins and a codex
-    // session gets mislabeled as ollama.
+    // 2. Walk the ancestor process tree. An agent that launched `tg` as a
+    // subprocess (codex, aider, pi, opencode, omp, claude) is the real sender
+    // even when it exports no env marker — codex notably sets neither CODEX
+    // nor CODEX_HOME for the shell commands it runs. An opencode ancestor is
+    // refined to the session's actual model name (config read), falling back
+    // to the generic kind when unreadable.
     const ancestorAgent = detectAgentViaAncestry()
+    if (ancestorAgent === "opencode") return opencodeModelFromConfig() ?? "opencode"
     if (ancestorAgent) return ancestorAgent
 
-    // 3b. Detect other known CLI tools
+    // 3. Env-marker fallbacks (no recognizable ancestor — detached spawn, or
+    // the launcher is not a known agent). The chain keeps the PRE-EXISTING
+    // relative order (CLAUDECODE → OPENCODE → CODEX) — the smallest possible
+    // behavior delta. The hop argument behind it covers the OBSERVED nesting
+    // (claude inner): CLAUDECODE is self-published by the inner agent (one
+    // hop), OPENCODE/CODEX are inherited from an outer pane (two hops). The
+    // reverse nesting in a DETACHED spawn (opencode inner, claude outer) is
+    // mislabeled by this order — accepted, lineage-first already covers the
+    // attached case. OPENCODE still refines to the config model name; an
+    // unreadable config falls through to CODEX (never to the pgrep block,
+    // where a background `ollama` daemon would otherwise win) and finally to
+    // the generic kind. CLAUDECODE ahead of pgrep covers the original ollama
+    // hazard for claude sessions. KNOWN LIMITATION (#246): a DETACHED spawn
+    // from an omp session lands here with only CLAUDECODE=1 (omp sets no
+    // marker of its own — verified live: no OMP_* in the process env) and
+    // brands claude; only attached spawns brand omp.
+    if (env.CLAUDECODE || env.CLAUDE_CODE_ENTRYPOINT) return "claude"
+    if (env.OPENCODE) {
+      const model = opencodeModelFromConfig()
+      if (model) return model
+      if (env.CODEX) return "codex"
+      return "opencode"
+    }
+    if (env.CODEX) return "codex"
+
+    // 4. Detect other known CLI tools
     if (isProcessRunning("aider")) return "aider"
     if (isProcessRunning("cursor")) return "cursor"
     if (isProcessRunning("windsurf")) return "windsurf"
