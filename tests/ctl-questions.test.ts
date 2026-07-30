@@ -21,6 +21,7 @@ import {
   resolveButtonCallback,
   type ButtonRequest,
 } from '../features/tg-ctl/questions';
+import { HOOK_AGENT_KINDS, isHookAgentKind } from '../features/tg-ctl/types';
 
 const QUESTION: ButtonRequest = {
   requestId: 'q_123',
@@ -69,11 +70,29 @@ test('registrationAllowsHook: cwd comparison goes through the injected path reso
   expect(registrationAllowsHook(reg, { cwd: '/proj' }, resolver)).toBe(true);
 });
 
-test('questionCapability is explicit: claude/codex/opencode support buttons, pi is limited', () => {
+test('questionCapability is explicit: claude/codex/opencode support buttons, pi/omp are limited', () => {
   expect(questionCapability('claude')).toBe('buttons');
   expect(questionCapability('codex')).toBe('buttons');
   expect(questionCapability('opencode')).toBe('buttons');
   expect(questionCapability('pi')).toBe('unsupported');
+  // omp is deliberately the honest tmux floor (like pi/aider): detectable and
+  // injectable, but NO native question buttons until a hook integration exists.
+  expect(questionCapability('omp')).toBe('unsupported');
+});
+
+test('HOOK_AGENT_KINDS accepts omp (ask --agent omp classifies as omp, not a claude fallback)', () => {
+  // Pins the single source hookAgentFromArgv validates against: dropping 'omp'
+  // from this list would silently give an explicit omp ask claude semantics.
+  expect(HOOK_AGENT_KINDS).toContain('omp');
+  expect(HOOK_AGENT_KINDS).toContain('pi');
+  expect(HOOK_AGENT_KINDS).toContain('aider');
+  // The guard narrows without coercion: typos, non-kinds, and
+  // Object.prototype keys are all rejected (Object.hasOwn, not `in`).
+  expect(isHookAgentKind('omp')).toBe(true);
+  expect(isHookAgentKind('opm')).toBe(false);
+  expect(isHookAgentKind('unknown')).toBe(false);
+  expect(isHookAgentKind('toString')).toBe(false);
+  expect(isHookAgentKind('constructor')).toBe(false);
 });
 
 test('buildButtonMessage renders a question as Telegram inline keyboard payload', () => {

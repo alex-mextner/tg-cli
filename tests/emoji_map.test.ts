@@ -106,7 +106,7 @@ test("EMBEDDABLE_EMOJI_MAP has all expected models", () => {
     "kimi", "moonshot", "o3", "o1", "gpt4", "gpt3", "gpt",
     "llama", "meta", "ollama", "mistral", "grok", "xai",
     "copilot", "github", "perplexity", "cursor", "windsurf",
-    "devin", "cognition", "aider", "continue",
+    "devin", "cognition", "aider", "continue", "omp",
   ]
   for (const model of expected) {
     expect(EMBEDDABLE_EMOJI_MAP[model]).toBeDefined()
@@ -165,7 +165,7 @@ test("fireworks is Unicode-only (no custom emoji ID)", () => {
 test("alias pairs map to identical IDs", () => {
   const aliases = [
     ["codex", "openai", "o3", "o1", "gpt4", "gpt3", "gpt"],
-    ["claude", "anthropic", "devin", "cognition", "aider", "continue"],
+    ["claude", "anthropic", "devin", "cognition", "aider", "continue", "omp"],
     ["gemini", "google"],
     ["qwen", "alibaba"],
     ["kimi", "moonshot"],
@@ -1066,4 +1066,26 @@ test("codex ancestor beats a background ollama daemon (fake ps + fake pgrep)", a
   const stdout = await new Response(proc.stdout).text()
   expect(await proc.exited).toBe(0)
   expect(stdout.startsWith("codex")).toBe(true)
+}, 10000)
+
+test("omp ancestor brands the session as omp with the pie emoji (fake ps)", async () => {
+  // Caller-level branding coverage for the omp AgentKind: `tg --detect-model`
+  // must surface the ancestry-detected 'omp' through detectAgentViaAncestry AND
+  // resolve its emoji from MODEL_EMOJI_MAP — the AgentKind→emoji-key bridge is
+  // string-keyed, so this guards the connection, not just the two ends.
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "/opt/homebrew/bin/omp")
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}` },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("omp")).toBe(true)
+  expect(stdout).toContain("🥧")
 }, 10000)

@@ -299,7 +299,7 @@ Text escape handling:
 Emoji helpers (custom emoji):
   Use :codex:, :gemini:, :claude:, :deepseek:, :qwen:, :kimi:
   :o3:, :o1:, :gpt4:, :gpt3:, :gpt:, :llama:, :ollama:, :mistral:, :grok:, :copilot:
-  :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:
+  :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:, :omp:
   :hyperide:
   to embed custom emoji icons from the HyperIDE.ai set.
   Set: https://t.me/addemoji/agents_by_HyperIDE_Bot
@@ -668,7 +668,7 @@ if (import.meta.main) {
     if (process.env.CODEX) return "codex"
 
     // 3a. Walk the ancestor process tree. An agent that launched `tg` as a
-    // subprocess (codex, aider, pi, opencode) is the real sender even when it
+    // subprocess (codex, aider, pi, opencode, omp) is the real sender even when it
     // exports no env marker — codex notably sets neither CODEX nor CODEX_HOME
     // for the shell commands it runs. This MUST run before the pgrep fallbacks:
     // otherwise a background `ollama` daemon (common on macOS) wins and a codex

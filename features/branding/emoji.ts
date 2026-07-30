@@ -41,6 +41,7 @@ export const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
   aider: "5274170649227600531",    // Custom ID: shares Claude's ✳️ ID. Unicode: 🤝
   continue: "5274170649227600531", // Custom ID: shares Claude's ✳️ ID. Unicode: ⏩
   gpt: "5273797309195393626",       // Custom ID: shares OpenAI's 👐 ID. Unicode: ⚡
+  omp: "5274170649227600531",       // Custom ID: shares Claude's ✳️ ID. Unicode: 🥧
 }
 
 // Unicode emoji fallback map
@@ -62,6 +63,7 @@ export const UNICODE_EMOJI_MAP: Record<string, string> = {
   devin: "🧑‍💻", cognition: "🧑‍💻",
   aider: "🤝",
   continue: "⏩",
+  omp: "🥧",
   hyperide: "🚁",
   fireworks: "🎆",
 }
@@ -85,6 +87,7 @@ export const MODEL_EMOJI_MAP: Record<string, string> = {
   devin: "🧑‍💻", cognition: "🧑‍💻",
   aider: "🤝",
   continue: "⏩",
+  omp: "🥧",
   hyperide: "🚁",
   fireworks: "🎆",
   gpt: "⚡",

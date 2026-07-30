@@ -233,6 +233,7 @@ import type {
   TopicBinding,
   TopicStatus,
 } from "./features/tg-ctl/types"
+import { HOOK_AGENT_KINDS, isHookAgentKind, type HookAgentKind } from "./features/tg-ctl/types"
 
 export const USAGE = `Usage:
   tg-ctl start [--pane %N] [--cwd PATH] [--session NAME]
@@ -2545,13 +2546,20 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
   await forwardAndPostQuestion(ctx, rt, req, socket, pendingKey)
 }
 
-// The agent kind the hook was installed for (`tg-ctl ask --agent codex`);
-// defaults to claude. Decides how the raw payload is normalized + formatted.
-function hookAgentFromArgv(): AgentKind {
+// The agent kind the hook was installed for (`tg-ctl ask --agent codex`). Decides
+// how the raw payload is normalized + formatted. The accepted set is
+// HOOK_AGENT_KINDS (features/tg-ctl/types.ts) — an exhaustiveness-checked single
+// source, so a future harness kind forces a compile error there, never a silent
+// fallthrough. An ABSENT flag defaults to claude (back-compat with hook installs
+// older than the selector); a PRESENT-but-unrecognized value still defaults to
+// claude but logs a warning — coercing it silently would hand a typo'd or
+// newer-than-the-daemon kind claude semantics with zero signal.
+function hookAgentFromArgv(): HookAgentKind {
   const i = process.argv.indexOf("--agent")
   const v = i >= 0 ? process.argv[i + 1] : undefined
-  const known = ["claude", "codex", "opencode", "pi", "aider"]
-  return (v && known.includes(v) ? v : "claude") as AgentKind
+  if (v && isHookAgentKind(v)) return v
+  if (v) log(`ask: unrecognized --agent '${v}' — falling back to claude (known: ${HOOK_AGENT_KINDS.join("/")})`)
+  return "claude"
 }
 
 function tmuxSessionName(): string | undefined {

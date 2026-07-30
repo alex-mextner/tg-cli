@@ -617,6 +617,7 @@ dropped per D4):**
 | **Claude Code** (`cc`) | tmux (no public inject API) | YES — hooks `PreToolUse`/`PermissionRequest`/`Notification` | `/rename` | `/clear` | hooks + channel + tmux |
 | **Codex** | `codex exec` / app-server | YES — `PermissionRequest` hook | — | `/new` | hooks + tmux |
 | **pi** | tmux | NO verified native API — no scraping | — | — | tmux + agent-calls-`tg`; Q→buttons says limited |
+| **omp** (Oh My Pi) | tmux | NO verified native API — no scraping | — | — | tmux + agent-calls-`tg`; Q→buttons says limited (added 2026-07, tg-cli#243) |
 | **Aider** | `--message` (one-shot) | **NO** | — | `/reset` | tmux-only; bot says "limited" |
 | **Gemini CLI** | `-p` | **NO** (retiring 2026-06-18 → Antigravity `agy`) | — | `/clear` (screen only) | tmux-only; bot says "limited" |
 
@@ -633,7 +634,7 @@ unless started with a fixed `--port` (or discovered via `--mdns`) — so the cle
 "bot owns the server, clients attach", not "inject into an arbitrary TUI".
 
 **The "not supported" rule:** when a harness lacks native question-forwarding (aider,
-gemini, pi-for-now), the bot does NOT silently scrape-and-hope; it forwards what tmux can
+gemini, pi-for-now, omp), the bot does NOT silently scrape-and-hope; it forwards what tmux can
 see and replies once: "native question forwarding isn't available for `<harness>` —
 inbound works, but I can't reliably forward its prompts; answer in the terminal."
 
@@ -641,7 +642,7 @@ inbound works, but I can't reliably forward its prompts; answer in the terminal.
 to pick the adapter; `pgrep` / pane-command disambiguates cc vs opencode vs codex vs pi.
 
 **Scope for v1:** ship `cc` (channel+hooks+tmux) and `opencode` (native) first-class;
-`codex` (hooks+tmux) and `pi`/`aider`/`gemini` (tmux floor + honest "limited" replies) as
+`codex` (hooks+tmux) and `pi`/`aider`/`omp`/`gemini` (tmux floor + honest "limited" replies) as
 the long tail. See D4 (§12).
 
 ## 15. Out of scope / future
