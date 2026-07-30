@@ -3,6 +3,36 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.43.1
+
+**Fix: `tg --detect-model` misbrands omp sessions as claude (#246).**
+
+- omp sessions export `CLAUDECODE=1` (pi heritage, verified live), and
+  `detectAiModel` checked that env var BEFORE walking the ancestor process
+  tree — so every outbound send from an omp session was branded `claude ✳️`
+  instead of `omp 🥧`. Detection is now LINEAGE-FIRST: the ancestor process
+  walk runs right after the explicit `TG_AI_MODEL` override, and env markers
+  become fallbacks for detached spawns whose launcher is not in the tree.
+  Env vars are inheritable — an agent inside another agent's pane carries the
+  outer agent's markers — so the nearest recognizable ancestor is the truth
+  in those topologies (a nested claude-inside-opencode stays claude, pinned
+  with a two-agent process tree). An opencode ancestor is still refined to
+  the session's actual model name via `opencode debug config` (extracted as
+  `opencodeModelFromConfig`), with the generic kind as the unreadable-config
+  fallback at BOTH call sites. The env-fallback chain keeps the pre-existing
+  relative order (CLAUDECODE → OPENCODE → CODEX): CLAUDECODE is
+  self-published by the inner agent (one hop of evidence), the others are
+  inherited (two hops). KNOWN LIMITATION: a DETACHED spawn from an omp
+  session has no lineage and no omp-specific marker (omp sets none — verified
+  live), so it still brands claude; only attached spawns brand omp.
+- Regression pins: `CLAUDECODE=1` + omp ancestry → `omp`; `CLAUDECODE=1` +
+  claude ancestry → `claude`; opencode ancestor → config model name;
+  inherited `OPENCODE` marker loses to a codex ancestor; nearest-wins with
+  two agents in one tree; detached nested spawn → `claude`; unreadable
+  opencode config → generic `opencode` at both call sites; env-only
+  CLAUDECODE tests pin a neutral fake ancestry so they stay deterministic
+  inside a real agent pane.
+
 ## 1.43.0
 
 **Feature: omp (Oh My Pi) harness support — inbound discovery + outbound branding (#243).**

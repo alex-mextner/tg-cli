@@ -35,15 +35,30 @@ function fakePgrepBinDir(): string {
 // shell with no agent ancestor). tg climbs from process.ppid, so we resolve the
 // real ppid of the tg process ($PPID of this fake ps) via the absolute /bin/ps
 // and label it. This lets us prove ancestry detection beats the pgrep fallback.
-function writeFakePs(dir: string, agentCommand: string): void {
-  const parentCmd = agentCommand || "-zsh"
+// Pass an ARRAY for a multi-agent chain, NEAREST ancestor first
+// (e.g. ['claude', 'opencode'] = tg → claude → opencode) — keeps the ps output
+// format knowledge in this one helper.
+function writeFakePs(dir: string, agentCommand: string | string[]): void {
+  const chain = Array.isArray(agentCommand) ? agentCommand : [agentCommand]
+  const lines = chain.map((cmd, i) => {
+    // The first chain row is anchored to the REAL TGPPID (the walk starts
+    // there); later rows use pids above macOS pid_max (99999) so they can
+    // never collide with a real pid allocated mid-test.
+    const pid = i === 0 ? '$TGPPID' : `$((900000 + ${i * 100}))`
+    const ppid = i === chain.length - 1 ? '1' : `$((900000 + ${(i + 1) * 100}))`
+    return `echo "${pid} ${ppid} ${cmd || '-zsh'}"`
+  })
   const script =
     "#!/bin/sh\n" +
     'TG="$PPID"\n' +
     'TGPPID=$(/bin/ps -o ppid= -p "$TG" 2>/dev/null | tr -d " ")\n' +
-    '[ -z "$TGPPID" ] && TGPPID=1\n' +
+    // A fallback base far from 1: with TGPPID=1 a chain's +100 offsets would
+    // cycle (1 → 101 → 1). The ancestry walk's visited set guards the loop,
+    // but the helper should never emit a cycle in the first place.
+    '[ -z "$TGPPID" ] && TGPPID=900000\n' +
     'echo "$TG $TGPPID bun run tg"\n' +
-    `echo "$TGPPID 1 ${parentCmd}"\n`
+    lines.join('\n') +
+    '\n'
   const p = join(dir, "ps")
   writeFileSync(p, script)
   chmodSync(p, 0o755)
@@ -947,10 +962,17 @@ test("emoji helpers are resolved correctly in ls-emoji-helpers", async () => {
 }, 10000)
 
 test("CLAUDECODE env detects claude (not a background ollama daemon)", async () => {
+  // Pin a no-agent ancestry: since #246 the ancestry walk runs BEFORE the env
+  // check, and this test exercises the ENV path — a real agent in the test
+  // runner's own process tree (e.g. a dev's tmux pane) would win instead.
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFakePs(binDir, "")
   const proc = Bun.spawn({
     cmd: ["bun", "run", TG_PATH, "--detect-model"],
     env: {
-      ...sanitizeEnv(),
+      ...env,
+      PATH: `${binDir}:${env.PATH}`,
       CLAUDECODE: "1",
       TG_BOT_TOKEN: "dummy",
       TG_CHAT_ID: "123",
@@ -987,11 +1009,16 @@ test("TG_AI_MODEL overrides CLAUDECODE detection", async () => {
 }, 10000)
 
 test("--detect-model works without Telegram credentials (info-only flag)", async () => {
+  // Neutral ancestry for the same reason as the CLAUDECODE-env test above.
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFakePs(binDir, "")
   const proc = Bun.spawn({
     cmd: ["bun", "run", TG_PATH, "--detect-model"],
     env: {
       // No TG_BOT_TOKEN / TG_CHAT_ID — info-only flags must not require them.
-      ...sanitizeEnv(),
+      ...env,
+      PATH: `${binDir}:${env.PATH}`,
       CLAUDECODE: "1",
     },
     stdout: "pipe",
@@ -1154,6 +1181,224 @@ test("SUBSTRING_FALLBACK_EXCLUDED_KEYS stays in sync with the emoji maps", () =>
     expect(Object.hasOwn(MODEL_EMOJI_MAP, key) || Object.hasOwn(EMBEDDABLE_MAP_MODULE, key)).toBe(true)
   }
 })
+
+test("REGRESSION (#246): CLAUDECODE=1 with an omp ancestor brands omp, not claude", async () => {
+  // omp sessions export CLAUDECODE=1 (pi heritage — verified live), and the
+  // env check used to run BEFORE the ancestry walk, so every outbound send
+  // from an omp session misbranded 'claude ✳️'. The ancestry walk must win.
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "/opt/homebrew/bin/omp")
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}`, CLAUDECODE: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("omp")).toBe(true)
+  expect(stdout).toContain("🥧")
+}, 10000)
+
+test("CLAUDECODE=1 with a claude ancestor still brands claude (no behavior change)", async () => {
+  // Companion pin to the #246 reorder: a REAL claude session has claude in its
+  // ancestry, so moving the walk ahead of the env check changes nothing there.
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "claude")
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}`, CLAUDECODE: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("claude")).toBe(true)
+  expect(stdout).toContain("✳️")
+}, 10000)
+
+test("opencode ancestor is refined to the config model name", async () => {
+  // Lineage-first ordering (#246): an opencode ancestor resolves the session's
+  // actual MODEL NAME via `opencode debug config`, not the generic kind.
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "opencode")
+  writeFileSync(
+    join(binDir, "opencode"),
+    '#!/bin/sh\nif [ "$1" = "debug" ]; then printf \'%s\' \'{"provider":{"moonshot":{"models":{"moonshot/kimi-k2p6-turbo":{}}}}}\'; fi\nexit 0\n',
+  )
+  chmodSync(join(binDir, "opencode"), 0o755)
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}` },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("kimi-k2p6-turbo")).toBe(true)
+}, 10000)
+
+test("an opencode ancestor with an UNREADABLE config falls back to the generic kind", async () => {
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "opencode")
+  writeFileSync(join(binDir, "opencode"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "opencode"), 0o755)
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}`, OPENCODE: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("opencode")).toBe(true)
+}, 10000)
+
+test("lineage beats an inherited OPENCODE marker (stale env from an outer pane)", async () => {
+  // Env vars are inheritable: a codex session inside an opencode pane carries
+  // OPENCODE=1, but the codex ancestor is the real sender. The ancestry walk
+  // must win over the env marker (#246 review).
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "/opt/homebrew/bin/codex exec --json")
+  writeFileSync(
+    join(binDir, "opencode"),
+    '#!/bin/sh\nif [ "$1" = "debug" ]; then printf \'%s\' \'{"provider":{"moonshot":{"models":{"moonshot/kimi-k2p6-turbo":{}}}}}\'; fi\nexit 0\n',
+  )
+  chmodSync(join(binDir, "opencode"), 0o755)
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}`, OPENCODE: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("codex")).toBe(true)
+}, 10000)
+
+test("OPENCODE env resolves the model name when no ancestor matches (detached spawn)", async () => {
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "") // neutral ancestry → env-marker fallback path
+  writeFileSync(
+    join(binDir, "opencode"),
+    '#!/bin/sh\nif [ "$1" = "debug" ]; then printf \'%s\' \'{"provider":{"moonshot":{"models":{"moonshot/kimi-k2p6-turbo":{}}}}}\'; fi\nexit 0\n',
+  )
+  chmodSync(join(binDir, "opencode"), 0o755)
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}`, OPENCODE: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("kimi-k2p6-turbo")).toBe(true)
+}, 10000)
+
+test("nested claude inside an opencode pane brands claude (lineage over inherited env)", async () => {
+  // OPENCODE=1 + CLAUDECODE=1 + claude ancestry: the claude process is the
+  // actual launcher, so claude wins — the pre-#246 env-first order happened
+  // to get this right, the first reorder shape regressed it (review finding).
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "claude")
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}`, OPENCODE: "1", CLAUDECODE: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("claude")).toBe(true)
+}, 10000)
+
+test("nearest ancestor wins with TWO agents in one tree (opencode → claude → tg)", async () => {
+  // Finding from review: every other fake-ps test pins a SINGLE agent. The
+  // nested topologies this PR reasons about have BOTH agents in the real
+  // tree — the walk must return the NEAREST (claude), not the outer opencode.
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  // Custom three-level tree via the chain form: tg → claude → opencode
+  // (nearest first wins).
+  writeFakePs(binDir, ["claude", "opencode"])
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}`, OPENCODE: "1", CLAUDECODE: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("claude")).toBe(true)
+}, 10000)
+
+test("detached nested spawn (OPENCODE+CLAUDECODE, no ancestry) brands claude", async () => {
+  // The env-fallback ordering decision (#246 review): with NO lineage signal,
+  // CLAUDECODE (self-published by the inner agent, one hop) outranks OPENCODE
+  // (inherited from an outer pane, two hops). This matches the pre-#246
+  // relative order — the smallest possible behavior delta.
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "") // neutral ancestry → env-marker fallback path
+  writeFileSync(
+    join(binDir, "opencode"),
+    '#!/bin/sh\nif [ "$1" = "debug" ]; then printf \'%s\' \'{"provider":{"moonshot":{"models":{"moonshot/kimi-k2p6-turbo":{}}}}}\'; fi\nexit 0\n',
+  )
+  chmodSync(join(binDir, "opencode"), 0o755)
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}`, OPENCODE: "1", CLAUDECODE: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("claude")).toBe(true)
+}, 10000)
+
+test("OPENCODE env with an UNREADABLE config falls back to the generic kind (symmetric with the ancestor path)", async () => {
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "") // neutral ancestry → env-marker fallback path
+  writeFileSync(join(binDir, "opencode"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "opencode"), 0o755)
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}`, OPENCODE: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("opencode")).toBe(true)
+}, 10000)
 
 test("omp ancestor brands the session as omp with the pie emoji (fake ps)", async () => {
   // Caller-level branding coverage for the omp AgentKind: `tg --detect-model`
