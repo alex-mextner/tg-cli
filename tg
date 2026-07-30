@@ -22,6 +22,7 @@ import { applyAutolink, linkifyTicketsCompound } from "./features/autolink-tasks
 import { styleTaskTitle, styleWindowName } from "./features/prefix-style/style"
 import {
   EMBEDDABLE_EMOJI_MAP,
+  SUBSTRING_FALLBACK_EXCLUDED_KEYS,
   MODEL_EMOJI_MAP,
   extractBaseModel,
 } from "./features/branding/emoji"
@@ -696,9 +697,15 @@ if (import.meta.main) {
     // 2. Derive from detected model name
     if (MODEL) {
       const base = extractBaseModel(MODEL)
-      if (MODEL_EMOJI_MAP[base]) return MODEL_EMOJI_MAP[base]
-      // Fallback to substring matching for partial matches
+      // typeof guard, not truthiness: prototype keys ('constructor', …) are
+      // truthy non-strings on a plain object map and must fall through.
+      const exact = MODEL_EMOJI_MAP[base]
+      if (typeof exact === 'string') return exact
+      // Fallback to substring matching for partial matches — minus the
+      // SUBSTRING_FALLBACK_EXCLUDED_KEYS (short substrings like 'omp' would
+      // misbrand unrelated names such as 'computer-use-preview').
       for (const [key, emoji] of Object.entries(MODEL_EMOJI_MAP)) {
+        if (SUBSTRING_FALLBACK_EXCLUDED_KEYS.has(key)) continue
         if (base.includes(key)) return emoji
       }
     }
