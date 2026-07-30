@@ -156,9 +156,29 @@ export function registrationSetAllowsHook(
   return regs.some((reg) => registrationAllowsHook(reg, req, resolvePath));
 }
 
+// Exhaustive over AgentKind on purpose: adding a new kind forces a deliberate
+// capability decision here (the compiler flags a missing case) instead of a
+// silent default — omp is explicitly the tmux floor, not an accidental one.
+// The default branch is the RUNTIME fail-safe: the kind crosses a JS boundary
+// (JSON on the hook socket), so an out-of-union value must still get the safe
+// capability rather than `undefined`.
 export function questionCapability(agent: AgentKind): QuestionCapability {
-  if (agent === 'claude' || agent === 'codex' || agent === 'opencode') return 'buttons';
-  return 'unsupported';
+  switch (agent) {
+    case 'claude':
+    case 'codex':
+    case 'opencode':
+      return 'buttons';
+    case 'pi':
+    case 'aider':
+    case 'omp':
+    case 'unknown':
+      return 'unsupported';
+    default: {
+      const _exhaustive: never = agent;
+      void _exhaustive;
+      return 'unsupported';
+    }
+  }
 }
 
 export function buildButtonMessage(chatId: number, req: ButtonRequest): ButtonMessagePayload {

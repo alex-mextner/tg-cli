@@ -1,4 +1,9 @@
 import { test, expect, beforeAll } from "bun:test"
+import {
+  EMBEDDABLE_EMOJI_MAP as EMBEDDABLE_MAP_MODULE,
+  SUBSTRING_FALLBACK_EXCLUDED_KEYS,
+  MODEL_EMOJI_MAP,
+} from "../features/branding/emoji"
 import { mkdtempSync, writeFileSync, chmodSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
@@ -106,7 +111,7 @@ test("EMBEDDABLE_EMOJI_MAP has all expected models", () => {
     "kimi", "moonshot", "o3", "o1", "gpt4", "gpt3", "gpt",
     "llama", "meta", "ollama", "mistral", "grok", "xai",
     "copilot", "github", "perplexity", "cursor", "windsurf",
-    "devin", "cognition", "aider", "continue",
+    "devin", "cognition", "aider", "continue", "omp",
   ]
   for (const model of expected) {
     expect(EMBEDDABLE_EMOJI_MAP[model]).toBeDefined()
@@ -165,7 +170,7 @@ test("fireworks is Unicode-only (no custom emoji ID)", () => {
 test("alias pairs map to identical IDs", () => {
   const aliases = [
     ["codex", "openai", "o3", "o1", "gpt4", "gpt3", "gpt"],
-    ["claude", "anthropic", "devin", "cognition", "aider", "continue"],
+    ["claude", "anthropic", "devin", "cognition", "aider", "continue", "omp"],
     ["gemini", "google"],
     ["qwen", "alibaba"],
     ["kimi", "moonshot"],
@@ -1066,4 +1071,108 @@ test("codex ancestor beats a background ollama daemon (fake ps + fake pgrep)", a
   const stdout = await new Response(proc.stdout).text()
   expect(await proc.exited).toBe(0)
   expect(stdout.startsWith("codex")).toBe(true)
+}, 10000)
+
+test("REGRESSION: 'computer-use-preview' does NOT misbrand as omp via the substring fallback", async () => {
+  // Codex-bot finding on #245: the generic base.includes(key) substring
+  // fallback hit the 3-letter 'omp' key inside unrelated model names
+  // ('computer-use-preview', 'composer', 'component', …) and branded them 🥧.
+  // 'omp' is now exact-match-only in the fallback.
+  const env = sanitizeEnv()
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, TG_AI_MODEL: "computer-use-preview", TG_BOT_TOKEN: "123:abc", TG_CHAT_ID: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout).not.toContain("🥧")
+  expect(stdout.startsWith("computer-use-preview")).toBe(true)
+
+  // Positive control: an exact 'omp' model still brands 🥧.
+  const exact = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, TG_AI_MODEL: "omp", TG_BOT_TOKEN: "123:abc", TG_CHAT_ID: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const exactOut = await new Response(exact.stdout).text()
+  expect(await exact.exited).toBe(0)
+  expect(exactOut).toContain("🥧")
+}, 10000)
+
+test("omp boundary: separator-suffixed 'omp-1.2' brands, fused 'omp2' does not", async () => {
+  // Pins the exact-match-only boundary. extractBaseModel's prefix shortening
+  // ('omp-1.2' → 'omp') is an EXACT map hit, so separator-suffixed versions
+  // still brand 🥧. A fused suffix ('omp2') previously matched via the
+  // substring fallback and now deliberately does NOT — the cost of excluding
+  // 'omp' from substring matching, accepted because fused suffixes are rare
+  // next to the 'computer-use-preview' collision class.
+  const env = sanitizeEnv()
+  const spawnDetect = (model: string) =>
+    Bun.spawn({
+      cmd: ["bun", "run", TG_PATH, "--detect-model"],
+      env: { ...env, TG_AI_MODEL: model, TG_BOT_TOKEN: "123:abc", TG_CHAT_ID: "1" },
+      stdout: "pipe",
+      stderr: "ignore",
+    })
+  const dashed = spawnDetect("omp-1.2")
+  const dashedOut = await new Response(dashed.stdout).text()
+  expect(await dashed.exited).toBe(0)
+  expect(dashedOut).toContain("🥧")
+
+  const fused = spawnDetect("omp2")
+  const fusedOut = await new Response(fused.stdout).text()
+  expect(await fused.exited).toBe(0)
+  expect(fusedOut).not.toContain("🥧")
+}, 10000)
+
+test("prototype key 'constructor' as TG_AI_MODEL yields no emoji (typeof guard)", async () => {
+  // Without the typeof guard, MODEL_EMOJI_MAP['constructor'] is
+  // Object.prototype.constructor — truthy — and its Function source would be
+  // returned as the "emoji".
+  const env = sanitizeEnv()
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, TG_AI_MODEL: "constructor", TG_BOT_TOKEN: "123:abc", TG_CHAT_ID: "1" },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("constructor")).toBe(true)
+  expect(stdout).not.toContain("function")
+}, 10000)
+
+test("SUBSTRING_FALLBACK_EXCLUDED_KEYS stays in sync with the emoji maps", () => {
+  // Invariant: an excluded key must exist in AT LEAST ONE map — only then is
+  // the exclusion truly stale. (A key legitimately living in MODEL only — plain
+  // emoji, no branded pill id — must NOT force its deletion from the set, which
+  // would silently reintroduce the misbranding.)
+  for (const key of SUBSTRING_FALLBACK_EXCLUDED_KEYS) {
+    expect(Object.hasOwn(MODEL_EMOJI_MAP, key) || Object.hasOwn(EMBEDDABLE_MAP_MODULE, key)).toBe(true)
+  }
+})
+
+test("omp ancestor brands the session as omp with the pie emoji (fake ps)", async () => {
+  // Caller-level branding coverage for the omp AgentKind: `tg --detect-model`
+  // must surface the ancestry-detected 'omp' through detectAgentViaAncestry AND
+  // resolve its emoji from MODEL_EMOJI_MAP — the AgentKind→emoji-key bridge is
+  // string-keyed, so this guards the connection, not just the two ends.
+  const env = sanitizeEnv()
+  const binDir = mkdtempSync(join(tmpdir(), "tg-fakebin-"))
+  writeFileSync(join(binDir, "pgrep"), '#!/bin/sh\nexit 1\n')
+  chmodSync(join(binDir, "pgrep"), 0o755)
+  writeFakePs(binDir, "/opt/homebrew/bin/omp")
+  const proc = Bun.spawn({
+    cmd: ["bun", "run", TG_PATH, "--detect-model"],
+    env: { ...env, PATH: `${binDir}:${env.PATH}` },
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  const stdout = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  expect(stdout.startsWith("omp")).toBe(true)
+  expect(stdout).toContain("🥧")
 }, 10000)

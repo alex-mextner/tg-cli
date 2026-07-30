@@ -19,7 +19,7 @@
 //   ✳️ [window] 🔵 ANSWER               (--tag only, unicode fallback)
 //   ✳️ [window] [agent] 🔵 ANSWER — <title>  (agent + tag + title, all compose)
 // The message body NEVER rides this line — only an explicit tag/title appear.
-import { EMBEDDABLE_EMOJI_MAP, extractBaseModel, hasRealPillIds, TAG_PILL_IDS } from '../branding/emoji';
+import { EMBEDDABLE_EMOJI_MAP, SUBSTRING_FALLBACK_EXCLUDED_KEYS, extractBaseModel, hasRealPillIds, TAG_PILL_IDS } from '../branding/emoji';
 import { styleTaskTitle, styleWindowName, toBoldItalic } from '../prefix-style/style';
 import { resolveTag } from './tag';
 import { escapeHtml } from './html';
@@ -55,11 +55,17 @@ export function buildPrefix(opts: {
   let forceHtml = false;
 
   if (aiEmoji) {
-    // Resolve the branded custom-emoji id (exact key, then substring match).
+    // Resolve the branded custom-emoji id (exact key, then substring match —
+    // minus the SUBSTRING_FALLBACK_EXCLUDED_KEYS: 'computer-use-preview'
+    // contains 'omp' but must NOT pick up its branded id).
     const base = extractBaseModel(model);
-    let emojiId = EMBEDDABLE_EMOJI_MAP[base];
+    // typeof guard, not truthiness: prototype keys ('constructor', …) are
+    // truthy non-strings on a plain object map and must fall through.
+    const exactId: unknown = EMBEDDABLE_EMOJI_MAP[base];
+    let emojiId = typeof exactId === 'string' ? exactId : undefined;
     if (!emojiId) {
       for (const [key, id] of Object.entries(EMBEDDABLE_EMOJI_MAP)) {
+        if (SUBSTRING_FALLBACK_EXCLUDED_KEYS.has(key)) continue;
         if (base.includes(key)) {
           emojiId = id;
           break;

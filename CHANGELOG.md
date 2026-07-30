@@ -3,6 +3,29 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.43.0
+
+**Feature: omp (Oh My Pi) harness support — inbound discovery + outbound branding (#243).**
+
+- `matchAgentCommand` (features/tg-ctl/discover.ts) now recognizes the `omp`
+  binary by argv0 basename (`omp` is a compiled Bun binary, e.g.
+  `/opt/homebrew/bin/omp`). This ONE row fixes every gate that keys off it:
+  inbound pane discovery (`findAgentInPane` BFS), the inject verify-pane
+  checks, reply-route liveness, and candidate discovery — an omp pane is now
+  classified as agent kind `omp` and is injectable at the tmux floor, exactly
+  like `pi`/`aider`.
+- Outbound branding: `detectAgentViaAncestry` (surfaced by `tg --detect-model`)
+  labels a session launched under omp as `omp`; the emoji
+  maps carry `omp` (custom ID shares Claude's ✳️, Unicode fallback 🥧), so
+  `tg` sends from an omp session get the agent emoji and `:omp:` works as an
+  emoji helper.
+- `questionCapability` intentionally unchanged: omp defaults to `unsupported`
+  (the honest tmux-floor behavior — inbound works, no native question
+  buttons), same as `pi`/`aider`. No hook/permission integration this round.
+  `tg-ctl ask --agent omp` classifies payloads as omp (pinned by test), so an
+  explicit omp ask gets the honest "unsupported" path instead of silently
+  falling back to claude semantics.
+
 ## 1.42.0
 
 **Feature: `--dry-run` — validate/render a message locally, never send it.**

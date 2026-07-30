@@ -41,6 +41,7 @@ export const EMBEDDABLE_EMOJI_MAP: Record<string, string> = {
   aider: "5274170649227600531",    // Custom ID: shares Claude's ✳️ ID. Unicode: 🤝
   continue: "5274170649227600531", // Custom ID: shares Claude's ✳️ ID. Unicode: ⏩
   gpt: "5273797309195393626",       // Custom ID: shares OpenAI's 👐 ID. Unicode: ⚡
+  omp: "5274170649227600531",       // Custom ID: shares Claude's ✳️ ID. Unicode: 🥧
 }
 
 // Unicode emoji fallback map
@@ -62,6 +63,7 @@ export const UNICODE_EMOJI_MAP: Record<string, string> = {
   devin: "🧑‍💻", cognition: "🧑‍💻",
   aider: "🤝",
   continue: "⏩",
+  omp: "🥧",
   hyperide: "🚁",
   fireworks: "🎆",
 }
@@ -85,6 +87,7 @@ export const MODEL_EMOJI_MAP: Record<string, string> = {
   devin: "🧑‍💻", cognition: "🧑‍💻",
   aider: "🤝",
   continue: "⏩",
+  omp: "🥧",
   hyperide: "🚁",
   fireworks: "🎆",
   gpt: "⚡",
@@ -204,18 +207,29 @@ export interface ParsedText {
   entities: EmojiEntity[]
 }
 
+// Keys EXCLUDED from the substring fallback in emoji resolution (tg's
+// detectAiEmoji and render/prefix's branded-id lookup): as short substrings
+// they misbrand unrelated model names — 'computer-use-preview', 'composer',
+// 'component', … all contain 'omp' and would wrongly brand 🥧. Exact matches
+// (and extractBaseModel's prefix-shortening matches, e.g. 'omp-1.2' → 'omp')
+// still win — only the raw substring fallback skips these. A Set, not a
+// Record: .has() is prototype-safe for a membership check.
+export const SUBSTRING_FALLBACK_EXCLUDED_KEYS: ReadonlySet<string> = new Set(['omp'])
+
 // Resolve a model name to its emoji-map base key: exact match, then progressively
 // shorter "-"/"_"-split prefixes (e.g. "claude-opus-4" → "claude"). Falls back to
 // the lowercased name when nothing matches.
 export function extractBaseModel(modelName: string): string {
   const lower = modelName.toLowerCase()
-  if (MODEL_EMOJI_MAP[lower]) return lower
-  if (EMBEDDABLE_EMOJI_MAP[lower]) return lower
+  // Object.hasOwn, not truthiness: prototype keys ('constructor', …) are
+  // truthy non-strings on these plain-object maps and must not match.
+  if (Object.hasOwn(MODEL_EMOJI_MAP, lower)) return lower
+  if (Object.hasOwn(EMBEDDABLE_EMOJI_MAP, lower)) return lower
   const parts = lower.split(/[-_]/)
   for (let i = parts.length; i > 0; i--) {
     const prefix = parts.slice(0, i).join("-")
-    if (MODEL_EMOJI_MAP[prefix]) return prefix
-    if (EMBEDDABLE_EMOJI_MAP[prefix]) return prefix
+    if (Object.hasOwn(MODEL_EMOJI_MAP, prefix)) return prefix
+    if (Object.hasOwn(EMBEDDABLE_EMOJI_MAP, prefix)) return prefix
   }
   return lower
 }

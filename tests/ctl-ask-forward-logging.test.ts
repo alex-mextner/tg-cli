@@ -173,6 +173,50 @@ test('not-forwardable agent logs a distinct reason', async () => {
   await waitForSent('answer in the terminal');
 });
 
+test('an unrecognized --agent value warns on hook stderr and falls back to claude', async () => {
+  // Pins hookAgentFromArgv's present-but-invalid branch: a typo'd kind must not
+  // silently inherit claude semantics WITHOUT a signal — the warning lands on
+  // the ask process's stderr (the hook installer's visible channel), and the
+  // payload is still processed as the fallback kind.
+  const proc = Bun.spawn([process.execPath, TG_CTL, 'ask', '--agent', 'opm'], {
+    env: {
+      HOME: cfgDir,
+      TG_CTL_CONFIG_DIR: cfgDir,
+      TG_API_BASE: `http://127.0.0.1:${server.port}`,
+    },
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  procs.push(proc);
+  proc.stdin.write('{}\n');
+  proc.stdin.end();
+  const stderr = await new Response(proc.stderr).text();
+  await proc.exited;
+  expect(stderr).toContain("unrecognized --agent 'opm'");
+  expect(stderr).toContain('falling back to claude');
+  expect(stderr).toContain('agent=claude'); // the drop line confirms the fallback kind
+});
+
+test('an omp question gets the same honest not-forwardable path (tmux floor)', async () => {
+  // End-to-end pin for the omp capability claim: an omp ask that passes the
+  // registration gate is dropped as not-forwardable (questionCapability('omp')
+  // === 'unsupported'), never silently given claude button semantics.
+  const proc = ask({
+    requestId: 'q_omp',
+    cwd: '/some/other/registered/dir',
+    paneId: '%9',
+    agent: 'omp',
+    kind: 'question',
+    question: 'pick one',
+    options: [{ label: 'A' }],
+  });
+  const log = await waitForLog('req=q_omp');
+  expect(log).toContain('ask-forward dropped: reason=not-forwardable');
+  expect(log).toContain('agent=omp');
+  await proc.exited;
+});
+
 test('duplicate in-flight question logs a distinct reason', async () => {
   // First scoped question forwards and blocks (held pending). A second identical
   // one (same callback key) hits the duplicate-in-flight gate.

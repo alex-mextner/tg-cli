@@ -387,7 +387,37 @@ export interface ProcInfo {
   command: string; // full command line
 }
 
-export type AgentKind = SpawnHarness | 'pi' | 'aider' | 'unknown';
+export type AgentKind = SpawnHarness | 'pi' | 'aider' | 'omp' | 'unknown';
+
+// The closed harness-kind selector for `tg-ctl ask --agent <kind>` (the entrypoint's
+// hookAgentFromArgv). Derived from a Record so EXHAUSTIVENESS is compile-checked:
+// adding a kind to AgentKind without adding it here (or vice versa) is a compile
+// compile error, never a silent fallthrough to claude semantics. 'unknown' is deliberately
+// excluded — it is not an installable harness. INVARIANT: every non-unknown AgentKind
+// is ask-addressable here; a kind with no payload format is still safe because the
+// questionCapability gate drops it downstream (the honest tmux floor). If a future
+// kind must be discoverable but NOT ask-selectable, this Record constraint must be
+// split. (`harness-event --agent` is a separate, free-form telemetry label and does
+// NOT use this list.)
+const HOOK_AGENT_KINDS_MAP = {
+  claude: true,
+  codex: true,
+  opencode: true,
+  pi: true,
+  aider: true,
+  omp: true,
+} as const satisfies Record<Exclude<AgentKind, 'unknown'>, true>;
+
+export type HookAgentKind = keyof typeof HOOK_AGENT_KINDS_MAP;
+
+export const HOOK_AGENT_KINDS = Object.keys(HOOK_AGENT_KINDS_MAP) as readonly HookAgentKind[];
+
+// Cast-free narrow for argv validation (hookAgentFromArgv): a present-but-invalid
+// `--agent` value fails this guard instead of being coerced. Object.hasOwn (NOT
+// `in`) so Object.prototype keys ('toString', 'constructor', …) are rejected.
+export function isHookAgentKind(v: string): v is HookAgentKind {
+  return Object.hasOwn(HOOK_AGENT_KINDS_MAP, v);
+}
 
 // Snapshot written by `tg` / `tg-ctl start` at auto-start time (spec §5.2).
 export interface Registration {

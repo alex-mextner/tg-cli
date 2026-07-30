@@ -22,6 +22,7 @@ import { applyAutolink, linkifyTicketsCompound } from "./features/autolink-tasks
 import { styleTaskTitle, styleWindowName } from "./features/prefix-style/style"
 import {
   EMBEDDABLE_EMOJI_MAP,
+  SUBSTRING_FALLBACK_EXCLUDED_KEYS,
   MODEL_EMOJI_MAP,
   extractBaseModel,
 } from "./features/branding/emoji"
@@ -299,7 +300,7 @@ Text escape handling:
 Emoji helpers (custom emoji):
   Use :codex:, :gemini:, :claude:, :deepseek:, :qwen:, :kimi:
   :o3:, :o1:, :gpt4:, :gpt3:, :gpt:, :llama:, :ollama:, :mistral:, :grok:, :copilot:
-  :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:
+  :perplexity:, :cursor:, :windsurf:, :devin:, :aider:, :continue:, :omp:
   :hyperide:
   to embed custom emoji icons from the HyperIDE.ai set.
   Set: https://t.me/addemoji/agents_by_HyperIDE_Bot
@@ -668,7 +669,7 @@ if (import.meta.main) {
     if (process.env.CODEX) return "codex"
 
     // 3a. Walk the ancestor process tree. An agent that launched `tg` as a
-    // subprocess (codex, aider, pi, opencode) is the real sender even when it
+    // subprocess (codex, aider, pi, opencode, omp) is the real sender even when it
     // exports no env marker — codex notably sets neither CODEX nor CODEX_HOME
     // for the shell commands it runs. This MUST run before the pgrep fallbacks:
     // otherwise a background `ollama` daemon (common on macOS) wins and a codex
@@ -696,9 +697,15 @@ if (import.meta.main) {
     // 2. Derive from detected model name
     if (MODEL) {
       const base = extractBaseModel(MODEL)
-      if (MODEL_EMOJI_MAP[base]) return MODEL_EMOJI_MAP[base]
-      // Fallback to substring matching for partial matches
+      // typeof guard, not truthiness: prototype keys ('constructor', …) are
+      // truthy non-strings on a plain object map and must fall through.
+      const exact = MODEL_EMOJI_MAP[base]
+      if (typeof exact === 'string') return exact
+      // Fallback to substring matching for partial matches — minus the
+      // SUBSTRING_FALLBACK_EXCLUDED_KEYS (short substrings like 'omp' would
+      // misbrand unrelated names such as 'computer-use-preview').
       for (const [key, emoji] of Object.entries(MODEL_EMOJI_MAP)) {
+        if (SUBSTRING_FALLBACK_EXCLUDED_KEYS.has(key)) continue
         if (base.includes(key)) return emoji
       }
     }

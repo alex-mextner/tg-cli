@@ -26,7 +26,7 @@ maps to a `custom_emoji_id` in a set owned by a bot.
 | Model | Emoji | Custom Emoji ID | Notes |
 |-------|-------|-----------------|-------|
 | HyperIDE | 🚁 | `5274191514178723918` | |
-| Claude | ✳️ | `5274170649227600531` | Also anthropic, devin, cognition, aider, continue |
+| Claude | ✳️ | `5274170649227600531` | Also anthropic, devin, cognition, aider, continue, omp |
 | Codex / OpenAI | 👐 | `5273797309195393626` | Also o3, o1, gpt4, gpt3, gpt |
 | Gemini | ♊️ | `5274254027427716477` | Also google |
 | DeepSeek | 🐳 | `5274018976752511967` | |
@@ -43,10 +43,12 @@ maps to a `custom_emoji_id` in a set owned by a bot.
 
 ## Alias system
 
-Multiple model names can share the same emoji ID. This is intentional — versions of the
-same model family share one icon:
+Multiple model names can share the same emoji ID. Versions of the same model family
+share one icon; agents without a dedicated icon in the set (aider, continue, devin,
+omp, …) share Claude's ✳️ as the neutral default — their Unicode fallback is still
+their own (omp → 🥧):
 
-- `claude`, `anthropic`, `devin`, `cognition`, `aider`, `continue` → Claude's ✳️
+- `claude`, `anthropic`, `devin`, `cognition`, `aider`, `continue`, `omp` → Claude's ✳️
 - `codex`, `openai`, `o3`, `o1`, `gpt4`, `gpt3`, `gpt` → OpenAI's 👐
 - `gemini`, `google` → Gemini's ♊️
 - `kimi`, `moonshot`, `kimi-k2p6-turbo`, `kimi-k1.5` → Kimi's 🌙

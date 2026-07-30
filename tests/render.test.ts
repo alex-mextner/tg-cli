@@ -7,7 +7,7 @@ import {
   parseModeFor,
 } from '../features/render/html';
 import { buildPrefix } from '../features/render/prefix';
-import { TAG_PILL_IDS, TAG_PILL_PLACEHOLDER } from '../features/branding/emoji';
+import { TAG_PILL_IDS, TAG_PILL_PLACEHOLDER, extractBaseModel } from '../features/branding/emoji';
 
 // Focused unit tests for the render modules extracted from the `tg` entrypoint
 // (decomposition Stage 1). These functions were previously only exercised
@@ -130,6 +130,50 @@ test('buildPrefix without a branded id keeps a plain (escaped) emoji, no forced 
   expect(p.plain).toBe('🤖\n');
   expect(p.present).toBe(true);
   expect(p.forceHtml).toBe(false);
+});
+
+test("substring fallback still resolves non-excluded keys ('my-claude-fork' → claude)", () => {
+  // Positive control for the exclusion loop: only listed keys are skipped — a
+  // fused name containing a NORMAL key keeps its substring branding. Guards
+  // against a future refactor inverting the skip condition.
+  const p = buildPrefix({ aiEmoji: '✳️', model: 'my-claude-fork', tmuxWindow: '' });
+  expect(p.html).toBe('<tg-emoji emoji-id="5274170649227600531">✳️</tg-emoji>\n');
+  expect(p.forceHtml).toBe(true);
+});
+
+test("extractBaseModel never resolves a prototype key, exact or prefix-shortened", () => {
+  // Direct pin for the Object.hasOwn hardening: without it, 'constructor'
+  // truthy-matches Object.prototype.constructor in the exact lookup, and
+  // 'constructor-foo' matches it via the prefix-shortening loop — both must
+  // fall through to the lowered input.
+  expect(extractBaseModel('constructor')).toBe('constructor');
+  expect(extractBaseModel('constructor-foo')).toBe('constructor-foo');
+  // Control: real keys still resolve, exact and prefix-shortened.
+  expect(extractBaseModel('omp')).toBe('omp');
+  expect(extractBaseModel('omp-1.2')).toBe('omp');
+});
+
+test("REGRESSION: prototype keys ('constructor') fall through to no branding", () => {
+  // The exact map lookup sits on a plain object: MODEL_EMOJI_MAP['constructor']
+  // is Object.prototype.constructor — truthy, non-string. Without the typeof
+  // guard the prefix would render that Function inside a tg-emoji tag.
+  const p = buildPrefix({ aiEmoji: '🤖', model: 'constructor', tmuxWindow: '' });
+  expect(p.html).toBe('🤖\n');
+  expect(p.forceHtml).toBe(false);
+});
+
+test("REGRESSION: 'computer-use-preview' does NOT pick up omp's branded id via substring", () => {
+  // Same fallback bug as tg's detectAiEmoji (#245 review): the EMBEDDABLE map's
+  // substring loop must skip exact-match-only keys, else a '🤖' prefix on a
+  // 'computer-use-preview' send would render inside Claude's ✳️ custom-emoji id
+  // (omp's shared id) — a nonsensical pair.
+  const p = buildPrefix({ aiEmoji: '🤖', model: 'computer-use-preview', tmuxWindow: '' });
+  expect(p.html).toBe('🤖\n');
+  expect(p.forceHtml).toBe(false);
+  // Control: an exact 'omp' model still resolves the branded id.
+  const omp = buildPrefix({ aiEmoji: '🥧', model: 'omp', tmuxWindow: '' });
+  expect(omp.html).toBe('<tg-emoji emoji-id="5274170649227600531">🥧</tg-emoji>\n');
+  expect(omp.forceHtml).toBe(true);
 });
 
 test('buildPrefix forces HTML for a Cyrillic window name (the <b> fallback)', () => {
