@@ -3,6 +3,37 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.43.2
+
+**Fix: bare `harness-event` StopFailure alerts mislabel the agent with the tmux window name, not the live harness (#263).**
+
+- The installed Claude Code StopFailure hook runs bare (`tg-ctl harness-event`,
+  no `--agent` flag). Its fallback resolver, `resolveAgentForPane`, read
+  `.windowName` (a tmux window's static, spawn-time-or-hand-set label) instead
+  of `.agent` (the live, process-tree-detected harness kind) from
+  `listAgentCandidates()` — a copy-paste mismatch against the parallel
+  `resolveWindowNameForPane`, which correctly uses `.windowName` for its own
+  distinct purpose. A window named `codex` that was later reused for a
+  `claude` session reported `codex` in the Telegram alert, and only some of
+  the time (whenever the stored window name and the live process happened to
+  disagree) — matching a live report of intermittent mislabeling. Also fixes
+  three latent misattributions gated on the same value: the codex hard-limit
+  diagnostic, the codex-specific `/usage` advice, and `allowCodexTryAgainReset`
+  could previously fire for the wrong harness.
+- Regression test: a pane whose tmux window is named `codex` but whose live
+  process is `claude` now renders `⚠️ <b>claude</b> hit its session limit`,
+  not `codex`.
+- Follow-up filed (#264): after this fix, two panes running the *same*
+  harness render an identical alert head with no per-pane identity — the
+  window name is already resolved separately and could be carried into the
+  notification text to restore disambiguation without reintroducing the bug.
+- Note: the resolved value also feeds the bare hook's usage-limit telemetry
+  gates (`extractUsageLimitEvents`). A `claude` session in a non-`claude`-named
+  window previously normalized to no agent and never got context-window 90%
+  warnings; it now correctly does, same as any other bare-hook `claude`
+  session. Expect a one-time uptick in these warnings for such panes — that's
+  the fix reaching cases it silently missed before, not a new false positive.
+
 ## 1.43.1
 
 **Fix: `tg --detect-model` misbrands omp sessions as claude (#246).**
