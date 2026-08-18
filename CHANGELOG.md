@@ -3,6 +3,37 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.44.0
+
+**Feature: late-deliver a permission tap by injecting the digit into the still-showing terminal menu (#267).**
+
+- A Telegram Approve/Reject tap that lands after a permission's hook socket
+  already closed (Claude Code's ~120s hook budget elapsed, harness fell back
+  to its own terminal "Do you want to proceed?" prompt) now re-checks the
+  pane via `tmux capture-pane` and, if the menu is still showing FOR THIS SAME
+  request, injects the matching digit directly — no waiting process, no
+  dependency on a hook reconnect that may never come. Previously the tap was
+  only ever QUEUED for delivery on a hook reconnect (tg-cli#31/#98), which
+  meant a terminal-fallback permission could wait forever despite the human
+  having already answered.
+- Scoped to `claude`: its numbered menu layout and bare-digit-submits-instantly
+  behavior (verified live, 2026-08-18 — a bare digit resolves the prompt in
+  well under a second, no trailing Enter) are the only ones confirmed; every
+  other agent kind, and claude when the menu can't be re-verified live, falls
+  through unchanged to the existing queue-and-wait-for-reconnect path.
+- The captured menu must ALSO still identify the SAME command/question the
+  request was originally asking about — not whatever permission happens to be
+  pending right now. Without this binding, a stale tap could inject "Yes" into
+  a newer, unrelated prompt within the retention window (review finding).
+- New pure module `features/tg-ctl/permission-menu.ts` parses the captured
+  pane text for the menu (from the LAST "Do you want to proceed?" occurrence,
+  not the first — the marker can also appear in scrollback) and picks the
+  digit matching an allow/deny decision by an EXACT "Yes"/"No" label match,
+  not a prefix — Claude Code has other wide "yes" variants beyond "don't ask
+  again" (e.g. auto-accepting edits for the session), and an exact allowlist
+  match is what actually enforces "never silently grant a broader standing
+  decision than the tapped Approve button represents."
+
 ## 1.43.1
 
 **Fix: `tg --detect-model` misbrands omp sessions as claude (#246).**

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { wrapInbound, buildTextInjectPlan, buildKeyInjectPlan } from '../features/tg-ctl/inject';
+import { wrapInbound, buildTextInjectPlan, buildKeyInjectPlan, buildDigitInjectPlan } from '../features/tg-ctl/inject';
 import type { InjectStep } from '../features/tg-ctl/types';
 
 // --- wrapInbound: {name}/{msg} template substitution ---
@@ -146,6 +146,7 @@ test('verify-pane is ALWAYS the first step', () => {
     buildTextInjectPlan('%9', 'one\ntwo'),
     buildTextInjectPlan('%9', 'one', { escapePrelude: true }),
     buildKeyInjectPlan('%9', 'Escape'),
+    buildDigitInjectPlan('%9', '1'),
   ];
   for (const plan of variants) {
     expect(plan[0]).toEqual({ kind: 'verify-pane', paneId: '%9' });
@@ -176,4 +177,32 @@ test('key plan: verify-pane + raw send-keys, no -l, no Enter, no sleep', () => {
     { kind: 'verify-pane', paneId: '%6' },
     { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%6', 'Escape'] },
   ]);
+});
+
+// --- buildDigitInjectPlan ---
+
+test('digit plan: verify-pane + literal send-keys, no Enter, no sleep', () => {
+  expect(buildDigitInjectPlan('%8', '1')).toEqual([
+    { kind: 'verify-pane', paneId: '%8' },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%8', '-l', '1'] },
+  ]);
+});
+
+test('digit plan uses -l (literal mode), unlike buildKeyInjectPlan', () => {
+  const plan = buildDigitInjectPlan('%8', '2');
+  const send = plan.find((s): s is Extract<InjectStep, { kind: 'tmux' }> => s.kind === 'tmux')!;
+  expect(send.argv).toContain('-l');
+});
+
+test('digit plan does NOT truncate or otherwise reinterpret its input — trusts the single-digit contract, never silently substitutes a plausible-but-wrong value', () => {
+  expect(buildDigitInjectPlan('%8', '10')).toEqual([
+    { kind: 'verify-pane', paneId: '%8' },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', '%8', '-l', '10'] },
+  ]);
+});
+
+test('digit plan never includes an Enter step', () => {
+  const plan = buildDigitInjectPlan('%8', '3');
+  expect(plan.some((s) => s.kind === 'tmux' && s.argv.includes('Enter'))).toBe(false);
+  expect(plan.some((s) => s.kind === 'sleep')).toBe(false);
 });
