@@ -60,12 +60,34 @@ const HR_RE = /<hr\b/iu;
 const WALL_LINE_CHARS = 350;
 const INLINE_ENUM_RE =
   /(?:pros?|cons?|плюсы|минусы|преимуществ\w*|недостат\w*)\s*[:：].*?,.*?,.*?,/iu;
+
+// Block-level HTML tags that Telegram renders as a visual line break
+// regardless of whether the source string contains a literal `\n` there
+// (tg-cli#261: a fully-structured Rich Message typed as one continuous
+// string, with no literal newline between sections, was misdiagnosed as a
+// wall of text purely because its RAW string had no newlines — every
+// section still renders on its own line in Telegram). The break goes
+// BEFORE an opening tag and AFTER a closing/void tag — never splitting an
+// element from its own tags — so `<li>…</li>` stays one line and the
+// skip-list below (which matches a line's STARTING tag, e.g. `<li`) keeps
+// excluding it exactly as it did for a literal-newline body.
+const OPEN_BLOCK_RE = /<(?:h[1-6]|p|tr|li|table|ul|ol|blockquote|pre)\b[^>]*>/giu;
+const CLOSE_BLOCK_RE = /<\/(?:h[1-6]|p|tr|li|table|ul|ol|blockquote|pre)\s*>|<(?:hr|br)\b[^>]*\/?>/giu;
+function withVisualLineBreaks(body: string): string {
+  return body.replace(OPEN_BLOCK_RE, (tag) => `\n${tag}`).replace(CLOSE_BLOCK_RE, (tag) => `${tag}\n`);
+}
 function hasWallOfText(body: string): boolean {
-  if (INLINE_ENUM_RE.test(body)) return true;
-  for (const raw of body.split('\n')) {
+  for (const raw of withVisualLineBreaks(body).split('\n')) {
     const line = raw.trim();
+    // INLINE_ENUM_RE runs on every visual line BEFORE the skips below (same
+    // as the original whole-body check): an inline "Плюсы: a, b, c," is
+    // still the pattern this exists to catch even inside a <li> or a
+    // markdown table row. Scoping it to one visual line (rather than the
+    // raw, possibly newline-free body) is what stops it from matching
+    // across unrelated sections of a one-line body — see tg-cli#261.
+    if (INLINE_ENUM_RE.test(line)) return true;
     if (line.includes('|')) continue; // table row
-    if (/^<\/?(?:table|tr|td|th|ul|ol|li|thead|tbody|caption|pre|code)\b/iu.test(line)) continue;
+    if (/^<\/?(?:table|tr|td|th|ul|ol|li|thead|tbody|caption|pre|code|blockquote)\b/iu.test(line)) continue;
     if (/[│┌┬┐└┴┘├┼┤─]/u.test(line)) continue; // boxed table
     if (line.length > WALL_LINE_CHARS) return true;
   }
@@ -75,11 +97,18 @@ function hasWallOfText(body: string): boolean {
 // A body has explanatory PROSE (the Context requirement) when at least one line
 // is not part of a table/list markup and carries real words (>= 20 chars).
 function hasContextProse(body: string): boolean {
-  for (const raw of body.split('\n')) {
+  // Same tg-cli#261 normalization as hasWallOfText: without it, a one-line
+  // structured body is a single "line" that starts with `<h3` (not in the
+  // skip-list below) and the word count runs over the WHOLE glued body
+  // including tag names ("h", "3", "C", "o", "n", "t", "e", "x", "t", …),
+  // trivially clearing 20 chars from markup alone — auto-passing Context
+  // with zero real prose, while the same content with literal newlines
+  // correctly fails. Caught in review of this same PR.
+  for (const raw of withVisualLineBreaks(body).split('\n')) {
     const line = raw.trim();
     if (line === '') continue;
     if (line.includes('|')) continue; // markdown pipe / boxed table row
-    if (/^<\/?(?:table|tr|td|th|ul|ol|li|thead|tbody|caption)\b/iu.test(line)) continue;
+    if (/^<\/?(?:table|tr|td|th|ul|ol|li|thead|tbody|caption|blockquote|pre|code)\b/iu.test(line)) continue;
     if (/[│┌┬┐└┴┘├┼┤─]/u.test(line)) continue; // boxed-table glyphs
     // Count word characters so a divider line ("-----") is not "prose".
     const words = (line.match(/[\p{L}\p{N}]/gu) ?? []).length;
