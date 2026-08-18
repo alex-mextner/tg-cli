@@ -3,6 +3,24 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.44.1
+
+**Fix: `--tag question|decision`'s escalation-format gate rejected realistic decision-request content while only the tool's own toy template passed (#261, #262).**
+
+- `hasWallOfText` split a message body on literal `\n` only. A fully structured
+  Rich Message (`<h3>`/`<p>`/`<table>`/`<ul>`/`<hr>`) assembled as one
+  continuous string, with no literal newline between sections, still renders
+  as separate visual lines in Telegram — but the raw source string was one
+  giant "line" whose character count blew past the 350-char wall-of-text
+  threshold the moment the content was realistic. Fixed by scanning "visual
+  lines" (a virtual break before each opening block tag, after each
+  closing/void one) instead of literal-newline-split lines, so the same
+  content gets the same verdict regardless of the caller's newline
+  formatting. `hasContextProse` had the identical bug (found during review of
+  this fix) and got the same normalization, plus a matching
+  `blockquote`/`pre`/`code` skip-list so quoted text or a code dump can't
+  satisfy the Context requirement with none of the agent's own prose.
+
 ## 1.44.0
 
 **Feature: late-deliver a permission tap by injecting the digit into the still-showing terminal menu (#267).**
