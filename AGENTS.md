@@ -237,10 +237,23 @@ tests can pass fakes.
   requests (no `paneId` — no card to late-deliver/re-attach to) keep the single-attempt client path,
   since resending those would post a duplicate card. `question-store.ts` owns the on-disk format
   (PURE); the entrypoint owns the I/O.
+- **Pane-inject late-delivery for permissions (`features/tg-ctl/permission-menu.ts`, tg-cli#267):**
+  for `claude` specifically, a disconnected permission's hook has already fallen back to Claude
+  Code's OWN numbered terminal "Do you want to proceed?" menu — answerable directly by
+  `tmux capture-pane -pJ`, re-verifying the menu still identifies THIS request (LINE-EXACT match
+  against `extractPermissionIdentity`, never a raw substring — a boundary-only check still lets a
+  stale "git push" tap match a live "git push --force" menu, since both genuinely continue at a
+  space; only comparing whole lines tells them apart), then injecting the matching digit (bare, no
+  Enter — Claude Code's menu submits instantly) and re-capturing after a pace to CONFIRM the menu is
+  actually gone before claiming delivery (a tmux exit code alone doesn't prove the app consumed the
+  key — e.g. copy-mode swallows it). No waiting process, no dependency on a hook reconnect that may
+  never come for a terminal-fallback permission. Every other agent kind, and claude when the menu
+  can't be re-verified live, falls through unchanged to the queuing mechanism below.
 - **Queued permission decisions (never drop a tap on a disconnected permission, and NEVER expire it
-  on a timer — Alex tg#9982):** a permission has no pane-text-injection fallback (the hook needs a
-  structured JSON reply, not terminal text), so a Telegram tap that lands while its hook is
-  disconnected can't be delivered immediately. It is QUEUED on the retained entry
+  on a timer — Alex tg#9982):** the pane-inject path above covers claude when its menu is live and
+  verifiable; every other case (a permission has no pane-text-injection fallback in general — the
+  hook needs a structured JSON reply, not terminal text) still can't be delivered immediately when a
+  Telegram tap lands while its hook is disconnected. It is QUEUED on the retained entry
   (`AbandonedButton.queuedDecision`, persisted immediately — survives a daemon crash between the tap
   and the reconnect) and delivered automatically the instant a reconnecting hook re-attaches to the
   same requestId AND its full payload (question text + `toolInput`, `permissionPayloadMatches`) still

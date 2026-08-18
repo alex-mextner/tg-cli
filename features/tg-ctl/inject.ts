@@ -76,3 +76,27 @@ export function buildKeyInjectPlan(paneId: string, key: 'Escape'): InjectStep[] 
     { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', paneId, key] },
   ];
 }
+
+// A single digit keypress for a numbered "Do you want to proceed?" menu — NO
+// trailing Enter. Verified live (2026-08-18, throwaway tmux session): Claude
+// Code's numbered permission menu submits the instant a bare digit is sent —
+// the prompt was already resolved and the command running 400ms after a
+// literal "1" with no Enter follow-up. Sending Enter afterward would risk it
+// landing on whatever prompt/input follows the now-resolved menu instead
+// (tg-cli#267's late-delivery-for-permissions path is the only caller).
+// `digit` is trusted single-character input: permission-menu.ts's OPTION_LINE
+// regex captures exactly one digit at the source, so this is the only shape
+// that ever reaches here. Deliberately NOT silently truncating a longer
+// string here (an earlier version did `digit.slice(0, 1)`, framed as
+// "insurance" — review finding: on a permission-ANSWERING path, silently
+// reinterpreting a caller's contract violation into "select whatever the
+// first character happens to be" is less safe than just trusting the
+// contract, since it can never be distinguished from a correct single-digit
+// call — a real bug upstream would inject a plausible-looking WRONG answer
+// instead of surfacing loudly).
+export function buildDigitInjectPlan(paneId: string, digit: string): InjectStep[] {
+  return [
+    { kind: 'verify-pane', paneId },
+    { kind: 'tmux', argv: ['tmux', 'send-keys', '-t', paneId, '-l', digit] },
+  ];
+}

@@ -57,7 +57,13 @@ import {
   pickTargetPaneFromSet,
   resolveByLastMessage,
 } from "./features/tg-ctl/discover"
-import { buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
+import { buildDigitInjectPlan, buildKeyInjectPlan, buildTextInjectPlan, wrapInbound } from "./features/tg-ctl/inject"
+import {
+  extractPermissionIdentity,
+  parsePermissionMenu,
+  permissionMenuMatchesRequest,
+  pickPermissionMenuDigit,
+} from "./features/tg-ctl/permission-menu"
 import { buildGitStateBanner, buildPaneGitState, type PaneGitState } from "./features/tg-ctl/git-state"
 import {
   autoContinueDelayMs,
@@ -903,6 +909,31 @@ function executeInjectStepsSync(steps: InjectStep[]): { ok: true } | { ok: false
     }
   }
   return { ok: true }
+}
+
+// Capture a pane's current visible text (`tmux capture-pane -pJ`), used to
+// re-check whether a Claude Code numbered permission menu is STILL showing
+// before late-delivering a decision into it (see the permission branch of
+// lateDeliverAbandonedQuestion). `-J` joins tmux's internal line-wrap breaks
+// back into logical lines — without it, a long command that hard-wraps
+// mid-token gets a newline (→ a space, after permission-menu.ts's whitespace
+// normalization) inserted INSIDE the token, which can turn a real identity
+// match into a false negative for exactly the long commands most likely to
+// hit the 120s hook budget in the first place (review finding). Never
+// throws: a dead pane / missing tmux yields null, same fail-soft posture as
+// the rest of this file's tmux calls.
+function capturePane(paneId: string): string | null {
+  try {
+    const proc = Bun.spawnSync(["tmux", "capture-pane", "-p", "-J", "-t", paneId], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: SUBPROC_ENV,
+    })
+    if (proc.exitCode !== 0) return null
+    return proc.stdout.toString()
+  } catch {
+    return null
+  }
 }
 
 // --- voice transcription (inbound STT) ---
@@ -6866,13 +6897,17 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       log(`ask-late-deliver-expired: ${describeAskRequest(retained.req)} key=${action.requestId} ageMs=${Date.now() - retained.at}`)
       return false
     }
-    // A permission has no pane-text-injection fallback (the hook needs a structured
-    // JSON reply, not terminal text), so a tap can't be delivered right now. It must
-    // NOT be silently dropped either (Alex tg requirement: never lose a tapped
-    // decision) — QUEUE it on the retained entry so a reconnecting hook delivers it
-    // automatically the instant it re-attaches (see handleHookSocketLine's RECONNECT
-    // re-attach branch). A later re-tap overwrites the queued value (last tap wins,
-    // covers a misclick).
+    // A permission's LIVE hook needs a structured JSON reply, not terminal text —
+    // but once that hook has closed, the harness has ALREADY fallen back to its own
+    // terminal prompt, and for claude that prompt is directly answerable by
+    // re-checking the pane and injecting the matching digit (see the pane-recheck
+    // block right below, tg-cli#267). That covers claude; every other agent kind,
+    // and claude when the menu can't be re-verified live, still can't be delivered
+    // to right now and must NOT be silently dropped either (Alex tg requirement:
+    // never lose a tapped decision) — QUEUE it on the retained entry so a
+    // reconnecting hook delivers it automatically the instant it re-attaches (see
+    // handleHookSocketLine's RECONNECT re-attach branch). A later re-tap overwrites
+    // the queued value (last tap wins, covers a misclick).
     if (retained.req.kind === "permission") {
       // `resolveButtonCallback` (features/tg-ctl/questions.ts) always sets a real
       // 'allow'|'deny' `decision` when it returns status:"answered" for a
@@ -6886,6 +6921,23 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const answer = resolveButtonCallback(retained.req, { requestId: action.requestId, value: action.value })
       if (answer.status !== "answered") return false
       const label = resolveWindowAgentLabel(retained.req.windowName, retained.req.cwd)
+      const paneId = retained.req.paneId
+
+      // QUEUE FIRST, unconditionally, BEFORE any pane-inject attempt below —
+      // durable on disk before we ever touch tmux. This ordering matters: a
+      // daemon crash between an inject attempt and its post-inject confirm
+      // (an await on a subprocess plus a pacing sleep — not a negligible
+      // window) must NEVER lose the tap (Alex tg#9982 requirement, the exact
+      // guarantee the queuedDecision mechanism exists to provide). If the tap
+      // were instead recorded as "answered" only AFTER a successful confirm,
+      // a crash in that window would persist NOTHING — no queuedDecision to
+      // recover from, no live socket to deliver to, and a re-tap would find
+      // nothing retained (review finding: an earlier version of this claimed
+      // "answered" BEFORE the inject even ran, regressing exactly this
+      // invariant). Queuing first means the worst case of a crash mid-inject
+      // is simply the pre-existing, already-durable "queued" state — a
+      // pane-inject success below UPGRADES this record to answered/delivered;
+      // it never has to roll one back.
       const queuedAt = Date.now()
       retained.queuedDecision = { value: answer.value, label: answer.label, decision: answer.decision, at: queuedAt }
       // A fresh tap is itself activity worth restarting the retention clock for —
@@ -6899,6 +6951,137 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // file (e.g. ANSWERED_REPLAY_MS on a fresh answer).
       retained.at = queuedAt
       persistQuestions() // durable NOW — a restart before any other mutation must not lose this tap
+
+      // The CTO's spec (verbatim): "no waiting process — check via tmux
+      // whether the permission request is still showing, and send the
+      // keypresses." Claude Code's own numbered "Do you want to proceed?"
+      // menu is answerable directly this way — the harness has already
+      // fallen back to ITS OWN terminal prompt, so nothing causes a fresh
+      // hook to fire and reconnect; queuing-and-waiting (below) can wait
+      // forever. Scoped to claude (tg-cli#267): its menu layout and
+      // bare-digit-submits-instantly behavior are the only ones verified
+      // live (tmux capture-pane test, 2026-08-18) — every other agent kind
+      // falls straight through to the existing queue-and-wait path,
+      // unchanged. KNOWN RESIDUAL LIMITATIONS, accepted rather than silently
+      // ignored (tg-cli#268 tracks broadening/verifying these further): a
+      // command containing a real newline (heredocs, multi-line strings) can
+      // never line-match in permissionMenuMatchesRequest and always falls
+      // through to queuing; and there is a millisecond TOCTOU between the
+      // pre-inject capture/identity-check and the actual `send-keys` where
+      // the human could resolve THIS menu at the keyboard and a genuinely
+      // DIFFERENT permission's menu could appear before the digit lands —
+      // the post-inject re-verify below narrows this but cannot fully close
+      // it from outside the app.
+      if (paneId && retained.req.agent === "claude" && !shouldDeferInbound(paneId)) {
+        const captured = capturePane(paneId)
+        // BOTH must hold: the menu is showing, AND its BOUNDED context (never
+        // the whole pane — see ParsedPermissionMenu.context) still identifies
+        // THIS request's own command/question — not a newer, unrelated
+        // permission the harness has since moved on to within the retention
+        // window. Skipping the identity check, or checking it against the
+        // whole pane instead of the menu's own context, would let a stale tap
+        // inject "Yes" into whatever happens to be pending right now (review
+        // finding — two independent reviewers found the whole-pane version of
+        // this check bypassable via an older command's leftover scrollback).
+        // hasLiveCursor gates injection the same way it gates the post-inject
+        // confirmation below: text alone doesn't prove this menu is the
+        // currently-answerable one — the cursor does (see
+        // ParsedPermissionMenu.hasLiveCursor). Injecting a digit at a menu
+        // that's already resolved (text still visible in scrollback, cursor
+        // gone) would land the keypress on whatever's actually focused now,
+        // not this request.
+        const menu = captured ? parsePermissionMenu(captured) : null
+        const menuIsLive = menu?.hasLiveCursor ?? false
+        const identityMatches = menuIsLive ? permissionMenuMatchesRequest(menu.context, extractPermissionIdentity(retained.req)) : false
+        const digit = menu && identityMatches ? pickPermissionMenuDigit(menu.options, answer.decision) : null
+        if (digit !== null) {
+          let deliveryFailure: string | null = null
+          try {
+            const res = await executeInjectSteps(buildDigitInjectPlan(paneId, digit))
+            deliveryFailure = res.ok ? null : res.error
+          } catch (err) {
+            // Bun.spawnSync can throw (missing tmux binary, broken PATH) —
+            // this call site is the one explicitly claiming rollback-safe
+            // semantics, so it must not let a throw skip straight past the
+            // "already safely queued" fallback below (review finding).
+            deliveryFailure = `inject threw: ${err instanceof Error ? err.message : String(err)}`
+          }
+          // A tmux exit-0 only proves the keypress was SENT, not that Claude
+          // Code actually consumed it as the menu choice — e.g. the pane is
+          // in tmux copy-mode (scrolled up), where a literal digit is
+          // swallowed by copy-mode's own key table instead of reaching the
+          // app underneath (review finding). Re-capture after a short pace
+          // and require the SAME identified menu to still be LIVE (its
+          // cursor glyph still present, see ParsedPermissionMenu.hasLiveCursor)
+          // before claiming non-delivery — this is what actually verifies the
+          // tap worked. Gating on the marker/option TEXT being gone (an
+          // earlier version) is unsound: we have no confirmed evidence
+          // Claude Code erases a resolved menu from the pane rather than
+          // leaving it visible as scrollback history, and a real terminal
+          // that retains it would make every successful delivery misread as
+          // "still pending" forever (review finding). The cursor is specific
+          // to the currently-answerable widget either way — gone means
+          // resolved, whether or not the surrounding text sticks around. A
+          // FAILED re-capture (tmux error, dead pane) proves NOTHING about
+          // the menu and must be treated as NOT confirmed, never as
+          // confirmed-by-default (review finding: an earlier version was
+          // fail-open here — a null capture made `stillPending` false, which
+          // read as "confirmed delivered").
+          if (deliveryFailure === null) {
+            await Bun.sleep(400)
+            const after = capturePane(paneId)
+            if (after === null) {
+              deliveryFailure = "post-inject re-capture failed — cannot confirm delivery"
+            } else {
+              const afterMenu = parsePermissionMenu(after)
+              const stillPending =
+                afterMenu !== null &&
+                afterMenu.hasLiveCursor &&
+                permissionMenuMatchesRequest(afterMenu.context, extractPermissionIdentity(retained.req))
+              if (stillPending) deliveryFailure = "delivery not confirmed — the same menu is still showing after inject"
+            }
+          }
+          if (deliveryFailure === null) {
+            // Confirmed delivered — UPGRADE the already-queued entry to
+            // answered/pane-delivered (never a rollback needed on this path:
+            // nothing was ever recorded as "answered" before this point).
+            abandonedButtons.delete(action.requestId)
+            pruneAnsweredButtons(answeredButtons, Date.now())
+            answeredButtons.set(action.requestId, { value: answer.value, label: answer.label, decision: answer.decision, at: Date.now(), delivery: "pane" })
+            persistQuestions()
+            log(`ask-late-deliver-permission-pane: ${describeAskRequest(retained.req)} key=${action.requestId} label=${answer.label} pane=${paneId} digit=${digit}`)
+            await answerCallbackQuery(ctx, action.callbackQueryId, "✓ sent to the agent")
+            const cardId = retained.messageId ?? action.messageId
+            if (cardId !== null) {
+              void clearMessageKeyboard(ctx, cardId)
+              void editMessageText(ctx, cardId, buildAnsweredQuestionText(retained.req, answer.label))
+            }
+            return true
+          }
+          // Not confirmed — the entry is ALREADY safely queued (from the top
+          // of this block), so there is nothing to roll back; just log why
+          // the optimization didn't apply and fall through to the normal
+          // queued-decision UI below.
+          log(`ask-late-deliver-permission-pane-failed: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId} err=${deliveryFailure}`)
+        } else {
+          // No live, identity-matching menu to inject into right now — log
+          // WHY, so a genuinely-dead pane-inject path (e.g. an unverified
+          // real-world deny label, tg-cli#268) is distinguishable in the
+          // field from "menu already resolved" instead of reading identical
+          // to the ordinary queuing case (review finding). `no-live-cursor`
+          // is its own reason, not folded into `identity-mismatch` — a
+          // resolved-but-retained menu box (text present, cursor gone) is a
+          // DIFFERENT cause than "a live menu is showing a different
+          // command," and conflating them points field debugging at the
+          // wrong one (review finding).
+          const reason = !menu ? "no-menu" : !menuIsLive ? "no-live-cursor" : !identityMatches ? "identity-mismatch" : "no-pickable-option"
+          log(`ask-late-deliver-permission-pane-skip: ${describeAskRequest(retained.req)} key=${action.requestId} pane=${paneId} reason=${reason}`)
+        }
+      }
+
+      // Not delivered via pane-inject (unsupported agent kind, deferred pane,
+      // no live/identity-matching menu, or unconfirmed injection) — already
+      // durably queued above; render the existing queued-decision UI.
       const cardId = retained.messageId ?? action.messageId
       // The keyboard MUST ride along explicitly here too (see the disconnect-edit
       // comment in armPendingSocketClose) — "tap again to change it" is a lie if
