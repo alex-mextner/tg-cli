@@ -107,37 +107,47 @@ test('--dry-run with a structurally-COMPLIANT decision body: exits 0, prints OK,
 
 // The regression this exists to catch: exactly the incident body, still
 // carrying "foo bar baz test" / "Option A" ok/bad / "foo.ts:1" placeholder
-// text. It is structurally compliant (headings, table, pros/cons keywords, a
-// recommendation, a file:line ref, <hr> dividers), so the OLD code (no
-// --dry-run) sent it for real. With --dry-run, it must be validated and
-// rendered locally ONLY — never reach the mock server.
-test('--dry-run with the incident PLACEHOLDER body ("foo bar baz test" / Option A "ok"/"bad"): passes structurally but sends NOTHING', async () => {
+// text. At the time this test was written it was structurally compliant
+// (headings, table, pros/cons keywords, a recommendation, a file:line ref,
+// <hr> dividers) INCLUDING Context, so the OLD code (no --dry-run) sent it
+// for real.
+//
+// tg-cli#262 (escalation-format's Context-prose check) subsequently tightened
+// what counts as "Context — a sentence of prose": this exact body's Context
+// line, "foo bar baz test.", is only 13 real (\p{L}/\p{N}) characters — under
+// the 20-char floor — and used to clear it only because pre-#262 counted
+// glued HTML tag-name characters toward the total (the same class of bug
+// #262 fixed for the wall-of-text check). Post-#262 this incident body is
+// REJECTED by the format gate itself, with or without --dry-run — a strictly
+// better outcome than before (the gate alone now prevents this exact
+// incident, not just --dry-run). Both tests below assert that.
+test('--dry-run with the incident PLACEHOLDER body ("foo bar baz test" / Option A "ok"/"bad"): now hard-blocked by the format gate itself, still sends NOTHING', async () => {
   received = [];
   const home = makeHomeWithCreds();
-  const { exitCode, stdout } = await run(
+  const { exitCode, stderr } = await run(
     ['--dry-run', '--tag', 'decision', '--format', 'html', PLACEHOLDER_BODY],
     { PATH: process.env.PATH ?? '', HOME: home, TG_API_BASE: `http://127.0.0.1:${server.port}` },
   );
-  expect(exitCode).toBe(0);
-  expect(stdout).toContain('tg --dry-run: OK');
+  expect(exitCode).toBe(1);
+  expect(stderr).toContain('Blocked:');
   expect(received).toHaveLength(0);
 });
 
-// Contrast case proving the mock-server harness itself is sound and that the
-// SAME placeholder body, without --dry-run, really does reach the wire — this
-// is the exact bug the incident hit, reproduced deliberately so the fix above
-// is proven against a real regression, not just an absence of behavior.
-test('the SAME placeholder body WITHOUT --dry-run really does reach the mock server (sanity: reproduces the incident)', async () => {
+// Contrast case: with tg-cli#262 landed, the SAME placeholder body no longer
+// reaches the wire even WITHOUT --dry-run — the format gate itself now
+// catches this incident's root cause (insufficient real Context prose)
+// before any network attempt. This is the defense-in-depth improvement:
+// --dry-run is no longer the only thing standing between this exact junk
+// body and a live send.
+test('the SAME placeholder body WITHOUT --dry-run is now also blocked before reaching the mock server (defense in depth, post-#262)', async () => {
   received = [];
   const home = makeHomeWithCreds();
   const { exitCode } = await run(
     ['--tag', 'decision', '--format', 'html', PLACEHOLDER_BODY],
     { PATH: process.env.PATH ?? '', HOME: home, TG_API_BASE: `http://127.0.0.1:${server.port}` },
   );
-  expect(exitCode).toBe(0);
-  expect(received).toHaveLength(1);
-  const richMessage = received[0].rich_message as { html: string };
-  expect(richMessage.html).toContain('foo bar baz test');
+  expect(exitCode).toBe(1);
+  expect(received).toHaveLength(0);
 });
 
 test('--dry-run with a MALFORMED decision body: still hard-blocks (exit 1) before ever reaching the dry-run OK path', async () => {
