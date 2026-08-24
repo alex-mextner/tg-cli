@@ -27,6 +27,7 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     usageWarnings: join(configDir, `${base}.usage-warnings.json`),
     usageLatest: join(configDir, `${base}.usage-latest.json`),
     deferred: join(configDir, `${base}.deferred.json`),
+    lastAlexTarget: join(configDir, `${base}.last-alex-target.json`),
   };
 }
 

@@ -41,10 +41,16 @@ const BLOCKED = [
   'credentials.json',
   'client_secret_12345.json',
   'kubeconfig',
-  // tg-ctl state: the message history is a full conversation transcript and the
-  // routes map leaks pane→project layout — neither must ride a Telegram attach.
+  // tg-ctl state: the message history is a full conversation transcript, the
+  // routes map leaks pane→project layout, and the last-Alex-target anchor
+  // (tg-cli#78) leaks the CTO's active pane id + project cwd — none must ride
+  // a Telegram attach.
   'tg-ctl.123456.history.jsonl',
   'tg-ctl.987.routes.json',
+  'tg-ctl.987.last-alex-target.json',
+  // the anchor's own write-then-rename staging file (review finding): a crash
+  // or failed rename can orphan this on disk with the same sensitive content.
+  'tg-ctl.987.last-alex-target.json.tmp.4242',
 ];
 
 const ALLOWED = [
@@ -87,6 +93,7 @@ test('denylist: matches the basename, not the directory', () => {
 const dir = mkdtempSync(join(tmpdir(), 'tg-denylist-'));
 writeFileSync(join(dir, 'prod.env'), 'TOKEN=supersecret\n');
 writeFileSync(join(dir, 'normal.ts'), 'export const x = 1\n');
+writeFileSync(join(dir, 'tg-ctl.987.last-alex-target.json'), '{"paneId":"%3","cwd":"/repo","ts":1}\n');
 
 test('explicit --file of a denylisted file is a hard error', () => {
   const r = parseArgs(['--file', join(dir, 'prod.env'), 'oops'], dir, dir);
@@ -109,6 +116,12 @@ test('auto-detected denylisted file is silently skipped, token stays in text', (
     expect(r.items).toEqual([]);
     expect(r.caption).toContain('prod.env');
   }
+});
+
+test('explicit --file of the last-alex-target anchor state file is a hard error', () => {
+  const r = parseArgs(['--file', join(dir, 'tg-ctl.987.last-alex-target.json'), 'oops'], dir, dir);
+  expect(r.action).toBe('error');
+  if (r.action === 'error') expect(r.message).toContain('last-alex-target.json');
 });
 
 test('--no-feature attach-denylist override: explicit attach goes through', () => {
