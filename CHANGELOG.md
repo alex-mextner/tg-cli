@@ -3,6 +3,26 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.44.3
+
+**Fix: a non-reply message could route to whichever agent pane merely spoke last, instead of the pane the CTO was actually addressing.**
+
+- An unrelated agent proactively messaging the CTO — right before the CTO sent
+  his own fresh, non-reply message — could hijack that message: routing bound
+  to `routes.json`'s "last outbound sender" (`lastMessagePane`), which
+  conflated "who spoke last" with "who the CTO was addressing" (live
+  incident). Fixed by adding a dedicated anchor
+  (`tg-ctl.<bot>.last-alex-target.json`) that records ONLY the CTO's own last
+  CONFIRMED inbound delivery — an auto-bound inject, a picker tap, a reply, or
+  a named `/agent` — never an agent's own outbound send and never a failed
+  inject. Guarded against tmux pane-id reuse the same way reply-routing
+  already was, and shared between inbound message routing and `/tasks`'s
+  default project scoping so the two no longer disagree.
+- Also fixed the same class of bug in the git-state-check banner (it could
+  silently check the daemon's own repo instead of skipping the banner when a
+  pane reported no known path), and widened the never-attach denylist to
+  cover the new anchor file's temp-write staging form.
+
 ## 1.44.2
 
 **Fix: `/agent <selector> <message>` dropped the inbound `tg#<id>` wrap tag, breaking threaded replies for anything routed by name.**
