@@ -617,6 +617,42 @@ test('TAP a button → routes the pending message to the chosen pane', async () 
   expect(reactionEmojis(tg.reactions, 20)).toEqual(['✍️', '👀']);
 }, 15_000);
 
+// Regression for GH-274: handleAgentCallback's NOT-prewrapped branch (a picker
+// spawned from a plain ambiguous message, not a reply-quote) calls the same
+// injectToPane(..., pending.sourceMessageId) as the confident-selector direct
+// route — this proves the tg#<id> tag survives THAT call site too, not only
+// the direct-route one covered by ctl-agent-route-message-id-integration.
+test('TAP a button on an ambiguous picker → injected text still carries the tg#<id> wrap tag (GH-274)', async () => {
+  const h = makeHarness([
+    { paneId: PANE_HYPER, cwd: '' },
+    { paneId: PANE_TOOLS, cwd: '' },
+  ]);
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushText(700, 4242, 'route me');
+  await waitFor(() => pickerOf(tg.sends) !== undefined);
+
+  const picker = pickerOf(tg.sends)!;
+  const toolsBtn = picker.buttons.find((b) => b.text.includes('agent-tools'))!;
+  expect(toolsBtn).toBeDefined();
+  tg.pushCallback(701, toolsBtn.callback_data, 9000 + tg.sends.indexOf(picker) + 1);
+
+  await waitFor(() => injectedLines(h.injectLog).length > 0);
+  await Bun.sleep(200);
+
+  const toolsLines = injectedLines(h.injectLog).filter((l) => l.startsWith(`${PANE_TOOLS}\t`));
+  expect(toolsLines.length).toBeGreaterThan(0);
+  // The inbound message's own id (4242) must be threaded through the picker
+  // tap, same as every other inbound path — this is what lets the agent
+  // answer back with `tg --reply-to 4242`.
+  expect(toolsLines.join('\n')).toContain('tg#4242');
+
+  daemon.kill('SIGTERM');
+  await daemon.exited;
+}, 15_000);
+
 test('REPLY to a now-GONE agent → picker WITH "no longer running" notice naming the gone agent', async () => {
   // routes.json: outbound message 500 originated from the hyperide agent (%0).
   // mode "tools": %0 is GONE (only agent-tools %2 is live). The reply's recognized

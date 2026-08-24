@@ -4677,7 +4677,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     sourceMessageId: number | null,
     deferReactionViaAck = false,
   ): Promise<{ ok: boolean; error?: string; deferred?: boolean; deferredItem?: DeferredInbound }> => {
-    const wrapped = wrapInbound(ctx.cfg.injectWrap, from, msg)
+    // `sourceMessageId` was accepted here for deferred-queue bookkeeping (see
+    // enqueueDeferred below) but never forwarded into wrapInbound — every
+    // /agent-routed inbound (direct hit, defer flush, and the ambiguous-picker
+    // confirm) silently lost its `tg#<id>` wrap tag while the generic
+    // auto-bind inject path (which does pass its messageId) kept it. Forward
+    // it here so `/agent <selector> <text>` gets the same `tg#<id>` tag as
+    // every other inbound path.
+    const wrapped = wrapInbound(ctx.cfg.injectWrap, from, msg, sourceMessageId ?? undefined)
     if (shouldDeferInbound(paneId)) {
       const item = enqueueDeferred(paneId, wrapped, sourceMessageId)
       if (deferReactionViaAck) markDeferredForAck(item)

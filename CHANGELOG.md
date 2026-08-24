@@ -3,6 +3,32 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.44.2
+
+**Fix: `/agent <selector> <message>` dropped the inbound `tg#<id>` wrap tag, breaking threaded replies for anything routed by name.**
+
+- `injectToPane` (the daemon's `/agent`-routing inject path) accepted a
+  `sourceMessageId` parameter — used only for deferred-queue bookkeeping — but
+  never forwarded it into `wrapInbound`. Every other inbound path (auto-bind
+  inject, reply-quote, deferred flush) already passed its message id and
+  rendered `[TG from Alex tg#<id>] <msg>`; a message sent via
+  `/agent <selector> <message>` rendered `[TG from Alex] <msg>` instead,
+  silently losing the id an agent needs for `tg --reply-to <id>` threading.
+  Present since the `/agent` selector routing was added (June 12) — the
+  `{id}` wrap convention landed later (PR #34) and was only wired into the
+  OTHER inject paths, never into this one. Fixed by forwarding
+  `sourceMessageId` into the existing `wrapInbound` call; covers the direct
+  hit, the ambiguous-picker confirm, and the defer-flush replay, since all
+  three share this one function. Three integration tests cover it:
+  `ctl-agent-route-message-id-integration.test.ts` (confident direct route),
+  a new case in `ctl-ambiguous-picker-integration.test.ts` (the picker-tap
+  call site of the same shared `injectToPane`), and
+  `ctl-agent-route-defer-flush-message-id-integration.test.ts` (a message
+  deferred behind an open question flushes with the id exactly once — no
+  double-tag from re-wrapping an already-wrapped deferred item). Also
+  corrected two stale doc comments (`inject.ts`, `types.ts`) that still
+  claimed a `/agent` route carries no id.
+
 ## 1.44.1
 
 **Fix: `--tag question|decision`'s escalation-format gate rejected realistic decision-request content while only the tool's own toy template passed (#261, #262).**
