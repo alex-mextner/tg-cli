@@ -35,8 +35,11 @@ test('wrapInbound substitutes {id} with tg#<messageId> when an id is given', () 
 });
 
 test('wrapInbound collapses the ` {id}` segment cleanly when no id is given', () => {
-  // A /agent route or media item has no inbound id → the marker drops and the
-  // space stranded before the closing bracket is cleaned up.
+  // A synthetic/non-inbound injection (no underlying Telegram message, e.g. a
+  // button-tap answer label) has no id → the marker drops and the space
+  // stranded before the closing bracket is cleaned up. A `/agent <selector>
+  // <text>` route DOES carry an id (forwarded from sourceMessageId) and is
+  // covered separately in tests/ctl-agent-route-message-id-integration.test.ts.
   expect(wrapInbound('[TG from {name} {id}] {msg} — reply via tg', 'Alex', 'hi')).toBe(
     '[TG from Alex] hi — reply via tg',
   );

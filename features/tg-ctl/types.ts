@@ -12,7 +12,7 @@ export interface ControlConfig {
   enabled: boolean;
   transport: 'auto' | 'tmux' | 'channel'; // 'channel' reserved for v1.2+
   session?: string; // fixed tmux session name (else auto-discover)
-  injectWrap: string; // template: {name}, {msg}
+  injectWrap: string; // template: {name}, {msg}, {id}
   stalenessSec: number; // legacy config; owner inbound is no longer dropped by age (#183)
   idleExitMin: number; // daemon exits after this long with no agent pane (default 30)
   allowedSenders: number[]; // extra allowed sender user ids
@@ -46,7 +46,9 @@ export const DEFAULT_CONTROL: ControlConfig = {
   transport: 'auto',
   // `{id}` renders the inbound Telegram message_id as `#<id>` — the agent passes
   // it to `tg --reply-to <id>` to thread its answer under this exact message.
-  // When no id is available (for example a /agent route) `{id}` collapses with
+  // A `/agent <selector> <text>` route carries an id too (forwarded from
+  // sourceMessageId, same as every other inbound path). Only a genuinely
+  // synthetic/non-inbound injection has no id — then `{id}` collapses with
   // its leading space (see wrapInbound), so the wrap stays `[TG from {name}] …`.
   injectWrap: '[TG from {name} {id}] {msg}',
   stalenessSec: 300,
