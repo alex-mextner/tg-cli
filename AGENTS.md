@@ -334,12 +334,18 @@ tests can pass fakes.
 
 - **Threaded replies:** the injected wrap (`injectWrap` in `DEFAULT_CONTROL`,
   `[TG from {name} {id}] {msg} — reply via tg`) now carries the inbound Telegram `message_id`
-  via the `{id}` placeholder (rendered `#<id>`; collapses cleanly when no id applies, e.g. an
-  `/agent` route). The agent passes that id to `tg --reply-to <id>`, which sets
-  `reply_to_message_id` on the FIRST outbound `sendMessage` so the answer threads under the
-  message it answers. The id IS Telegram's own per-chat sequential `message_id` — no parallel id
-  scheme. `wrapInbound` takes an optional `messageId`; `stepUpdates`/`buildReplyInject` forward
-  `m.message_id`; the `download-media` / `transcribe-voice` actions carry it too.
+  via the `{id}` placeholder, rendered `tg#<id>` (the `tg#` prefix — not a bare `#` — is the
+  message-ref convention that keeps it distinct from a GitHub issue/PR `#<id>`, tg#28). It
+  collapses cleanly only for a genuinely synthetic/non-inbound injection with no underlying
+  Telegram message — e.g. a button-tap answer label. An `/agent <selector> <text>` route DOES
+  carry an id, forwarded from `sourceMessageId` through `injectToPane` the same as every other
+  inbound path (GH-274; before that fix the id silently collapsed for anything routed by name).
+  The agent passes the id's numeric portion (without the `tg#` prefix) to `tg --reply-to <id>`,
+  which sets `reply_to_message_id` on the FIRST outbound `sendMessage` so the answer threads
+  under the message it answers. The id IS Telegram's own per-chat sequential `message_id` — no
+  parallel id scheme. `wrapInbound` takes an optional `messageId`; `stepUpdates`/
+  `buildReplyInject` forward `m.message_id`; the `download-media` / `transcribe-voice` actions
+  carry it too.
 
 ### Feature Flags
 
