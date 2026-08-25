@@ -99,7 +99,7 @@ through `discoverTarget` → `pickTargetPaneFromSet`. With several live agent pa
 and no registration pinning one, that picker returns `ambiguous`. Rather than
 immediately asking, `discoverForInject` binds the message to the pane of the
 **CTO's own last resolved inbound delivery** — persisted in
-`tg-ctl.<bot>.last-alex-target.json` (`features/tg-ctl/last-alex-target.ts`) and
+`tg-ctl.<bot>.last-user-target.json` (`features/tg-ctl/last-user-target.ts`) and
 written ONLY on a confirmed delivery: an auto-bound inject, an explicit picker
 tap, a named `/agent`, or a recognized reply — never on a failed inject, and
 never on an agent's own outbound send. `resolveTasksScopeDir` (the `/tasks`
@@ -109,7 +109,7 @@ agree on "the default target".
 This deliberately does **not** track "whoever spoke last" (an earlier mechanism,
 `lastMessagePane` over the outbound-send routes map): an unrelated agent
 proactively messaging the CTO could otherwise hijack his very next message —
-the live incident this fix closes. `resolveLastAlexTarget` also guards against
+the live incident this fix closes. `resolveLastUserTarget` also guards against
 tmux pane-id reuse: the anchor's recorded cwd must match the live candidate's
 `pane_current_path` (mirroring `routeMatchesPane`'s reply-route protection,
 including rejecting an EMPTY live path, which would otherwise resolve to the

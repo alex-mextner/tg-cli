@@ -143,7 +143,7 @@ test('/tasks composes task-cli + gh into a rich-HTML table via sendRichMessage',
   expect(readFileSync(ghInvocationLog, 'utf8').split('|')[0]).toBe(realpathSync(projectDir));
 }, 15_000);
 
-test('/tasks without selector follows the last-Alex-target anchor, not routes.json (tg-cli#271/#78 anchor fix — review finding)', async () => {
+test('/tasks without selector follows the last-user-target anchor, not routes.json (tg-cli#271/#78 anchor fix — review finding)', async () => {
   // resolveTasksScopeDir now shares the SAME default-target anchor the daemon's
   // inbound routing uses (tg-cli#78) — routes.json's old "whoever spoke last"
   // fallback is gone. The anchor's pane-id-reuse guard (routeMatchesPane)
@@ -167,7 +167,7 @@ test('/tasks without selector follows the last-Alex-target anchor, not routes.js
   // resolves the ambiguity anymore; the anchor below is.
   writeFileSync(join(localCfgDir, 'tg-ctl.123.routes.json'), JSON.stringify([{ id: 77, paneId: '%1', cwd: routedDir, ts: 1 }]));
   writeFileSync(
-    join(localCfgDir, 'tg-ctl.123.last-alex-target.json'),
+    join(localCfgDir, 'tg-ctl.123.last-user-target.json'),
     JSON.stringify({ paneId: '%1', cwd: routedDir, ts: 1 }),
   );
 
@@ -259,7 +259,7 @@ exit 0
 
 test('/tasks without selector: routes.json ALONE (no anchor) no longer resolves an ambiguous fleet (review finding: proves the old fallback is gone)', async () => {
   // Same ambiguous 2-pane fleet and the SAME routes.json entry for %1 as the
-  // test above, but with NO last-alex-target.json anchor written. Before this
+  // test above, but with NO last-user-target.json anchor written. Before this
   // fix, routes.json's "whoever spoke last" alone would have resolved this to
   // %1 (routed-project). Now it must send the explicit "not resolvable" error
   // instead of guessing — proving the routes.json fallback is genuinely gone,

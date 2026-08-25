@@ -12,7 +12,7 @@ semantic versioning.
   to `routes.json`'s "last outbound sender" (`lastMessagePane`), which
   conflated "who spoke last" with "who the CTO was addressing" (live
   incident). Fixed by adding a dedicated anchor
-  (`tg-ctl.<bot>.last-alex-target.json`) that records ONLY the CTO's own last
+  (`tg-ctl.<bot>.last-user-target.json`) that records ONLY the CTO's own last
   CONFIRMED inbound delivery — an auto-bound inject, a picker tap, a reply, or
   a named `/agent` — never an agent's own outbound send and never a failed
   inject. Guarded against tmux pane-id reuse the same way reply-routing

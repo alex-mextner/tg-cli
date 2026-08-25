@@ -403,13 +403,13 @@ test('REGRESSION single-agent: an UNRECOGNIZED reply with ONE visible agent inje
 // === tg-cli#75 fix B, ANCHOR CORRECTED tg-cli#78 (2026-08-20/21): a NON-reply
 // inbound auto-binds to the CTO's OWN last-addressed pane — NOT merely whichever
 // agent's outbound send is newest in routes.json (that let an unrelated agent's
-// unprompted message hijack the CTO's very next message; see last-alex-target.ts). ===
+// unprompted message hijack the CTO's very next message; see last-user-target.ts). ===
 
 test('NO-REPLY AUTO-BIND: an agent merely posting last (routes.json) is NOT an anchor — asks', async () => {
   // No registration → both agents visible and unpinned → a non-reply text is
   // ambiguous. routes.json shows %5 (3d) posted most recently, but that alone is
   // no longer a valid anchor (it only proves who SPOKE last, not who the CTO was
-  // ADDRESSING) — with no last-alex-target recorded, this must ask, never guess.
+  // ADDRESSING) — with no last-user-target recorded, this must ask, never guess.
   const h = makeHarness({ noRegistration: true });
   const tg = startFakeTg();
   h.setMode('normal'); // both agents visible
@@ -438,7 +438,7 @@ test('NO-REPLY AUTO-BIND: binds to the CTO\'s own last-addressed pane, ignoring 
     ],
   });
   writeFileSync(
-    join(h.cfgDir, 'tg-ctl.123.last-alex-target.json'),
+    join(h.cfgDir, 'tg-ctl.123.last-user-target.json'),
     JSON.stringify({ paneId: PANE_3D, cwd: h.dir3d, ts: 1500 }),
   );
   const tg = startFakeTg();
@@ -459,7 +459,7 @@ test('NO-REPLY AUTO-BIND: binds to the CTO\'s own last-addressed pane, ignoring 
 test('A CONFIRMED REPLY updates the anchor: the NEXT ambiguous non-reply follows it, no picker', async () => {
   // No registration → a subsequent non-reply is genuinely ambiguous, so ANY bind
   // it gets must come from the anchor the reply itself just recorded — proving
-  // handleReplyRoute's recordLastAlexTarget call (review finding: explicit CTO
+  // handleReplyRoute's recordLastUserTarget call (review finding: explicit CTO
   // routing previously never updated the anchor).
   const h = makeHarness({ noRegistration: true });
   const tg = startFakeTg();
@@ -492,7 +492,7 @@ test('PANE-ID REUSE GUARD: a stale anchor whose recorded cwd no longer matches t
   // paneId alone (review finding P1).
   const h = makeHarness({ noRegistration: true });
   writeFileSync(
-    join(h.cfgDir, 'tg-ctl.123.last-alex-target.json'),
+    join(h.cfgDir, 'tg-ctl.123.last-user-target.json'),
     JSON.stringify({ paneId: PANE_3D, cwd: '/some/other/now-defunct/project', ts: Math.floor(Date.now() / 1000) }),
   );
   const tg = startFakeTg();
@@ -509,9 +509,9 @@ test('PANE-ID REUSE GUARD: a stale anchor whose recorded cwd no longer matches t
   expect(tg.sends.some((s) => s.hasMarkup)).toBe(true);
 }, 15_000);
 
-test('CORRUPT last-alex-target.json falls back to the picker (never crashes, never guesses)', async () => {
+test('CORRUPT last-user-target.json falls back to the picker (never crashes, never guesses)', async () => {
   const h = makeHarness({ noRegistration: true });
-  writeFileSync(join(h.cfgDir, 'tg-ctl.123.last-alex-target.json'), '{not valid json');
+  writeFileSync(join(h.cfgDir, 'tg-ctl.123.last-user-target.json'), '{not valid json');
   const tg = startFakeTg();
   h.setMode('normal');
   const daemon = await startDaemon(h.cfgDir, tg.port);
