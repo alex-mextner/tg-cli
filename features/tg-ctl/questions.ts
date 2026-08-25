@@ -68,7 +68,8 @@ export interface ButtonRequest {
   multiQuestion?: boolean;
   opencode?: OpencodeRequestRef;
   // The identity proof tg-ctl requires before AUTOMATICALLY delivering a QUEUED
-  // permission decision to a reconnecting hook with no time bound: without it,
+  // permission decision to a reconnecting hook within its retention window
+  // (tg-cli#182: ABANDONED_PERMISSION_RETAIN_MS): without this proof,
   // requestId equality alone doesn't prove the reconnect is the SAME invocation
   // rather than a later, unrelated one that merely asks an identical question —
   // see permissionPayloadMatches and tg-ctl's reconnect branch. SOURCED
@@ -292,8 +293,10 @@ export function abandonedMultiText(req: ButtonRequest, label: string): string {
   return [buildQuestionText(req), status].join('\n\n');
 }
 
-// Reconnect never happened within the retention window (ABANDONED_RETAIN_MS,
-// tg-ctl): the daemon is giving up on this entry (see pruneAbandonedButtons's
+// Reconnect never happened within the applicable retention window
+// (ABANDONED_RETAIN_MS for a question, the much longer
+// ABANDONED_PERMISSION_RETAIN_MS for a permission — tg-cli#182 — tg-ctl's
+// retainMsFor): the daemon is giving up on this entry (see pruneAbandonedButtons's
 // notify callback) rather than leaving the human staring at a stale "queued" or
 // "hook disconnected" card forever with no further signal (Alex tg requirement:
 // a long-running uncertainty must eventually be reported, not left silent). The
@@ -317,11 +320,13 @@ export function abandonedLongOutageText(req: ButtonRequest, label: string, queue
 // (tg-ctl tracks `queuedDecision.notifiedAt` so this never repeats on every
 // sweep). Unlike the pre-fix "demoted" text this replaced, the decision is
 // NEVER cleared here — it stays fully queued and deliverable the instant a
-// genuine reconnect lands, however long that takes; this is a notice, not an
-// expiry.
+// genuine reconnect lands within its retention window; this is a notice, not
+// an expiry (the entry's own later expiry, if the window runs out with no
+// reconnect, is handled elsewhere — see the next comment).
 // `decisionLabel` is deliberately NOT promised "however long that takes" — the
-// entry is still bound by ABANDONED_RETAIN_MS (the daemon's genuine give-up
-// point, tg-ctl's notifyAbandonedLongOutage), so a human who never re-taps and
+// entry is still bound by its retention window (ABANDONED_PERMISSION_RETAIN_MS
+// for a permission — tg-cli#182 — the daemon's genuine give-up point,
+// tg-ctl's notifyAbandonedLongOutage), so a human who never re-taps and
 // never sees that later give-up notice would be misled by an unconditional
 // guarantee (review finding). This says only what's true right now: not
 // discarded YET, still queued, will keep trying until reconnect OR the

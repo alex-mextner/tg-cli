@@ -3,6 +3,21 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.44.4
+
+**Fix: tg-ctl gave up on permission prompts too early, falsely reporting them as "never delivered" (tg-cli#182).**
+
+- A `permission`-kind entry (an approve/reject request whose hook socket closed) now uses its own,
+  much longer retention window (`TG_CTL_ABANDONED_PERMISSION_RETAIN_MS`, default 12h) before the
+  daemon gives up and tells the human "this was never delivered over Telegram" — previously it shared
+  the 30-minute question window (`TG_CTL_ABANDONED_RETAIN_MS`), so a permission left unanswered for
+  as little as half an hour (easily overnight, or a few hours away from the phone) was falsely
+  reported as unrecoverable even though the harness might still be sitting on its own terminal
+  fallback prompt, fully answerable.
+- A separate, related fix (multi-line command matching for the late-delivery pane-injection path,
+  tg-cli#267) was attempted but reverted after a 3-round review surfaced an unresolved escalation
+  risk and an unverified rendering assumption — tracked as tg-cli#283 for a live-verified redesign.
+
 ## 1.44.3
 
 **Fix: a non-reply message could route to whichever agent pane merely spoke last, instead of the pane the CTO was actually addressing.**

@@ -402,11 +402,16 @@ forwarded-question state** (see AGENTS.md's "Durable forwarded-question state" a
 "Queued permission decisions" entries): a SCOPED question or SCOPED permission is
 retained on socket close instead of immediately expiring — a question late-delivers
 into its pane, a permission's decision is QUEUED and delivered automatically on a
-matching reconnect with NO time bound (safety comes from requestId being scoped to
-the prompt turn, not a delivery timer — `TG_CTL_QUEUED_DECISION_NOTICE_MS` only
-triggers a one-time proactive notice past that threshold, it never clears the
-queue), and only past `ABANDONED_RETAIN_MS` with no delivery does the card actually
-expire/give up (with a proactive "still no connection" notice, not a silent drop).
+matching reconnect within its retention window (safety WITHIN that window comes
+from requestId being scoped to the prompt turn, not a delivery timer —
+`TG_CTL_QUEUED_DECISION_NOTICE_MS` only triggers a one-time proactive notice past
+a shorter threshold, it never clears the queue by itself), and only past its
+retention window with no delivery does the card actually
+expire/give up (with a proactive "still no connection" notice, not a silent drop) —
+`ABANDONED_RETAIN_MS` (default 30 min) for a question, or the much longer
+`ABANDONED_PERMISSION_RETAIN_MS` (default 12h, tg-cli#182) for a permission,
+since its answer stays fully actionable for hours (the harness may still be sitting
+on its own terminal fallback prompt) unlike a question's fast-fading value.
 The plain "expire on timeout, reject a late tap" behavior described just above
 still applies UNSCOPED (no `paneId` — no pane to late-deliver to, no card worth
 retaining).
