@@ -43,16 +43,20 @@ sub="$1"; shift
 mode=$(cat '${join(cfgDir, 'tmux-mode')}' 2>/dev/null || echo both)
 case "$sub" in
   list-panes)
-    show_hyper=0; show_tools=0
+    show_hyper=0; show_tools=0; hyper_path='${dirHyper}'
     case "$mode" in
       both)  show_hyper=1; show_tools=1;;
       tools) show_tools=1;;
       hyper) show_hyper=1;;
+      # hyper-nopath: hyperide live but reports NO pane_current_path (tmux gives
+      # an empty field) — exercises recordLastAlexTarget's no-cwd/invalidate
+      # branch (review finding: untested).
+      hyper-nopath) show_hyper=1; hyper_path='';;
     esac
     # 7-field core PANE_FORMAT carries #{window_name} (field 6, before the path) —
     # the daemon reads window names from the core snapshot now (tg-cli#75), not a
     # separate call. The CTO's screenshot window names: 'hyperide', 'agent-tools'.
-    [ "$show_hyper" = "1" ] && printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'shyper' '4' '${PANE_HYPER}' '${PID_HYPER}' 'claude' 'hyperide' '${dirHyper}'
+    [ "$show_hyper" = "1" ] && printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'shyper' '4' '${PANE_HYPER}' '${PID_HYPER}' 'claude' 'hyperide' "$hyper_path"
     [ "$show_tools" = "1" ] && printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'stools' '4' '${PANE_TOOLS}' '${PID_TOOLS}' 'claude' 'agent-tools' '${dirTools}'
     ;;
   display-message)
@@ -102,7 +106,7 @@ interface Harness {
   dirHyper: string;
   dirTools: string;
   injectLog: string;
-  setMode: (m: 'both' | 'tools' | 'hyper') => void;
+  setMode: (m: 'both' | 'tools' | 'hyper' | 'hyper-nopath') => void;
 }
 
 // `regs` lets a test register one or both agents (the per-pane registration SET).
@@ -336,10 +340,14 @@ test('AMBIGUOUS plain message, NO last message → inline-keyboard picker (butto
   expect(reactionEmojis(tg.reactions, 20)).toEqual(['✍️']);
 }, 15_000);
 
-test('NO-REPLY plain message → binds DIRECTLY to the last-message agent, NO picker (tg-cli#78)', async () => {
-  // Two registered live agents, and the LAST MESSAGE in the chat came from agent-tools
-  // (%2) — its outbound send is the newest route. A fresh non-reply message must land
-  // ON %2 directly (the agent the CTO was just talking to), never popping a picker.
+test('NO-REPLY plain message: an agent merely POSTING last (routes.json) is NOT an anchor — asks (tg-cli#78 anchor fix)', async () => {
+  // Two registered live agents, and agent-tools (%2) sent the CTO an unprompted
+  // outbound message (routes.json's newest entry — e.g. an agent proactively
+  // reporting status). Before the anchor fix, this alone would silently bind the
+  // CTO's next non-reply message to %2 — the exact live incident (an unrelated
+  // agent's inbound-to-CTO message hijacking his very next message). With NO
+  // last-alex-target recorded, "who merely spoke last" is no longer a valid
+  // signal at all: this must stay ambiguous and ask, never guess.
   const now = Math.floor(Date.now() / 1000);
   const h = makeHarness(
     [
@@ -347,8 +355,8 @@ test('NO-REPLY plain message → binds DIRECTLY to the last-message agent, NO pi
       { paneId: PANE_TOOLS, cwd: '' },
     ],
     [
-      { id: 400, paneId: PANE_HYPER, cwd: '', ts: now - 60 }, // hyperide spoke earlier
-      { id: 401, paneId: PANE_TOOLS, cwd: '', ts: now }, // agent-tools spoke LAST
+      { id: 400, paneId: PANE_HYPER, cwd: '', ts: now - 60 },
+      { id: 401, paneId: PANE_TOOLS, cwd: '', ts: now }, // agent-tools posted LAST (unprompted)
     ],
   );
   const tg = startFakeTg();
@@ -357,21 +365,20 @@ test('NO-REPLY plain message → binds DIRECTLY to the last-message agent, NO pi
 
   tg.pushText(706, 30, 'continue where we left off');
 
-  await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.length > 0);
+  await waitFor(() => pickerOf(tg.sends) !== undefined);
   await Bun.sleep(200);
 
-  // Bound to the last-message agent (%2) directly — no picker, and never into %0.
-  expect(pickerOf(tg.sends)).toBeUndefined();
-  const lines = injectedLines(h.injectLog);
-  expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`))).toBe(true);
-  expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(false);
-  expect(lines.join('\n')).toContain('continue where we left off');
+  // Asked via the picker — NOT silently bound to whichever agent merely spoke last.
+  expect(pickerOf(tg.sends)).toBeDefined();
+  expect(injectedLines(h.injectLog).length).toBe(0);
 }, 15_000);
 
-test('NO-REPLY bind FLIPS to whoever posted last (a newer post from the other agent wins)', async () => {
-  // Mirror of the test above, but now HYPERIDE (%0) posted the last message. The same
-  // fresh non-reply message must flip and bind to %0 — proving the bind tracks the
-  // last message, not a fixed agent.
+test('NO-REPLY plain message binds to the CTO\'s OWN last-addressed pane, ignoring a MORE RECENT unrelated agent post (tg-cli#78 anchor fix)', async () => {
+  // The exact reported incident: an unrelated agent (agent-tools, standing in for
+  // "ext-cc") posts the newest routes.json entry — AFTER the CTO's own last
+  // resolved delivery went to hyperide. A fresh non-reply message must still land
+  // on hyperide (where the CTO was last addressing), never hijacked by the
+  // just-arrived unrelated post, even though that post is objectively more recent.
   const now = Math.floor(Date.now() / 1000);
   const h = makeHarness(
     [
@@ -379,9 +386,14 @@ test('NO-REPLY bind FLIPS to whoever posted last (a newer post from the other ag
       { paneId: PANE_TOOLS, cwd: '' },
     ],
     [
-      { id: 410, paneId: PANE_TOOLS, cwd: '', ts: now - 60 }, // agent-tools spoke earlier
-      { id: 411, paneId: PANE_HYPER, cwd: '', ts: now }, // hyperide spoke LAST
+      { id: 410, paneId: PANE_HYPER, cwd: '', ts: now - 60 },
+      { id: 411, paneId: PANE_TOOLS, cwd: '', ts: now }, // agent-tools posted MOST RECENTLY (unprompted)
     ],
+  );
+  // The CTO's own last resolved delivery went to hyperide, BEFORE agent-tools' post.
+  writeFileSync(
+    join(h.cfgDir, 'tg-ctl.123.last-alex-target.json'),
+    JSON.stringify({ paneId: PANE_HYPER, cwd: h.dirHyper, ts: now - 30 }),
   );
   const tg = startFakeTg();
   h.setMode('both');
@@ -550,10 +562,11 @@ test('PHOTO caption /agent with no matching selector reports the miss and never 
 
 test('NO-REPLY bind: last-message agent GONE → never guesses into the gone pane (no fabricated button)', async () => {
   // The last message came from hyperide (%0), but %0 is now GONE (mode "tools" → only
-  // agent-tools %2 is live). The last-message bind must NOT inject into the gone %0
-  // nor fabricate a button for it. (The pure fallback-to-picker is asserted by the
-  // resolveByLastMessage unit test "last-message pane is GONE → stays ambiguous"; with
-  // a SINGLE live agent the SET tier may legitimately resolve to %2 directly, so the
+  // agent-tools %2 is live). The anchor bind must NOT inject into the gone %0 nor
+  // fabricate a button for it. (resolveLastAlexTarget's own pane-id-reuse guard —
+  // a recorded cwd that no longer matches the live pane — is covered directly by
+  // "PANE-ID REUSE GUARD" in ctl-reply-misroute-integration.test.ts; with a SINGLE
+  // live agent the SET tier may legitimately resolve to %2 directly, so the
   // integration invariant here is only "never the gone pane", #49 safety.)
   const now = Math.floor(Date.now() / 1000);
   const h = makeHarness(
@@ -653,6 +666,41 @@ test('TAP a button on an ambiguous picker → injected text still carries the tg
   await daemon.exited;
 }, 15_000);
 
+test('PICKER TAP updates the anchor: the NEXT ambiguous message follows the tapped pane, no second picker', async () => {
+  // Review finding (P1): explicit CTO routing via a picker tap previously never
+  // updated the anchor, so an ambiguous fleet could ask forever even after the
+  // CTO had already picked once. Confirm the tap now records last-alex-target.
+  const h = makeHarness([
+    { paneId: PANE_HYPER, cwd: '' },
+    { paneId: PANE_TOOLS, cwd: '' },
+  ]);
+  const tg = startFakeTg();
+  h.setMode('both');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushText(710, 36, 'first ambiguous message');
+  await waitFor(() => pickerOf(tg.sends) !== undefined);
+  const picker = pickerOf(tg.sends)!;
+  const toolsBtn = picker.buttons.find((b) => b.text.includes('agent-tools'))!;
+  tg.pushCallback(711, toolsBtn.callback_data, 9000 + tg.sends.indexOf(picker) + 1);
+  await waitFor(() => injectedLines(h.injectLog).some((l) => l.startsWith(`${PANE_TOOLS}\t`)));
+  await Bun.sleep(200);
+
+  const pickerCountBefore = tg.sends.filter((s) => s.hasMarkup).length;
+
+  // A SECOND, unrelated ambiguous message — must bind directly to %2 (agent-tools,
+  // the tapped pane) via the anchor, with NO new picker.
+  tg.pushText(712, 37, 'second message, same session please');
+  await waitFor(() => injectedLines(h.injectLog).filter((l) => l.startsWith(`${PANE_TOOLS}\t`)).length >= 2);
+  await Bun.sleep(200);
+
+  const pickerCountAfter = tg.sends.filter((s) => s.hasMarkup).length;
+  expect(pickerCountAfter).toBe(pickerCountBefore); // no additional picker posted
+  const lines = injectedLines(h.injectLog);
+  expect(lines.filter((l) => l.startsWith(`${PANE_TOOLS}\t`)).length).toBe(2);
+  expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(false);
+}, 15_000);
+
 test('REPLY to a now-GONE agent → picker WITH "no longer running" notice naming the gone agent', async () => {
   // routes.json: outbound message 500 originated from the hyperide agent (%0).
   // mode "tools": %0 is GONE (only agent-tools %2 is live). The reply's recognized
@@ -714,6 +762,105 @@ test('HAPPY PATH: a single registered live agent → direct inject, NO picker', 
   // Injected straight into %0 — and NO picker posted.
   expect(lines.some((l) => l.startsWith(`${PANE_HYPER}\t`))).toBe(true);
   expect(pickerOf(tg.sends)).toBeUndefined();
+}, 15_000);
+
+test('ORDINARY auto-bound delivery records the anchor: a later-ambiguous message follows it, no picker (recordIfAutoBound coverage)', async () => {
+  // The MAIN write path (review finding: untested) — an everyday auto-bound
+  // delivery, not a picker tap or a reply. Both agents are REGISTERED, but only
+  // hyperide is visible at first, so message 1 resolves unambiguously (single
+  // live registered pane) straight through injectViaTarget's ordinary success
+  // path. Once agent-tools also comes up, message 2 is genuinely ambiguous at
+  // the registration tier — it must follow message 1's anchor (hyperide),
+  // proving the ordinary/unambiguous auto-bind path recorded it.
+  const h = makeHarness([
+    { paneId: PANE_HYPER, cwd: '' },
+    { paneId: PANE_TOOLS, cwd: '' },
+  ]);
+  const tg = startFakeTg();
+  h.setMode('hyper'); // only hyperide live so far
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushText(720, 40, 'first message, only hyperide up');
+  await waitFor(() => injectedLines(h.injectLog).some((l) => l.startsWith(`${PANE_HYPER}\t`)));
+  await Bun.sleep(200);
+  expect(pickerOf(tg.sends)).toBeUndefined();
+
+  // Now agent-tools comes up too — a plain follow-up is genuinely ambiguous at
+  // the registration tier.
+  h.setMode('both');
+  tg.pushText(721, 41, 'second message, now ambiguous');
+  await waitFor(() => injectedLines(h.injectLog).filter((l) => l.startsWith(`${PANE_HYPER}\t`)).length >= 2);
+  await Bun.sleep(200);
+
+  const lines = injectedLines(h.injectLog);
+  expect(lines.filter((l) => l.startsWith(`${PANE_HYPER}\t`)).length).toBe(2);
+  expect(lines.some((l) => l.startsWith(`${PANE_TOOLS}\t`))).toBe(false);
+  expect(pickerOf(tg.sends)).toBeUndefined();
+}, 15_000);
+
+test('auto-bound delivery to a pane with NO known cwd never checks the DAEMON\'s own git state for a banner (Fable review finding)', async () => {
+  // withGitStateBanner must reject an empty panePath the same way routeMatchesPane
+  // does: `git -C ''` leaves the daemon's OWN cwd unchanged, so without the guard
+  // the banner would silently check THIS repo (not a Telegram pane) and could
+  // prepend an unrelated "⚠ This pane currently has uncommitted work…" banner —
+  // computed from the daemon's own checkout — to a message delivered to an
+  // unrelated agent.
+  const h = makeHarness([{ paneId: PANE_HYPER, cwd: '' }]);
+  const tg = startFakeTg();
+  h.setMode('hyper-nopath'); // single live agent, but tmux reports NO cwd for it
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushText(724, 44, 'go ahead');
+  await waitFor(() => injectedLines(h.injectLog).some((l) => l.startsWith(`${PANE_HYPER}\t`)));
+
+  const lines = injectedLines(h.injectLog).filter((l) => l.startsWith(`${PANE_HYPER}\t`));
+  expect(lines.some((l) => l.includes('⚠'))).toBe(false);
+}, 15_000);
+
+test('auto-bound delivery to a pane with NO known cwd invalidates a STALE anchor pointing elsewhere (review finding: untested)', async () => {
+  // recordLastAlexTarget's no-cwd branch: a confirmed delivery whose live pane
+  // reports an empty pane_current_path can't record a pane-id-reuse-safe
+  // anchor. The prior anchor pointed at a DIFFERENT pane (agent-tools) — that
+  // is now genuinely stale (the CTO's next message just went to hyperide
+  // instead), so it must be invalidated rather than left in place (fail-closed:
+  // the next ambiguous message should ask, not silently follow the stale pane).
+  const h = makeHarness([{ paneId: PANE_HYPER, cwd: '' }]);
+  const anchorFile = join(h.cfgDir, 'tg-ctl.123.last-alex-target.json');
+  writeFileSync(anchorFile, JSON.stringify({ paneId: PANE_TOOLS, cwd: h.dirTools, ts: Math.floor(Date.now() / 1000) - 30 }));
+  const tg = startFakeTg();
+  h.setMode('hyper-nopath'); // single live agent, but tmux reports NO cwd for it
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushText(722, 42, 'go ahead');
+  await waitFor(() => injectedLines(h.injectLog).some((l) => l.startsWith(`${PANE_HYPER}\t`)));
+  // Poll rather than guess a fixed delay for recordLastAlexTarget's write.
+  await waitFor(() => !existsSync(anchorFile), 8000);
+
+  expect(existsSync(anchorFile)).toBe(false);
+}, 15_000);
+
+test('auto-bound delivery to a pane with NO known cwd does NOT wipe an anchor already pointing at that SAME pane (review finding: pure loss otherwise)', async () => {
+  // Same no-cwd delivery as above, but the anchor ALREADY points at the pane
+  // receiving this delivery (hyperide) — it still carries a good cwd from an
+  // earlier delivery. Invalidating here would be pure loss, not a safety fix
+  // (Opus review finding), so the anchor must survive unchanged.
+  const h = makeHarness([{ paneId: PANE_HYPER, cwd: '' }]);
+  const anchorFile = join(h.cfgDir, 'tg-ctl.123.last-alex-target.json');
+  const original = { paneId: PANE_HYPER, cwd: h.dirHyper, ts: Math.floor(Date.now() / 1000) - 30 };
+  writeFileSync(anchorFile, JSON.stringify(original));
+  const tg = startFakeTg();
+  h.setMode('hyper-nopath'); // single live agent, but tmux reports NO cwd for it
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushText(723, 43, 'go ahead');
+  await waitFor(() => injectedLines(h.injectLog).some((l) => l.startsWith(`${PANE_HYPER}\t`)));
+  // Proving a NON-event (the anchor must NOT change) needs a bounded wait for
+  // recordIfAutoBound's write path to have had a chance to run, rather than a
+  // predicate to poll — there's nothing to poll FOR when nothing should happen.
+  await Bun.sleep(1500);
+
+  expect(existsSync(anchorFile)).toBe(true);
+  expect(JSON.parse(readFileSync(anchorFile, 'utf8'))).toEqual(original);
 }, 15_000);
 
 test('AMBIGUOUS control verb (/stop, no routable text) → select-only picker, NO inject, NO 👀 receipt', async () => {

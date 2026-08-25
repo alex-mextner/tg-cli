@@ -284,27 +284,19 @@ export function resolveRouteCwd(opts: { queryPanePath: () => string | null; fall
 // project B's agent. An absent recorded cwd (old route) or absent pane → no match,
 // so the daemon falls through to the picker rather than risk mis-routing.
 export function routeMatchesPane(opts: { recognizedCwd: string | undefined; panePath: string | undefined }): boolean {
-  if (!opts.recognizedCwd || opts.panePath === undefined) return false;
+  // An EMPTY panePath (tmux reporting no pane_current_path) is rejected the same
+  // as `undefined`, not just checked against recognizedCwd alone (review
+  // finding): `resolve('')` resolves to the DAEMON's own process.cwd(), so an
+  // empty panePath would otherwise falsely MATCH any recognizedCwd that happens
+  // to equal wherever the daemon was launched from — bypassing the pane-id-reuse
+  // guard this function exists to enforce.
+  if (!opts.recognizedCwd || !opts.panePath) return false;
   return resolve(opts.panePath) === resolve(opts.recognizedCwd);
 }
 
 export interface PaneUsage {
   lastTs: number; // most recent send to this pane (MRU)
   count: number; // number of sends to this pane in the window (MFU)
-}
-
-// The origin pane of the LAST MESSAGE in the chat (tg-cli#78): the pane that
-// produced the most-recently-recorded outbound `tg` send. This is the single
-// "who posted last" value the no-reply bind uses (resolveByLastMessage) — NOT a
-// per-pane aggregate.
-//
-// "Last" = the LAST entry by POSITION, not the max `ts`. appendRoute keeps the
-// file strictly chronological (each send is pushed onto the tail), so the final
-// element IS the last message — and position is robust to a clock that steps
-// backward (NTP correction) between two sends, where a max-`ts` scan would wrongly
-// prefer the earlier-but-higher-ts send. Returns null when there are no routes. PURE.
-export function lastMessagePane(routes: Route[]): string | null {
-  return routes.length > 0 ? routes[routes.length - 1].paneId : null;
 }
 
 // Aggregate the routes per pane into recency + frequency.

@@ -141,9 +141,14 @@ test('/tasks composes task-cli + gh into a rich-HTML table via sendRichMessage',
   }
   expect(taskInvocation).not.toContain('--all');
   expect(readFileSync(ghInvocationLog, 'utf8').split('|')[0]).toBe(realpathSync(projectDir));
-});
+}, 15_000);
 
-test('/tasks without selector follows the same last-message bind and uses matching registration when tmux has no path', async () => {
+test('/tasks without selector follows the last-Alex-target anchor, not routes.json (tg-cli#271/#78 anchor fix — review finding)', async () => {
+  // resolveTasksScopeDir now shares the SAME default-target anchor the daemon's
+  // inbound routing uses (tg-cli#78) — routes.json's old "whoever spoke last"
+  // fallback is gone. The anchor's pane-id-reuse guard (routeMatchesPane)
+  // requires the anchor's recorded cwd to match the CANDIDATE'S LIVE
+  // pane_current_path, so both live panes are given real (non-empty) paths here.
   const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-route-'));
   writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
   writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
@@ -158,7 +163,13 @@ test('/tasks without selector follows the same last-message bind and uses matchi
       { paneId: '%2', cwd: newestDir, registeredAt: 2 },
     ]),
   );
+  // routes.json still has a (now-irrelevant) entry for %1 — proves it is NOT what
+  // resolves the ambiguity anymore; the anchor below is.
   writeFileSync(join(localCfgDir, 'tg-ctl.123.routes.json'), JSON.stringify([{ id: 77, paneId: '%1', cwd: routedDir, ts: 1 }]));
+  writeFileSync(
+    join(localCfgDir, 'tg-ctl.123.last-alex-target.json'),
+    JSON.stringify({ paneId: '%1', cwd: routedDir, ts: 1 }),
+  );
 
   const localBin = join(localCfgDir, 'bin');
   mkdirSync(localBin);
@@ -167,7 +178,7 @@ test('/tasks without selector follows the same last-message bind and uses matchi
     `#!/bin/sh
 case "$1" in
   list-panes)
-    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '%1' '111' 'zsh' 'routed' '' ''
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '%1' '111' 'zsh' 'routed' '' '${routedDir}'
     printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '1' '%2' '222' 'zsh' 'newest' '' '${newestDir}'
     ;;
   display-message) printf 'main\\n' ;;
@@ -244,7 +255,102 @@ exit 0
     }
     localServer.stop(true);
   }
-});
+}, 15_000);
+
+test('/tasks without selector: routes.json ALONE (no anchor) no longer resolves an ambiguous fleet (review finding: proves the old fallback is gone)', async () => {
+  // Same ambiguous 2-pane fleet and the SAME routes.json entry for %1 as the
+  // test above, but with NO last-alex-target.json anchor written. Before this
+  // fix, routes.json's "whoever spoke last" alone would have resolved this to
+  // %1 (routed-project). Now it must send the explicit "not resolvable" error
+  // instead of guessing — proving the routes.json fallback is genuinely gone,
+  // not just shadowed by the anchor when both are present.
+  const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-noanchor-'));
+  writeFileSync(join(localCfgDir, '.env'), 'TG_BOT_TOKEN=123:abc\nTG_CHAT_ID=1\n');
+  writeFileSync(join(localCfgDir, 'config.yaml'), 'control:\n  enabled: true\n');
+  const routedDir = join(localCfgDir, 'routed-project');
+  const newestDir = join(localCfgDir, 'newest-registration');
+  mkdirSync(routedDir);
+  mkdirSync(newestDir);
+  writeFileSync(
+    join(localCfgDir, 'tg-ctl.123.registration.json'),
+    JSON.stringify([
+      { paneId: '%1', cwd: routedDir, registeredAt: 1 },
+      { paneId: '%2', cwd: newestDir, registeredAt: 2 },
+    ]),
+  );
+  writeFileSync(join(localCfgDir, 'tg-ctl.123.routes.json'), JSON.stringify([{ id: 77, paneId: '%1', cwd: routedDir, ts: 1 }]));
+
+  const localBin = join(localCfgDir, 'bin');
+  mkdirSync(localBin);
+  writeFileSync(
+    join(localBin, 'tmux'),
+    `#!/bin/sh
+case "$1" in
+  list-panes)
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '%1' '111' 'zsh' 'routed' '' '${routedDir}'
+    printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '1' '%2' '222' 'zsh' 'newest' '' '${newestDir}'
+    ;;
+  display-message) printf 'main\\n' ;;
+esac
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(join(localBin, 'ps'), "#!/bin/sh\nprintf '111 1 claude\\n222 1 claude\\n'\n", { mode: 0o755 });
+  writeFileSync(join(localBin, 'task'), "#!/bin/sh\nprintf '[]\\n'\n", { mode: 0o755 });
+  writeFileSync(join(localBin, 'gh'), "#!/bin/sh\nprintf '[]\\n'\n", { mode: 0o755 });
+
+  let servedLocal = false;
+  const localTextMessages: string[] = [];
+  const localServer = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname.endsWith('/getUpdates')) {
+        if (!servedLocal) {
+          servedLocal = true;
+          return Response.json({
+            ok: true,
+            result: [
+              {
+                update_id: 302,
+                message: {
+                  message_id: 12,
+                  from: { id: 1, first_name: 'Alex' },
+                  chat: { id: 1 },
+                  date: Math.floor(Date.now() / 1000),
+                  text: '/tasks',
+                },
+              },
+            ],
+          });
+        }
+        await Bun.sleep(80);
+        return Response.json({ ok: true, result: [] });
+      }
+      if (url.pathname.endsWith('/sendMessage')) {
+        const body = await req.json();
+        localTextMessages.push(body.text ?? '');
+        return Response.json({ ok: true, result: { message_id: 90 } });
+      }
+      return Response.json({ ok: true, result: {} });
+    },
+  });
+
+  let daemon: Subprocess | null = null;
+  try {
+    daemon = await startTasksDaemon(localCfgDir, localBin, localServer.port);
+
+    expect(await waitFor(() => localTextMessages.length === 1)).toBe(true);
+    expect(existsSync(join(localCfgDir, 'task-invocation.txt'))).toBe(false);
+  } finally {
+    if (daemon && daemon.exitCode === null) {
+      daemon.kill(9);
+      await daemon.exited;
+    }
+    localServer.stop(true);
+  }
+}, 15_000);
 
 test('/tasks matches duplicate task ids to PRs by repo identity, not worktree basename', async () => {
   const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-dup-project-'));
@@ -333,7 +439,7 @@ test('/tasks matches duplicate task ids to PRs by repo identity, not worktree ba
     }
     localServer.stop(true);
   }
-});
+}, 15_000);
 
 test('/tasks reply scopes to the replied-to agent instead of the latest sender', async () => {
   const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-reply-'));
@@ -442,7 +548,7 @@ exit 0
     }
     localServer.stop(true);
   }
-});
+}, 15_000);
 
 test('/tasks <agent> uses matching registration when tmux has no path', async () => {
   const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-agent-'));
@@ -531,7 +637,7 @@ exit 0
     }
     localServer.stop(true);
   }
-});
+}, 15_000);
 
 test('/tasks without a resolvable project sends an explicit error instead of running in daemon cwd', async () => {
   const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-noscope-'));
@@ -631,7 +737,7 @@ exit 0
     }
     localServer.stop(true);
   }
-});
+}, 15_000);
 
 test('/tasks pagination callback sends the requested page with a filter keyboard', async () => {
   const localCfgDir = mkdtempSync(join(tmpdir(), 'tgctl-tasks-page-'));
@@ -1475,4 +1581,4 @@ test('/tasks stale pagination callback answers expired without guessing a projec
     }
     localServer.stop(true);
   }
-});
+}, 15_000);

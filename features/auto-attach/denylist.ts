@@ -32,10 +32,17 @@ export const NEVER_ATTACH_PATTERNS: RegExp[] = [
   // kubernetes access config
   /^kubeconfig$/i,
   // tg-ctl daemon state: the message history is a full conversation transcript
-  // (`tg replies` source) and the routes map leaks pane→project layout. Neither
-  // should ever ride a Telegram attach, even when named explicitly.
+  // (`tg replies` source), the routes map leaks pane→project layout, and the
+  // last-Alex-target anchor (tg-cli#78) leaks the CTO's currently active pane
+  // id and its project cwd. None of these should ever ride a Telegram attach,
+  // even when named explicitly. The `.tmp.<pid>` form is the anchor's OWN
+  // write-then-rename staging file (tg-ctl's recordLastAlexTarget) — a crash or
+  // failed rename between the write and the rename can leave it orphaned on
+  // disk with the same sensitive content, so it needs the same denylist
+  // coverage as the final filename (review finding), not just the final name.
   /^tg-ctl\..*\.history\.jsonl$/i,
   /^tg-ctl\..*\.routes\.json$/i,
+  /^tg-ctl\..*\.last-alex-target\.json(\.tmp\.\d+)?$/i,
 ];
 
 /** True when the file's BASENAME matches any never-attach pattern. */

@@ -125,7 +125,14 @@ tests can pass fakes.
   routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree
   walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`),
   `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons),
-  `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker), `hook-normalize.ts`
+  `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker),
+  `last-alex-target.ts` (tg-cli#78 anchor fix: the pane of the CTO's OWN last CONFIRMED
+  inbound delivery — auto-bound, a recognized reply, or an explicit picker/`/agent`
+  selection — distinct from the removed `lastMessagePane` mechanism, which used to track
+  whichever pane most recently sent an outbound `tg` message, including an agent
+  proactively messaging the CTO unprompted; an otherwise-ambiguous non-reply binds here,
+  never to "whoever spoke last", cwd-validated against pane-id reuse the same way `routeMatchesPane` guards
+  reply routing), `hook-normalize.ts`
   (raw harness hook payload → ButtonRequest(s) — a multi-question AskUserQuestion (2-4 questions)
   yields one request per question via `normalizeHookRequests`, forwarded as sequential cards whose
   answers the ask client composes into ONE combined hook reply (tg#5741); the reply envelope stamps

@@ -264,37 +264,6 @@ export function pickTargetPaneFromSet(
   return { ok: false, reason: 'no-agent', candidates: [] };
 }
 
-// No-reply bind to the LAST MESSAGE in the chat (tg-cli#78). When a NON-reply
-// inbound would otherwise be `ambiguous` (several live agent panes, no reply anchor
-// to disambiguate), bind it to the agent whose message is the MOST RECENT in the
-// chat — i.e. the pane that produced the newest outbound `tg` send. The CTO almost
-// always means "the agent I was just talking to", and a fresh message after a burst
-// from one agent should land there without a tap.
-//
-// This replaces the earlier per-pane LRU/MRU machinery (#77's resolveAmbiguousByActivity
-// over aggregateUsage): there is exactly ONE "last message", so the caller passes its
-// origin pane id directly (the newest route — see lastMessagePane). No per-pane
-// aggregation, no "unique most-recent" tie logic — the last message is a single,
-// unambiguous value.
-//
-// It is layered ON TOP of pickTargetPane(FromSet), NOT inside it: the picker stays the
-// honest fallback. It fires only when (a) the picker said `ambiguous` AND (b) the
-// last-message pane is one of those ambiguous candidates (still a live agent). If there
-// is NO last message, or its pane has gone / isn't a candidate, the result is left
-// ambiguous → the button picker decides (preserving the unscoped fail-closed, #49: a
-// bind we genuinely can't determine is never guessed).
-//
-// PURE: `lastMessagePaneId` is the origin pane of the newest route (or null when
-// routes.json is empty), built by the caller from routes (see lastMessagePane below).
-// Returns the resolved `{ ok: true, target }` when that pane is a candidate, else the
-// input result unchanged.
-export function resolveByLastMessage(result: DiscoverResult, lastMessagePaneId: string | null): DiscoverResult {
-  if (result.ok || result.reason !== 'ambiguous') return result;
-  if (!lastMessagePaneId) return result; // no last message → picker decides
-  const hit = result.candidates.find((c) => c.pane.paneId === lastMessagePaneId);
-  return hit ? { ok: true, target: hit } : result;
-}
-
 // Resilient pane query (tg-ctl discovery): run `tmux list-panes -a` and parse, RETRYING the one
 // transient flake. In the daemon's long-running launchd runtime the tmux query was observed to
 // intermittently exit 0 with an EMPTY pane list (a momentary connect to the wrong/empty server) —

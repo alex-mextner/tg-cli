@@ -457,6 +457,7 @@ export interface CtlPaths {
   usageWarnings: string; // recent proactive usage warnings, for duplicate suppression (#132)
   usageLatest: string; // latest supported usage/rate-limit telemetry for /limit
   deferred: string; // durable defer-while-waiting backlog (restored on reload, no message loss)
+  lastAlexTarget: string; // pane of the CTO's own last resolved inbound delivery (tg-cli#78 anchor fix)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---
