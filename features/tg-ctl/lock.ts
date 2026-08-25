@@ -27,8 +27,37 @@ export function ctlPaths(configDir: string, botId: string): CtlPaths {
     usageWarnings: join(configDir, `${base}.usage-warnings.json`),
     usageLatest: join(configDir, `${base}.usage-latest.json`),
     deferred: join(configDir, `${base}.deferred.json`),
-    lastAlexTarget: join(configDir, `${base}.last-alex-target.json`),
+    lastUserTarget: join(configDir, `${base}.last-user-target.json`),
   };
+}
+
+// One-time migration plan (tg-cli#281): last-user-target.json replaces the
+// last-alex-target.json filename PR #278 shipped hours earlier. A live daemon
+// may already hold state under the old name — this only returns a plan
+// (never touches disk) so it stays testable with an injected `exists`, same
+// as `pidStatus`'s injected `kill0`.
+//
+// 'migrate': the new file is absent — rename the legacy one forward so the
+// CTO's anchor survives the upgrade.
+// 'remove-stale': the new file ALREADY exists (freshly written, or a prior
+// invalidation deliberately cleared it — see recordLastUserTarget's fail-closed
+// unlink) while the legacy file is STILL sitting there. Leaving it would let a
+// FUTURE restart, after that same intentional invalidation removes the new
+// file again, silently "migrate" the stale legacy copy back and resurrect the
+// anchor the invalidation meant to clear (review finding). The legacy file is
+// unconditionally redundant once an authoritative new-name file exists, so it
+// is removed outright rather than left to linger.
+// null: nothing to do (fresh install, or already fully migrated).
+export function planLegacyLastUserTargetMigration(
+  configDir: string,
+  botId: string,
+  exists: (path: string) => boolean,
+): { kind: 'migrate'; from: string; to: string } | { kind: 'remove-stale'; path: string } | null {
+  const base = `tg-ctl.${botId}`;
+  const to = join(configDir, `${base}.last-user-target.json`);
+  const from = join(configDir, `${base}.last-alex-target.json`);
+  if (exists(to)) return exists(from) ? { kind: 'remove-stale', path: from } : null;
+  return exists(from) ? { kind: 'migrate', from, to } : null;
 }
 
 // Bot tokens look like "123456:ABC-DEF…" — the numeric part is stable and safe

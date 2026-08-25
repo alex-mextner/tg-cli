@@ -49,7 +49,7 @@ case "$sub" in
       tools) show_tools=1;;
       hyper) show_hyper=1;;
       # hyper-nopath: hyperide live but reports NO pane_current_path (tmux gives
-      # an empty field) — exercises recordLastAlexTarget's no-cwd/invalidate
+      # an empty field) — exercises recordLastUserTarget's no-cwd/invalidate
       # branch (review finding: untested).
       hyper-nopath) show_hyper=1; hyper_path='';;
     esac
@@ -346,7 +346,7 @@ test('NO-REPLY plain message: an agent merely POSTING last (routes.json) is NOT 
   // reporting status). Before the anchor fix, this alone would silently bind the
   // CTO's next non-reply message to %2 — the exact live incident (an unrelated
   // agent's inbound-to-CTO message hijacking his very next message). With NO
-  // last-alex-target recorded, "who merely spoke last" is no longer a valid
+  // last-user-target recorded, "who merely spoke last" is no longer a valid
   // signal at all: this must stay ambiguous and ask, never guess.
   const now = Math.floor(Date.now() / 1000);
   const h = makeHarness(
@@ -392,7 +392,7 @@ test('NO-REPLY plain message binds to the CTO\'s OWN last-addressed pane, ignori
   );
   // The CTO's own last resolved delivery went to hyperide, BEFORE agent-tools' post.
   writeFileSync(
-    join(h.cfgDir, 'tg-ctl.123.last-alex-target.json'),
+    join(h.cfgDir, 'tg-ctl.123.last-user-target.json'),
     JSON.stringify({ paneId: PANE_HYPER, cwd: h.dirHyper, ts: now - 30 }),
   );
   const tg = startFakeTg();
@@ -563,7 +563,7 @@ test('PHOTO caption /agent with no matching selector reports the miss and never 
 test('NO-REPLY bind: last-message agent GONE → never guesses into the gone pane (no fabricated button)', async () => {
   // The last message came from hyperide (%0), but %0 is now GONE (mode "tools" → only
   // agent-tools %2 is live). The anchor bind must NOT inject into the gone %0 nor
-  // fabricate a button for it. (resolveLastAlexTarget's own pane-id-reuse guard —
+  // fabricate a button for it. (resolveLastUserTarget's own pane-id-reuse guard —
   // a recorded cwd that no longer matches the live pane — is covered directly by
   // "PANE-ID REUSE GUARD" in ctl-reply-misroute-integration.test.ts; with a SINGLE
   // live agent the SET tier may legitimately resolve to %2 directly, so the
@@ -669,7 +669,7 @@ test('TAP a button on an ambiguous picker → injected text still carries the tg
 test('PICKER TAP updates the anchor: the NEXT ambiguous message follows the tapped pane, no second picker', async () => {
   // Review finding (P1): explicit CTO routing via a picker tap previously never
   // updated the anchor, so an ambiguous fleet could ask forever even after the
-  // CTO had already picked once. Confirm the tap now records last-alex-target.
+  // CTO had already picked once. Confirm the tap now records last-user-target.
   const h = makeHarness([
     { paneId: PANE_HYPER, cwd: '' },
     { paneId: PANE_TOOLS, cwd: '' },
@@ -818,14 +818,14 @@ test('auto-bound delivery to a pane with NO known cwd never checks the DAEMON\'s
 }, 15_000);
 
 test('auto-bound delivery to a pane with NO known cwd invalidates a STALE anchor pointing elsewhere (review finding: untested)', async () => {
-  // recordLastAlexTarget's no-cwd branch: a confirmed delivery whose live pane
+  // recordLastUserTarget's no-cwd branch: a confirmed delivery whose live pane
   // reports an empty pane_current_path can't record a pane-id-reuse-safe
   // anchor. The prior anchor pointed at a DIFFERENT pane (agent-tools) — that
   // is now genuinely stale (the CTO's next message just went to hyperide
   // instead), so it must be invalidated rather than left in place (fail-closed:
   // the next ambiguous message should ask, not silently follow the stale pane).
   const h = makeHarness([{ paneId: PANE_HYPER, cwd: '' }]);
-  const anchorFile = join(h.cfgDir, 'tg-ctl.123.last-alex-target.json');
+  const anchorFile = join(h.cfgDir, 'tg-ctl.123.last-user-target.json');
   writeFileSync(anchorFile, JSON.stringify({ paneId: PANE_TOOLS, cwd: h.dirTools, ts: Math.floor(Date.now() / 1000) - 30 }));
   const tg = startFakeTg();
   h.setMode('hyper-nopath'); // single live agent, but tmux reports NO cwd for it
@@ -833,7 +833,7 @@ test('auto-bound delivery to a pane with NO known cwd invalidates a STALE anchor
 
   tg.pushText(722, 42, 'go ahead');
   await waitFor(() => injectedLines(h.injectLog).some((l) => l.startsWith(`${PANE_HYPER}\t`)));
-  // Poll rather than guess a fixed delay for recordLastAlexTarget's write.
+  // Poll rather than guess a fixed delay for recordLastUserTarget's write.
   await waitFor(() => !existsSync(anchorFile), 8000);
 
   expect(existsSync(anchorFile)).toBe(false);
@@ -845,7 +845,7 @@ test('auto-bound delivery to a pane with NO known cwd does NOT wipe an anchor al
   // earlier delivery. Invalidating here would be pure loss, not a safety fix
   // (Opus review finding), so the anchor must survive unchanged.
   const h = makeHarness([{ paneId: PANE_HYPER, cwd: '' }]);
-  const anchorFile = join(h.cfgDir, 'tg-ctl.123.last-alex-target.json');
+  const anchorFile = join(h.cfgDir, 'tg-ctl.123.last-user-target.json');
   const original = { paneId: PANE_HYPER, cwd: h.dirHyper, ts: Math.floor(Date.now() / 1000) - 30 };
   writeFileSync(anchorFile, JSON.stringify(original));
   const tg = startFakeTg();

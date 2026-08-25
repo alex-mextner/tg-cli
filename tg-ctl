@@ -110,7 +110,7 @@ import {
 } from "./features/tg-ctl/schedule-store"
 import { normalizeRichHtml, validateRichHtml } from "./features/render/rich"
 import { BOT_COMMANDS, validateBotCommands } from "./features/tg-ctl/bot-commands"
-import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, readPidFile } from "./features/tg-ctl/lock"
+import { botIdFromToken, ctlPaths, ownsPidFile, pidStatus, planLegacyLastUserTargetMigration, readPidFile } from "./features/tg-ctl/lock"
 import {
   abandonedLongOutageText,
   abandonedMultiText,
@@ -166,7 +166,7 @@ import {
   routeMatchesPane,
   withRoutesLock,
 } from "./features/tg-ctl/routes"
-import { parseLastAlexTarget, serializeLastAlexTarget, type LastAlexTarget } from "./features/tg-ctl/last-alex-target"
+import { parseLastUserTarget, serializeLastUserTarget, type LastUserTarget } from "./features/tg-ctl/last-user-target"
 import { appendRecordsToBlob, type HistoryRecord } from "./features/replies/history"
 import { inboundHistoryRecords } from "./features/replies/inbound"
 import { agentNameForPane } from "./features/tg-ctl/agent-name"
@@ -2811,8 +2811,8 @@ async function readStdinText(): Promise<string> {
 // matches the LIVE candidate's path. A stale/mismatched anchor returns null
 // rather than risk mis-routing into a different project that now happens to
 // own that pane id.
-function resolveLastAlexTarget(ctx: Ctx, candidates: TargetPane[]): TargetPane | null {
-  const anchor = parseLastAlexTarget(readFileOrNull(ctx.paths.lastAlexTarget))
+function resolveLastUserTarget(ctx: Ctx, candidates: TargetPane[]): TargetPane | null {
+  const anchor = parseLastUserTarget(readFileOrNull(ctx.paths.lastUserTarget))
   if (!anchor) return null
   const hit = candidates.find((c) => c.pane.paneId === anchor.paneId)
   if (!hit) return null
@@ -2849,7 +2849,7 @@ function resolveTasksScopeDir(ctx: Ctx, action: Pick<Extract<Action, { kind: "ta
   const target = discoverTarget(ctx)
   let routed: DiscoverResult = target
   if (!target.ok && target.reason === "ambiguous") {
-    const anchor = resolveLastAlexTarget(ctx, target.candidates)
+    const anchor = resolveLastUserTarget(ctx, target.candidates)
     if (anchor) routed = { ok: true, target: anchor }
   }
   if (routed.ok) return routed.target.pane.panePath || registeredCwdForPane(regs, routed.target.pane)
@@ -3882,6 +3882,29 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   }
 
   writeFileSync(ctx.paths.pid, `${process.pid}\n`)
+
+  // One-time migration (tg-cli#281): best-effort rename a pre-existing
+  // last-alex-target.json forward so the CTO's routing anchor survives the
+  // upgrade instead of silently resetting to the ambiguity picker — or, if a
+  // new-name file already exists, remove the now-redundant legacy file so a
+  // FUTURE restart (after a legitimate invalidation clears the new file
+  // again) can never resurrect it (review finding, round 3). Deliberately
+  // placed AFTER the flock is held (review finding, round 2): running this
+  // from every CLI invocation (send/status/ask/etc, not just the daemon)
+  // could race a still-running pre-rename daemon and clobber ITS fresh anchor
+  // write with the stale legacy file — only the flock-holding daemon may
+  // touch either file. Non-fatal: a failed rename/unlink just means the
+  // legacy file lingers (still denylisted) or the daemon starts with no
+  // anchor, same as a fresh install.
+  const legacyAction = planLegacyLastUserTargetMigration(ctx.configDir, ctx.botId, existsSync)
+  if (legacyAction) {
+    try {
+      if (legacyAction.kind === "migrate") renameSync(legacyAction.from, legacyAction.to)
+      else unlinkSync(legacyAction.path)
+    } catch {
+      // best-effort; see comment above
+    }
+  }
   const pendingButtons = new Map<string, PendingButton>()
   const activeButtonKeys = new Set<string>()
   // Answered-request replay cache (tg-cli#97): requestId → the answer just given,
@@ -4551,10 +4574,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // wrong anchor for a fresh non-reply: it let an unrelated agent's inbound-to-CTO
   // message hijack the CTO's very next message. His own fix, verbatim: "всегда
   // есть самое последнее сообщение его и нужно использовать для определения
-  // адресата". Written only in recordLastAlexTarget below, on a CONFIRMED
+  // адресата". Written only in recordLastUserTarget below, on a CONFIRMED
   // delivery to the CTO's own inbound (auto-bound, a picker/`/agent` selection,
   // or a recognized reply) — never on an agent's own outbound send, and never on
-  // a failed/unconfirmed attempt. `resolveLastAlexTarget` itself (pane-id-reuse
+  // a failed/unconfirmed attempt. `resolveLastUserTarget` itself (pane-id-reuse
   // guard included) is shared with resolveTasksScopeDir's `/tasks` default
   // scoping (top-level function, above) so both surfaces agree on "the default
   // target" — see that function's docstring.
@@ -4568,9 +4591,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // is intentionally not staleness-bearing; a plain unconditional write keeps this
   // simple and correct (the write itself is a trivial tmp+rename, not worth an
   // extra disk read to maybe skip).
-  const invalidateLastAlexTarget = (): void => {
+  const invalidateLastUserTarget = (): void => {
     try {
-      unlinkSync(ctx.paths.lastAlexTarget)
+      unlinkSync(ctx.paths.lastUserTarget)
     } catch {
       // Already absent (or unremovable) — either way there's no stale anchor
       // left to worry about.
@@ -4587,13 +4610,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // not just imprecise — he just moved away from it. Between "the next ambiguous
   // message asks once more" and "silently routes to a pane the CTO explicitly
   // left", asking is the safer failure, so both paths invalidate the same way.
-  const recordLastAlexTarget = (paneId: string, cwd: string | undefined): void => {
+  const recordLastUserTarget = (paneId: string, cwd: string | undefined): void => {
     // "does the anchor already point at THIS pane" is read LAZILY — only inside
     // the two branches that actually need it (the no-cwd branch, the
     // write-failure catch) — not unconditionally up front (performance review
     // finding, raised twice): the overwhelmingly common case (cwd present,
     // write+rename succeeds) never touches this read at all.
-    const readCurrent = (): LastAlexTarget | null => parseLastAlexTarget(readFileOrNull(ctx.paths.lastAlexTarget))
+    const readCurrent = (): LastUserTarget | null => parseLastUserTarget(readFileOrNull(ctx.paths.lastUserTarget))
     if (!cwd) {
       // A confirmed delivery whose pane has no known cwd can't record a
       // pane-id-reuse-safe anchor. If the CURRENT anchor already points at this
@@ -4607,13 +4630,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // than trusting outdated state (design review finding: that's fail-OPEN on
       // the wrong pane, not fail-closed).
       if (readCurrent()?.paneId === paneId) return
-      invalidateLastAlexTarget()
+      invalidateLastUserTarget()
       return
     }
-    const tmp = `${ctx.paths.lastAlexTarget}.tmp.${process.pid}`
+    const tmp = `${ctx.paths.lastUserTarget}.tmp.${process.pid}`
     try {
-      writeFileSync(tmp, serializeLastAlexTarget({ paneId, cwd, ts: Math.floor(Date.now() / 1000) }), { mode: 0o600 })
-      renameSync(tmp, ctx.paths.lastAlexTarget)
+      writeFileSync(tmp, serializeLastUserTarget({ paneId, cwd, ts: Math.floor(Date.now() / 1000) }), { mode: 0o600 })
+      renameSync(tmp, ctx.paths.lastUserTarget)
     } catch {
       // A failed renameSync (write succeeded, rename didn't) leaves the tmp file
       // on disk carrying the same sensitive pane id + cwd the denylist protects
@@ -4634,7 +4657,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // place there would silently keep routing to a stale pane instead of
       // falling back to the picker as intended (review finding).
       if (readCurrent()?.paneId === paneId) return
-      invalidateLastAlexTarget()
+      invalidateLastUserTarget()
     }
   }
 
@@ -4650,14 +4673,14 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return result
   }
 
-  // discover() PLUS the no-reply last-ALEX-message bind (tg-cli#78, anchor fixed
+  // discover() PLUS the no-reply last-user-message bind (tg-cli#78, anchor fixed
   // 2026-08-20/21): an otherwise-ambiguous NON-reply inbound binds to the pane of
   // the CTO's OWN last resolved message, never to "whichever agent spoke most
   // recently" (routes.json's outbound-send history) — that let an unrelated agent's
   // unprompted message to the CTO hijack his very next message (live incident).
   // This runs BEFORE #76's ambiguous-picker: a fresh message after the CTO's own
   // last one lands in the same place directly; the picker fires only when there is
-  // no last-Alex-target, or its pane is gone / not a candidate. The lookup is LAZY
+  // no last-user-target, or its pane is gone / not a candidate. The lookup is LAZY
   // — only on a genuinely ambiguous base result — so the common ok/no-agent path
   // never reads the store. This is the ONLY discovery used by the non-reply INJECT
   // paths (injectViaTarget with autoBind). A no-last-target case stays ambiguous →
@@ -4665,7 +4688,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   const discoverForInject = (): DiscoverResult => {
     const result = discover()
     if (result.ok || result.reason !== "ambiguous") return result
-    const hit = resolveLastAlexTarget(ctx, result.candidates)
+    const hit = resolveLastUserTarget(ctx, result.candidates)
     return hit ? { ok: true, target: hit } : result
   }
 
@@ -4790,7 +4813,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // received anything — codex/Opus review finding). This is what the NEXT
     // ambiguous non-reply anchors against (tg-cli#78 fix above).
     const recordIfAutoBound = () => {
-      if (autoBind) recordLastAlexTarget(paneId, found.target.pane.panePath)
+      if (autoBind) recordLastUserTarget(paneId, found.target.pane.panePath)
     }
     // Defer a text message behind the pane's outstanding question OR an existing
     // backlog (⏳); control verbs (Escape, no deferText) always go through to
@@ -4960,7 +4983,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     sourceMessageId: number | null,
     // REQUIRED, not optional (review finding): both call sites already have the
     // target's live `panePath` on hand, and an optional `cwd` would let a future
-    // caller silently omit it — recordLastAlexTarget then treats a missing cwd
+    // caller silently omit it — recordLastUserTarget then treats a missing cwd
     // as "invalidate the anchor" (tg-cli#78), so a forgotten argument here would
     // silently wipe the CTO's anchor on every delivery through this path.
     cwd: string,
@@ -4970,7 +4993,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // A media `/agent` caption is an explicit CTO routing choice, same as its
       // text equivalent — record the tg-cli#78 anchor (review finding: this path
       // was the one remaining explicit-routing gap).
-      recordLastAlexTarget(paneId, cwd)
+      recordLastUserTarget(paneId, cwd)
       return true
     }
     const res = await executeInjectSteps(buildTextInjectPlan(paneId, prewrappedText))
@@ -4978,7 +5001,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       await sendMessage(ctx, res.error)
       return false
     }
-    recordLastAlexTarget(paneId, cwd)
+    recordLastUserTarget(paneId, cwd)
     return true
   }
 
@@ -5042,7 +5065,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // An armed one-shot route is the CTO's own prior explicit choice — record
       // it as the tg-cli#78 anchor (review finding: `/agent`-driven routing
       // previously never updated it).
-      recordLastAlexTarget(liveTarget.paneId, liveTarget.panePath)
+      recordLastUserTarget(liveTarget.paneId, liveTarget.panePath)
       return true
     }
     const text = withGitStateBanner(liveTarget.panePath, prewrappedText)
@@ -5053,7 +5076,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       return false
     }
     if (selected.messageId !== null) void editMessageText(ctx, selected.messageId, routedReply(label, false))
-    recordLastAlexTarget(liveTarget.paneId, liveTarget.panePath)
+    recordLastUserTarget(liveTarget.paneId, liveTarget.panePath)
     return true
   }
 
@@ -5124,7 +5147,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
           // A named `/agent <name> <msg>` is the CTO explicitly addressing this
           // pane — record it as the tg-cli#78 anchor (review finding: `/agent`
           // routing previously never updated it, unlike the ambiguous picker).
-          recordLastAlexTarget(target.paneId, target.panePath)
+          recordLastUserTarget(target.paneId, target.panePath)
           return true
         }
         // Ambiguous: multiple matches — show picker over matched subset
@@ -5155,7 +5178,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // (review finding: this was one of two remaining gaps where a successful
       // delivery never updated the anchor, leaving it stale once a second pane
       // later appears).
-      recordLastAlexTarget(target.paneId, target.panePath)
+      recordLastUserTarget(target.paneId, target.panePath)
       await sendMessage(ctx, routedReply(labelFor(target, candidates), res.deferred), out)
       return true
     }
@@ -5228,7 +5251,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // sets `ok: true` for a deferred outcome too, so `res.ok` alone covers both
     // today — `res.deferred` is included explicitly anyway (Opus review finding)
     // so this stays correct even if a future refactor ever decouples the two.
-    if (res.ok || res.deferred) recordLastAlexTarget(target.paneId, target.panePath)
+    if (res.ok || res.deferred) recordLastUserTarget(target.paneId, target.panePath)
     if (res.deferred && pending.sourceMessageId !== null && !res.deferredItem?.delivered) {
       await setReaction(pending.sourceMessageId, DEFER_REACTION)
     } else if (res.ok) {
@@ -5354,7 +5377,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         // injectVerbatim confirms delivery (queued-deferred or actually injected),
         // never on a failed inject (codex/Opus review finding).
         const delivered = await injectVerbatim(recognized.paneId)
-        if (delivered) recordLastAlexTarget(recognized.paneId, pane.panePath)
+        if (delivered) recordLastUserTarget(recognized.paneId, pane.panePath)
         return delivered
       }
 
@@ -5409,7 +5432,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // Still a confirmed CTO-explicit delivery — record it as the tg-cli#78
       // anchor (review finding: this was the other remaining gap where a
       // successful delivery never updated the anchor).
-      if (delivered) recordLastAlexTarget(candidates[0].paneId, candidates[0].panePath)
+      if (delivered) recordLastUserTarget(candidates[0].paneId, candidates[0].panePath)
       return delivered
     }
 

@@ -46,13 +46,13 @@
 //
 // PURE serialization; the daemon owns the actual file I/O (mirrors routes.ts).
 
-export interface LastAlexTarget {
+export interface LastUserTarget {
   paneId: string;
   cwd: string;
   ts: number; // unix seconds
 }
 
-export function parseLastAlexTarget(raw: string | null): LastAlexTarget | null {
+export function parseLastUserTarget(raw: string | null): LastUserTarget | null {
   if (!raw) return null;
   let parsed: unknown;
   try {
@@ -80,6 +80,6 @@ export function parseLastAlexTarget(raw: string | null): LastAlexTarget | null {
   return { paneId: rec.paneId, cwd: rec.cwd, ts: rec.ts };
 }
 
-export function serializeLastAlexTarget(target: LastAlexTarget): string {
+export function serializeLastUserTarget(target: LastUserTarget): string {
   return JSON.stringify(target);
 }
