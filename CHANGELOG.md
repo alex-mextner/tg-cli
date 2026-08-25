@@ -3,6 +3,17 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.44.4
+
+**Fix: renamed the 1.44.3 routing-anchor feature's identifiers/filenames off the repo owner's own name.**
+
+- `last-alex-target.ts`/`LastAlexTarget`/`recordLastAlexTarget` (and siblings)
+  and the on-disk `tg-ctl.<bot>.last-alex-target.json` state file are renamed
+  to their `User` equivalents throughout. A daemon upgrading from 1.44.3
+  migrates a pre-existing anchor forward automatically (once it holds its
+  singleton lock); the denylist still blocks both the new and legacy
+  filenames from ever riding a Telegram attach.
+
 ## 1.44.3
 
 **Fix: a non-reply message could route to whichever agent pane merely spoke last, instead of the pane the CTO was actually addressing.**
