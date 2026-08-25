@@ -1933,18 +1933,89 @@ const ABANDONED_RETAIN_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60_000
 })()
 
+// PERMISSIONS get a MUCH longer retention window than questions before the
+// daemon gives up and posts abandonedLongOutageText's "never delivered" notice
+// (tg-cli#182: Alex reported a permission going stale — and the card claiming
+// it was "never delivered" — well before he'd had a realistic chance to check
+// his phone, e.g. overnight or a few hours away). A question always has a live
+// human decision to make in the moment (its own value fades fast if stale), but
+// a permission's answer is still fully actionable hours later: the harness may
+// still be sitting on its own terminal fallback prompt (late-delivery via
+// pane-digit-injection, tg-cli#267) or a hook may still reconnect and consume a
+// queued decision (queuedDecision, above) — neither is time-bounded by anything
+// on the harness side, so tg-ctl's own give-up window was the only thing
+// artificially cutting this short. Env-overridable for tests; production never
+// sets it.
+const ABANDONED_PERMISSION_RETAIN_MS = (() => {
+  const raw = Number(process.env.TG_CTL_ABANDONED_PERMISSION_RETAIN_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 12 * 60 * 60_000
+})()
+
+// PURE — the single source of truth for "which retention window applies to
+// this entry's kind" (review finding, round 5: this ternary was duplicated
+// verbatim at 5+ call sites, risking future drift) and "is it past that
+// window right now". EXPORTED for direct unit testing (review finding, round
+// 6: forcing the exact race between "expired" and "the periodic sweep
+// already caught it" isn't reliable from outside a real running daemon
+// process — see tests/ctl-question-durable-integration.test.ts's own comment
+// on 'PERM QUEUE EXPIRED AT RECONNECT' — so the boolean logic itself is
+// tested directly here instead, deterministically, with no timing race).
+// Scalar args, not an entry object (review finding: avoids a throwaway
+// wrapper allocation at every restore-loop call site).
+export function retainMsFor(kind: ButtonRequest["kind"]): number {
+  return kind === "permission" ? ABANDONED_PERMISSION_RETAIN_MS : ABANDONED_RETAIN_MS
+}
+export function isAbandonedExpired(kind: ButtonRequest["kind"], at: number, now: number): boolean {
+  return now - at > retainMsFor(kind)
+}
+
+// PURE decision for what a hook reconnect should do about a retained entry's
+// QUEUED permission decision — extracted from handleHookSocketLine (review
+// finding, tg-cli#182 round 8: five straight rounds asked for deterministic
+// coverage of this exact branch, since exercising it through a REAL daemon
+// racing a REAL sweep is not reliably forceable — see this module's unit
+// tests for `decideQueuedPermissionReconnect`, which call it directly with
+// no daemon, no timing race, no sweep to race against). Order matters and
+// mirrors the ORIGINAL single if/else-if chain exactly (round 7's fix): a
+// second, independent if-chain re-evaluating overlapping conditions is
+// EXACTLY what produced round 7's bug (an expired decision ALSO logging a
+// false "payload mismatch") — one function, one return value, one caller
+// switch, structurally impossible to double-fire.
+export type QueuedPermissionReconnectOutcome =
+  | { kind: "no-queued-decision" }
+  | { kind: "expired" }
+  | { kind: "no-turn-proof" }
+  | { kind: "turn-mismatch" }
+  | { kind: "payload-mismatch" }
+  | { kind: "deliver"; queuedDecision: NonNullable<AbandonedButton["queuedDecision"]> }
+export function decideQueuedPermissionReconnect(
+  retained: Pick<AbandonedButton, "req" | "at" | "queuedDecision">,
+  req: ButtonRequest,
+  now: number,
+): QueuedPermissionReconnectOutcome {
+  if (!retained.queuedDecision) return { kind: "no-queued-decision" }
+  if (isAbandonedExpired(retained.req.kind, retained.at, now)) return { kind: "expired" }
+  if (!queuedDecisionCanAutoDeliver(retained.req)) return { kind: "no-turn-proof" }
+  if (retained.req.promptTurnId !== req.promptTurnId) return { kind: "turn-mismatch" }
+  if (!permissionPayloadMatches(retained.req, req)) return { kind: "payload-mismatch" }
+  return { kind: "deliver", queuedDecision: retained.queuedDecision }
+}
+
 // How long a QUEUED permission decision can wait with no reconnect before the
 // human gets a PROACTIVE "still waiting to reconnect" notice — a NOTICE
 // threshold, not an expiry (Alex tg#9982: a queued tap must never be silently
-// dropped/demoted on a timer; while it's pending it stays pending in Telegram
-// until there's 100% confirmation it's resolved, or the daemon genuinely gives
-// up after the full ABANDONED_RETAIN_MS with its own proactive notice). Past
-// this threshold the queue is NOT cleared and stays fully eligible for
-// automatic delivery — see noticeStaleQueuedDecisions and the reconnect branch
-// in handleHookSocketLine, neither of which time-bounds delivery anymore.
+// dropped/demoted on the SHORT question timer; while it's pending it stays
+// pending in Telegram until there's 100% confirmation it's resolved, or the
+// daemon genuinely gives up after the full ABANDONED_PERMISSION_RETAIN_MS
+// (tg-cli#182, default 12h — NOT the bare ABANDONED_RETAIN_MS question
+// window) with its own proactive notice). Past this NOTICE threshold the
+// queue is NOT cleared and stays fully eligible for automatic delivery — see
+// noticeStaleQueuedDecisions and decideQueuedPermissionReconnect, neither of
+// which is bounded by THIS threshold (they ARE bounded by the longer
+// retention window above — see isAbandonedExpired).
 //
-// The identity check that makes an UNBOUNDED wait safe lives upstream, in
-// hook-normalize.ts's `invocationSeed`: requestId is now scoped to the prompt
+// The identity check that makes delivery safe WITHIN that window lives
+// upstream, in hook-normalize.ts's `invocationSeed`: requestId is now scoped to the prompt
 // TURN (Claude Code's `prompt_id`, Codex's `turn_id`), not just the session, so
 // a materially later, only-coincidentally-identical-looking request (the agent
 // re-running the same command in a NEW turn) gets a fresh requestId and can
@@ -1964,14 +2035,16 @@ const QUEUED_DECISION_NOTICE_MS = (() => {
 // the daemon giving up on ever reconnecting it, so it is also the one honest place
 // to surface the "still no connection after a long wait" notice (Alex tg
 // requirement: a long-running uncertainty must eventually be reported, never left
-// silent). Called with the entry BEFORE it is deleted from the map.
+// silent). Called with the entry BEFORE it is deleted from the map. Permissions use
+// ABANDONED_PERMISSION_RETAIN_MS instead of ABANDONED_RETAIN_MS (see its own
+// comment, tg-cli#182) — everything else about giving up is unchanged.
 function pruneAbandonedButtons(
   abandoned: Map<string, AbandonedButton>,
   now: number,
   onExpire?: (key: string, entry: AbandonedButton) => void,
 ): void {
   for (const [key, entry] of abandoned) {
-    if (now - entry.at > ABANDONED_RETAIN_MS) {
+    if (isAbandonedExpired(entry.req.kind, entry.at, now)) {
       onExpire?.(key, entry)
       abandoned.delete(key)
     }
@@ -2043,8 +2116,9 @@ function normalizeButtonRequest(value: unknown): ButtonRequest | null {
     multiQuestion: rec.multiQuestion === true ? true : undefined,
     // The per-turn identity proof (see ButtonRequest.promptTurnId) MUST survive
     // BOTH the socket boundary and the disk restore — it's what the reconnect
-    // branch requires before auto-delivering a queued permission decision with
-    // no time bound (handleHookSocketLine). Dropping it here would silently
+    // branch requires before auto-delivering a queued permission decision
+    // within its retention window (handleHookSocketLine, tg-cli#182). Dropping
+    // it here would silently
     // degrade every restored/reconnected request to the untrusted case.
     promptTurnId: typeof rec.promptTurnId === "string" ? rec.promptTurnId : undefined,
   }
@@ -2480,9 +2554,12 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       // "no queued decision": fall through to the ordinary re-attach so the human is
       // shown a fresh live prompt and taps it explicitly.
       //
-      // NOT time-bounded (Alex tg#9982): a genuinely QUEUED decision stays eligible
-      // for automatic delivery no matter how long the reconnect takes, because the
-      // identity check itself is now airtight for permissions — requestId folds in
+      // Bounded by the permission's own retention window (ABANDONED_PERMISSION_RETAIN_MS,
+      // default 12h — tg-cli#182 round 7; PREVIOUSLY documented here as "not
+      // time-bounded", which stopped being true once that window was added — see
+      // the synchronous check below), not the short question one (Alex tg#9982:
+      // never demoted onto the SHORT timer). Within that window, delivery is safe
+      // because the identity check itself is airtight for permissions — requestId folds in
       // `env.invocationNonce` (hook-normalize.ts), a random id generated ONCE PER
       // `tg-ctl ask` PROCESS. Claude's `prompt_id` / Codex's `turn_id` alone are
       // NOT sufficient here (they scope to the whole prompt TURN, not the
@@ -2513,43 +2590,66 @@ async function handleHookSocketLine(ctx: Ctx, rt: QuestionRuntime, socket: Socke
       // (PendingButton has no queuedDecision slot): once identity can't be proven,
       // presenting a genuinely fresh choice is the honest, safe behavior, not a
       // stale tap silently reapplied.
-      if (retained.queuedDecision && queuedDecisionCanAutoDeliver(retained.req) && permissionPayloadMatches(retained.req, req)) {
-        const qd = retained.queuedDecision
-        const answer: ButtonAnswer = {
-          status: "answered",
-          requestId: req.requestId,
-          label: qd.label,
-          value: qd.value,
-          decision: qd.decision,
+      // Synchronous age check, not just the periodic pruneAbandonedButtons sweep
+      // (review finding, tg-cli#182 round 4): the sweep only runs on the poll
+      // loop's own cadence, so a reconnect landing in the gap between an entry
+      // crossing its retention window and the next sweep could otherwise still
+      // deliver a queued decision past its own kind's window — the entry's
+      // "genuinely still retained" status must be true AT THE MOMENT OF
+      // DELIVERY, not merely "not yet swept". This does not weaken the
+      // design above (safety WITHIN the window comes from identity, not a
+      // timer) — it only closes the race on the boundary that design already
+      // assumes pruneAbandonedButtons enforces synchronously. Gated on `queuedDecision`
+      // actually being present (review finding, round 5): an ordinary late
+      // reconnect with no tap ever made isn't a "decision" expiring — logging
+      // it as one would be misleading noise on the common overnight case.
+      const outcome = decideQueuedPermissionReconnect(retained, req, Date.now())
+      switch (outcome.kind) {
+        case "deliver": {
+          const qd = outcome.queuedDecision
+          const answer: ButtonAnswer = {
+            status: "answered",
+            requestId: req.requestId,
+            label: qd.label,
+            value: qd.value,
+            decision: qd.decision,
+          }
+          const output = formatAgentHookOutput(req, answer)
+          socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
+          // Deliberately NOT added to `rt.answered` (the question-only replay cache —
+          // see the "Scoped to questions on purpose" comment in the live-tap handler
+          // below): silently replaying a permission decision to a LATER unrelated
+          // re-fire that happens to reuse the same key would be exactly the
+          // behavioral/security change that cache was built to avoid (review
+          // finding). The entry is already gone from `rt.abandoned` above, so a
+          // genuinely fresh re-fire of this requestId just forwards as a normal new
+          // prompt — no double-delivery risk without the cache.
+          rt.persist()
+          if (retained.messageId !== null) {
+            void clearMessageKeyboard(ctx, retained.messageId)
+            void editMessageText(ctx, retained.messageId, buildAnsweredQuestionText(req, qd.label))
+          }
+          log(`ask-forward queued-decision-delivered: ${describeAskRequest(req)} key=${pendingKey} label=${qd.label}`)
+          return
         }
-        const output = formatAgentHookOutput(req, answer)
-        socket.end(output === null ? "null\n" : `${JSON.stringify(output)}\n`)
-        // Deliberately NOT added to `rt.answered` (the question-only replay cache —
-        // see the "Scoped to questions on purpose" comment in the live-tap handler
-        // below): silently replaying a permission decision to a LATER unrelated
-        // re-fire that happens to reuse the same key would be exactly the
-        // behavioral/security change that cache was built to avoid (review
-        // finding). The entry is already gone from `rt.abandoned` above, so a
-        // genuinely fresh re-fire of this requestId just forwards as a normal new
-        // prompt — no double-delivery risk without the cache.
-        rt.persist()
-        if (retained.messageId !== null) {
-          void clearMessageKeyboard(ctx, retained.messageId)
-          void editMessageText(ctx, retained.messageId, buildAnsweredQuestionText(req, qd.label))
-        }
-        log(`ask-forward queued-decision-delivered: ${describeAskRequest(req)} key=${pendingKey} label=${qd.label}`)
-        return
-      }
-      if (retained.queuedDecision && !queuedDecisionCanAutoDeliver(retained.req)) {
-        log(`ask-forward queued-decision-discarded: retained request has no promptTurnId (no per-invocation identity proof) — refusing auto-delivery, showing a fresh live prompt instead. key=${pendingKey}`)
-      } else if (retained.queuedDecision && retained.req.promptTurnId !== req.promptTurnId) {
-        // Distinct from the generic permissionPayloadMatches mismatch below (review
-        // finding: this log used to blame "question text or toolInput" even when the
-        // REAL mismatch was promptTurnId — e.g. a manual/back-compat caller reusing
-        // the same requestId while omitting or changing the field).
-        log(`ask-forward queued-decision-discarded: reconnecting request's promptTurnId does not match the queued decision's (permissionPayloadMatches) — showing a fresh live prompt instead. key=${pendingKey}`)
-      } else if (retained.queuedDecision) {
-        log(`ask-forward queued-decision-discarded: reconnecting request's question text or toolInput no longer matches the queued decision's (permissionPayloadMatches) — showing a fresh live prompt instead. key=${pendingKey}`)
+        case "expired":
+          log(`ask-forward queued-decision-expired-at-reconnect: key=${pendingKey} ageMs=${Date.now() - retained.at}`)
+          break
+        case "no-turn-proof":
+          log(`ask-forward queued-decision-discarded: retained request has no promptTurnId (no per-invocation identity proof) — refusing auto-delivery, showing a fresh live prompt instead. key=${pendingKey}`)
+          break
+        case "turn-mismatch":
+          // Distinct from the generic payload-mismatch case below (review finding:
+          // this log used to blame "question text or toolInput" even when the REAL
+          // mismatch was promptTurnId — e.g. a manual/back-compat caller reusing the
+          // same requestId while omitting or changing the field).
+          log(`ask-forward queued-decision-discarded: reconnecting request's promptTurnId does not match the queued decision's (permissionPayloadMatches) — showing a fresh live prompt instead. key=${pendingKey}`)
+          break
+        case "payload-mismatch":
+          log(`ask-forward queued-decision-discarded: reconnecting request's question text or toolInput no longer matches the queued decision's (permissionPayloadMatches) — showing a fresh live prompt instead. key=${pendingKey}`)
+          break
+        case "no-queued-decision":
+          break // ordinary reconnect, nothing queued — nothing to log
       }
       rt.activeKeys.add(pendingKey)
       const entry: PendingButton = { req, socket, messageId: retained.messageId, at: Date.now() }
@@ -3935,10 +4035,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // a long-running uncertainty must be reported, but the queued tap itself must
   // NEVER be silently dropped/demoted on a timer). Unlike the pre-fix behavior
   // this replaces, the queue is NOT cleared — it stays fully eligible for
-  // automatic delivery (see the reconnect branch in handleHookSocketLine, which
-  // is no longer time-bounded) for as long as the entry itself is retained
-  // (ABANDONED_RETAIN_MS, refreshed by every tap). `notifiedAt` makes this
-  // idempotent: a sweep that finds an already-notified entry does nothing.
+  // automatic delivery (see decideQueuedPermissionReconnect, called from the
+  // reconnect branch in handleHookSocketLine) for as long as the entry itself
+  // is retained (ABANDONED_PERMISSION_RETAIN_MS for a permission, refreshed
+  // by every tap — tg-cli#182), not bounded by THIS shorter notice threshold.
+  // `notifiedAt` makes this idempotent: a sweep that finds an
+  // already-notified entry does nothing.
   // Returns whether anything changed, so callers know whether a persist is
   // warranted. `now` is caller-supplied (not sampled internally) and MUST be the
   // exact same value the caller then passes to `pruneAbandonedButtons` right
@@ -3956,7 +4058,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // lie for it (review finding: the notice text overpromised for exactly the
       // case the delivery gate carves out). Skip the still-waiting notice
       // entirely here; the entry still gets the accurate, decision-naming give-up
-      // notice at ABANDONED_RETAIN_MS (notifyAbandonedLongOutage), which never
+      // notice at its own retention window (ABANDONED_PERMISSION_RETAIN_MS — this
+      // whole function only ever processes `queuedDecision` entries, which are
+      // permission-only — notifyAbandonedLongOutage), which never
       // claims automatic delivery in the first place.
       if (!queuedDecisionCanAutoDeliver(entry.req)) continue
       // Skip an entry that pruneAbandonedButtons (called right after this with the
@@ -3969,16 +4073,21 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // that resolves to nothing (review finding). Let pruneAbandonedButtons's own
       // notify own this entry — reachable in normal production (not just
       // misconfiguration): the daemon can be down from shortly after the tap until
-      // past the full ABANDONED_RETAIN_MS, so `notifiedAt` is still unset on
+      // past the full ABANDONED_PERMISSION_RETAIN_MS, so `notifiedAt` is still unset on
       // restore and both thresholds are crossed in the very first post-restore
       // sweep. `>=` (not pruneAbandonedButtons's own strict `>`), deliberately
       // ASYMMETRIC with the shared `now`: this must skip everything the prune is
       // about to take (the double-edit hazard, never allowed), even though that
-      // means the exact boundary tick (`now - entry.at === ABANDONED_RETAIN_MS`)
+      // means the exact boundary tick (`now - entry.at === retainMsFor(entry.req.kind)`)
       // gets neither notice nor prune this ONE sweep (prune's `>` doesn't take it
       // yet either) — resolved trivially on the very next sweep. A stale "neither
       // fired for one tick" beats a card showing two contradictory edits.
-      if (now - entry.at >= ABANDONED_RETAIN_MS) continue
+      // `queuedDecision` only ever exists on a `permission`-kind entry in
+      // practice (see the restore path's explicit `req.kind === "permission"`
+      // gate) — this branch is defense-in-depth against that convention ever
+      // drifting, matching every OTHER retention-window check in this file
+      // (review finding: this was the one site left unconditional).
+      if (now - entry.at >= retainMsFor(entry.req.kind)) continue
       qd.notifiedAt = now
       changed = true
       const label = resolveWindowAgentLabel(entry.req.windowName, entry.req.cwd)
@@ -4102,7 +4211,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     for (const rec of raw.questions) {
       const req = normalizeButtonRequest(rec.req)
       if (!req || !req.paneId || (req.kind === "question" && !req.options?.length)) continue
-      if (nowRestore - rec.at > ABANDONED_RETAIN_MS) {
+      if (isAbandonedExpired(req.kind, rec.at, nowRestore)) {
         // Carry the queuedDecision through (same rule as the live-abandonedButtons
         // restore below): a tap that was never delivered before the daemon went
         // down for the whole retention window must still be NAMED in the give-up
@@ -7105,10 +7214,13 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     // QUIET daemon (no mutation since the abandon) pruneAbandonedButtons never runs, so
     // without this check an arbitrarily-stale answer would still be injected into a pane
     // whose agent has long since moved on. Past the window → drop the entry, retire the
-    // now-dead card, and fall through to the "expired" toast. Applies uniformly to every
-    // kind (question, permission, multi-question member) — a permission's QUEUING below
-    // must not queue against an entry the daemon has already given up on.
-    if (Date.now() - retained.at > ABANDONED_RETAIN_MS) {
+    // now-dead card, and fall through to the "expired" toast. Applies to every kind
+    // (question, permission, multi-question member) — a permission's QUEUING below must
+    // not queue against an entry the daemon has already given up on — but a permission
+    // uses ABANDONED_PERMISSION_RETAIN_MS here, matching pruneAbandonedButtons's own
+    // per-kind window (tg-cli#182): otherwise a tap could be rejected as "expired" here
+    // for an entry pruneAbandonedButtons has NOT actually deleted yet.
+    if (isAbandonedExpired(retained.req.kind, retained.at, Date.now())) {
       abandonedButtons.delete(action.requestId)
       persistQuestions()
       const staleCardId = retained.messageId ?? action.messageId
@@ -7188,7 +7300,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       // ignored (tg-cli#268 tracks broadening/verifying these further): a
       // command containing a real newline (heredocs, multi-line strings) can
       // never line-match in permissionMenuMatchesRequest and always falls
-      // through to queuing; and there is a millisecond TOCTOU between the
+      // through to queuing (tracked separately as tg-cli#283, needing live
+      // verification of how Claude Code actually renders a multi-line
+      // command's box before a fix can be trusted — see that issue); and
+      // there is a millisecond TOCTOU between the
       // pre-inject capture/identity-check and the actual `send-keys` where
       // the human could resolve THIS menu at the keyboard and a genuinely
       // DIFFERENT permission's menu could appear before the digit lands —
@@ -7774,8 +7889,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
 
       // Sweep the retention window every loop iteration (roughly once per ~50s
-      // long-poll, sooner if messages keep arriving) so an entry past
-      // ABANDONED_RETAIN_MS gets its long-outage notice promptly even on an
+      // long-poll, sooner if messages keep arriving) so an entry past its
+      // applicable retention window (retainMsFor — ABANDONED_RETAIN_MS for a
+      // question, the much longer ABANDONED_PERMISSION_RETAIN_MS for a
+      // permission, tg-cli#182) gets its long-outage notice promptly even on an
       // otherwise-idle bot — persistQuestions only runs on a mutation, and on a
       // quiet channel nothing else may mutate for a long time. Prune directly
       // (cheap: an in-memory Map scan) rather than calling the full persistQuestions

@@ -235,7 +235,12 @@ tests can pass fakes.
   moves out of `pendingButtons` into `abandonedButtons` (so it never defers its pane's inbound) and
   is retained for `TG_CTL_ABANDONED_RETAIN_MS` (default 30 min) — a window enforced at delivery time
   (not only on restore), so a tap past the window expires rather than injecting a long-stale answer,
-  even on a quiet daemon with no intervening mutation. (b) **lossless reconnect** — the
+  even on a quiet daemon with no intervening mutation. A `permission`-kind entry uses the separate,
+  much longer `TG_CTL_ABANDONED_PERMISSION_RETAIN_MS` (default 12h) instead — tg-cli#182: a
+  permission's answer is still fully actionable hours later (the harness may still be sitting on its
+  own terminal fallback prompt, or a hook may still reconnect), unlike a question, whose value fades
+  fast if stale; every retention/expiry check (`pruneAbandonedButtons`, restore, delivery-time
+  enforcement) branches on `req.kind` to use the right window. (b) **lossless reconnect** — the
   `tg-ctl ask` client for a SCOPED question reconnect-and-resends the same requestId across a
   mid-block socket drop; the restored daemon re-attaches the pending entry (no duplicate card) or
   replays the stored answer (#98, now persisted). (c) **dead-card UX** — a genuinely-dead card (an
@@ -250,24 +255,34 @@ tests can pass fakes.
   `tmux capture-pane -pJ`, re-verifying the menu still identifies THIS request (LINE-EXACT match
   against `extractPermissionIdentity`, never a raw substring — a boundary-only check still lets a
   stale "git push" tap match a live "git push --force" menu, since both genuinely continue at a
-  space; only comparing whole lines tells them apart), then injecting the matching digit (bare, no
-  Enter — Claude Code's menu submits instantly) and re-capturing after a pace to CONFIRM the menu is
+  space; only comparing whole lines tells them apart). A multi-line command (a heredoc, or several
+  statements written across lines) still cannot match here — tracked as tg-cli#283, needing live
+  verification of how Claude Code actually renders a multi-line command's box before a fix can be
+  trusted (a real incident, 2026-08-25, confirmed this class of command gets permanently stranded in
+  the queue-and-wait path below with no way to ever resolve — the fix attempted for it was reverted
+  after a 3-round review surfaced an unresolved escalation risk and unverified rendering assumption,
+  see tg-cli#283 for the full history). The daemon injects the matching digit (bare,
+  no Enter — Claude Code's menu submits instantly) and re-captures after a pace to CONFIRM the menu is
   actually gone before claiming delivery (a tmux exit code alone doesn't prove the app consumed the
   key — e.g. copy-mode swallows it). No waiting process, no dependency on a hook reconnect that may
   never come for a terminal-fallback permission. Every other agent kind, and claude when the menu
   can't be re-verified live, falls through unchanged to the queuing mechanism below.
-- **Queued permission decisions (never drop a tap on a disconnected permission, and NEVER expire it
-  on a timer — Alex tg#9982):** the pane-inject path above covers claude when its menu is live and
-  verifiable; every other case (a permission has no pane-text-injection fallback in general — the
-  hook needs a structured JSON reply, not terminal text) still can't be delivered immediately when a
-  Telegram tap lands while its hook is disconnected. It is QUEUED on the retained entry
-  (`AbandonedButton.queuedDecision`, persisted immediately — survives a daemon crash between the tap
-  and the reconnect) and delivered automatically the instant a reconnecting hook re-attaches to the
-  same requestId AND its full payload (question text + `toolInput`, `permissionPayloadMatches`) still
-  matches — guarding against a stale requestId reused against a materially different action. This
-  delivery is **not time-bounded**: while a decision is pending, its Telegram card stays pending, and
-  it is never silently cleared without 100% confirmation it was actually delivered. What makes an
-  unbounded wait safe is the identity check upstream in `hook-normalize.ts`, applied ONLY to
+- **Queued permission decisions (never drop a tap on a disconnected permission, and never expire it
+  on the SHORT question timer — Alex tg#9982):** the pane-inject path above covers claude when its
+  menu is live and verifiable; every other case (a permission has no pane-text-injection fallback in
+  general — the hook needs a structured JSON reply, not terminal text) still can't be delivered
+  immediately when a Telegram tap lands while its hook is disconnected. It is QUEUED on the retained
+  entry (`AbandonedButton.queuedDecision`, persisted immediately — survives a daemon crash between the
+  tap and the reconnect) and delivered automatically the instant a reconnecting hook re-attaches to
+  the same requestId AND its full payload (question text + `toolInput`, `permissionPayloadMatches`)
+  still matches — guarding against a stale requestId reused against a materially different action.
+  While a decision is pending, its Telegram card stays pending, and it is never silently cleared
+  without 100% confirmation it was actually delivered. Delivery IS still bounded, but by the
+  permission's own much longer window (`ABANDONED_PERMISSION_RETAIN_MS`, default 12h — tg-cli#182),
+  not the 30-min question one; a reconnect past that window falls through to a fresh live prompt
+  instead of auto-delivering the stale decision (enforced synchronously at the reconnect point itself,
+  not only by the periodic sweep — tg-cli#182 round 4). What makes delivery WITHIN that window safe is
+  the identity check upstream in `hook-normalize.ts`, applied ONLY to
   `permission`/plan-approval requests (never `question`-kind — see below): `env.invocationNonce`
   (`HookEnv`), a random id `askDaemon` generates ONCE PER `tg-ctl ask` PROCESS. The harness spawns a
   fresh process for every hook event, so this is a true per-INVOCATION identity, folded into a
@@ -301,11 +316,11 @@ tests can pass fakes.
   the queue (last tap wins). Past `TG_CTL_QUEUED_DECISION_NOTICE_MS` (default 10 min) with no
   reconnect, the human gets a ONE-TIME proactive "still waiting to reconnect" notice
   (`queuedDecision.notifiedAt` makes it idempotent) — the queue is NOT cleared by this notice, only
-  reported. An entry that never reconnects within the full `ABANDONED_RETAIN_MS` (default 30 min,
-  refreshed by every tap) is the daemon's genuine give-up point and gets its own proactive "still no
-  connection" notice (mentioning the queued decision by name if one was pending) — both from the
-  daemon's poll-loop sweep while it is up, and on restore if the window elapsed while the daemon was
-  down.
+  reported. An entry that never reconnects within the full `TG_CTL_ABANDONED_PERMISSION_RETAIN_MS`
+  (default 12h, refreshed by every tap — tg-cli#182, NOT the 30-min `ABANDONED_RETAIN_MS` questions
+  use) is the daemon's genuine give-up point and gets its own proactive "still no connection" notice
+  (mentioning the queued decision by name if one was pending) — both from the daemon's poll-loop
+  sweep while it is up, and on restore if the window elapsed while the daemon was down.
 
 - **Graceful reload — no dropped channel (`tg-ctl.<botid>.deferred.json` + cooperative SIGTERM):**
   a reload (a deliberate `tg-ctl restart`, a launchd `bootout`/`bootstrap`, or a crash-relaunch)
