@@ -126,7 +126,7 @@ tests can pass fakes.
   walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`),
   `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons),
   `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker),
-  `last-alex-target.ts` (tg-cli#78 anchor fix: the pane of the CTO's OWN last CONFIRMED
+  `last-user-target.ts` (tg-cli#78 anchor fix: the pane of the CTO's OWN last CONFIRMED
   inbound delivery — auto-bound, a recognized reply, or an explicit picker/`/agent`
   selection — distinct from the removed `lastMessagePane` mechanism, which used to track
   whichever pane most recently sent an outbound `tg` message, including an agent

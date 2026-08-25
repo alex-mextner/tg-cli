@@ -3,7 +3,7 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.44.4
+## 1.44.5
 
 **Fix: tg-ctl gave up on permission prompts too early, falsely reporting them as "never delivered" (tg-cli#182).**
 
@@ -18,6 +18,17 @@ semantic versioning.
   tg-cli#267) was attempted but reverted after a 3-round review surfaced an unresolved escalation
   risk and an unverified rendering assumption — tracked as tg-cli#283 for a live-verified redesign.
 
+## 1.44.4
+
+**Fix: renamed the 1.44.3 routing-anchor feature's identifiers/filenames off the repo owner's own name.**
+
+- `last-alex-target.ts`/`LastAlexTarget`/`recordLastAlexTarget` (and siblings)
+  and the on-disk `tg-ctl.<bot>.last-alex-target.json` state file are renamed
+  to their `User` equivalents throughout. A daemon upgrading from 1.44.3
+  migrates a pre-existing anchor forward automatically (once it holds its
+  singleton lock); the denylist still blocks both the new and legacy
+  filenames from ever riding a Telegram attach.
+
 ## 1.44.3
 
 **Fix: a non-reply message could route to whichever agent pane merely spoke last, instead of the pane the CTO was actually addressing.**
@@ -27,7 +38,7 @@ semantic versioning.
   to `routes.json`'s "last outbound sender" (`lastMessagePane`), which
   conflated "who spoke last" with "who the CTO was addressing" (live
   incident). Fixed by adding a dedicated anchor
-  (`tg-ctl.<bot>.last-alex-target.json`) that records ONLY the CTO's own last
+  (`tg-ctl.<bot>.last-user-target.json`) that records ONLY the CTO's own last
   CONFIRMED inbound delivery — an auto-bound inject, a picker tap, a reply, or
   a named `/agent` — never an agent's own outbound send and never a failed
   inject. Guarded against tmux pane-id reuse the same way reply-routing
