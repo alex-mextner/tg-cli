@@ -227,6 +227,8 @@ plain text to send the answer into the agent pane post-factum.
 | `/limit [<agent>]` | Show the latest saved 5-hour/weekly/context usage telemetry for all agents or one agent |
 | `/tasks [<agent>] [<status>]` | Show the task board; defaults to work that needs attention, with filters and pages |
 | `/agent [<window>] <msg>` | Route a message to a specific agent (fuzzy window match, else selection buttons) |
+| `/daily` | What-shipped report: merged PRs since the last run (`rig daily`) |
+| `/spend [day\|week\|month]` | Token/cost usage report (`rig usage`) — also pushed automatically weekly/monthly, see `tg-ctl usage-schedule enable` |
 
 `/tasks` renders a rich task table for the resolved project. The default view is
 the attention view: blocked/stuck/problem tasks plus ready tasks, not every task.
