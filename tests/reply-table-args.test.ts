@@ -147,16 +147,14 @@ test('the OTHER lowercase-english tags do NOT require --reply-to', () => {
     const r = parseArgs(['--tag', tag, 'body'], CWD, HOME);
     expect(r.action).toBe('send');
   }
-  // decision/question get an ADVISORY escalation-format warning for a tableless
+  // decision gets an ADVISORY escalation-format warning for a tableless
   // body (TAG_GATES, features/cli/args.ts — see escalation-gate-args.test.ts),
-  // but that is WARN-mode: they still SEND, they don't error. Only the
-  // off-by-default ESCALATION_GATE_ENFORCE flag would hard-block them (in the
-  // entrypoint), not parseArgs.
-  for (const tag of ['decision', 'question']) {
-    const r = parseArgs(['--tag', tag, 'body'], CWD, HOME);
-    expect(r.action).toBe('send');
-    if (r.action === 'send') expect(r.escalationWarning).toBeDefined();
-  }
+  // but that is WARN-mode at the parse layer: it still SENDS, it doesn't
+  // error. The entrypoint (escalationGateEnforced, ON by default) is what
+  // hard-blocks it, not parseArgs.
+  const r = parseArgs(['--tag', 'decision', 'body'], CWD, HOME);
+  expect(r.action).toBe('send');
+  if (r.action === 'send') expect(r.escalationWarning).toBeDefined();
 });
 
 test('an unknown tag is rejected (lowercase-english only) — never reaches the answer gate', () => {

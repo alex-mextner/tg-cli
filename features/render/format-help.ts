@@ -92,15 +92,17 @@ Header badge (--tag / --title), composes with BOTH basic and rich sends:
   --title "<text>"   explicit headline on the \`✳️ [window]\` line (renders as the
                      header line above a rich body too).
   --tag <tag>        a labeling pill: lowercase english only —
-                     answer/decision/problem/question/report. Composes with --title.
+                     answer/decision/problem/report. Composes with --title.
+                     An open question for the recipient is a decision request:
+                     send it as --tag decision (--tag question was removed).
   --reply-to <id>    thread the message under an inbound Telegram message
                      (sendMessage: reply_to_message_id; sendRichMessage:
                      reply_parameters). The answer tag REQUIRES this.
 
---tag decision | --tag question (ESCALATION) — REQUIRED format (deny-by-default):
+--tag decision (ESCALATION) — REQUIRED format (deny-by-default):
   An escalation asks the CTO to choose, so it MUST be a self-contained,
   STRUCTURED Rich Message the human can answer in ~30s without opening the repo
-  AND without reading a wall of text. tg BLOCKS a malformed decision/question
+  AND without reading a wall of text. tg BLOCKS a malformed decision
   send (exit 1) and lists what's missing. Required sections (skill:
   decision-request-discipline):
     • Context — one line: where the code is (file:line) and what it does.

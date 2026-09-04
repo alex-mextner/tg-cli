@@ -1,5 +1,5 @@
 // Escalation-format gate (parse-time TAG_GATES in features/cli/args.ts). For
-// --tag decision|question the gate now runs the FULL decision-request-format
+// --tag decision the gate now runs the FULL decision-request-format
 // validator (features/cli/escalation-format.ts): a self-contained STRUCTURED
 // Rich Message — Context + Options-with-pros/cons + Recommendation + a
 // "where to look" file:line, laid out with headings / bullet lists / <hr>
@@ -23,10 +23,15 @@ const COMPLIANT = [
   '<h4>Where to look</h4><ul><li>features/foo.ts:42</li></ul>',
 ].join('\n');
 
-test('the "question" tag is accepted by --tag (parses, no validateTag rejection)', () => {
+test('the removed "question" tag is REFUSED at parse time — even with a compliant body (tg-cli#301)', () => {
+  // The refusal is about vocabulary, not format: a perfectly formatted
+  // question is still refused and redirected to --tag decision.
   const r = parseArgs(['--tag', 'question', '--format', 'html', COMPLIANT], CWD, HOME);
-  expect(r.action).toBe('send');
-  if (r.action === 'send') expect(r.tag).toBe('question');
+  expect(r.action).toBe('error');
+  if (r.action === 'error') {
+    expect(r.message).toContain('--tag question was removed');
+    expect(r.message).toContain('use --tag decision in the decision-request format');
+  }
 });
 
 test('--tag decision with plain prose (no format) is WARN (still a send); names the actual tag', () => {
@@ -43,16 +48,6 @@ test('--tag decision with plain prose (no format) is WARN (still a send); names 
     // The mode-specific framing (advisory vs blocked, ESCALATION_GATE_ENFORCE)
     // lives in the ENTRYPOINT, not the parse-time message.
     expect(r.escalationWarning).not.toContain('ESCALATION_GATE_ENFORCE');
-  }
-});
-
-test('--tag question with plain prose is WARN (still a send); names "question"', () => {
-  const r = parseArgs(['--tag', 'question', 'which one do we ship?'], CWD, HOME);
-  expect(r.action).toBe('send');
-  if (r.action === 'send') {
-    expect(r.escalationWarning).toContain('--tag question is an escalation');
-    // The other escalation tag word must not leak into a question send.
-    expect(r.escalationWarning).not.toContain('--tag decision');
   }
 });
 

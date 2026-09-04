@@ -2,7 +2,7 @@
 // (features/hooks/escalation-format-descriptor/pre_send_text_gate.ts), run as
 // an actual `bun` subprocess through the pre-send-text hook framework — not a
 // mocked stand-in. Verifies the WARN-MODE contract end to end: for
-// --tag decision|question with no literal table, the send is NOT blocked, a
+// --tag decision with no literal table, the send is NOT blocked, a
 // human-readable warning reaches stderr (surfaced via deps.warn in
 // runner.ts), and the gate_* fields land in the hook's result.
 import { afterEach, beforeEach, expect, test } from 'bun:test';
@@ -56,12 +56,15 @@ test('decision tag, no table → NOT blocked (warn mode), stderr carries the war
   expect(v.results[0].bodySha256).toMatch(/^[0-9a-f]{64}$/);
 }, 15000);
 
-test('question tag, no table → NOT blocked (warn mode)', () => {
+test('the removed question tag is NOT an escalation tag for the hook — plain allow, no gate fields (tg-cli#301)', () => {
+  // The CLI refuses --tag question before any hook runs; a programmatic caller
+  // handing the hook that tag gets a plain allow (it is off the ESCALATION_TAGS
+  // list), not a gated verdict.
   installDescriptor();
   const v = runPreSendTextHooks({ body: 'which option do we take?', tag: 'question' }, guardOffEnv, home);
   expect(v.blocked).toBe(false);
-  expect(v.results[0].gateTag).toBe('question');
-  expect(v.results[0].gateMissing).toBe('table');
+  expect(v.results[0].errored).toBe(false);
+  expect(v.results[0].gateTag).toBeUndefined();
 }, 15000);
 
 test('decision tag WITH a literal pipe table → allowed, gate_missing is empty', () => {
