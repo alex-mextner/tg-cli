@@ -189,6 +189,47 @@ test('--dry-run prints the rendered body it would have sent', async () => {
 // review finding: a --dry-run OK must never imply "attachments validated too"
 // when attachments are not even inspected — reject explicitly instead of a
 // silent partial pass.
+// tg-cli#229 review finding: --dry-run exited before the real send's rich-table and
+// flood-cap preflights, so it could print "OK" for a body the real send would refuse.
+test('--dry-run refuses a rich HTML table over the 20-column cap — same guard the real send enforces', async () => {
+  const home = makeHomeWithCreds();
+  const cols = Array.from({ length: 21 }, (_, i) => `<th>c${i}</th>`).join('');
+  const table = `<table><tr>${cols}</tr></table>`;
+  const { exitCode, stdout, stderr } = await run(
+    ['--dry-run', '--format', 'html', table],
+    { PATH: process.env.PATH ?? '', HOME: home, TG_API_BASE: `http://127.0.0.1:${server.port}` },
+  );
+  expect(exitCode).not.toBe(0);
+  expect(stderr).toContain('table has 21 columns');
+  expect(stdout).not.toContain('tg --dry-run: OK');
+});
+
+test('--dry-run refuses a body that would flood-fragment past the message cap — same guard the real send enforces', async () => {
+  const home = makeHomeWithCreds();
+  // FLOOD_CAP_MAX_MESSAGES is 6; MESSAGE_LIMIT is 4096 — a plain body well past
+  // 6*4096 chars splits into more than 6 messages.
+  const overLong = 'x'.repeat(30_000);
+  const { exitCode, stdout, stderr } = await run(
+    ['--dry-run', overLong],
+    { PATH: process.env.PATH ?? '', HOME: home, TG_API_BASE: `http://127.0.0.1:${server.port}` },
+  );
+  expect(exitCode).not.toBe(0);
+  expect(stderr).toContain('refusing');
+  expect(stderr).toContain('flood-cap');
+  expect(stdout).not.toContain('tg --dry-run: OK');
+});
+
+test('--dry-run with --no-feature flood-cap allows an oversized body through, matching the real send', async () => {
+  const home = makeHomeWithCreds();
+  const overLong = 'x'.repeat(30_000);
+  const { exitCode, stdout } = await run(
+    ['--dry-run', '--no-feature', 'flood-cap', overLong],
+    { PATH: process.env.PATH ?? '', HOME: home, TG_API_BASE: `http://127.0.0.1:${server.port}` },
+  );
+  expect(exitCode).toBe(0);
+  expect(stdout).toContain('tg --dry-run: OK');
+});
+
 test('--dry-run with an attachment (--photo/--file) is a hard error, not a silent partial OK', async () => {
   const home = mkdtempSync(join(tmpdir(), 'tg-dry-run-attach-'));
   dirs.push(home);
