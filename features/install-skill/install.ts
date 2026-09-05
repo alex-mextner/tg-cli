@@ -83,20 +83,23 @@ content on the header line:
 - \`--tag <tag>\` — an emoji badge labeling what the message IS. Composes with
   \`--title\`: \`✳️ [window] 🔵 ANSWER — <title>\`.
 
-Tags are LOWERCASE ENGLISH ONLY — \`answer\` / \`decision\` / \`problem\` / \`question\` /
-\`report\`. The badge (the unicode fallback non-premium clients see) is a colored
-dot + the English word:
+Tags are LOWERCASE ENGLISH ONLY — \`answer\` / \`decision\` / \`problem\` / \`report\`.
+The badge (the unicode fallback non-premium clients see) is a colored dot + the
+English word:
 
 | Tag | Badge | Use it for |
 |-----|-------|------------|
 | answer | 🔵 ANSWER | answering the user's question |
 | decision | 🟠 DECISION | a decision you need the user to make / confirm |
 | problem | 🔴 PROBLEM | a blocker / problem report |
-| question | 🟠 QUESTION | an open question needing the user's input |
 | report | 🟢 REPORT | a status / result report |
 
-\`decision\` / \`question\` are ESCALATIONS — they ask the CTO to choose — and tg
-now REQUIRES the decision-request format on them, DENY-BY-DEFAULT (skill:
+There is NO \`question\` tag: an open question for the user IS a decision request —
+send it as \`decision\` in the decision-request format (\`--tag question\` is refused
+with exactly that hint).
+
+\`decision\` is an ESCALATION — it asks the CTO to choose — and tg
+REQUIRES the decision-request format on it, DENY-BY-DEFAULT (skill:
 decision-request-discipline). A malformed send is BLOCKED (exit 1) with a
 checklist of what's missing. The message must be a self-contained, STRUCTURED
 Rich Message the human can answer in ~30s without opening the repo AND without
@@ -120,13 +123,10 @@ clear error and a non-zero exit — use a lowercase-english tag from the table.
 
 In a PUSH NOTIFICATION (rendered by the OS, which can't load the pill image) the
 badge shows as \`<color>▫️▫️\` — ONE colored dot identifies the tag's CLASS
-(🔵 answer / 🟠 decision-or-question / 🔴 problem / 🟢 report), the rest are
-neutral squares. \`decision\` and \`question\` share the same orange dot (see the
-QUESTION-pill note above), so a push notification alone can't tell them apart —
-only the in-app wordmark pill (ANSWER/DECISION/PROBLEM/REPORT; QUESTION has none
-yet) or the message body itself distinguishes them. The tag word is not in the
-badge (any text after the dots is your \`--title\`/body). In-app, premium
-clients still see the full wordmark pill for the four tags that have one.
+(🔵 answer / 🟠 decision / 🔴 problem / 🟢 report), the rest are neutral
+squares. The tag word is not in the badge (any text after the dots is your
+\`--title\`/body). In-app, premium clients see the full wordmark pill
+(ANSWER/DECISION/PROBLEM/REPORT).
 
 ## Subagent identification (\`--subagent <label>\`) — REQUIRED when dispatching subagents
 The header shows the sender as \`✳️ [window] [subagent]\`. The MAIN/orchestrator agent
@@ -233,7 +233,7 @@ Always use \`tg\`, never direct curl to the Telegram API. tmux only.
 const SKILL_BLURB =
   '`tg` — send Telegram messages/files/reports: `tg "msg"`, ' +
   '`tg --format html "..."`, `tg --file f.pdf "cap"`, `tg --photo p.png`. ' +
-  'Label messages with `--tag <answer|decision|problem|question|report>` ' +
+  'Label messages with `--tag <answer|decision|problem|report>` ' +
   '(lowercase english only) and set an explicit header line with ' +
   '`--title "..."` (the body is never pulled up). ' +
   'Reply UNDER a specific inbound message with `--reply-to <message_id>` (the id ' +

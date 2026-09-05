@@ -33,17 +33,21 @@ test('writes SKILL.md, a blurb file, and the claude-skills symlink', () => {
   expect(existsSync(join(TH, '.claude/skills/tg'))).toBe(true);
 });
 
-test('SKILL.md and the blurb advertise --tag / --title and the five canonical tags', () => {
+test('SKILL.md and the blurb advertise --tag / --title and the four canonical tags', () => {
   installSkill();
   const skill = readFileSync(join(TH, '.agents/skills/tg/SKILL.md'), 'utf8');
   // Flags are documented.
   expect(skill).toContain('--tag');
   expect(skill).toContain('--title');
-  // The five lowercase-english canonical tags (the ONLY accepted form). No
-  // Cyrillic aliases anymore.
-  for (const tag of ['answer', 'decision', 'problem', 'question', 'report']) {
+  // The four lowercase-english canonical tags (the ONLY accepted form). No
+  // Cyrillic aliases anymore, and no `question` (tg-cli#301): the skill must
+  // never teach a tag tg refuses — it may only mention it as the removed word.
+  for (const tag of ['answer', 'decision', 'problem', 'report']) {
     expect(skill).toContain(tag);
   }
+  expect(skill).not.toContain('QUESTION');
+  expect(skill).not.toContain('| question |');
+  expect(skill).toContain('an open question for the user IS a decision request');
   for (const cyrillic of ['ОТВЕТ', 'РЕШЕНИЕ', 'ПРОБЛЕМА', 'ОТЧЁТ']) {
     expect(skill).not.toContain(`--tag ${cyrillic}`);
   }

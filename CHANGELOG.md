@@ -3,7 +3,7 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.45.0
+## 1.45.1
 
 **Feature: `/spend` and `/daily` bot commands + a scheduled weekly/monthly usage push (tg-cli#290).**
 
@@ -36,6 +36,34 @@ semantic versioning.
 - The scheduled push escapes the report at the HTML boundary (`rig usage` really emits a
   `<synthetic>` model name); `rig usage --json` periods are shape-validated before formatting, and
   an all-unpriced period renders as "unpriced" instead of "~$0.00".
+
+## 1.45.0
+
+**`--tag question` is removed — only the standard tags stay (`answer`, `decision`, `problem`, `report`); an open question IS a decision request (tg-cli#301).**
+
+Alex (2026-09-05): agents use one typed vocabulary. There is no separate "question"
+message type — an open question for him is a decision he has to make, so it goes out as
+`--tag decision` in the decision-request format (options, pros/cons, a recommendation).
+Two names for the same escalation split the format rules and let agents pick the softer one.
+
+- **`--tag question` is refused** at parse time (non-zero exit, nothing sent) with a one-line
+  redirect instead of the generic off-list error:
+
+  ```
+  --tag question was removed: an open question is a decision request — use --tag decision in the decision-request format
+  ```
+
+  It is refused even when the body is a fully compliant decision request — the problem is the
+  vocabulary, not the format. `--dry-run` refuses it the same way.
+- `--help`, `tg help format`, and the installed `tg` skill / blurb list exactly
+  `answer` / `decision` / `problem` / `report`; `decision` is now the single ESCALATION tag
+  behind the deny-by-default decision-request gate (`ESCALATION_TAGS`).
+- The QUESTION wordmark/emoji branding (`TAG_PILL_IDS` / `TAG_PILL_DOT` / `TAG_PILL_FALLBACK`
+  entries, the orange `🟠 QUESTION` fallback badge) is deleted; the header renderer is
+  unchanged (the placeholder-id guard stays, it is generic).
+- Companion change in agent-tools (#524): the `decision-request-format` hook's escalation tag
+  set becomes `decision` + `problem`, it blocks a `tg --tag question` command with the same
+  hint, and the `decision-request-discipline` skill no longer mentions `question`.
 
 ## 1.44.5
 

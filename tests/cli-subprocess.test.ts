@@ -141,7 +141,7 @@ test('--tag with an uppercase tag is rejected (lowercase-english only) before th
   expect(proc.exitCode).not.toBe(0);
   expect(err).toContain("invalid --tag 'ANSWER'");
   expect(err).toContain('lowercase english');
-  expect(err).toContain('Use one of: answer, decision, problem, question, report');
+  expect(err).toContain('Use one of: answer, decision, problem, report');
   expect(err).not.toContain('TG_BOT_TOKEN');
 });
 
@@ -208,12 +208,17 @@ test('deny-by-default: --tag decision with plain prose hard-blocks (exit 1) befo
   expect(err).not.toContain('TG_BOT_TOKEN');
 });
 
-test('--tag question with plain prose also hard-blocks by default, naming "question"', () => {
+test('--tag question is REFUSED with the one-line decision hint, before the credential gate (tg-cli#301)', () => {
   const proc = run(['--tag', 'question', 'which option?']);
   const err = proc.stderr.toString();
-  expect(proc.exitCode).toBe(1);
-  expect(err).toContain('--tag question is an escalation');
-  expect(err).toContain('Blocked:');
+  expect(proc.exitCode).not.toBe(0);
+  expect(err).toContain(
+    '--tag question was removed: an open question is a decision request — ' +
+      'use --tag decision in the decision-request format',
+  );
+  // It is a redirect, not the escalation-format checklist and not the generic off-list error.
+  expect(err).not.toContain('is an escalation');
+  expect(err).not.toContain('Use one of:');
   expect(err).not.toContain('TG_BOT_TOKEN');
 });
 

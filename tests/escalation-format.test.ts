@@ -1,6 +1,6 @@
 // Unit tests for the pure decision-request-format validator
 // (features/cli/escalation-format.ts) — the machine-checkable half of the
-// decision-request-discipline skill enforced for --tag decision|question.
+// decision-request-discipline skill enforced for --tag decision.
 import { expect, test } from 'bun:test';
 import { validateEscalationFormat } from '../features/cli/escalation-format';
 

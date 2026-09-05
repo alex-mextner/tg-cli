@@ -92,6 +92,25 @@ import {
   enumerateWorktreeRoots,
   runGitReal,
 } from "./features/auto-attach/worktree"
+import { isEscalationTag } from "./features/render/tag"
+
+// Shared verdict for BOTH escalation-format checks in this file (the parse-time
+// warning attached by parseArgs, and the --table final-body check): print the
+// checklist, then either hard-stop (DEFAULT, deny-by-default) or — under the
+// one documented escape ESCALATION_GATE_ENFORCE=0 — downgrade to advisory and
+// let the send proceed.
+function enforceEscalationGate(checklist: string, tag: string, env: NodeJS.ProcessEnv): void {
+  console.error(checklist)
+  if (escalationGateEnforced(env)) {
+    console.error(
+      `Blocked: --tag ${tag} must follow the decision-request format ` +
+        "(deny-by-default). Fix the sections listed above and resend. " +
+        "Genuine non-escalation / urgent edge case only: ESCALATION_GATE_ENFORCE=0 downgrades this to a warning.",
+    )
+    process.exit(1)
+  }
+  console.error("Advisory only (ESCALATION_GATE_ENFORCE=0) — sending anyway.")
+}
 
 // Re-export VERSION from its module so `import { VERSION } from "../tg"` keeps
 // working (tests/ergonomics.test.ts) after the version helpers moved to
@@ -154,9 +173,11 @@ Options:
                          answer    🔵 ANSWER    answering a question
                          decision  🟠 DECISION  a decision to confirm
                          problem   🔴 PROBLEM   a blocker / problem
-                         question  🟠 QUESTION  an open question needing input
                          report    🟢 REPORT    a status / result report
-                       decision/question are ESCALATIONS: they REQUIRE the
+                       An open question for the recipient IS a decision
+                       request: send it as --tag decision (the former
+                       --tag question is refused with that hint).
+                       decision is an ESCALATION: it REQUIRES the
                        decision-request format (deny-by-default) — options as a
                        real table/list with pros/cons, a recommendation, context,
                        a file:line "where to look", and readable structure
@@ -198,7 +219,7 @@ Options:
                        (escalation-format gate, cjk-guard, table conversion) and
                        print the outcome — NO network call, NO credentials
                        required, NOTHING is sent. Use this to iterate against
-                       the strict --tag decision|question format instead of
+                       the strict --tag decision format instead of
                        testing it with real sends (a real send that happens to
                        pass structurally still delivers to the live chat, even
                        if the content is a placeholder draft).
@@ -816,7 +837,7 @@ if (import.meta.main) {
   }
 
   // --- Escalation-format gate (DENY-BY-DEFAULT) --------------------------
-  // parseArgs attaches `escalationWarning` when a --tag decision|question send
+  // parseArgs attaches `escalationWarning` when a --tag decision send
   // does not follow the decision-request format. By DEFAULT this is a hard stop
   // (exit 1): the escalation format is REQUIRED. ESCALATION_GATE_ENFORCE=0 is the
   // one documented escape — it downgrades to advisory (warn + proceed). Placed
@@ -824,21 +845,12 @@ if (import.meta.main) {
   // so the block path is observable in a no-creds subprocess test). The --table
   // path bypasses THIS parse-time gate (stdin unseen) and is validated on the
   // final rendered body further below. See args.ts for the validator wiring.
-  if (parsed.action === "send" && parsed.escalationWarning) {
-    console.error(parsed.escalationWarning)
-    if (escalationGateEnforced(env)) {
-      // Enforce mode (DEFAULT): a --tag decision|question send that does not
-      // follow the decision-request format is a hard error. The checklist of
-      // what's missing was already printed above.
-      console.error(
-        "Blocked: --tag decision|question must follow the decision-request format " +
-          "(deny-by-default). Fix the sections listed above and resend. " +
-          "Genuine non-escalation / urgent edge case only: ESCALATION_GATE_ENFORCE=0 downgrades this to a warning.",
-      )
-      process.exit(1)
-    }
-    // Downgraded to advisory (ESCALATION_GATE_ENFORCE=0) — the send proceeds.
-    console.error("Advisory only (ESCALATION_GATE_ENFORCE=0) — sending anyway.")
+  // `escalationWarning` is only ever attached by the escalation-format gate,
+  // which TAG_GATES registers for ESCALATION_TAGS entries alone — so `tag` is
+  // always set here; the narrowing guard keeps that explicit rather than
+  // fabricating a tag word for the Blocked line.
+  if (parsed.action === "send" && parsed.escalationWarning && parsed.tag !== undefined) {
+    enforceEscalationGate(parsed.escalationWarning, parsed.tag, env)
   }
 
   const BOT_TOKEN = env.TG_BOT_TOKEN
@@ -994,20 +1006,9 @@ if (import.meta.main) {
   // So for an ESCALATION sent via --table, validate the FINAL rendered body here
   // (a boxed table alone is not a decision-request: it still lacks a
   // recommendation, context, a file ref, and the section structure).
-  if ((tag === "decision" || tag === "question") && table) {
+  if (tag !== undefined && isEscalationTag(tag) && table) {
     const fin = validateEscalationFormat(caption)
-    if (fin.missing.length > 0) {
-      console.error(escalationFormatMessage(tag, fin.missing))
-      if (escalationGateEnforced(env)) {
-        console.error(
-          "Blocked: --tag decision|question must follow the decision-request format " +
-            "(deny-by-default). Fix the sections listed above and resend. " +
-            "Genuine non-escalation / urgent edge case only: ESCALATION_GATE_ENFORCE=0 downgrades this to a warning.",
-        )
-        process.exit(1)
-      }
-      console.error("Advisory only (ESCALATION_GATE_ENFORCE=0) — sending anyway.")
-    }
+    if (fin.missing.length > 0) enforceEscalationGate(escalationFormatMessage(tag, fin.missing), tag, env)
   }
 
   // --- dry-run short-circuit --------------------------------------------
