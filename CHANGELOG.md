@@ -3,6 +3,13 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.45.3
+
+**Feature: delegate codex hooks to rig (scoped) + gate the codex hook-trust bypass.** Codex hook
+provisioning is now delegated to rig within a scoped boundary, and the codex hook-trust bypass is
+gated behind the explicit `NO_RIG` sentinel (aligned with #282) instead of being implicit, with the
+hook-trust flag placed before the prompt separator.
+
 ## 1.45.2
 
 **Fix: bare `harness-event` StopFailure alerts mislabel the agent with the tmux window name, not the live harness (#263).**

@@ -92,6 +92,8 @@ test('model catalog helpers: harness labels, harness filters, and task argv', ()
   expect(spawnArgvWithTask('claude-opus', '/x', '')).toEqual(['claude', '--model', 'opus']);
   expect(spawnArgvWithTask('claude-opus', '/x', 'do it')).toEqual(['claude', '--model', 'opus', '--', 'do it']);
   expect(spawnArgvWithTask('claude-opus', '/x', '--force --all')).toEqual(['claude', '--model', 'opus', '--', '--force --all']);
+  // models.ts is PURE: the codex hook-trust bypass is added at spawn time (gated on rig-managed
+  // hooks), not baked into the catalog argv — see tests/ctl-models-codex-hook-trust.test.ts.
   expect(spawnArgvWithTask('codex-gpt-5.5', '/x', 'do it')).toEqual(['codex', '--model', 'gpt-5.5', '--', 'do it']);
   expect(spawnArgvWithTask('codex-gpt-5.5', '/x', '; rm -rf /')).toEqual(['codex', '--model', 'gpt-5.5', '--', '; rm -rf /']);
   expect(spawnArgvWithTask('opencode-zai-glm-5.2', '/x', 'do it')).toEqual(['opencode', '--model', 'zai/glm-5.2', '--prompt=do it']);

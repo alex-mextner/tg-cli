@@ -175,6 +175,7 @@ import {
   withClaudeStatusLineTelemetry,
   withCodexUsageHook,
 } from "./features/tg-ctl/hook-install"
+import { applyCodexHookTrustBypass, detectRig, NO_RIG_EXIT, runRigDelegate } from "./features/tg-ctl/rig-delegate"
 import { normalizeHookRequests, type HookEnv } from "./features/tg-ctl/hook-normalize"
 import { retryFetch, type RetryInfo } from "./features/tg-ctl/retry"
 import {
@@ -280,6 +281,7 @@ export const USAGE = `Usage:
                          # remove the scheduled usage-report launchd job
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
   tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude/Codex usage telemetry
+                         #   (codex: delegates to rig when present — rig owns ~/.codex hooks)
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
   tg-ctl harness-event [--dry-run] [--pane %N] [--window-name NAME] [--agent NAME] [--language LANG]
                         [--reason MATCHER]
@@ -1360,10 +1362,110 @@ function ensureClaudeHooksOnStartup(ctx: Ctx): void {
   }
 }
 
+// Direct fallback writer: merges the Codex Stop usage-telemetry hook straight into
+// ~/.codex/hooks.json (backing the file up first). Used when rig is absent, and as the
+// telemetry-preservation safety net when rig is present but hasn't provisioned the hook itself
+// yet — see installCodexUsageTelemetry below.
+function installCodexUsageTelemetryDirect(codexHooksPath: string, codexRaw: string | null, codexExisting: Record<string, unknown>): void {
+  const codexUsage = withCodexUsageHook(codexExisting, CODEX_USAGE_HOOK_CMD)
+  if (codexUsage.changed) {
+    if (codexRaw) {
+      try {
+        writeFileSync(`${codexHooksPath}.bak`, codexRaw)
+      } catch {}
+    }
+    mkdirSync(dirname(codexHooksPath), { recursive: true })
+    writeFileSync(codexHooksPath, `${JSON.stringify(codexUsage.settings, null, 2)}\n`)
+    console.log(`tg-ctl: installed Codex Stop usage telemetry collector → ${codexHooksPath}` + (codexRaw ? ` (backup: ${codexHooksPath}.bak)` : ""))
+  } else {
+    console.log("tg-ctl: Codex Stop usage telemetry collector already installed — nothing to do.")
+  }
+}
+
+// Rig-aware Codex hook provisioning (tg#8672). When rig is present it owns the codex hook
+// bridge (writes ~/.codex/config.toml), so writing tg-ctl's own hook straight into
+// ~/.codex/hooks.json makes codex warn about loading hooks from both files. Delegate to
+// `rig apply` first; rig does NOT yet fold the usage-telemetry Stop hook into its bridge, so we
+// always re-check afterwards and only skip the direct hooks.json write when the hook is actually
+// found installed — telemetry must never be silently lost while rig catches up (see
+// features/tg-ctl/rig-delegate.ts for the detection/delegation mechanics and the full caveat).
+// Returns the exit code the caller should propagate: 0 on success (rig owns it, or telemetry
+// written directly), or rig's non-zero exit when a PRESENT rig FAILS (never swallowed into a
+// fallback — the shared contract is that fallback is for ABSENT rig only).
+function installCodexUsageTelemetry(codexHooksPath: string, codexRaw: string | null, codexExisting: Record<string, unknown>): number {
+  const rig = detectRig(process.env)
+  if (!rig.present) {
+    // rig absent (or its shared helper not installed) — the direct write is the fallback.
+    installCodexUsageTelemetryDirect(codexHooksPath, codexRaw, codexExisting)
+    return 0
+  }
+  // Scope the reconcile to `--only harness` — the codex hook bridge is provisioned under the
+  // harness layer, so a bare `rig apply` (which would reconcile skills/CI/GitHub/tmux/… too) is
+  // both too broad and surprising for an `install-hooks` command.
+  const delegated = runRigDelegate(["apply", "--only", "harness"], process.env, process.cwd())
+  if (!delegated.ran) {
+    // rig binary present but the shared helper couldn't run (e.g. agent-tools not fully
+    // deployed) — the delegation never happened, so honor the request via the direct write.
+    console.log(`tg-ctl: rig detected (${rig.rigPath}) but the delegation helper could not run — writing the telemetry hook directly.`)
+    installCodexUsageTelemetryDirect(codexHooksPath, codexRaw, codexExisting)
+    return 0
+  }
+  if (delegated.exitCode === NO_RIG_EXIT) {
+    // The shared helper reports rig ABSENT via its sentinel (agent-tools#282: 97, moved off 3 so
+    // it can't be confused with rig's own EXIT_DRIFT=3). detectRig said present, but rig went
+    // away between detect and delegate (uninstalled mid-flight) — this is the "rig absent" case,
+    // NOT a rig failure, so honor the request with the direct write. Branch on the sentinel
+    // EXACTLY: a real rig failure (1/2/3/…) must fall through to the propagate path below.
+    // Checked BEFORE the "delegated … (exit N)" log so the absent path never claims provisioning
+    // happened.
+    console.log(`tg-ctl: rig reported absent (sentinel ${NO_RIG_EXIT}) at delegation time — writing the telemetry hook directly.`)
+    installCodexUsageTelemetryDirect(codexHooksPath, codexRaw, codexExisting)
+    return 0
+  }
+  console.log(`tg-ctl: rig detected (${rig.rigPath}) — delegated codex hook provisioning via \`rig apply --only harness\` (exit ${delegated.exitCode})`)
+  if (delegated.exitCode !== 0) {
+    // A PRESENT rig that FAILS is a real failure — surface it, do NOT fall back to a direct
+    // write (that would recreate the dual-source we set out to remove). Propagate the exit code.
+    if (delegated.stderr.trim()) {
+      console.error(`tg-ctl: rig apply failed: ${delegated.stderr.trim().split("\n").slice(0, 3).join(" | ")}`)
+    }
+    console.error("tg-ctl: rig apply failed — not writing codex hooks directly. Fix rig and re-run `tg-ctl install-hooks`.")
+    return delegated.exitCode ?? 1
+  }
+  // rig succeeded. Check the AUTHORITATIVE artifact rig actually writes (~/.codex/config.toml),
+  // re-read from disk — NOT the pre-delegation snapshot — to see whether rig now provisions the
+  // usage-telemetry Stop hook itself.
+  const codexConfigToml = readFileOrNull(join(dirname(codexHooksPath), "config.toml"))
+  if (codexConfigToml && codexConfigToml.includes(CODEX_USAGE_HOOK_CMD)) {
+    console.log("tg-ctl: rig now provisions the codex usage-telemetry Stop hook (~/.codex/config.toml) — skipping the direct hooks.json write.")
+    return 0
+  }
+  // rig does not fold in the telemetry hook yet — write it directly so telemetry is not lost.
+  // Re-read hooks.json FRESH (rig apply may have touched ~/.codex) rather than reusing the stale
+  // pre-delegation snapshot.
+  const freshRaw = readFileOrNull(codexHooksPath)
+  let freshExisting: Record<string, unknown> = {}
+  if (freshRaw) {
+    try {
+      const parsed = JSON.parse(freshRaw)
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) freshExisting = parsed as Record<string, unknown>
+    } catch {
+      console.error(`tg-ctl: ${codexHooksPath} is not valid JSON after rig apply — fix or move it aside, then re-run`)
+      return 1
+    }
+  }
+  console.log(
+    "tg-ctl: rig does not yet provision the codex usage-telemetry Stop hook — writing it directly so telemetry is not lost " +
+      "(may coexist with rig's ~/.codex/config.toml bridge until rig folds this hook in; tg#8672).",
+  )
+  installCodexUsageTelemetryDirect(codexHooksPath, freshRaw, freshExisting)
+  return 0
+}
+
 // Idempotently install the q→buttons agent-question hooks into Claude Code's
 // user settings (backing the file up first), then print guidance for the other
 // harnesses. Pure JSON merge lives in features/tg-ctl/hook-install.ts.
-function installHooks(home: string): void {
+function installHooks(home: string): number {
   const settingsPath = join(home, ".claude", "settings.json")
   const raw = readFileOrNull(settingsPath)
   let existing: Record<string, unknown> = {}
@@ -1433,19 +1535,7 @@ function installHooks(home: string): void {
   if (!changed && !shadowChanged) {
     console.log("tg-ctl: Claude Code q→buttons + StopFailure + statusLine usage telemetry already installed — nothing to do.")
   }
-  const codexUsage = withCodexUsageHook(codexExisting, CODEX_USAGE_HOOK_CMD)
-  if (codexUsage.changed) {
-    if (codexRaw) {
-      try {
-        writeFileSync(`${codexHooksPath}.bak`, codexRaw)
-      } catch {}
-    }
-    mkdirSync(dirname(codexHooksPath), { recursive: true })
-    writeFileSync(codexHooksPath, `${JSON.stringify(codexUsage.settings, null, 2)}\n`)
-    console.log(`tg-ctl: installed Codex Stop usage telemetry collector → ${codexHooksPath}` + (codexRaw ? ` (backup: ${codexHooksPath}.bak)` : ""))
-  } else {
-    console.log("tg-ctl: Codex Stop usage telemetry collector already installed — nothing to do.")
-  }
+  const codexExit = installCodexUsageTelemetry(codexHooksPath, codexRaw, codexExisting)
   console.log("")
   console.log("Codex: trust the `tg-ctl codex-usage-hook` Stop hook via /hooks so quota telemetry can flow; add a PermissionRequest hook running `tg-ctl ask --agent codex` if you also want q→buttons.")
   console.log("opencode: native — the bot subscribes to question/permission SSE events; no hook file needed.")
@@ -1462,6 +1552,7 @@ function installHooks(home: string): void {
         `To stop that, delete ${claudeHooksSentinelPath(configDir)}.`,
     )
   } catch {}
+  return codexExit
 }
 
 // --- start: registration snapshot + detached daemon spawn, then exit ---
@@ -6059,8 +6150,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     model: string,
     task = "",
   ): { ok: true; paneId: string } | { ok: false; error: string } => {
-    const argv = spawnArgvWithTask(model, path, task)
-    if (!argv) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
+    const argvBase = spawnArgvWithTask(model, path, task)
+    if (!argvBase) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
+    // tg#8708 (option a): add codex --dangerously-bypass-hook-trust ONLY when codex hooks are
+    // rig-managed (rig vouches for them); never bypass a user's own untrusted hooks.
+    const argv = applyCodexHookTrustBypass(argvBase, findModel(model)?.kind, process.env)
     try {
       // sessionForSpawn() runs snapshot() (tmux list-panes / ps), which CAN throw if a binary is
       // missing — it MUST be inside this try, else the throw escapes the local guard, past
@@ -6754,8 +6848,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     task: string,
     spawnToken: string,
   ): { ok: true; paneId: string } | { ok: false; error: string } => {
-    const argv = spawnArgvWithTask(model, path, task)
-    if (!argv) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
+    const argvBase = spawnArgvWithTask(model, path, task)
+    if (!argvBase) return { ok: false, error: `unknown model \`${model}\` — pick a model again` }
+    // tg#8708 (option a): add codex --dangerously-bypass-hook-trust ONLY when codex hooks are
+    // rig-managed (rig vouches for them); never bypass a user's own untrusted hooks.
+    const argv = applyCodexHookTrustBypass(argvBase, findModel(model)?.kind, process.env)
     try {
       const session = sessionForSpawn()
       const tmuxArgv = [
@@ -8435,8 +8532,7 @@ if (import.meta.main) {
   const home = process.env.HOME ?? "~"
   // install-hooks edits ~/.claude/settings.json only — no bot token needed.
   if (cmd === "install-hooks") {
-    installHooks(home)
-    process.exit(0)
+    process.exit(installHooks(home))
   }
   // TG_CTL_CONFIG_DIR exists so tests can point a spawned daemon at a tmpdir. Resolve it to an
   // ABSOLUTE path: `enable` pins this dir into the launchd/systemd unit, and the OS launches the

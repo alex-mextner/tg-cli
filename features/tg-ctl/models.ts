@@ -25,6 +25,18 @@ export interface ModelEntry {
 
 export const SPAWN_HARNESSES: readonly SpawnHarness[] = ['claude', 'codex', 'opencode'] as const;
 
+// tg#8708 (option a): every codex session spawned from `/new` runs rig-managed codex hooks
+// (~/.codex/config.toml, provisioned by `rig apply` — see features/tg-ctl/rig-delegate.ts) that
+// codex otherwise refuses to run because they are "untrusted" for THIS invocation (codex's
+// per-invocation hook-trust gate, distinct from the harness-wide sandbox approval prompts). rig
+// already vouches for the hooks it writes, so bypass codex's own trust gate at spawn time rather
+// than have every autonomous codex session silently skip its hooks. This module is PURE, so the
+// flag is NOT baked into the argv here — it is inserted at spawn time (as an OPTION, ahead of any
+// `--` prompt separator), and ONLY when codex hooks are actually rig-managed (see
+// applyCodexHookTrustBypass in features/tg-ctl/rig-delegate.ts):
+// bypassing codex's trust gate is only justified for hooks rig vouches for, never for a user's
+// own untrusted hooks on a machine without rig.
+
 export function harnessLabel(harness: SpawnHarness): string {
   if (harness === 'claude') return 'Claude';
   if (harness === 'codex') return 'Codex';
