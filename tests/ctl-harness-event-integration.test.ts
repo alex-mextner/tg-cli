@@ -1471,3 +1471,105 @@ test('Codex usage Stop hook relies on existing warning dedupe for repeated sampl
   expect(sentMessages).toHaveLength(1);
   expect(sentMessages[0].text).toContain('92%');
 });
+
+// tg-cli#263: the bare installed StopFailure hook (`tg-ctl harness-event`, no `--agent`) must label
+// the notification with the LIVE harness running in the pane, not the tmux window's (possibly
+// stale/unrelated) name. A window named "codex" that currently hosts a `claude` process — e.g. a
+// pane spawned once for one harness and later reused for another without renaming the window — must
+// still report "claude" in the Telegram message, since that's the process that actually failed.
+test('bare harness-event (no --agent) labels the notification with the live pane agent, not the tmux window name', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const fakeBinDir = mkdtempSync(join(tmpdir(), 'tgctl-harness-fakebin-'));
+  writeFileSync(
+    join(fakeBinDir, 'tmux'),
+    `#!/bin/sh
+sub="$1"; shift
+case "$sub" in
+  list-panes) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '%9' '5301' 'claude' 'codex' '' '/tmp' ;;
+  *) : ;;
+esac
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(fakeBinDir, 'ps'),
+    `#!/bin/sh
+printf '%s %s %s\\n' '5301' '1' 'claude'
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  const payload = JSON.stringify({
+    session_id: 'agent-label-1',
+    hook_event_name: 'StopFailure',
+    error_type: 'rate_limit',
+    error: 'You have hit your usage limit. Try again later.',
+  });
+  try {
+    const { code, stdout } = await runHarnessEvent(['--dry-run', '--pane', '%9'], payload, {
+      PATH: `${fakeBinDir}:/usr/bin:/bin`,
+    });
+    expect(code).toBe(0);
+    expect(stdout).toContain('<b>claude</b>');
+    expect(stdout).not.toContain('<b>codex</b>');
+    // The payload text also matches the codex hard-limit pattern (CODEX_HARD_USAGE_LIMIT_RE),
+    // so pre-fix this claude session would ALSO have wrongly received the codex-only diagnostic
+    // block gated on `ev.agent === 'codex'` (limits.ts buildCodexHardLimitDiagnostic).
+    expect(stdout).not.toContain('Codex usage telemetry');
+  } finally {
+    rmSync(fakeBinDir, { recursive: true, force: true });
+  }
+});
+
+// tg-cli#263 follow-up: the fix isn't just cosmetic — `ev.agent` also gates codex-specific
+// behavior (extractFailure's `allowCodexTryAgainReset`, limits.ts:567), so a pane whose LIVE
+// process is codex but whose window is named something else must now get the codex "try again
+// at <time>" reset parsed (and the resulting auto-continue button), not just the right label.
+// Before the fix this reset silently went unscheduled for any codex session in a non-"codex"-
+// named window (the common case — windows are project-named, not harness-named).
+test('bare harness-event (no --agent) applies codex try-again reset parsing for a live codex pane in a non-codex-named window', async () => {
+  sentMessages.length = 0;
+  reactions.length = 0;
+  const fakeBinDir = mkdtempSync(join(tmpdir(), 'tgctl-harness-fakebin-'));
+  writeFileSync(
+    join(fakeBinDir, 'tmux'),
+    `#!/bin/sh
+sub="$1"; shift
+case "$sub" in
+  list-panes) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' 'main' '0' '%9' '5302' 'codex' 'project-x' '' '/tmp' ;;
+  *) : ;;
+esac
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  writeFileSync(
+    join(fakeBinDir, 'ps'),
+    `#!/bin/sh
+printf '%s %s %s\\n' '5302' '1' 'codex'
+exit 0
+`,
+    { mode: 0o755 },
+  );
+  const payload = JSON.stringify({
+    session_id: 'agent-label-2',
+    hook_event_name: 'StopFailure',
+    error_type: 'rate_limit',
+    error: 'You have hit your usage limit. Try again at 11:59pm.',
+  });
+  try {
+    const { code, stdout } = await runHarnessEvent(['--dry-run', '--pane', '%9'], payload, {
+      PATH: `${fakeBinDir}:/usr/bin:/bin`,
+    });
+    expect(code).toBe(0);
+    expect(stdout).toContain('<b>codex</b>');
+    // The parsed try-again reset is what surfaces the auto-continue button — proof
+    // `allowCodexTryAgainReset` actually fired for this pane, not just that the label is right.
+    expect(stdout).toContain('[button]');
+    expect(stdout).not.toContain('Reset time unknown');
+  } finally {
+    rmSync(fakeBinDir, { recursive: true, force: true });
+  }
+});

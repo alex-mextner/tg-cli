@@ -10,7 +10,7 @@
 // under ~/.agents/hooks/tg/ at this file.
 //
 // WARN MODE ONLY (CTO-approved design, 2026-07): this hook NEVER blocks. For
-// --tag decision|question it checks whether the message body already
+// --tag decision it checks whether the message body already
 // contains a literal table (the standard escalation form: options / tradeoffs
 // / recommendation, so the recipient can answer without re-deriving the
 // question) and, if not, prints an actionable, copy-pasteable recommendation
@@ -34,12 +34,12 @@
 //       "body_sha256":...,"gate_version":...}
 //   - stderr: human-readable warning (the runner surfaces it unconditionally,
 //       whether or not the hook errors — see runner.ts)
-//   - exit code: ALWAYS 0 in this version (warn mode). A non-decision/question
+//   - exit code: ALWAYS 0 in this version (warn mode). A non-decision
 //     tag, or a body that already has a table, is a silent allow (no stderr).
 
 import { createHash } from 'crypto';
 import { detectTableKind } from '../../render/table';
-import { ESCALATION_TAGS } from '../../render/tag';
+import { isEscalationTag } from '../../render/tag';
 import { HOOK_API, type HookEvent, type HookOutput } from '../types';
 
 const GATE_VERSION = '1';
@@ -47,9 +47,6 @@ const GATE_VERSION = '1';
 // reserved for the future block-mode + RIG_HATCH_REQUEST-style bypass path
 // (see the TODO above); there is nothing to bypass while every send is
 // already allowed.
-// Same list features/cli/args.ts's TAG_GATES builds from — a single source
-// of truth so the two gates can never disagree on which tags are escalations.
-const GATED_TAGS = new Set<string>(ESCALATION_TAGS);
 
 function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -86,7 +83,7 @@ async function main(): Promise<number> {
   const body = typeof event.args?.body === 'string' ? event.args.body : '';
   const bodySha256 = createHash('sha256').update(body, 'utf8').digest('hex');
 
-  if (!GATED_TAGS.has(tag)) {
+  if (!isEscalationTag(tag)) {
     // Not an escalation tag — nothing for this gate to check.
     emit({ decision: 'allow', gate_version: GATE_VERSION });
     return 0;

@@ -778,6 +778,36 @@ test('§11 d2: /limit in a bound topic → daemon-intercepted with source thread
   expect(r.actions[0]).toMatchObject({ kind: 'limit-status', agent: 'codex', threadId: 50 });
 });
 
+test('§11 d2: /daily in a bound topic → daemon-intercepted with source thread id', () => {
+  const r = stepUpdates(
+    [upd(28, { text: '/daily', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]).toMatchObject({ kind: 'daily-report', threadId: 50 });
+});
+
+// Named /spend, NOT /usage/cost/stats — see ctl-updates.test.ts for the full reserved-set
+// rationale (tg-cli#290 review finding).
+test('§11 d2: /spend in a bound topic → daemon-intercepted with source thread id', () => {
+  const r = stepUpdates(
+    [upd(29, { text: '/spend week', message_thread_id: 50, is_topic_message: true })],
+    makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+  );
+  expect(r.actions[0]).toMatchObject({ kind: 'usage-report', period: 'week', threadId: 50 });
+});
+
+// The whole reserved set (/usage, /cost, /stats — see ctl-updates.test.ts) must reach the
+// topic's agent pane VERBATIM, not be daemon-intercepted.
+for (const [idx, reserved] of ['/usage', '/cost', '/stats'].entries()) {
+  test(`§11 d2: ${reserved} in a bound topic passes through to the agent (NOT intercepted)`, () => {
+    const r = stepUpdates(
+      [upd(30 + idx, { text: reserved, message_thread_id: 50, is_topic_message: true })],
+      makeOpts({ topicsEnabled: true, topicStatusOf: () => 'bound' }),
+    );
+    expect(r.actions[0]).toMatchObject({ kind: 'topic-route', injectText: reserved, threadId: 50 });
+  });
+}
+
 // Deferral 1: prose reply in a bound topic gets the ↩ tg#<id> «…» quote-anchor.
 test('§11 d1: prose reply in a bound topic → topic-route with ↩ tg#<id> «…» quote-anchor', () => {
   const replyTo = { message_id: 42, date: 1_749_000_000, text: 'quoted text', chat: { id: CHAT_ID, type: 'supergroup' as const } };
