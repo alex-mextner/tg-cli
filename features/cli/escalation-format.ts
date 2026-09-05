@@ -1,8 +1,8 @@
-// --- Full escalation-format validator (--tag decision|question) ---
+// --- Full escalation-format validator (--tag decision) ---
 //
 // WHAT THIS IS
 //   The machine-checkable half of the `decision-request-discipline` skill. A
-//   `--tag decision` / `--tag question` send is an ESCALATION: it asks the human
+//   `--tag decision` send is an ESCALATION: it asks the human
 //   (CTO) to choose. The skill mandates a self-contained request the human can
 //   answer in ~30s WITHOUT opening the repo — Context, Options with real
 //   pros/cons, a Recommendation, and "where to look" (a file:line reference),
@@ -118,7 +118,7 @@ function hasContextProse(body: string): boolean {
 }
 
 /**
- * Validate a decision/question body against the decision-request-discipline
+ * Validate a decision body against the decision-request-discipline
  * format. Returns `ok:true` with an empty `missing` when every required section
  * is present, else `ok:false` and the labels of what's missing (skill order).
  */
@@ -171,7 +171,7 @@ export function validateEscalationFormat(body: string): EscalationFormatResult {
   return { ok: missing.length === 0, missing };
 }
 
-// The copy-pasteable guidance appended when a decision/question send is
+// The copy-pasteable guidance appended when a decision send is
 // malformed. Shared by the parse-time gate and the pre-send-text hook so the two
 // never drift.
 export function escalationFormatMessage(tag: string, missing: string[]): string {
