@@ -264,18 +264,14 @@ test('buildPrefix --tag (lowercase english) resolves to the canonical fallback',
   expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 DECISION\n');
 });
 
-// QUESTION has no uploaded pill asset (TAG_PILL_IDS.QUESTION is PLACEHOLDER),
-// unlike ANSWER/DECISION/PROBLEM/REPORT which render a real <tg-emoji> pill for
-// premium clients. This is DELIBERATE (review finding, see emoji.ts's comment
-// on TAG_PILL_IDS.QUESTION): reusing DECISION's real pill would show a
-// DECISION-labeled wordmark to premium viewers while non-premium viewers see
-// the correct "QUESTION" text — a visible mismatch. Placeholder keeps EVERY
-// viewer on the same unicode fallback until a real pill is uploaded.
-test('buildPrefix --tag question ALWAYS renders the unicode fallback (no real pill yet, by design)', () => {
+// The QUESTION tag was removed (tg-cli#301): no wordmark, no orange-question
+// badge. The renderer stays total, so the word falls to the soft `[WORD]`
+// badge like any off-list input — the CLI refuses it long before this runs.
+test('buildPrefix --tag question renders NO branding — only the bare [QUESTION] badge (removed tag)', () => {
   const p = buildPrefix({ aiEmoji: '✳️', model: 'no-brand', tmuxWindow: 'tg-cli', tag: 'question' });
-  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] 🟠 QUESTION\n');
+  expect(p.plain).toBe('✳️ [𝘁𝗴-𝗰𝗹𝗶] [QUESTION]\n');
+  expect(p.html).not.toContain('🟠');
   expect(p.html).not.toContain('<tg-emoji');
-  expect(p.html).not.toContain('PLACEHOLDER');
 });
 
 test('buildPrefix --tag (Russian alias) no longer resolves — renders the bare [WORD] badge', () => {

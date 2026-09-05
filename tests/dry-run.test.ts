@@ -4,7 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 // Regression coverage for the `--dry-run` flag (tg-cli issue: a subagent
-// iterating against the strict `--tag decision|question` escalation-format
+// iterating against the strict `--tag decision` escalation-format
 // gate had no way to test structural compliance except a REAL send. A
 // structurally-compliant draft — even one still carrying scaffold/placeholder
 // text like "foo bar baz test" / "Option A" pros "ok" cons "bad" / "foo.ts:1"
@@ -243,15 +243,17 @@ test('--dry-run with an attachment (--photo/--file) is a hard error, not a silen
   expect(stdout).not.toContain('tg --dry-run: OK');
 });
 
-test('--dry-run with --tag question and a compliant body: same OK path as decision', async () => {
+test('--dry-run with the removed --tag question is REFUSED even with a compliant body (tg-cli#301)', async () => {
   received = [];
   const home = makeHomeWithCreds();
-  const { exitCode, stdout } = await run(
+  const { exitCode, stdout, stderr } = await run(
     ['--dry-run', '--tag', 'question', '--format', 'html', COMPLIANT_BODY],
     { PATH: process.env.PATH ?? '', HOME: home, TG_API_BASE: `http://127.0.0.1:${server.port}` },
   );
-  expect(exitCode).toBe(0);
-  expect(stdout).toContain('tg --dry-run: OK');
+  expect(exitCode).not.toBe(0);
+  expect(stderr).toContain('--tag question was removed');
+  expect(stderr).toContain('use --tag decision');
+  expect(stdout).not.toContain('tg --dry-run: OK');
   expect(received).toHaveLength(0);
 });
 
