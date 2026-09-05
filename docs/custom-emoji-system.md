@@ -26,7 +26,7 @@ maps to a `custom_emoji_id` in a set owned by a bot.
 | Model | Emoji | Custom Emoji ID | Notes |
 |-------|-------|-----------------|-------|
 | HyperIDE | 🚁 | `5274191514178723918` | |
-| Claude | ✳️ | `5274170649227600531` | Also anthropic, devin, cognition, aider, continue |
+| Claude | ✳️ | `5274170649227600531` | Also anthropic, devin, cognition, aider, continue, omp |
 | Codex / OpenAI | 👐 | `5273797309195393626` | Also o3, o1, gpt4, gpt3, gpt |
 | Gemini | ♊️ | `5274254027427716477` | Also google |
 | DeepSeek | 🐳 | `5274018976752511967` | |
@@ -43,10 +43,12 @@ maps to a `custom_emoji_id` in a set owned by a bot.
 
 ## Alias system
 
-Multiple model names can share the same emoji ID. This is intentional — versions of the
-same model family share one icon:
+Multiple model names can share the same emoji ID. Versions of the same model family
+share one icon; agents without a dedicated icon in the set (aider, continue, devin,
+omp, …) share Claude's ✳️ as the neutral default — their Unicode fallback is still
+their own (omp → 🥧):
 
-- `claude`, `anthropic`, `devin`, `cognition`, `aider`, `continue` → Claude's ✳️
+- `claude`, `anthropic`, `devin`, `cognition`, `aider`, `continue`, `omp` → Claude's ✳️
 - `codex`, `openai`, `o3`, `o1`, `gpt4`, `gpt3`, `gpt` → OpenAI's 👐
 - `gemini`, `google` → Gemini's ♊️
 - `kimi`, `moonshot`, `kimi-k2p6-turbo`, `kimi-k1.5` → Kimi's 🌙
@@ -54,16 +56,37 @@ same model family share one icon:
 ## Agent / model detection
 
 `detectAiModel()` picks the icon for the agent sending the message. Resolution order
-(first match wins) — explicit signals MUST come before pgrep fallbacks:
+(first match wins) — LINEAGE-FIRST (#246): env vars are inheritable (an agent inside
+another agent's pane carries the outer agent's markers — omp exports `CLAUDECODE=1`
+via its pi heritage), so the process tree outranks env markers, and everything
+outranks the pgrep fallbacks:
 
 1. `TG_AI_MODEL` env — explicit override, always wins.
-2. **`CLAUDECODE` / `CLAUDE_CODE_ENTRYPOINT` env → `claude`.** Claude Code sets these in
-   the agent environment. This check is deliberately ahead of the pgrep block: a
-   background `ollama` daemon (common on macOS) matches `pgrep -x ollama` and otherwise
-   mislabels a Claude Code session as ollama. (Regression covered by tests.)
-3. `OPENCODE` env → read the model from `opencode debug config`.
-4. `CODEX` env → `codex`.
-5. pgrep fallbacks for `aider`, `cursor`, `windsurf`, `llama`, `ollama`, `opencode`.
+2. **Ancestor process walk** — the nearest recognizable agent that launched `tg`
+   (claude/codex/opencode/pi/aider/omp). An `opencode` ancestor is refined to the
+   session's actual model name via `opencode debug config` (timeout-guarded,
+   generic `opencode` as fallback).
+3. Env-marker fallbacks (detached spawns whose launcher is not in the tree), in the
+   pre-existing relative order: **`CLAUDECODE` / `CLAUDE_CODE_ENTRYPOINT` → `claude`**
+   (self-published by the inner agent; also still ahead of pgrep, so a background
+   `ollama` daemon can't mislabel a Claude Code session), then `OPENCODE` → config
+   model name (falling through to `CODEX`, never to pgrep), then `CODEX` → `codex`.
+   Every step of this precedence is pinned in `tests/emoji_map.test.ts` — including
+   ancestor-beats-`CLAUDECODE` (the omp case), nearest-of-two-agents-in-one-tree,
+   and both opencode-config failure fallbacks.
+4. pgrep fallbacks for `aider`, `cursor`, `windsurf`, `llama`, `ollama`, `opencode`.
+
+Known limitation: a DETACHED spawn from an omp session has no lineage and no
+omp-specific env marker (omp sets none), so it still brands `claude` — only attached
+spawns brand `omp`. The escape hatch is step 1: whatever creates the detached spawn
+can export `TG_AI_MODEL=omp` (a confident wrong answer is worse than an explicit
+override).
+
+The two detection sets differ on purpose: the ancestor walk lists agents that can
+launch `tg` as a subprocess (CLI harnesses), while the pgrep fallbacks cover tools
+that are never process ancestors (GUI editors like cursor/windsurf) or tools that
+run as background daemons rather than launchers (ollama, llama) — plus claude/codex,
+which already have env markers and need no pgrep row.
 
 Debug the result without sending a message: `tg --detect-model` prints `<model>\t<emoji>`.
 This is an info-only flag and works without Telegram credentials configured.

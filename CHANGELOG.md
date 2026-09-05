@@ -3,12 +3,296 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.42.0
+## 1.45.3
 
 **Feature: delegate codex hooks to rig (scoped) + gate the codex hook-trust bypass.** Codex hook
 provisioning is now delegated to rig within a scoped boundary, and the codex hook-trust bypass is
 gated behind the explicit `NO_RIG` sentinel (aligned with #282) instead of being implicit, with the
 hook-trust flag placed before the prompt separator.
+
+## 1.44.5
+
+**Fix: tg-ctl gave up on permission prompts too early, falsely reporting them as "never delivered" (tg-cli#182).**
+
+- A `permission`-kind entry (an approve/reject request whose hook socket closed) now uses its own,
+  much longer retention window (`TG_CTL_ABANDONED_PERMISSION_RETAIN_MS`, default 12h) before the
+  daemon gives up and tells the human "this was never delivered over Telegram" — previously it shared
+  the 30-minute question window (`TG_CTL_ABANDONED_RETAIN_MS`), so a permission left unanswered for
+  as little as half an hour (easily overnight, or a few hours away from the phone) was falsely
+  reported as unrecoverable even though the harness might still be sitting on its own terminal
+  fallback prompt, fully answerable.
+- A separate, related fix (multi-line command matching for the late-delivery pane-injection path,
+  tg-cli#267) was attempted but reverted after a 3-round review surfaced an unresolved escalation
+  risk and an unverified rendering assumption — tracked as tg-cli#283 for a live-verified redesign.
+
+## 1.44.4
+
+**Fix: renamed the 1.44.3 routing-anchor feature's identifiers/filenames off the repo owner's own name.**
+
+- `last-alex-target.ts`/`LastAlexTarget`/`recordLastAlexTarget` (and siblings)
+  and the on-disk `tg-ctl.<bot>.last-alex-target.json` state file are renamed
+  to their `User` equivalents throughout. A daemon upgrading from 1.44.3
+  migrates a pre-existing anchor forward automatically (once it holds its
+  singleton lock); the denylist still blocks both the new and legacy
+  filenames from ever riding a Telegram attach.
+
+## 1.44.3
+
+**Fix: a non-reply message could route to whichever agent pane merely spoke last, instead of the pane the CTO was actually addressing.**
+
+- An unrelated agent proactively messaging the CTO — right before the CTO sent
+  his own fresh, non-reply message — could hijack that message: routing bound
+  to `routes.json`'s "last outbound sender" (`lastMessagePane`), which
+  conflated "who spoke last" with "who the CTO was addressing" (live
+  incident). Fixed by adding a dedicated anchor
+  (`tg-ctl.<bot>.last-user-target.json`) that records ONLY the CTO's own last
+  CONFIRMED inbound delivery — an auto-bound inject, a picker tap, a reply, or
+  a named `/agent` — never an agent's own outbound send and never a failed
+  inject. Guarded against tmux pane-id reuse the same way reply-routing
+  already was, and shared between inbound message routing and `/tasks`'s
+  default project scoping so the two no longer disagree.
+- Also fixed the same class of bug in the git-state-check banner (it could
+  silently check the daemon's own repo instead of skipping the banner when a
+  pane reported no known path), and widened the never-attach denylist to
+  cover the new anchor file's temp-write staging form.
+
+## 1.44.2
+
+**Fix: `/agent <selector> <message>` dropped the inbound `tg#<id>` wrap tag, breaking threaded replies for anything routed by name.**
+
+- `injectToPane` (the daemon's `/agent`-routing inject path) accepted a
+  `sourceMessageId` parameter — used only for deferred-queue bookkeeping — but
+  never forwarded it into `wrapInbound`. Every other inbound path (auto-bind
+  inject, reply-quote, deferred flush) already passed its message id and
+  rendered `[TG from Alex tg#<id>] <msg>`; a message sent via
+  `/agent <selector> <message>` rendered `[TG from Alex] <msg>` instead,
+  silently losing the id an agent needs for `tg --reply-to <id>` threading.
+  Present since the `/agent` selector routing was added (June 12) — the
+  `{id}` wrap convention landed later (PR #34) and was only wired into the
+  OTHER inject paths, never into this one. Fixed by forwarding
+  `sourceMessageId` into the existing `wrapInbound` call; covers the direct
+  hit, the ambiguous-picker confirm, and the defer-flush replay, since all
+  three share this one function. Three integration tests cover it:
+  `ctl-agent-route-message-id-integration.test.ts` (confident direct route),
+  a new case in `ctl-ambiguous-picker-integration.test.ts` (the picker-tap
+  call site of the same shared `injectToPane`), and
+  `ctl-agent-route-defer-flush-message-id-integration.test.ts` (a message
+  deferred behind an open question flushes with the id exactly once — no
+  double-tag from re-wrapping an already-wrapped deferred item). Also
+  corrected two stale doc comments (`inject.ts`, `types.ts`) that still
+  claimed a `/agent` route carries no id.
+
+## 1.44.1
+
+**Fix: `--tag question|decision`'s escalation-format gate rejected realistic decision-request content while only the tool's own toy template passed (#261, #262).**
+
+- `hasWallOfText` split a message body on literal `\n` only. A fully structured
+  Rich Message (`<h3>`/`<p>`/`<table>`/`<ul>`/`<hr>`) assembled as one
+  continuous string, with no literal newline between sections, still renders
+  as separate visual lines in Telegram — but the raw source string was one
+  giant "line" whose character count blew past the 350-char wall-of-text
+  threshold the moment the content was realistic. Fixed by scanning "visual
+  lines" (a virtual break before each opening block tag, after each
+  closing/void one) instead of literal-newline-split lines, so the same
+  content gets the same verdict regardless of the caller's newline
+  formatting. `hasContextProse` had the identical bug (found during review of
+  this fix) and got the same normalization, plus a matching
+  `blockquote`/`pre`/`code` skip-list so quoted text or a code dump can't
+  satisfy the Context requirement with none of the agent's own prose.
+
+## 1.44.0
+
+**Feature: late-deliver a permission tap by injecting the digit into the still-showing terminal menu (#267).**
+
+- A Telegram Approve/Reject tap that lands after a permission's hook socket
+  already closed (Claude Code's ~120s hook budget elapsed, harness fell back
+  to its own terminal "Do you want to proceed?" prompt) now re-checks the
+  pane via `tmux capture-pane` and, if the menu is still showing FOR THIS SAME
+  request, injects the matching digit directly — no waiting process, no
+  dependency on a hook reconnect that may never come. Previously the tap was
+  only ever QUEUED for delivery on a hook reconnect (tg-cli#31/#98), which
+  meant a terminal-fallback permission could wait forever despite the human
+  having already answered.
+- Scoped to `claude`: its numbered menu layout and bare-digit-submits-instantly
+  behavior (verified live, 2026-08-18 — a bare digit resolves the prompt in
+  well under a second, no trailing Enter) are the only ones confirmed; every
+  other agent kind, and claude when the menu can't be re-verified live, falls
+  through unchanged to the existing queue-and-wait-for-reconnect path.
+- The captured menu must ALSO still identify the SAME command/question the
+  request was originally asking about — not whatever permission happens to be
+  pending right now. Without this binding, a stale tap could inject "Yes" into
+  a newer, unrelated prompt within the retention window (review finding).
+- New pure module `features/tg-ctl/permission-menu.ts` parses the captured
+  pane text for the menu (from the LAST "Do you want to proceed?" occurrence,
+  not the first — the marker can also appear in scrollback) and picks the
+  digit matching an allow/deny decision by an EXACT "Yes"/"No" label match,
+  not a prefix — Claude Code has other wide "yes" variants beyond "don't ask
+  again" (e.g. auto-accepting edits for the session), and an exact allowlist
+  match is what actually enforces "never silently grant a broader standing
+  decision than the tapped Approve button represents."
+
+## 1.43.1
+
+**Fix: `tg --detect-model` misbrands omp sessions as claude (#246).**
+
+- omp sessions export `CLAUDECODE=1` (pi heritage, verified live), and
+  `detectAiModel` checked that env var BEFORE walking the ancestor process
+  tree — so every outbound send from an omp session was branded `claude ✳️`
+  instead of `omp 🥧`. Detection is now LINEAGE-FIRST: the ancestor process
+  walk runs right after the explicit `TG_AI_MODEL` override, and env markers
+  become fallbacks for detached spawns whose launcher is not in the tree.
+  Env vars are inheritable — an agent inside another agent's pane carries the
+  outer agent's markers — so the nearest recognizable ancestor is the truth
+  in those topologies (a nested claude-inside-opencode stays claude, pinned
+  with a two-agent process tree). An opencode ancestor is still refined to
+  the session's actual model name via `opencode debug config` (extracted as
+  `opencodeModelFromConfig`), with the generic kind as the unreadable-config
+  fallback at BOTH call sites. The env-fallback chain keeps the pre-existing
+  relative order (CLAUDECODE → OPENCODE → CODEX): CLAUDECODE is
+  self-published by the inner agent (one hop of evidence), the others are
+  inherited (two hops). KNOWN LIMITATION: a DETACHED spawn from an omp
+  session has no lineage and no omp-specific marker (omp sets none — verified
+  live), so it still brands claude; only attached spawns brand omp.
+- Regression pins: `CLAUDECODE=1` + omp ancestry → `omp`; `CLAUDECODE=1` +
+  claude ancestry → `claude`; opencode ancestor → config model name;
+  inherited `OPENCODE` marker loses to a codex ancestor; nearest-wins with
+  two agents in one tree; detached nested spawn → `claude`; unreadable
+  opencode config → generic `opencode` at both call sites; env-only
+  CLAUDECODE tests pin a neutral fake ancestry so they stay deterministic
+  inside a real agent pane.
+
+## 1.43.0
+
+**Feature: omp (Oh My Pi) harness support — inbound discovery + outbound branding (#243).**
+
+- `matchAgentCommand` (features/tg-ctl/discover.ts) now recognizes the `omp`
+  binary by argv0 basename (`omp` is a compiled Bun binary, e.g.
+  `/opt/homebrew/bin/omp`). This ONE row fixes every gate that keys off it:
+  inbound pane discovery (`findAgentInPane` BFS), the inject verify-pane
+  checks, reply-route liveness, and candidate discovery — an omp pane is now
+  classified as agent kind `omp` and is injectable at the tmux floor, exactly
+  like `pi`/`aider`.
+- Outbound branding: `detectAgentViaAncestry` (surfaced by `tg --detect-model`)
+  labels a session launched under omp as `omp`; the emoji
+  maps carry `omp` (custom ID shares Claude's ✳️, Unicode fallback 🥧), so
+  `tg` sends from an omp session get the agent emoji and `:omp:` works as an
+  emoji helper.
+- `questionCapability` intentionally unchanged: omp defaults to `unsupported`
+  (the honest tmux-floor behavior — inbound works, no native question
+  buttons), same as `pi`/`aider`. No hook/permission integration this round.
+  `tg-ctl ask --agent omp` classifies payloads as omp (pinned by test), so an
+  explicit omp ask gets the honest "unsupported" path instead of silently
+  falling back to claude semantics.
+
+## 1.42.0
+
+**Feature: `--dry-run` — validate/render a message locally, never send it.**
+
+- `tg --dry-run [...]` runs every LOCAL guard on the fully assembled message
+  (the `--tag decision|question` escalation-format gate, the `--table` final
+  check, the cjk/mixed-script guard, markdown-pipe→`<table>` conversion) and
+  prints the outcome — but makes NO network call and requires NO
+  `TG_BOT_TOKEN`/`TG_CHAT_ID`. On success it prints `tg --dry-run: OK` plus the
+  rendered body; a malformed `--tag decision|question` still hard-blocks
+  exactly as it would for a real send (deny-by-default), just without ever
+  touching the network.
+- Fixes a real incident: an agent iterating against the strict escalation
+  gate had no way to test structural compliance except a REAL send. A
+  structurally-valid-but-still-placeholder draft (the gate's own
+  `foo.ts:42` / `Option A: fast/risky` example, half-edited) passed the gate
+  and went out for real — six live messages in one incident, two of them
+  still carrying literal placeholder text ("foo bar baz test.", "Option A"
+  pros "ok" cons "bad"). `--dry-run` removes the reason to ever test a
+  decision/question format against the live chat.
+
+
+## 1.41.2
+
+**Fix: a queued permission tap is never silently expired/demoted on a timer
+again (tg#9982).** 1.41.1 introduced a 10-minute `TG_CTL_QUEUED_DECISION_DELIVERY_MS`
+window after which a QUEUED Telegram decision on a disconnected permission was
+silently discarded (the card fell back to plain "hook disconnected" text, with no
+proactive notice) — a real violation of the standing rule that a pending question
+must stay pending in Telegram until there's 100% confirmation it was resolved, and
+that a long outage must be *reported*, never silently dropped.
+
+- The queue no longer expires. A reconnecting hook that matches the queued
+  decision's requestId and full payload (`permissionPayloadMatches`) gets it
+  delivered no matter how long the reconnect takes.
+- What made the old timer necessary is fixed at the root, for PERMISSIONS
+  specifically: `requestId` for a `permission`/plan-approval is now scoped to
+  the exact INVOCATION, not just the session or even the prompt turn. `tg-ctl
+  ask` generates a random nonce ONCE PER PROCESS (`HookEnv.invocationNonce`) —
+  the harness spawns a fresh process for every tool/permission hook event — and
+  folds it into the requestId hash. A first attempt at this used only Claude
+  Code's `prompt_id` / Codex's `turn_id`, but those scope to the whole prompt
+  TURN, not the individual tool call: two DISTINCT permission invocations of an
+  identical command in the SAME turn would still have shared a requestId under
+  that scheme (caught in review before shipping). The per-process nonce closes
+  that gap completely for permissions — a materially later, unrelated request
+  (whether a later turn or a second identical call within the same turn)
+  always gets a DIFFERENT requestId and can never be mistaken for a reconnect
+  of an earlier one, timer or not; `prompt_id`/`turn_id` are still folded in as
+  extra hash entropy but are no longer relied on for safety. Auto-delivery
+  additionally REQUIRES this identity proof (`ButtonRequest.promptTurnId`) to
+  be present on the retained request at all — the ONE remaining case it can be
+  absent is a manual/back-compat caller that hand-builds an already-normalized
+  request (not real harness traffic) or a pre-upgrade on-disk record; either
+  way the tap still stays queued and re-tappable, a reconnect there just shows
+  a fresh live prompt instead, and the tap-time/notice text never claims
+  automatic delivery for it (`queuedPermissionDecisionText`,
+  `queuedDecisionStillWaitingText`).
+- `question`-kind requests (`AskUserQuestion`, and anything routed through
+  `ExitPlanMode`'s sibling question path) DELIBERATELY do NOT get the
+  per-process nonce — a question has no queuedDecision auto-delivery hazard,
+  and the existing multi-question retry contract needs a re-asked question
+  from a genuinely new process (same content) to hash IDENTICALLY so it
+  re-attaches to its retained card instead of duplicating. Only `prompt_id`/
+  `turn_id` scope a question's requestId, same as before this release; a
+  question re-asked in a NEW turn still gets a fresh card either way.
+- `TG_CTL_QUEUED_DECISION_DELIVERY_MS` is renamed `TG_CTL_QUEUED_DECISION_NOTICE_MS`
+  and repurposed: past that threshold with no reconnect, the human gets a
+  ONE-TIME proactive "still waiting to reconnect" notice — the queue itself is
+  never cleared by it.
+- The existing full-retention "still no connection" give-up notice now names the
+  queued decision when one was pending, instead of implying nothing was ever
+  chosen.
+- Upgrade note: a `permission`'s `requestId` hash SEED changed (it now folds in
+  `env.invocationNonce`), so a permission card retained across the
+  1.41.1→1.41.2 daemon upgrade won't requestId-match a subsequent reconnect
+  and won't auto-deliver — it falls through to an ordinary fresh live prompt
+  instead (a one-time transient on upgrade, not a regression in steady state).
+  A `question`'s hash seed ALSO changed (it now folds in `prompt_id`/`turn_id`
+  when the harness sends one), so a question card retained across the upgrade
+  and re-asked with a `prompt_id`/`turn_id` present may likewise fail to
+  re-attach — for a question this means a duplicate card rather than a missed
+  auto-delivery (a question never auto-delivers anything), same one-time
+  transient severity.
+
+
+## 1.41.1
+
+**Fix: `tg-ctl` no longer sends an unidentifiable, overclaiming "hook disconnected"
+card, and never silently drops a Telegram tap on a disconnected permission.**
+
+- The abandoned-hook card now names the pane (reusing the same resolver the
+  outbound `[window]` header uses) and never promises a reconnect it can't
+  guarantee, while keeping the original question/permission text visible and
+  preserving the inline keyboard on every such edit (a real pre-existing gap
+  this release also closes).
+- A tap on a disconnected PERMISSION is now QUEUED instead of silently
+  discarded, and delivered automatically the instant a reconnecting hook
+  re-attaches with a matching payload — bounded by a short delivery window so
+  a coincidentally-identical later request is never auto-approved from a stale
+  tap. The queue survives a daemon restart and demotes back to the plain
+  disconnected text if it never gets delivered.
+- An entry that never reconnects within the retention window now gets a
+  proactive "still no connection" notice instead of sitting silently forever.
+
+**Fix: the usage-limit "banked/earned reset — redeem via `/usage`" advice no
+longer appears for every harness.** That mechanic is Codex-specific; other
+agents (including Claude) now get a plain "plan around it / switch agents"
+line with no redemption claim.
 
 ## 1.41.0
 

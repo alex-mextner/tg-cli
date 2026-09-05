@@ -125,7 +125,14 @@ tests can pass fakes.
   routing, reply-quote forwarding), tmux inject plans as data, agent pane discovery (process-tree
   walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`),
   `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons),
-  `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker), `hook-normalize.ts`
+  `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker),
+  `last-user-target.ts` (tg-cli#78 anchor fix: the pane of the CTO's OWN last CONFIRMED
+  inbound delivery — auto-bound, a recognized reply, or an explicit picker/`/agent`
+  selection — distinct from the removed `lastMessagePane` mechanism, which used to track
+  whichever pane most recently sent an outbound `tg` message, including an agent
+  proactively messaging the CTO unprompted; an otherwise-ambiguous non-reply binds here,
+  never to "whoever spoke last", cwd-validated against pane-id reuse the same way `routeMatchesPane` guards
+  reply routing), `hook-normalize.ts`
   (raw harness hook payload → ButtonRequest(s) — a multi-question AskUserQuestion (2-4 questions)
   yields one request per question via `normalizeHookRequests`, forwarded as sequential cards whose
   answers the ask client composes into ONE combined hook reply (tg#5741); the reply envelope stamps
@@ -228,13 +235,92 @@ tests can pass fakes.
   moves out of `pendingButtons` into `abandonedButtons` (so it never defers its pane's inbound) and
   is retained for `TG_CTL_ABANDONED_RETAIN_MS` (default 30 min) — a window enforced at delivery time
   (not only on restore), so a tap past the window expires rather than injecting a long-stale answer,
-  even on a quiet daemon with no intervening mutation. (b) **lossless reconnect** — the
+  even on a quiet daemon with no intervening mutation. A `permission`-kind entry uses the separate,
+  much longer `TG_CTL_ABANDONED_PERMISSION_RETAIN_MS` (default 12h) instead — tg-cli#182: a
+  permission's answer is still fully actionable hours later (the harness may still be sitting on its
+  own terminal fallback prompt, or a hook may still reconnect), unlike a question, whose value fades
+  fast if stale; every retention/expiry check (`pruneAbandonedButtons`, restore, delivery-time
+  enforcement) branches on `req.kind` to use the right window. (b) **lossless reconnect** — the
   `tg-ctl ask` client for a SCOPED question reconnect-and-resends the same requestId across a
   mid-block socket drop; the restored daemon re-attaches the pending entry (no duplicate card) or
   replays the stored answer (#98, now persisted). (c) **dead-card UX** — a genuinely-dead card (an
-  unscoped question, or a send-failed forward) has its inline keyboard cleared on expiry.
-  Permissions + unscoped questions keep the single-attempt client path (resending would duplicate
-  the card). `question-store.ts` owns the on-disk format (PURE); the entrypoint owns the I/O.
+  unscoped question, or a send-failed forward) has its inline keyboard cleared on expiry. A SCOPED
+  permission is reconnectable the same as a scoped question (`askDaemonOnce`); only UNSCOPED
+  requests (no `paneId` — no card to late-deliver/re-attach to) keep the single-attempt client path,
+  since resending those would post a duplicate card. `question-store.ts` owns the on-disk format
+  (PURE); the entrypoint owns the I/O.
+- **Pane-inject late-delivery for permissions (`features/tg-ctl/permission-menu.ts`, tg-cli#267):**
+  for `claude` specifically, a disconnected permission's hook has already fallen back to Claude
+  Code's OWN numbered terminal "Do you want to proceed?" menu — answerable directly by
+  `tmux capture-pane -pJ`, re-verifying the menu still identifies THIS request (LINE-EXACT match
+  against `extractPermissionIdentity`, never a raw substring — a boundary-only check still lets a
+  stale "git push" tap match a live "git push --force" menu, since both genuinely continue at a
+  space; only comparing whole lines tells them apart). A multi-line command (a heredoc, or several
+  statements written across lines) still cannot match here — tracked as tg-cli#283, needing live
+  verification of how Claude Code actually renders a multi-line command's box before a fix can be
+  trusted (a real incident, 2026-08-25, confirmed this class of command gets permanently stranded in
+  the queue-and-wait path below with no way to ever resolve — the fix attempted for it was reverted
+  after a 3-round review surfaced an unresolved escalation risk and unverified rendering assumption,
+  see tg-cli#283 for the full history). The daemon injects the matching digit (bare,
+  no Enter — Claude Code's menu submits instantly) and re-captures after a pace to CONFIRM the menu is
+  actually gone before claiming delivery (a tmux exit code alone doesn't prove the app consumed the
+  key — e.g. copy-mode swallows it). No waiting process, no dependency on a hook reconnect that may
+  never come for a terminal-fallback permission. Every other agent kind, and claude when the menu
+  can't be re-verified live, falls through unchanged to the queuing mechanism below.
+- **Queued permission decisions (never drop a tap on a disconnected permission, and never expire it
+  on the SHORT question timer — Alex tg#9982):** the pane-inject path above covers claude when its
+  menu is live and verifiable; every other case (a permission has no pane-text-injection fallback in
+  general — the hook needs a structured JSON reply, not terminal text) still can't be delivered
+  immediately when a Telegram tap lands while its hook is disconnected. It is QUEUED on the retained
+  entry (`AbandonedButton.queuedDecision`, persisted immediately — survives a daemon crash between the
+  tap and the reconnect) and delivered automatically the instant a reconnecting hook re-attaches to
+  the same requestId AND its full payload (question text + `toolInput`, `permissionPayloadMatches`)
+  still matches — guarding against a stale requestId reused against a materially different action.
+  While a decision is pending, its Telegram card stays pending, and it is never silently cleared
+  without 100% confirmation it was actually delivered. Delivery IS still bounded, but by the
+  permission's own much longer window (`ABANDONED_PERMISSION_RETAIN_MS`, default 12h — tg-cli#182),
+  not the 30-min question one; a reconnect past that window falls through to a fresh live prompt
+  instead of auto-delivering the stale decision (enforced synchronously at the reconnect point itself,
+  not only by the periodic sweep — tg-cli#182 round 4). What makes delivery WITHIN that window safe is
+  the identity check upstream in `hook-normalize.ts`, applied ONLY to
+  `permission`/plan-approval requests (never `question`-kind — see below): `env.invocationNonce`
+  (`HookEnv`), a random id `askDaemon` generates ONCE PER `tg-ctl ask` PROCESS. The harness spawns a
+  fresh process for every hook event, so this is a true per-INVOCATION identity, folded into a
+  permission's requestId hash and carried as `ButtonRequest.promptTurnId`. This is stronger than (and
+  does not depend on) Claude Code's `prompt_id` / Codex's `turn_id` (`hook-normalize.ts`'s
+  `invocationSeed`, kept only as extra hash entropy for permissions): those scope to the whole prompt
+  TURN, not the individual tool call, so two DISTINCT permission invocations of an identical command in
+  the SAME turn would still share a requestId under `prompt_id`/`turn_id` alone — a real gap found in
+  review (tg#9982 follow-up) that the per-process nonce closes completely. A genuine reconnect is the
+  SAME process's own reconnect-and-resend loop (`requestHookAnswerWithReconnect`), which resends the
+  identical serialized request (same nonce), so it still matches; a materially later invocation is
+  always a NEW process with a NEW nonce and can never collide, no matter how much wall-clock time
+  passes. `permissionPayloadMatches` remains as defense-in-depth against the narrower residual risk of
+  a lossy `summarizeInput` digest collision, not a stand-in for identity. **`question`-kind requests
+  deliberately keep the OLDER, looser `prompt_id`/`turn_id`-only scoping** (no `env.invocationNonce`):
+  a question has no queuedDecision auto-delivery hazard (only pane late-delivery on an explicit human
+  tap, or reconnect re-attach), and the existing, tested multi-question retry contract
+  (`ctl-multi-question-abandon-integration.test.ts`) requires a re-asked question from a genuinely new
+  process (the harness always spawns one per hook event) to hash IDENTICALLY so it re-attaches to its
+  retained card instead of duplicating — folding the nonce into a question's hash breaks that (tried
+  once during review, reverted). `promptTurnId` rides through as an explicit field, and a permission's
+  auto-delivery REQUIRES it on the retained request: the ONE remaining case it can be absent is a
+  manual/back-compat caller that hand-builds an already-normalized ButtonRequest JSON (not real harness
+  traffic — a genuine Claude Code/Codex hook always sends raw JSON, which always gets a nonce for a
+  permission) or a retained record persisted to disk before this field existed (a one-time
+  1.41.1→1.41.2 upgrade transient). Either way the queue stays alive and re-tappable, but a reconnect
+  just shows an ordinary fresh live prompt instead of risking a stale approval on unproven identity — a
+  human who taps that fresh prompt again is never mistold their earlier tap will still auto-apply
+  (`queuedPermissionDecisionText` and `queuedDecisionStillWaitingText` both skip the "delivered
+  automatically" promise for a `promptTurnId`-less entry). A later tap overwrites
+  the queue (last tap wins). Past `TG_CTL_QUEUED_DECISION_NOTICE_MS` (default 10 min) with no
+  reconnect, the human gets a ONE-TIME proactive "still waiting to reconnect" notice
+  (`queuedDecision.notifiedAt` makes it idempotent) — the queue is NOT cleared by this notice, only
+  reported. An entry that never reconnects within the full `TG_CTL_ABANDONED_PERMISSION_RETAIN_MS`
+  (default 12h, refreshed by every tap — tg-cli#182, NOT the 30-min `ABANDONED_RETAIN_MS` questions
+  use) is the daemon's genuine give-up point and gets its own proactive "still no connection" notice
+  (mentioning the queued decision by name if one was pending) — both from the daemon's poll-loop
+  sweep while it is up, and on restore if the window elapsed while the daemon was down.
 
 - **Graceful reload — no dropped channel (`tg-ctl.<botid>.deferred.json` + cooperative SIGTERM):**
   a reload (a deliberate `tg-ctl restart`, a launchd `bootout`/`bootstrap`, or a crash-relaunch)
@@ -270,12 +356,18 @@ tests can pass fakes.
 
 - **Threaded replies:** the injected wrap (`injectWrap` in `DEFAULT_CONTROL`,
   `[TG from {name} {id}] {msg} — reply via tg`) now carries the inbound Telegram `message_id`
-  via the `{id}` placeholder (rendered `#<id>`; collapses cleanly when no id applies, e.g. an
-  `/agent` route). The agent passes that id to `tg --reply-to <id>`, which sets
-  `reply_to_message_id` on the FIRST outbound `sendMessage` so the answer threads under the
-  message it answers. The id IS Telegram's own per-chat sequential `message_id` — no parallel id
-  scheme. `wrapInbound` takes an optional `messageId`; `stepUpdates`/`buildReplyInject` forward
-  `m.message_id`; the `download-media` / `transcribe-voice` actions carry it too.
+  via the `{id}` placeholder, rendered `tg#<id>` (the `tg#` prefix — not a bare `#` — is the
+  message-ref convention that keeps it distinct from a GitHub issue/PR `#<id>`, tg#28). It
+  collapses cleanly only for a genuinely synthetic/non-inbound injection with no underlying
+  Telegram message — e.g. a button-tap answer label. An `/agent <selector> <text>` route DOES
+  carry an id, forwarded from `sourceMessageId` through `injectToPane` the same as every other
+  inbound path (GH-274; before that fix the id silently collapsed for anything routed by name).
+  The agent passes the id's numeric portion (without the `tg#` prefix) to `tg --reply-to <id>`,
+  which sets `reply_to_message_id` on the FIRST outbound `sendMessage` so the answer threads
+  under the message it answers. The id IS Telegram's own per-chat sequential `message_id` — no
+  parallel id scheme. `wrapInbound` takes an optional `messageId`; `stepUpdates`/
+  `buildReplyInject` forward `m.message_id`; the `download-media` / `transcribe-voice` actions
+  carry it too.
 
 ### Feature Flags
 

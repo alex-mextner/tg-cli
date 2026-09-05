@@ -27,6 +27,12 @@ export interface HookEnv {
   sessionName?: string; // tmux session of the pane
   windowName?: string; // tmux window name of the hook process
   subagent?: string; // TG_AGENT / harness subagent signal when available
+  // A random id the entrypoint generates ONCE per `tg-ctl ask` PROCESS (see
+  // tg-ctl's askDaemon). This is the PRIMARY per-invocation identity proof
+  // folded into every requestId hash below and carried as
+  // ButtonRequest.promptTurnId — see that field's own doc comment (questions.ts)
+  // for why it exists and what it gates.
+  invocationNonce: string;
 }
 
 // djb2 — a short stable id so a repeated identical prompt reuses its callback key.
@@ -34,6 +40,31 @@ function hash(s: string): string {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
   return h.toString(36);
+}
+
+// The per-TURN identifier Claude Code (`prompt_id`, docs: "UUID identifying the
+// user prompt currently being processed", v2.1.196+) and Codex (`turn_id`) carry
+// on every tool/permission hook event, distinct from `session_id` (which spans
+// the whole conversation). Used two ways below:
+//   - For a PERMISSION/plan-approval, folded in alongside the STRICT
+//     `env.invocationNonce` (extra hash entropy only — the nonce alone already
+//     proves per-invocation identity there; see HookEnv.invocationNonce and
+//     `build`'s doc comment for why permissions need that strictness and
+//     questions deliberately don't).
+//   - For a QUESTION, this is the ONLY identity signal used (no
+//     `env.invocationNonce`) — a question has no queuedDecision auto-delivery
+//     hazard, and the existing, TESTED multi-question retry contract
+//     (ctl-multi-question-abandon-integration.test.ts) relies on a re-asked
+//     question — a genuinely NEW `tg-ctl ask` process, since the harness spawns
+//     one per hook event — re-attaching to its retained card via a STABLE hash
+//     instead of posting a duplicate. Folding a per-process nonce in here would
+//     make every retry hash differently and break that (tried once, reverted).
+//     Absent on an older/foreign harness payload, a question degrades to
+//     session-only scoping — unchanged pre-existing behavior, not made worse.
+function invocationSeed(p: Record<string, unknown>): string {
+  if (typeof p.prompt_id === 'string' && p.prompt_id) return p.prompt_id;
+  if (typeof p.turn_id === 'string' && p.turn_id) return p.turn_id;
+  return '';
 }
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -64,6 +95,23 @@ function readOptions(raw: unknown): ButtonOption[] | null {
 }
 
 // Build a ButtonRequest from an already-known field set, folding in the env.
+// `promptTurnId`, when non-empty, rides along as ButtonRequest.promptTurnId —
+// the identity proof tg-ctl requires before auto-delivering a QUEUED
+// PERMISSION decision to a reconnecting hook within its retention window
+// (tg-cli#182: ABANDONED_PERMISSION_RETAIN_MS, not a tight one — see the
+// field's own doc comment in questions.ts). DELIBERATELY per-KIND, not
+// blanket-applied: a `permission` gets the STRICT per-process
+// `env.invocationNonce` (see HookEnv.invocationNonce) because that's the one
+// place a stale queued decision could otherwise auto-apply to an unrelated
+// later invocation. A `question` keeps the LOOSER turn-scoped `invocationSeed`
+// (Claude's `prompt_id` / Codex's `turn_id`) on purpose: a question has no
+// queuedDecision auto-delivery risk at all (only late-delivery into the pane on
+// an explicit human tap, or reconnect re-attach), and the existing, TESTED
+// multi-question retry contract relies on a re-asked question (a genuinely NEW
+// `tg-ctl ask` process, since the harness spawns a fresh one per hook event)
+// re-attaching to its retained card instead of duplicating — folding a
+// per-process nonce into a question's hash would break that (caught by
+// ctl-multi-question-abandon-integration.test.ts when first tried).
 function build(
   env: HookEnv,
   kind: ButtonRequestKind,
@@ -72,6 +120,7 @@ function build(
   title: string | undefined,
   options: ButtonOption[] | undefined,
   cwd: string | undefined,
+  promptTurnId: string,
 ): ButtonRequest {
   return {
     requestId: `${env.agent}-${hash(idSeed)}`,
@@ -85,6 +134,7 @@ function build(
     sessionName: env.sessionName,
     windowName: env.windowName,
     subagent: env.subagent,
+    ...(promptTurnId ? { promptTurnId } : {}),
   };
 }
 
@@ -115,6 +165,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       sessionName: typeof p.sessionName === 'string' ? p.sessionName : env.sessionName,
       windowName: typeof p.windowName === 'string' ? p.windowName : env.windowName,
       subagent: typeof p.subagent === 'string' ? p.subagent : env.subagent,
+      promptTurnId: typeof p.promptTurnId === 'string' ? p.promptTurnId : undefined,
     };
   }
 
@@ -143,7 +194,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
     const plan = clampPlan(typeof input?.plan === 'string' ? input.plan.trim() : '');
     const body = plan ? `Proceed with this plan?\n\n${plan}` : 'The plan is ready. Proceed?';
     return {
-      requestId: `${env.agent}-${hash(`${session}:plan:${plan}`)}`,
+      requestId: `${env.agent}-${hash(`${session}:${invocationSeed(p)}:${env.invocationNonce}:plan:${plan}`)}`,
       agent: env.agent,
       kind: 'permission',
       question: body,
@@ -158,6 +209,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
       sessionName: env.sessionName,
       windowName: env.windowName,
       subagent: env.subagent,
+      promptTurnId: env.invocationNonce,
     };
   }
 
@@ -166,7 +218,7 @@ export function normalizeHookPayload(payload: unknown, env: HookEnv): ButtonRequ
     if (!toolName) return null;
     const detail = input ? summarizeInput(toolName, input) : '';
     const question = detail ? `Allow ${toolName}? ${detail}` : `Allow ${toolName}?`;
-    const req = build(env, 'permission', `${session}:perm:${toolName}:${detail}`, question, toolName, undefined, cwd);
+    const req = build(env, 'permission', `${session}:${invocationSeed(p)}:${env.invocationNonce}:perm:${toolName}:${detail}`, question, toolName, undefined, cwd, env.invocationNonce);
     req.permissionEvent = permissionEventOf(p);
     if (input) req.toolInput = input;
     return req;
@@ -237,8 +289,8 @@ function normalizeAskUserQuestions(p: Record<string, unknown>, env: HookEnv): Bu
     // fresh id (a stale retained card's buttons would otherwise resolve by
     // index against the new options — review finding). A true re-fire of the
     // same call keeps the same id, so tg-cli#97 dedup/replay is unchanged.
-    const seed = `${session}:q:${q.question}:${options.map((o) => o.label).join('\u001F')}`;
-    const req = build(env, 'question', seed, q.question, title, options, cwd);
+    const seed = `${session}:${invocationSeed(p)}:q:${q.question}:${options.map((o) => o.label).join('\u001F')}`;
+    const req = build(env, 'question', seed, q.question, title, options, cwd, invocationSeed(p));
     // Carried so the answer envelope can echo the original input (schema-valid
     // wholesale) instead of a lossy rebuild — see buildClaudeQuestionAnswerOutput.
     req.toolInput = input;

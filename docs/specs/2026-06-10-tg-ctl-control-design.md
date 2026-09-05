@@ -397,6 +397,25 @@ message to "expired — answer in terminal". Late button taps get
 The daemon must also expire the TG message when the hook process dies (local
 Esc abort), not only on timeout.
 
+**SUPERSEDED for scoped requests (a `paneId` is present) by the durable
+forwarded-question state** (see AGENTS.md's "Durable forwarded-question state" and
+"Queued permission decisions" entries): a SCOPED question or SCOPED permission is
+retained on socket close instead of immediately expiring — a question late-delivers
+into its pane, a permission's decision is QUEUED and delivered automatically on a
+matching reconnect within its retention window (safety WITHIN that window comes
+from requestId being scoped to the prompt turn, not a delivery timer —
+`TG_CTL_QUEUED_DECISION_NOTICE_MS` only triggers a one-time proactive notice past
+a shorter threshold, it never clears the queue by itself), and only past its
+retention window with no delivery does the card actually
+expire/give up (with a proactive "still no connection" notice, not a silent drop) —
+`ABANDONED_RETAIN_MS` (default 30 min) for a question, or the much longer
+`ABANDONED_PERMISSION_RETAIN_MS` (default 12h, tg-cli#182) for a permission,
+since its answer stays fully actionable for hours (the harness may still be sitting
+on its own terminal fallback prompt) unlike a question's fast-fading value.
+The plain "expire on timeout, reject a late tap" behavior described just above
+still applies UNSCOPED (no `paneId` — no pane to late-deliver to, no card worth
+retaining).
+
 **Shipped core path (user request 2026-06-10):** UDS protocol, inline buttons,
 callback routing, expiry editing, Claude/Codex hook output formatting, opencode
 adapter helpers, and `pi` limited-status handling. Deferred: idempotent hook
@@ -603,6 +622,7 @@ dropped per D4):**
 | **Claude Code** (`cc`) | tmux (no public inject API) | YES — hooks `PreToolUse`/`PermissionRequest`/`Notification` | `/rename` | `/clear` | hooks + channel + tmux |
 | **Codex** | `codex exec` / app-server | YES — `PermissionRequest` hook | — | `/new` | hooks + tmux |
 | **pi** | tmux | NO verified native API — no scraping | — | — | tmux + agent-calls-`tg`; Q→buttons says limited |
+| **omp** (Oh My Pi) | tmux | NO verified native API — no scraping | — | — | tmux + agent-calls-`tg`; Q→buttons says limited (added 2026-07, tg-cli#243) |
 | **Aider** | `--message` (one-shot) | **NO** | — | `/reset` | tmux-only; bot says "limited" |
 | **Gemini CLI** | `-p` | **NO** (retiring 2026-06-18 → Antigravity `agy`) | — | `/clear` (screen only) | tmux-only; bot says "limited" |
 
@@ -619,7 +639,7 @@ unless started with a fixed `--port` (or discovered via `--mdns`) — so the cle
 "bot owns the server, clients attach", not "inject into an arbitrary TUI".
 
 **The "not supported" rule:** when a harness lacks native question-forwarding (aider,
-gemini, pi-for-now), the bot does NOT silently scrape-and-hope; it forwards what tmux can
+gemini, pi-for-now, omp), the bot does NOT silently scrape-and-hope; it forwards what tmux can
 see and replies once: "native question forwarding isn't available for `<harness>` —
 inbound works, but I can't reliably forward its prompts; answer in the terminal."
 
@@ -627,7 +647,7 @@ inbound works, but I can't reliably forward its prompts; answer in the terminal.
 to pick the adapter; `pgrep` / pane-command disambiguates cc vs opencode vs codex vs pi.
 
 **Scope for v1:** ship `cc` (channel+hooks+tmux) and `opencode` (native) first-class;
-`codex` (hooks+tmux) and `pi`/`aider`/`gemini` (tmux floor + honest "limited" replies) as
+`codex` (hooks+tmux) and `pi`/`aider`/`omp`/`gemini` (tmux floor + honest "limited" replies) as
 the long tail. See D4 (§12).
 
 ## 15. Out of scope / future

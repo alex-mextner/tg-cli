@@ -2,14 +2,14 @@ import { expect, test } from 'bun:test';
 import {
   parsePaneList,
   parseProcList,
+  matchAgentCommand,
   findAgentInPane,
   findAgentInAncestry,
   pickTargetPane,
   pickTargetPaneFromSet,
   panesWithRetry,
-  resolveByLastMessage,
 } from '../features/tg-ctl/discover';
-import type { DiscoverResult, PaneInfo, ProcInfo, TargetPane } from '../features/tg-ctl/types';
+import type { PaneInfo, ProcInfo } from '../features/tg-ctl/types';
 
 // --- fixtures ---
 
@@ -171,9 +171,35 @@ test('matches opencode.exe basename', () => {
 });
 
 test('matches pi by argv0 basename', () => {
-  const p = pane('a', 0, '%7', 710, 'pi', '/x');
+  const p = pane('a', 0, '%6', 710, 'pi', '/w');
   const procs = [proc(710, 1, '/opt/homebrew/bin/pi')];
   expect(findAgentInPane(p, procs)).toEqual({ agent: 'pi', pid: 710 });
+});
+
+// omp (Oh My Pi) is a compiled Bun binary at /opt/homebrew/bin/omp — its argv0
+// basename is literally 'omp'. The one matchAgentCommand row feeds BOTH
+// directions: inbound pane discovery (findAgentInPane) and outbound branding
+// (findAgentInAncestry).
+test('matchAgentCommand classifies the omp binary by argv0 basename', () => {
+  expect(matchAgentCommand('omp')).toBe('omp');
+  expect(matchAgentCommand('/opt/homebrew/bin/omp')).toBe('omp');
+  expect(matchAgentCommand('/opt/homebrew/bin/omp --print-session')).toBe('omp');
+  // Never a prefix/substring match: an unrelated binary merely CONTAINING the
+  // letters stays unmatched.
+  expect(matchAgentCommand('/usr/local/bin/ompi-info')).toBeNull();
+  expect(matchAgentCommand('compose up')).toBeNull();
+});
+
+test('finds omp running directly as the pane process', () => {
+  const p = pane('a', 0, '%7', 720, 'omp', '/v');
+  const procs = [proc(720, 1, '/opt/homebrew/bin/omp')];
+  expect(findAgentInPane(p, procs)).toEqual({ agent: 'omp', pid: 720 });
+});
+
+test('finds omp as a child of the pane shell (launched from zsh)', () => {
+  const p = pane('a', 0, '%8', 730, 'zsh', '/u');
+  const procs = [proc(730, 1, '-zsh'), proc(731, 730, 'omp')];
+  expect(findAgentInPane(p, procs)).toEqual({ agent: 'omp', pid: 731 });
 });
 
 test('shells and unrelated processes are traversed but never matched', () => {
@@ -207,7 +233,7 @@ test('survives a ppid cycle in the snapshot without hanging', () => {
 // --- findAgentInAncestry ---
 // Mirror of findAgentInPane but walking UP the ppid chain from a start pid.
 // Used by outbound `tg` to learn which agent launched it as a subprocess
-// (codex/aider/pi export no env marker, unlike Claude Code's CLAUDECODE).
+// (codex/aider/pi/omp export no env marker, unlike Claude Code's CLAUDECODE).
 
 test('finds codex as the direct parent of tg (codex launched the shell command)', () => {
   // Real shape verified live: `codex exec` is the immediate parent of the shell
@@ -227,6 +253,17 @@ test('finds codex through an intermediate shell (codex → bash -lc → tg)', ()
   ];
   // tg's process.ppid is 710 (the shell); walk up past it to codex.
   expect(findAgentInAncestry(procs, 710)).toEqual({ agent: 'codex', pid: 700 });
+});
+
+test('finds omp through an intermediate shell (omp → bash -lc → tg)', () => {
+  // omp exports no env marker (compiled Bun binary); the process tree is the
+  // only signal. tg's ppid is the shell; walk up past it to omp.
+  const procs = [
+    proc(750, 1, '/opt/homebrew/bin/omp'),
+    proc(760, 750, 'bash -lc tg "status"'),
+    proc(770, 760, 'tg status'),
+  ];
+  expect(findAgentInAncestry(procs, 760)).toEqual({ agent: 'omp', pid: 750 });
 });
 
 test('a background ollama daemon is NOT in the ancestry, so it never matches', () => {
@@ -504,53 +541,3 @@ test('panesWithRetry: a null run (tmux binary missing) breaks immediately — no
   expect(calls).toBe(1);
 });
 
-// --- resolveByLastMessage (tg-cli#78: no-reply bind to the last-message agent) ---
-
-function target(paneId: string): TargetPane {
-  return { pane: pane('s', 0, paneId, 100, 'claude', '/p', 'win'), agent: 'claude' };
-}
-
-function ambiguous(...paneIds: string[]): DiscoverResult {
-  return { ok: false, reason: 'ambiguous', candidates: paneIds.map(target) };
-}
-
-test('resolveByLastMessage: binds an ambiguous result to the last-message pane', () => {
-  // %5 posted the last message in the chat → a non-reply inbound binds there, no picker.
-  const r = resolveByLastMessage(ambiguous('%2', '%5'), '%5');
-  expect(r.ok).toBe(true);
-  if (r.ok) expect(r.target.pane.paneId).toBe('%5');
-});
-
-test('resolveByLastMessage: the last-message pane flips with a newer post (binds the new last pane)', () => {
-  // The newest message is from %2 now → it wins over %5.
-  const r = resolveByLastMessage(ambiguous('%2', '%5'), '%2');
-  expect(r.ok).toBe(true);
-  if (r.ok) expect(r.target.pane.paneId).toBe('%2');
-});
-
-test('resolveByLastMessage: NO last message → stays ambiguous (picker fires)', () => {
-  const r = resolveByLastMessage(ambiguous('%2', '%5'), null);
-  expect(r.ok).toBe(false);
-  if (!r.ok) expect(r.reason).toBe('ambiguous');
-});
-
-test('resolveByLastMessage: last-message pane is GONE (not a candidate) → stays ambiguous (picker)', () => {
-  // The last message came from %9, but %9 is no longer a live candidate → don't guess.
-  const r = resolveByLastMessage(ambiguous('%2', '%5'), '%9');
-  expect(r.ok).toBe(false);
-  if (!r.ok) expect(r.reason).toBe('ambiguous');
-});
-
-test('resolveByLastMessage: a no-agent result is passed through untouched (no false bind)', () => {
-  const noAgent: DiscoverResult = { ok: false, reason: 'no-agent', candidates: [] };
-  const r = resolveByLastMessage(noAgent, '%2');
-  expect(r.ok).toBe(false);
-  if (!r.ok) expect(r.reason).toBe('no-agent');
-});
-
-test('resolveByLastMessage: an already-resolved (ok) result is returned unchanged', () => {
-  const ok: DiscoverResult = { ok: true, target: target('%7') };
-  const r = resolveByLastMessage(ok, '%2');
-  expect(r.ok).toBe(true);
-  if (r.ok) expect(r.target.pane.paneId).toBe('%7');
-});

@@ -32,6 +32,108 @@ test('serialize → parse round-trips questions and answered within the window',
   expect(restored.answered).toEqual([{ key: 'q0', value: 'Production', label: 'Production', decision: undefined, at: NOW - 2000, delivery: 'socket' }]);
 });
 
+test('a queued permission decision survives the round-trip (a daemon restart must not lose it)', () => {
+  const data: QuestionStoreData = {
+    questions: [
+      {
+        req: { requestId: 'p1', agent: 'claude', kind: 'permission', paneId: '%1', question: 'Allow rm -rf /tmp/x?' },
+        messageId: 12,
+        at: NOW - 1000,
+        queuedDecision: { value: 'allow', label: 'Approve', decision: 'allow', at: NOW - 500 },
+      },
+    ],
+    answered: [],
+  };
+  const restored = parseQuestionStore(serializeQuestionStore(data), NOW, 60_000, 60_000);
+  expect(restored.questions[0].queuedDecision).toEqual({ value: 'allow', label: 'Approve', decision: 'allow', at: NOW - 500 });
+});
+
+test('a retained question with no queued decision round-trips with queuedDecision undefined', () => {
+  const data: QuestionStoreData = {
+    questions: [{ req: scopedQuestionReq('q1'), messageId: 77, at: NOW - 1000 }],
+    answered: [],
+  };
+  const restored = parseQuestionStore(serializeQuestionStore(data), NOW, 60_000, 60_000);
+  expect(restored.questions[0].queuedDecision).toBeUndefined();
+});
+
+test('a malformed queuedDecision is dropped, not corrupting the whole record', () => {
+  const blob = JSON.stringify({
+    v: 1,
+    questions: [
+      { req: scopedQuestionReq('q'), messageId: 1, at: NOW, queuedDecision: { value: 'allow' /* missing label */ } },
+    ],
+    answered: [],
+  });
+  const restored = parseQuestionStore(blob, NOW, 60_000, 60_000);
+  expect(restored.questions).toHaveLength(1);
+  expect(restored.questions[0].queuedDecision).toBeUndefined();
+});
+
+test('a queuedDecision with a missing/invalid decision (allow|deny) is dropped, not delivered as a malformed reply', () => {
+  const blob = JSON.stringify({
+    v: 1,
+    questions: [
+      {
+        req: scopedQuestionReq('q'),
+        messageId: 1,
+        at: NOW,
+        // value/label/at are all valid, but `decision` is what the delivery path
+        // (formatAgentHookOutput) actually uses to build {behavior: 'allow'|'deny'}
+        // — a corrupt/legacy record with no valid decision must not survive and be
+        // auto-delivered as a malformed or wrong permission reply on reconnect.
+        queuedDecision: { value: 'allow', label: 'Approve', at: NOW },
+      },
+    ],
+    answered: [],
+  });
+  const restored = parseQuestionStore(blob, NOW, 60_000, 60_000);
+  expect(restored.questions).toHaveLength(1);
+  expect(restored.questions[0].queuedDecision).toBeUndefined();
+});
+
+test('a queuedDecision where value and decision DISAGREE is dropped (never deliver one while displaying the other)', () => {
+  const blob = JSON.stringify({
+    v: 1,
+    questions: [
+      {
+        req: scopedQuestionReq('q'),
+        messageId: 1,
+        at: NOW,
+        // A corrupt/crafted record: the card would show "Reject" (value/label) but
+        // the hook would actually be told "allow" (decision) — a dangerous
+        // display/delivery mismatch that must never survive to be delivered.
+        queuedDecision: { value: 'deny', label: 'Reject', decision: 'allow', at: NOW },
+      },
+    ],
+    answered: [],
+  });
+  const restored = parseQuestionStore(blob, NOW, 60_000, 60_000);
+  expect(restored.questions).toHaveLength(1);
+  expect(restored.questions[0].queuedDecision).toBeUndefined();
+});
+
+test('a queuedDecision with a future-dated `at` is dropped (a bad clock value must not defeat the delivery/retention TTLs)', () => {
+  const blob = JSON.stringify({
+    v: 1,
+    questions: [
+      {
+        req: scopedQuestionReq('q'),
+        messageId: 1,
+        at: NOW,
+        // now - at would be NEGATIVE, which is always "within" any window — a
+        // corrupted future timestamp must not make the queue look permanently
+        // fresh to tg-ctl's demote/expire sweeps.
+        queuedDecision: { value: 'allow', label: 'Approve', decision: 'allow', at: NOW + 60_000 },
+      },
+    ],
+    answered: [],
+  });
+  const restored = parseQuestionStore(blob, NOW, 60_000, 60_000);
+  expect(restored.questions).toHaveLength(1);
+  expect(restored.questions[0].queuedDecision).toBeUndefined();
+});
+
 test('an answered permission decision survives the round-trip', () => {
   const data: QuestionStoreData = {
     questions: [],

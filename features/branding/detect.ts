@@ -17,7 +17,7 @@ export function isProcessRunning(name: string): boolean {
 }
 
 // Which agent launched this `tg` process? Climb the ppid chain and match the
-// nearest ancestor command (codex/aider/pi/opencode/claude). This is the
+// nearest ancestor command (claude/codex/opencode/pi/aider/omp). This is the
 // reliable signal for agents that — unlike Claude Code's CLAUDECODE — export no
 // env marker: a `codex exec` is the direct parent of the shell command it runs.
 // Crucially it runs BEFORE the pgrep fallbacks so a background `ollama` daemon

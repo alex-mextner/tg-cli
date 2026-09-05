@@ -400,12 +400,16 @@ test('REGRESSION single-agent: an UNRECOGNIZED reply with ONE visible agent inje
   expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
 }, 15_000);
 
-// === tg-cli#75 fix B: a NON-reply inbound auto-binds to the most-recent agent ===
+// === tg-cli#75 fix B, ANCHOR CORRECTED tg-cli#78 (2026-08-20/21): a NON-reply
+// inbound auto-binds to the CTO's OWN last-addressed pane — NOT merely whichever
+// agent's outbound send is newest in routes.json (that let an unrelated agent's
+// unprompted message hijack the CTO's very next message; see last-user-target.ts). ===
 
-test('NO-REPLY AUTO-BIND: an ambiguous non-reply message binds to the most-recently-active agent (%5), no picker', async () => {
+test('NO-REPLY AUTO-BIND: an agent merely posting last (routes.json) is NOT an anchor — asks', async () => {
   // No registration → both agents visible and unpinned → a non-reply text is
-  // ambiguous. routes.json shows %5 (3d) spoke most recently, so the auto-bind
-  // lands the message in %5 WITHOUT posting a picker.
+  // ambiguous. routes.json shows %5 (3d) posted most recently, but that alone is
+  // no longer a valid anchor (it only proves who SPOKE last, not who the CTO was
+  // ADDRESSING) — with no last-user-target recorded, this must ask, never guess.
   const h = makeHarness({ noRegistration: true });
   const tg = startFakeTg();
   h.setMode('normal'); // both agents visible
@@ -416,23 +420,27 @@ test('NO-REPLY AUTO-BIND: an ambiguous non-reply message binds to the most-recen
   await waitFor(() => injectedLines(h.injectLog).length > 0 || tg.sends.some((s) => s.hasMarkup));
   await Bun.sleep(300);
 
-  const lines = injectedLines(h.injectLog);
-  // Bound to %5 (the most-recently-active), NOT %2, and NO picker posted.
-  expect(lines.some((l) => l.startsWith(`${PANE_3D}\t`))).toBe(true);
-  expect(lines.some((l) => l.startsWith(`${PANE_RIG}\t`))).toBe(false);
-  expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
+  // Asked (picker), not silently bound to %5 or %2.
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(true);
+  expect(injectedLines(h.injectLog).length).toBe(0);
 }, 15_000);
 
-test('NO-REPLY AUTO-BIND respects recency: %2 most-recent → binds to %2', async () => {
-  // Same shape, but now %2 (rig) is the most-recent sender → the auto-bind flips
-  // to %2. Proves it tracks ACTUAL recency, not a fixed pane.
+test('NO-REPLY AUTO-BIND: binds to the CTO\'s own last-addressed pane, ignoring a MORE RECENT unrelated agent post', async () => {
+  // The exact reported incident: %2 (rig) posts the newest routes.json entry
+  // (an unrelated agent messaging the CTO unprompted) — AFTER the CTO's own last
+  // resolved delivery went to %5 (3d). A fresh non-reply message must still land
+  // on %5, never hijacked by %2's more-recent-but-unrelated post.
   const h = makeHarness({
     noRegistration: true,
     routes: [
       { id: 500, paneId: PANE_3D, cwd: '/x', ts: 1000 },
-      { id: 501, paneId: PANE_RIG, cwd: '/y', ts: 2000 }, // %2 newer
+      { id: 501, paneId: PANE_RIG, cwd: '/y', ts: 2000 }, // %2 posted MOST RECENTLY (unprompted)
     ],
   });
+  writeFileSync(
+    join(h.cfgDir, 'tg-ctl.123.last-user-target.json'),
+    JSON.stringify({ paneId: PANE_3D, cwd: h.dir3d, ts: 1500 }),
+  );
   const tg = startFakeTg();
   h.setMode('normal');
   const daemon = await startDaemon(h.cfgDir, tg.port);
@@ -443,9 +451,78 @@ test('NO-REPLY AUTO-BIND respects recency: %2 most-recent → binds to %2', asyn
   await Bun.sleep(300);
 
   const lines = injectedLines(h.injectLog);
-  expect(lines.some((l) => l.startsWith(`${PANE_RIG}\t`))).toBe(true);
-  expect(lines.some((l) => l.startsWith(`${PANE_3D}\t`))).toBe(false);
+  expect(lines.some((l) => l.startsWith(`${PANE_3D}\t`))).toBe(true);
+  expect(lines.some((l) => l.startsWith(`${PANE_RIG}\t`))).toBe(false);
   expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
+}, 15_000);
+
+test('A CONFIRMED REPLY updates the anchor: the NEXT ambiguous non-reply follows it, no picker', async () => {
+  // No registration → a subsequent non-reply is genuinely ambiguous, so ANY bind
+  // it gets must come from the anchor the reply itself just recorded — proving
+  // handleReplyRoute's recordLastUserTarget call (review finding: explicit CTO
+  // routing previously never updated the anchor).
+  const h = makeHarness({ noRegistration: true });
+  const tg = startFakeTg();
+  h.setMode('normal');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  // A confirmed reply to the recognized origin (%5, message 500 from makeHarness's
+  // default routes).
+  tg.pushReply(703, 23, 500, 'reply to the 3d agent');
+  await waitFor(() => injectedLines(h.injectLog).some((l) => l.startsWith(`${PANE_3D}\t`)));
+  await Bun.sleep(200);
+
+  // Now a plain, non-reply message — with NO registration and BOTH agents live,
+  // base discovery alone is ambiguous. It must bind to %5 (the reply's target),
+  // not ask, and not fall back to routes.json's %2 (which never even posted here).
+  tg.pushText(704, 24, 'keep going');
+  await waitFor(() => injectedLines(h.injectLog).filter((l) => l.startsWith(`${PANE_3D}\t`)).length >= 2);
+  await Bun.sleep(200);
+
+  const lines = injectedLines(h.injectLog);
+  expect(lines.filter((l) => l.startsWith(`${PANE_3D}\t`)).length).toBe(2);
+  expect(lines.some((l) => l.startsWith(`${PANE_RIG}\t`))).toBe(false);
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(false);
+}, 15_000);
+
+test('PANE-ID REUSE GUARD: a stale anchor whose recorded cwd no longer matches the live pane never auto-binds', async () => {
+  // The anchor claims %5, but the FAKE tmux for this test reports %5 hosting a
+  // DIFFERENT project's cwd than what was recorded (simulating a closed pane's id
+  // reused by an unrelated project) — the anchor must be rejected, not trusted on
+  // paneId alone (review finding P1).
+  const h = makeHarness({ noRegistration: true });
+  writeFileSync(
+    join(h.cfgDir, 'tg-ctl.123.last-user-target.json'),
+    JSON.stringify({ paneId: PANE_3D, cwd: '/some/other/now-defunct/project', ts: Math.floor(Date.now() / 1000) }),
+  );
+  const tg = startFakeTg();
+  h.setMode('normal');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushText(705, 25, 'plain message after pane reuse');
+
+  await waitFor(() => tg.sends.some((s) => s.hasMarkup) || injectedLines(h.injectLog).length > 0);
+  await Bun.sleep(200);
+
+  // Never silently injected into the pane-id-reused %5 — asked instead.
+  expect(injectedLines(h.injectLog).length).toBe(0);
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(true);
+}, 15_000);
+
+test('CORRUPT last-user-target.json falls back to the picker (never crashes, never guesses)', async () => {
+  const h = makeHarness({ noRegistration: true });
+  writeFileSync(join(h.cfgDir, 'tg-ctl.123.last-user-target.json'), '{not valid json');
+  const tg = startFakeTg();
+  h.setMode('normal');
+  const daemon = await startDaemon(h.cfgDir, tg.port);
+
+  tg.pushText(706, 26, 'plain message with a corrupt anchor file');
+
+  await waitFor(() => tg.sends.some((s) => s.hasMarkup) || injectedLines(h.injectLog).length > 0);
+  await Bun.sleep(200);
+
+  expect(injectedLines(h.injectLog).length).toBe(0);
+  expect(tg.sends.some((s) => s.hasMarkup)).toBe(true);
 }, 15_000);
 
 test('NO-REPLY no-history: an ambiguous non-reply with NO activity stays ambiguous → the picker fires', async () => {

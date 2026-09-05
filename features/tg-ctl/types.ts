@@ -12,7 +12,7 @@ export interface ControlConfig {
   enabled: boolean;
   transport: 'auto' | 'tmux' | 'channel'; // 'channel' reserved for v1.2+
   session?: string; // fixed tmux session name (else auto-discover)
-  injectWrap: string; // template: {name}, {msg}
+  injectWrap: string; // template: {name}, {msg}, {id}
   stalenessSec: number; // legacy config; owner inbound is no longer dropped by age (#183)
   idleExitMin: number; // daemon exits after this long with no agent pane (default 30)
   allowedSenders: number[]; // extra allowed sender user ids
@@ -46,7 +46,9 @@ export const DEFAULT_CONTROL: ControlConfig = {
   transport: 'auto',
   // `{id}` renders the inbound Telegram message_id as `#<id>` — the agent passes
   // it to `tg --reply-to <id>` to thread its answer under this exact message.
-  // When no id is available (for example a /agent route) `{id}` collapses with
+  // A `/agent <selector> <text>` route carries an id too (forwarded from
+  // sourceMessageId, same as every other inbound path). Only a genuinely
+  // synthetic/non-inbound injection has no id — then `{id}` collapses with
   // its leading space (see wrapInbound), so the wrap stays `[TG from {name}] …`.
   injectWrap: '[TG from {name} {id}] {msg}',
   stalenessSec: 300,
@@ -387,7 +389,37 @@ export interface ProcInfo {
   command: string; // full command line
 }
 
-export type AgentKind = SpawnHarness | 'pi' | 'aider' | 'unknown';
+export type AgentKind = SpawnHarness | 'pi' | 'aider' | 'omp' | 'unknown';
+
+// The closed harness-kind selector for `tg-ctl ask --agent <kind>` (the entrypoint's
+// hookAgentFromArgv). Derived from a Record so EXHAUSTIVENESS is compile-checked:
+// adding a kind to AgentKind without adding it here (or vice versa) is a compile
+// compile error, never a silent fallthrough to claude semantics. 'unknown' is deliberately
+// excluded — it is not an installable harness. INVARIANT: every non-unknown AgentKind
+// is ask-addressable here; a kind with no payload format is still safe because the
+// questionCapability gate drops it downstream (the honest tmux floor). If a future
+// kind must be discoverable but NOT ask-selectable, this Record constraint must be
+// split. (`harness-event --agent` is a separate, free-form telemetry label and does
+// NOT use this list.)
+const HOOK_AGENT_KINDS_MAP = {
+  claude: true,
+  codex: true,
+  opencode: true,
+  pi: true,
+  aider: true,
+  omp: true,
+} as const satisfies Record<Exclude<AgentKind, 'unknown'>, true>;
+
+export type HookAgentKind = keyof typeof HOOK_AGENT_KINDS_MAP;
+
+export const HOOK_AGENT_KINDS = Object.keys(HOOK_AGENT_KINDS_MAP) as readonly HookAgentKind[];
+
+// Cast-free narrow for argv validation (hookAgentFromArgv): a present-but-invalid
+// `--agent` value fails this guard instead of being coerced. Object.hasOwn (NOT
+// `in`) so Object.prototype keys ('toString', 'constructor', …) are rejected.
+export function isHookAgentKind(v: string): v is HookAgentKind {
+  return Object.hasOwn(HOOK_AGENT_KINDS_MAP, v);
+}
 
 // Snapshot written by `tg` / `tg-ctl start` at auto-start time (spec §5.2).
 export interface Registration {
@@ -425,6 +457,7 @@ export interface CtlPaths {
   usageWarnings: string; // recent proactive usage warnings, for duplicate suppression (#132)
   usageLatest: string; // latest supported usage/rate-limit telemetry for /limit
   deferred: string; // durable defer-while-waiting backlog (restored on reload, no message loss)
+  lastUserTarget: string; // pane of the CTO's own last resolved inbound delivery (tg-cli#78 anchor fix)
 }
 
 // --- forum topics (docs/specs/tg-forum-topics.md) ---
