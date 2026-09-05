@@ -422,6 +422,55 @@ test('/limit [agent] → limit-status', () => {
   ]);
 });
 
+test('/daily → daily-report', () => {
+  const r = stepUpdates([upd(1, { text: '/daily' })], makeOpts());
+  expect(r.actions).toEqual([{ kind: 'daily-report' }, { kind: 'ack', messageId: 1 }]);
+});
+
+// Named /spend, NOT /usage, /cost, or /stats — all three of those are reserved by an
+// agent harness this daemon supports and would silently swallow the text before it ever
+// reached the pane: Codex has its own native /usage (redeems a banked/earned reset, see
+// limits.ts's CODEX_RESET_REDEMPTION_NOTE), and Claude Code's /cost and /stats are both
+// documented aliases for its own /usage (tg-cli#290 review finding — /cost was tried
+// first and rejected for this exact reason).
+test('/spend → usage-report with no period', () => {
+  const r = stepUpdates([upd(1, { text: '/spend' })], makeOpts());
+  expect(r.actions).toEqual([{ kind: 'usage-report', period: null }, { kind: 'ack', messageId: 1 }]);
+});
+
+test('/spend week|month|day → usage-report with the parsed period', () => {
+  expect(stepUpdates([upd(1, { text: '/spend week' })], makeOpts()).actions).toEqual([
+    { kind: 'usage-report', period: 'week' },
+    { kind: 'ack', messageId: 1 },
+  ]);
+  expect(stepUpdates([upd(2, { text: '/spend month' })], makeOpts()).actions).toEqual([
+    { kind: 'usage-report', period: 'month' },
+    { kind: 'ack', messageId: 2 },
+  ]);
+  expect(stepUpdates([upd(3, { text: '/spend DAY' })], makeOpts()).actions).toEqual([
+    { kind: 'usage-report', period: 'day' },
+    { kind: 'ack', messageId: 3 },
+  ]);
+});
+
+test('/spend garbage → usage-report with a null period (not a crash)', () => {
+  const r = stepUpdates([upd(1, { text: '/spend nonsense' })], makeOpts());
+  expect(r.actions).toEqual([{ kind: 'usage-report', period: null }, { kind: 'ack', messageId: 1 }]);
+});
+
+// The whole reserved set must fall through verbatim to the agent, never be
+// daemon-intercepted — each of these is a real native command/alias in at least one
+// supported harness (Codex: /usage; Claude Code: /usage, /cost, /stats).
+for (const reserved of ['/usage', '/cost', '/stats']) {
+  test(`${reserved} passes through verbatim (NOT intercepted — reserved by an agent harness)`, () => {
+    const r = stepUpdates([upd(1, { text: reserved })], makeOpts());
+    expect(r.actions).toEqual([
+      { kind: 'inject-text', text: reserved, messageId: 1 },
+      { kind: 'ack', messageId: 1 },
+    ]);
+  });
+}
+
 test('/tasks carries reply target for scoped board lookup', () => {
   const r = stepUpdates(
     [
