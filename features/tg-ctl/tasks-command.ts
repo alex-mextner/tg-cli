@@ -217,6 +217,16 @@ const REVIEW_GLYPH: Readonly<Record<Exclude<ReviewState, null>, string>> = {
   draft: '✏️',
 };
 
+// Exported glyph lookups so other rich-HTML composers (next-command.ts's /next ticket card)
+// render the SAME CI/review verdict marks as the /tasks table, without re-deriving the maps.
+export function ciGlyph(ci: CiState): string {
+  return ci ? CI_GLYPH[ci] : '—';
+}
+
+export function reviewGlyph(review: ReviewState): string {
+  return review ? REVIEW_GLYPH[review] : '—';
+}
+
 // The lifecycle table's columns, in render order — the ONE source of truth. The header HTML and
 // the group-separator colspan both derive from this list, so they cannot drift; each taskRow
 // emits exactly TASKS_TABLE_COLUMNS <td> cells (guarded by a structural test) or Telegram's rich
@@ -448,7 +458,10 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
 }
 
-function escapeRegExp(s: string): string {
+// Exported for next-command.ts's own PR-body ticket-ref matcher (a different match shape than
+// matchPrsToTasks below — Linear-style refs like "HYP-1033" vs. GitHub's "#117" — so it can't
+// reuse matchPrsToTasks itself, only this primitive).
+export function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 

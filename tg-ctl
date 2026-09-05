@@ -100,6 +100,18 @@ import {
   type TaskItem,
 } from "./features/tg-ctl/tasks-command"
 import {
+  NEXT_USAGE_TEXT,
+  candidatePmIds,
+  classifyPmWhyFailure,
+  composeNextCard,
+  findMatchingPr,
+  parsePmWhyJson,
+  type NextGitResult,
+  type NextPrResult,
+  type NextWhyResult,
+  type PmWhyJson,
+} from "./features/tg-ctl/next-command"
+import {
   isDeadReset,
   parseSchedules,
   removeSchedule,
@@ -3011,16 +3023,25 @@ function flattenTaskListJson(parsed: unknown): TaskItem[] {
 }
 
 async function loadPrRefs(scopeDir: string | null): Promise<PrRef[]> {
+  return (await loadPrRefsResult(scopeDir, "/tasks")).prs
+}
+
+// The `ok` flag distinguishes "gh ran, zero PRs" from "gh failed/timed out/produced bad JSON" —
+// /tasks collapses that (loadPrRefs above, its existing, unchanged behavior), but /next must NOT:
+// reporting a failed lookup as "no matching PR found" fabricates an absence result (review catch,
+// tg-cli#289 P2). `logTag` labels the failure log line with whichever command triggered the spawn
+// (was hardcoded "/tasks", silently mislabeling a /next-triggered failure).
+async function loadPrRefsResult(scopeDir: string | null, logTag: string): Promise<{ ok: boolean; prs: PrRef[] }> {
   const argv = ["gh", "pr", "list", "--state", "all", "--limit", "100", "--json", "number,title,url,body,statusCheckRollup,reviewDecision,isDraft"]
   const r = await spawnGuarded(argv, 20_000, scopeDir ? { cwd: scopeDir } : {})
   if (r.exitCode !== 0) {
-    log(`/tasks: 'gh pr list' failed (${r.exitCode}): ${r.stderr.slice(0, 200)}`)
-    return []
+    log(`${logTag}: 'gh pr list' failed (${r.exitCode}): ${r.stderr.slice(0, 200)}`)
+    return { ok: false, prs: [] }
   }
   try {
     const parsed = JSON.parse(r.stdout)
-    if (!Array.isArray(parsed)) return []
-    return parsed
+    if (!Array.isArray(parsed)) return { ok: false, prs: [] }
+    const prs = parsed
       .filter((p) => p && typeof p.number === "number")
       .map((p) => {
         const url = typeof p.url === "string" ? p.url : ""
@@ -3034,8 +3055,9 @@ async function loadPrRefs(scopeDir: string | null): Promise<PrRef[]> {
           project: projectFromPrUrl(url),
         }
       })
+    return { ok: true, prs }
   } catch {
-    return []
+    return { ok: false, prs: [] }
   }
 }
 
@@ -3158,6 +3180,106 @@ function agentForTaskProject(task: TaskItem, candidates: AgentCandidate[]): stri
   if (matches.length !== 1) return null
   const match = matches[0]
   return isBareWindowName(match.windowName) ? basename(match.panePath) : match.windowName
+}
+
+// --- /next command: pm-cli lifecycle state + live git + PR/CI, composed fresh every query ---
+// (see features/tg-ctl/next-command.ts's header for the "why not a cache file" rationale)
+
+const PM_WHY_TIMEOUT_MS = 5_000
+
+// `pm why <id> --json` exits 2 for BOTH "no such work item" AND argparse's generic "unrecognized
+// arguments" — the latter is what a `pm` predating the --json flag (pm-cli#18) prints for EVERY
+// id. classifyPmWhyFailure (next-command.ts) checks stderr, not just the exit code, so a stale
+// `pm` reports a real 'error' instead of a confident false "not tracked" (review + advisor catch,
+// tg-cli#289). Tries each id candidate in order, stopping at the first success.
+async function loadPmWhy(ticketId: string): Promise<NextWhyResult> {
+  let sawRealError = false
+  for (const id of candidatePmIds(ticketId)) {
+    const r = await spawnGuarded(["pm", "why", id, "--json"], PM_WHY_TIMEOUT_MS)
+    if (r.exitCode === 0) {
+      try {
+        return { ok: true, data: parsePmWhyJson(r.stdout) }
+      } catch (err) {
+        log(`/next: pm why ${id} --json produced an unusable response: ${err}`)
+        sawRealError = true
+      }
+      continue
+    }
+    if (classifyPmWhyFailure(r.exitCode, r.stderr) === "error") {
+      log(`/next: pm why ${id} --json failed (${r.exitCode}): ${r.stderr.slice(0, 200)}`)
+      sawRealError = true
+    }
+  }
+  return { ok: false, reason: sawRealError ? "error" : "not-found" }
+}
+
+// The repo dir to run `git status`/`gh pr list` against, for the card's git/PR sections. Tries
+// the SAME anchors resolveTasksScopeDir does (topic, reply) before falling back to a fuzzy
+// match of the pm work item's project id against live agent panes (agent-match.ts) — there is
+// no explicit `/next <ticket-id> <agent>` selector (unlike /tasks), so this is the only signal
+// once neither anchor applies. Returns null (not a failure) when nothing resolves; the card
+// renders an explicit "no project scope resolved" line rather than guessing.
+function resolveNextScopeDir(ctx: Ctx, action: Extract<Action, { kind: "next" }>, item: PmWhyJson | null): string | null {
+  if (action.threadId !== null && action.threadId !== undefined) {
+    const topic = findTopic(parseTopics(readFileOrNull(ctx.paths.topics)), action.threadId)
+    if (topic?.path) return topic.path
+  }
+  if (action.replyToMessageId !== null) {
+    const recognized = recognizeRoute(parseRoutes(readFileOrNull(ctx.paths.routes)), action.replyToMessageId)
+    if (recognized?.cwd) return recognized.cwd
+  }
+  if (!item?.project) return null
+  const m = matchWindows(item.project, listAgentCandidates())
+  if (!m.confident) return null
+  const pane = m.matches[0]
+  return pane?.panePath || (pane ? registeredCwdForPane(readRegistrations(ctx.paths), pane) : null)
+}
+
+async function loadNextGitStatus(scopeDir: string | null): Promise<NextGitResult> {
+  if (!scopeDir) return { ok: false, reason: "no-scope" }
+  const state = gitStateForPath(scopeDir)
+  return state ? { ok: true, state } : { ok: false, reason: "unavailable" }
+}
+
+async function loadNextPrStatus(scopeDir: string | null, ticketId: string): Promise<NextPrResult> {
+  if (!scopeDir) return { ok: false, reason: "no-scope" }
+  const { ok, prs } = await loadPrRefsResult(scopeDir, "/next")
+  return ok ? { ok: true, pr: findMatchingPr(ticketId, prs) } : { ok: false, reason: "unavailable" }
+}
+
+function nextMessageContext(action: Extract<Action, { kind: "next" }>): { message_thread_id?: number; reply_parameters?: { message_id: number } } {
+  const ctx: { message_thread_id?: number; reply_parameters?: { message_id: number } } = {}
+  if (action.threadId !== null && action.threadId !== undefined) ctx.message_thread_id = action.threadId
+  if (action.replyToMessageId !== null) ctx.reply_parameters = { message_id: action.replyToMessageId }
+  return ctx
+}
+
+// git/PR results for a `why` that already failed — composeNextCard early-returns on it and never
+// reads either, so this is a fixed, no-spawn placeholder (never actually rendered).
+const NEXT_SCOPE_SKIPPED: { git: NextGitResult; pr: NextPrResult } = { git: { ok: false, reason: "no-scope" }, pr: { ok: false, reason: "no-scope" } }
+
+async function loadNextGitAndPr(ctx: Ctx, action: Extract<Action, { kind: "next" }>, why: NextWhyResult): Promise<{ git: NextGitResult; pr: NextPrResult }> {
+  // Skip both spawns (gh alone carries a 20s timeout) when there is nothing to scope them
+  // against — stalling every action still queued behind this one in the batch (dispatch is
+  // strictly sequential) for a card that discards the result is pure waste (review catch,
+  // tg-cli#289 round 2).
+  if (!why.ok) return NEXT_SCOPE_SKIPPED
+  const scopeDir = resolveNextScopeDir(ctx, action, why.data)
+  const [git, pr] = await Promise.all([loadNextGitStatus(scopeDir), loadNextPrStatus(scopeDir, action.ticketId)])
+  return { git, pr }
+}
+
+async function runNextCommand(ctx: Ctx, action: Extract<Action, { kind: "next" }>): Promise<void> {
+  const messageContext = nextMessageContext(action)
+  if (!action.ticketId) {
+    await sendMessage(ctx, NEXT_USAGE_TEXT, messageContext)
+    return
+  }
+  const why = await loadPmWhy(action.ticketId)
+  const { git, pr } = await loadNextGitAndPr(ctx, action, why)
+  const html = composeNextCard({ ticketId: action.ticketId, why, git, pr })
+  const sent = await sendRich(ctx, html, messageContext)
+  if (sent === null) await sendMessage(ctx, "couldn't render the ticket card — see the daemon log", messageContext)
 }
 
 // --- harness-event subcommand (#113): notify on a StopFailure hook ---
@@ -7734,6 +7856,9 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         return true
       case "tasks":
         await runTasksCommand(ctx, action)
+        return true
+      case "next":
+        await runNextCommand(ctx, action)
         return true
       case "limit-continue":
         return handleLimitContinue(action)

@@ -18,6 +18,7 @@ import { isAgentCommand, parseAgentCallback, parseAgentCancelCallback, parseAgen
 import { parseTopicModelCallback, parseTopicPathCallback, parseTopicRespawnCallback } from './topics';
 import { parseNewCommand, parseNewDirCallback, parseNewHarnessCallback, parseNewModelCallback, parseNewRetryCallback } from './new-command';
 import { parseTasksCallback, parseTasksCommand } from './tasks-command';
+import { parseNextCommand } from './next-command';
 import { parseContinueCallback } from './limits';
 import { botCommandNames } from './bot-commands';
 
@@ -509,6 +510,15 @@ function textAction(
       const p = parseTasksCommand(text);
       return { kind: 'tasks', agent: p.agent, status: p.status, replyToMessageId, threadId };
     }
+    if (cmd === '/next') {
+      // A missing ticket id still emits 'next' (ticketId: '') rather than the generic
+      // context-free 'reply' action — 'reply' has no thread/reply fields (types.ts), so inside a
+      // bound forum topic its usage text would land in General instead of the topic (review
+      // catch, tg-cli#289). runNextCommand sends the usage message itself, WITH this action's
+      // threadId/replyToMessageId, so it stays in the right place either way.
+      const p = parseNextCommand(text);
+      return { kind: 'next', ticketId: p?.ticketId ?? '', replyToMessageId, threadId };
+    }
     if (cmd === '/agent') {
       const p = parseAgentCommand(text);
       return { kind: 'agent-route', selector: p.selector, rest: p.rest, all: p.all, from: name, messageId, ...topic };
@@ -594,7 +604,7 @@ function topicActionFor(m: TgMessage, name: string, opts: StepOpts): Action[] | 
     // a bound topic — they control the daemon, not the topic agent. /stop and /kill are NOT
     // intercepted: they must still reach the topic's pane (kill/escape the harness session).
     // Using an explicit set (not isDaemonSlashCommand) to avoid over-intercepting.
-    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit']);
+    const TOPIC_GLOBAL_CMDS = new Set(['/status', '/agent', '/new', '/tasks', '/limit', '/next']);
     const verb = text.split(/\s+/, 1)[0].replace(/@\w+$/, '');
     if (TOPIC_GLOBAL_CMDS.has(verb)) return [textAction(text, name, opts, m.message_id, m.reply_to_message?.message_id ?? null, threadId)];
     // A `!shell` passthrough is VERBATIM into the topic pane (harness `!` convention): no wrap and

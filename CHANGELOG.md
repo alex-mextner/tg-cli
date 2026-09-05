@@ -3,6 +3,31 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.45.0
+
+**Feature: `/next <ticket-id>` — a live ticket-lifecycle card, replacing the old dead `/state`/`/next` runbooks.**
+
+- New bot command `/next <ticket-id>` composes pm-cli's ticket-lifecycle state
+  (`pm why <id> --json`, pm-cli#16/#18), the ticket's project's live git status
+  (branch + uncommitted-file count), and a `gh pr list` CI/review rollup into
+  one rich-HTML card — the same architecture `/tasks` (#115) established: a
+  pure render module (`features/tg-ctl/next-command.ts`) plus daemon-owned
+  spawns, composed FRESH on every query. There is deliberately no local state
+  file: hyperide's earlier `/state`/`/next` slash-command runbooks cached
+  ticket state and relied on a hook that was planned but never actually wired
+  up, so the cache silently rotted from the day it was written.
+- Each data source degrades independently: `pm why` is the one required
+  source (no ticket state, no card); a missing/failed `gh` or an unresolved
+  project scope renders an explicit "—" placeholder line rather than blanking
+  the whole card or fabricating a value.
+- Ticket-id resolution tries the id as typed, `task:<id>`, and — for a
+  `<PREFIX>-<N>`-shaped id like `HYP-1033` — the project-qualified
+  `task:<PREFIX>:<id>` pm-cli mints on ingest, stopping at the first `pm why`
+  that succeeds.
+- Reuses `tasks-command.ts`'s CI/review glyphs (`ciGlyph`/`reviewGlyph`,
+  now exported) and `git-state.ts`'s `PaneGitState`/`buildPaneGitState`
+  rather than re-deriving either.
+
 ## 1.44.5
 
 **Fix: tg-ctl gave up on permission prompts too early, falsely reporting them as "never delivered" (tg-cli#182).**

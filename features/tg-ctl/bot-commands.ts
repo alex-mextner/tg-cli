@@ -37,6 +37,7 @@ export const BOT_COMMANDS: readonly BotCommand[] = [
   { command: 'status', description: 'Report daemon state' },
   { command: 'limit', description: 'Show latest agent usage limits: /limit [agent]' },
   { command: 'tasks', description: 'Task board: attention default, filters, pages' },
+  { command: 'next', description: 'Ticket lifecycle card: /next <ticket-id> — state, git, PR/CI' },
 ];
 
 export function botCommandNames(): string[] {
