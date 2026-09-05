@@ -4,13 +4,24 @@
 // passed in explicitly).
 import { expect, test } from 'bun:test';
 import {
+  EMPTY_USAGE_SCHEDULE_WATERMARK,
   USAGE_SCHEDULE_LAUNCHD_LABEL,
   buildUsageScheduleDisablePlan,
   buildUsageScheduleEnablePlan,
+  completedMonthId,
+  completedWeekId,
   isEndOfMonth,
   isEndOfWeek,
+  missedUsageReportNotice,
+  parseUsageScheduleWatermark,
+  seedUsageScheduleWatermarkFor,
+  shouldSeedUsageScheduleWatermark,
+  usageScheduleGapNote,
+  USAGE_SCHEDULE_FIRE_HOUR,
+  USAGE_SCHEDULE_FIRE_MINUTE,
   usageScheduleLaunchdPlist,
   usageScheduleLaunchdPlistPath,
+  usageSchedulePeriodsDue,
   type UsageScheduleEnv,
 } from '../features/tg-ctl/usage-schedule';
 
@@ -118,5 +129,187 @@ test('buildUsageScheduleEnablePlan: unload-then-load, file mode 0o644', () => {
 test('buildUsageScheduleDisablePlan: single unload command gates file removal', () => {
   const plan = buildUsageScheduleDisablePlan('/home/u');
   expect(plan.filePath).toBe(usageScheduleLaunchdPlistPath('/home/u'));
-  expect(plan.commands).toEqual([{ argv: ['launchctl', 'unload', plan.filePath], describe: 'unload the usage-schedule LaunchAgent (stops it)' }]);
+  // `optional`: a plist left on disk by a half-failed enable (load failed) was never loaded, so
+  // its unload exits non-zero — disable must still go on to delete the file (review finding).
+  expect(plan.commands).toEqual([
+    { argv: ['launchctl', 'unload', plan.filePath], describe: 'unload the usage-schedule LaunchAgent (stops it)', optional: true },
+  ]);
+});
+
+test('completedWeekId: mid-week resolves to the PRIOR Sunday (this week has not completed yet)', () => {
+  // Mon 2026-08-24 through Sat 2026-08-29 are still an in-progress week — the most recently
+  // COMPLETED week ended on the Sunday before, 2026-08-23.
+  expect(completedWeekId(new Date(2026, 7, 24))).toBe('2026-08-23'); // Mon
+  expect(completedWeekId(new Date(2026, 7, 26))).toBe('2026-08-23'); // Wed
+  // On Sunday itself, that week is currently completing — it resolves to itself.
+  expect(completedWeekId(new Date(2026, 7, 30))).toBe('2026-08-30');
+  // The Monday right after still resolves to the Sunday that JUST completed, not itself.
+  expect(completedWeekId(new Date(2026, 7, 31))).toBe('2026-08-30');
+});
+
+test('completedWeekId: a Sunday in the first days of January resolves across the year boundary', () => {
+  // Fri 2027-01-01: the last completed week ended Sun 2026-12-27 — the literal-Sunday id
+  // has no ISO week-number ambiguity to trip over.
+  expect(completedWeekId(new Date(2027, 0, 1))).toBe('2026-12-27');
+});
+
+test('completedMonthId: before month-end resolves to the PRIOR month (this month has not completed yet)', () => {
+  expect(completedMonthId(new Date(2026, 7, 1))).toBe('2026-07'); // Aug 1: August isn't done — July is the last completed month
+  expect(completedMonthId(new Date(2026, 7, 15))).toBe('2026-07');
+  expect(completedMonthId(new Date(2026, 7, 31))).toBe('2026-08'); // last day: August is currently completing
+  expect(completedMonthId(new Date(2026, 8, 1))).toBe('2026-08'); // Sep 1: August just completed
+  expect(completedMonthId(new Date(2027, 0, 1))).toBe('2026-12'); // Jan 1: December of the prior year
+});
+
+// launchd fires at 23:50 — every "on time" fixture below uses that instant so it doesn't
+// trip the boundary-day-hasn't-closed-yet gate (see periodHasClosed / review finding).
+const atFireTime = (y: number, m: number, d: number) => new Date(y, m, d, USAGE_SCHEDULE_FIRE_HOUR, USAGE_SCHEDULE_FIRE_MINUTE);
+
+test('usageSchedulePeriodsDue: both due on a fresh (null watermark) run, checked AT the fire time; week on time on a Sunday, month not', () => {
+  const due = usageSchedulePeriodsDue(atFireTime(2026, 7, 30), EMPTY_USAGE_SCHEDULE_WATERMARK); // Sunday Aug 30, 23:50
+  expect(due.map((d) => d.period).sort()).toEqual(['month', 'week']);
+  expect(due.find((d) => d.period === 'week')).toMatchObject({ id: '2026-08-30', onTime: true, hasGap: false });
+  expect(due.find((d) => d.period === 'month')).toMatchObject({ id: '2026-07', onTime: false, hasGap: false });
+});
+
+test('usageSchedulePeriodsDue: a boundary day BEFORE the fire time is NOT due yet — no premature partial report (review HIGH finding)', () => {
+  // Sunday Aug 30, 09:00 — the week hasn't actually finished; a run this early (a wake from
+  // a missed EARLIER firing, a hand-run, or any trigger before 23:50) must not send a report
+  // covering only part of the day, nor claim the day was "missed" — tonight's real 23:50
+  // firing still covers it normally.
+  const earlyOnBoundaryDay = new Date(2026, 7, 30, 9, 0);
+  const due = usageSchedulePeriodsDue(earlyOnBoundaryDay, EMPTY_USAGE_SCHEDULE_WATERMARK);
+  expect(due.find((d) => d.period === 'week')).toBeUndefined();
+});
+
+test('usageSchedulePeriodsDue: the fire minute itself is on time; one minute earlier is not', () => {
+  const dueAt = usageSchedulePeriodsDue(new Date(2026, 7, 30, 23, 50), EMPTY_USAGE_SCHEDULE_WATERMARK);
+  expect(dueAt.find((d) => d.period === 'week')).toMatchObject({ onTime: true, hasGap: false });
+  const dueBefore = usageSchedulePeriodsDue(new Date(2026, 7, 30, 23, 49), EMPTY_USAGE_SCHEDULE_WATERMARK);
+  expect(dueBefore.find((d) => d.period === 'week')).toBeUndefined();
+});
+
+test('usageSchedulePeriodsDue: a NON-boundary day is never gated by time of day (only a boundary day can be "not closed yet")', () => {
+  const midWeekMidnight = usageSchedulePeriodsDue(new Date(2026, 7, 24), { lastWeekReported: '2026-08-16', lastMonthReported: '2026-07' }); // Monday 00:00
+  // '2026-08-16' IS the week immediately before '2026-08-23' — adjacent, no gap.
+  expect(midWeekMidnight.find((d) => d.period === 'week')).toMatchObject({ id: '2026-08-23', onTime: false, hasGap: false });
+});
+
+test('usageSchedulePeriodsDue: neither due once both watermarks match the current period', () => {
+  const now = new Date(2026, 7, 24); // mid-August, mid-week
+  const watermark = { lastWeekReported: completedWeekId(now), lastMonthReported: completedMonthId(now) };
+  expect(usageSchedulePeriodsDue(now, watermark)).toEqual([]);
+});
+
+test('usageSchedulePeriodsDue: a watermark already matching TODAY\'s in-progress boundary period is not re-marked due before the fire time', () => {
+  // Guards against a regression where the "not closed yet" gate is bypassed for a period
+  // whose id already happens to equal today's (there is no such period pre-fire-time, but
+  // the watermark equality check must still short-circuit correctly either way).
+  const earlyOnBoundaryDay = new Date(2026, 7, 30, 9, 0); // Sunday, before 23:50
+  const watermark = { lastWeekReported: completedWeekId(earlyOnBoundaryDay), lastMonthReported: null };
+  expect(usageSchedulePeriodsDue(earlyOnBoundaryDay, watermark).find((d) => d.period === 'week')).toBeUndefined();
+});
+
+test('usageSchedulePeriodsDue: a week missed while the machine was asleep is still surfaced on the next run — as LATE', () => {
+  // Watermark still points at the PRIOR week (the machine slept through last Sunday's 23:50
+  // firing). The next real run, even mid-week, must still see it — but flagged onTime:false,
+  // because `rig usage --period week` would now cover the NEW week, not the missed one.
+  const now = new Date(2026, 7, 24); // Monday, not itself end-of-week
+  const watermark = { lastWeekReported: '2026-08-16', lastMonthReported: completedMonthId(now) };
+  const due = usageSchedulePeriodsDue(now, watermark);
+  expect(due).toEqual([{ period: 'week', id: '2026-08-23', title: 'Weekly usage report', onTime: false, hasGap: false }]);
+});
+
+test('usageSchedulePeriodsDue: hasGap is true when the watermark is more than one boundary stale (review MEDIUM finding)', () => {
+  // Machine slept through TWO Sundays (Aug 16 and Aug 23); wakes Monday Aug 31 — the catch-up
+  // run lands on a NON-boundary day (late branch) and must still flag that Aug 23's week was
+  // ALSO skipped, not just silently jump straight to Aug 30.
+  const now = new Date(2026, 7, 31); // Monday
+  const watermark = { lastWeekReported: '2026-08-09', lastMonthReported: null };
+  const due = usageSchedulePeriodsDue(now, watermark);
+  expect(due.find((d) => d.period === 'week')).toMatchObject({ id: '2026-08-30', onTime: false, hasGap: true });
+});
+
+test('usageSchedulePeriodsDue: hasGap is true even on the ON-TIME branch — a catch-up landing on a later boundary day must not silently swallow an earlier one (review MEDIUM finding)', () => {
+  // Slept through Aug 23's 23:50 fire; wakes and the check next runs Aug 30 at 23:50 — a
+  // BOUNDARY day, so onTime is true and a REAL report goes out, but Aug 23's week must not
+  // vanish with zero mention just because this run happened to land on a later boundary.
+  const now = atFireTime(2026, 7, 30);
+  const watermark = { lastWeekReported: '2026-08-09', lastMonthReported: null };
+  const due = usageSchedulePeriodsDue(now, watermark);
+  expect(due.find((d) => d.period === 'week')).toMatchObject({ id: '2026-08-30', onTime: true, hasGap: true });
+});
+
+test('usageScheduleGapNote: names the period and says the earlier numbers are gone', () => {
+  expect(usageScheduleGapNote('week')).toContain('earlier week');
+  expect(usageScheduleGapNote('week')).toContain('gone');
+  expect(usageScheduleGapNote('month')).toContain('earlier month');
+});
+
+test('usageSchedulePeriodsDue: both due AND on time the same day when a week ends on the last day of its month, checked at the fire time', () => {
+  const bothTrue = atFireTime(2026, 4, 31); // confirmed Sunday + May's last day (see above), 23:50
+  const due = usageSchedulePeriodsDue(bothTrue, EMPTY_USAGE_SCHEDULE_WATERMARK);
+  expect(due.map((d) => d.period).sort()).toEqual(['month', 'week']);
+  expect(due.every((d) => d.onTime)).toBe(true);
+  expect(due.every((d) => !d.hasGap)).toBe(true); // fresh watermark, nothing to have skipped
+});
+
+test('seedUsageScheduleWatermarkFor: seeds the in-progress period as already-reported on a normal (non-boundary) day', () => {
+  const seed = seedUsageScheduleWatermarkFor(new Date(2026, 7, 24)); // Monday, mid-August
+  expect(seed).toEqual({ lastWeekReported: completedWeekId(new Date(2026, 7, 24)), lastMonthReported: completedMonthId(new Date(2026, 7, 24)) });
+});
+
+test('seedUsageScheduleWatermarkFor: on a boundary day BEFORE the fire time, seeds the PRIOR period — not the one that legitimately closes later tonight (review LOW finding)', () => {
+  const earlyOnBoundaryDay = new Date(2026, 7, 30, 9, 0); // Sunday Aug 30, 09:00 — not closed yet
+  const seed = seedUsageScheduleWatermarkFor(earlyOnBoundaryDay);
+  expect(seed.lastWeekReported).toBe('2026-08-23'); // the PRIOR Sunday, not today's not-yet-closed '2026-08-30'
+  // Tonight's real 23:50 fire then sees '2026-08-30' !== '2026-08-23' → correctly due, onTime, no gap.
+  const duesTonight = usageSchedulePeriodsDue(atFireTime(2026, 7, 30), seed);
+  expect(duesTonight.find((d) => d.period === 'week')).toMatchObject({ id: '2026-08-30', onTime: true, hasGap: false });
+});
+
+test('seedUsageScheduleWatermarkFor: on a boundary day AT/AFTER the fire time, seeds today\'s own (now genuinely closed) period', () => {
+  const seed = seedUsageScheduleWatermarkFor(atFireTime(2026, 7, 30));
+  expect(seed.lastWeekReported).toBe('2026-08-30');
+});
+
+test('shouldSeedUsageScheduleWatermark: true only on a genuinely absent file — a re-enable must never reseed and silently swallow a pending/failed period (review finding, two independent reviewers)', () => {
+  expect(shouldSeedUsageScheduleWatermark(null)).toBe(true);
+  // Any existing content — even a stale/all-null watermark from a prior enable — blocks reseeding.
+  expect(shouldSeedUsageScheduleWatermark(JSON.stringify(EMPTY_USAGE_SCHEDULE_WATERMARK))).toBe(false);
+  expect(shouldSeedUsageScheduleWatermark(JSON.stringify({ lastWeekReported: '2026-08-16', lastMonthReported: null }))).toBe(false);
+  expect(shouldSeedUsageScheduleWatermark('garbage')).toBe(false); // re-enable must not clobber even unparseable content
+  expect(shouldSeedUsageScheduleWatermark('')).toBe(false); // an empty (not absent) file still blocks reseeding
+});
+
+test('missedUsageReportNotice: names the period id, the cause, the fire time, and the by-hand command', () => {
+  const week = missedUsageReportNotice({ period: 'week', id: '2026-08-23', title: 'Weekly usage report', onTime: false, hasGap: false });
+  expect(week).toContain('Weekly usage report for the week ending 2026-08-23 was NOT generated');
+  expect(week).toContain('asleep');
+  expect(week).toContain('23:50');
+  expect(week).toContain('rig usage --period week');
+  expect(week.toLowerCase()).not.toContain('collapses to this single latest period'); // no gap, no footnote
+  const month = missedUsageReportNotice({ period: 'month', id: '2026-07', title: 'Monthly usage report', onTime: false, hasGap: false });
+  expect(month).toContain('for the month 2026-07');
+  expect(month).toContain('rig usage --period month');
+});
+
+test('missedUsageReportNotice: appends the gap footnote ONLY when hasGap is true', () => {
+  const withGap = missedUsageReportNotice({ period: 'week', id: '2026-08-23', title: 'Weekly usage report', onTime: false, hasGap: true });
+  expect(withGap.toLowerCase()).toContain('collapses to this single latest period');
+});
+
+test('parseUsageScheduleWatermark: round-trips a valid file and fails CLOSED on garbage', () => {
+  const wm = { lastWeekReported: '2026-08-23', lastMonthReported: '2026-07' };
+  expect(parseUsageScheduleWatermark(JSON.stringify(wm))).toEqual(wm);
+  // Missing / malformed / wrong-typed → "never reported" (at worst one duplicate report,
+  // never a silently skipped one).
+  expect(parseUsageScheduleWatermark(null)).toEqual(EMPTY_USAGE_SCHEDULE_WATERMARK);
+  expect(parseUsageScheduleWatermark('')).toEqual(EMPTY_USAGE_SCHEDULE_WATERMARK);
+  expect(parseUsageScheduleWatermark('{not json')).toEqual(EMPTY_USAGE_SCHEDULE_WATERMARK);
+  expect(parseUsageScheduleWatermark('[1,2]')).toEqual(EMPTY_USAGE_SCHEDULE_WATERMARK);
+  expect(parseUsageScheduleWatermark('{"lastWeekReported":7,"lastMonthReported":"2026-07"}')).toEqual({
+    lastWeekReported: null,
+    lastMonthReported: '2026-07',
+  });
 });
