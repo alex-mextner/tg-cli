@@ -382,6 +382,14 @@ if (import.meta.main) {
     process.exit(installSkill())
   }
   const home = process.env.HOME ?? "~"
+  // The config dir the credential/env lookups below read from — honors
+  // TG_CTL_CONFIG_DIR (same override tg-ctl's own daemon and the `replies`
+  // subcommand already respect) so a non-default dir (e.g. two bots on one
+  // machine, or tg-ctl's usage-schedule launchd job, which pins exactly this
+  // var into its plist) doesn't silently fall back to ~/.config/tg-cli and
+  // either fail to find credentials or send with the WRONG bot's (review
+  // finding — this send path used to hardcode the default dir, unlike `replies`).
+  const configDir = process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")
 
   // `tg hooks ...` — list / trust / untrust for pre-send-photo hooks. Hooks are
   // trust-by-default (they run with no trust step), so `trust` is a no-op unless
@@ -389,11 +397,11 @@ if (import.meta.main) {
   // `tg "hooks ..."` as a plain message still sends. Returns null when argv is
   // not a hooks subcommand. Pass the SAME merged config+process env the later
   // gate uses (config `.env` → process.env precedence) so AGENTS_HOOKS_TRUST set
-  // in ~/.config/tg-cli/.env governs `hooks list/trust` exactly as it governs a
-  // real send — otherwise `trust` would no-op while sends still quarantine.
+  // in the resolved config dir's .env governs `hooks list/trust` exactly as it
+  // governs a real send — otherwise `trust` would no-op while sends still quarantine.
   if (rawArgs[0] === "hooks") {
     const hooksEnv = {
-      ...loadEnv(join(home, ".config", "tg-cli", ".env")),
+      ...loadEnv(join(configDir, ".env")),
       ...process.env,
     }
     const code = runHooksCli(rawArgs, home, hooksEnv)
@@ -457,10 +465,10 @@ if (import.meta.main) {
   // leading token only, so `tg "replies ..."` as a plain message still sends.
   // Returns null when argv is not a replies subcommand → fall through to send.
   if (rawArgs[0] === "replies") {
-    // Resolve the bot id from the SAME config dir whose history we read, so an
-    // alternate TG_CTL_CONFIG_DIR can't mix a home-`.env` token with a different
-    // dir's history file. process.env still wins over the dir's `.env`.
-    const configDir = process.env.TG_CTL_CONFIG_DIR || join(home, ".config", "tg-cli")
+    // Resolve the bot id from the SAME config dir whose history we read (now the
+    // one shared `configDir` above), so an alternate TG_CTL_CONFIG_DIR can't mix
+    // a different dir's token with a different dir's history file. process.env
+    // still wins over the dir's `.env`.
     const repliesEnv = {
       ...loadEnv(join(configDir, ".env")),
       ...process.env,
@@ -596,7 +604,7 @@ if (import.meta.main) {
     process.exit(1)
   }
 
-  const configEnv = loadEnv(join(home, ".config", "tg-cli", ".env"))
+  const configEnv = loadEnv(join(configDir, ".env"))
   const env = { ...configEnv, ...process.env }
 
   // Override embeddable emoji IDs with env vars if provided. Runs before any

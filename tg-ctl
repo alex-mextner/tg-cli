@@ -1910,7 +1910,20 @@ function disableUsageSchedule(ctx: Ctx): number {
     return 0
   }
   const plan = buildUsageScheduleDisablePlan(ctx.home)
+  // The watermark is cleared on EVERY disable call that reaches this function — including
+  // the "already gone" early-return paths below — not just the branch that actually
+  // unloads/removes a plist. A re-disable after a partial failure, or a disable after the
+  // plist was already removed by hand, is still an intentional "stop watching" the user
+  // asked for; leaving the watermark behind in either case would make a LATER re-enable
+  // (which only reseeds an ABSENT file, see shouldSeedUsageScheduleWatermark) see it as
+  // present and skip reseeding, then fire a false "machine was asleep" notice for the whole
+  // disabled window — the exact bug an earlier fix (review MEDIUM finding) closed for the
+  // plist-present path but left open here (review HIGH finding: the early returns below
+  // used to skip this cleanup entirely).
+  const clearWatermark = () =>
+    unlinkGuarded(usageScheduleWatermarkPath(ctx), "tg-ctl: usage-schedule: removing the watermark failed (harmless — a stale one only delays the next reseed)")
   if (!existsSync(plan.filePath)) {
+    clearWatermark()
     console.log("tg-ctl: usage-schedule is not installed — nothing to remove.")
     return 0
   }
@@ -1925,11 +1938,7 @@ function disableUsageSchedule(ctx: Ctx): number {
     console.error(`tg-ctl: removing ${plan.filePath} failed: ${err}`)
     return EXIT_AUTOSTART_FAILED
   }
-  // Also clear the watermark: an intentional disable is a real "stop watching" — leaving a
-  // stale watermark behind would make a LATER re-enable (which only reseeds an ABSENT file,
-  // see shouldSeedUsageScheduleWatermark) see it as present and skip reseeding, then fire a
-  // false "machine was asleep" notice for the entire disabled window (review MEDIUM finding).
-  unlinkGuarded(usageScheduleWatermarkPath(ctx), "tg-ctl: usage-schedule: removing the watermark failed (harmless — a stale one only delays the next reseed)")
+  clearWatermark()
   console.log("tg-ctl: usage-schedule disabled.")
   return 0
 }
@@ -4158,11 +4167,13 @@ async function runAutoContinueOnce(ctx: Ctx, argv: string[]): Promise<number> {
   }
 }
 
-// The agent (window) name for a pane, from the live tmux snapshot — so the bare
-// installed hook still labels the notification instead of a default "agent".
+// The LIVE harness kind for a pane — so the bare installed hook still labels the
+// notification instead of a default "agent". MUST read `.agent` (the process-tree-
+// detected harness), not `.windowName`: a window's name is set once at spawn time
+// (or by hand) and drifts from whatever's actually running in the pane (tg-cli#263).
 function resolveAgentForPane(paneId: string | null): string {
   if (!paneId) return "agent"
-  return listAgentCandidates().find((c) => c.paneId === paneId)?.windowName ?? "agent"
+  return listAgentCandidates().find((c) => c.paneId === paneId)?.agent ?? "agent"
 }
 
 function resolveWindowNameForPane(paneId: string | null): string | null {
