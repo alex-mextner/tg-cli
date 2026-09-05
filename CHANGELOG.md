@@ -3,7 +3,7 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.43.2
+## 1.45.1
 
 **Fix: bare `harness-event` StopFailure alerts mislabel the agent with the tmux window name, not the live harness (#263).**
 
@@ -33,6 +33,127 @@ semantic versioning.
   warnings; it now correctly does, same as any other bare-hook `claude`
   session. Expect a one-time uptick in these warnings for such panes — that's
   the fix reaching cases it silently missed before, not a new false positive.
+
+## 1.44.5
+
+**Fix: tg-ctl gave up on permission prompts too early, falsely reporting them as "never delivered" (tg-cli#182).**
+
+- A `permission`-kind entry (an approve/reject request whose hook socket closed) now uses its own,
+  much longer retention window (`TG_CTL_ABANDONED_PERMISSION_RETAIN_MS`, default 12h) before the
+  daemon gives up and tells the human "this was never delivered over Telegram" — previously it shared
+  the 30-minute question window (`TG_CTL_ABANDONED_RETAIN_MS`), so a permission left unanswered for
+  as little as half an hour (easily overnight, or a few hours away from the phone) was falsely
+  reported as unrecoverable even though the harness might still be sitting on its own terminal
+  fallback prompt, fully answerable.
+- A separate, related fix (multi-line command matching for the late-delivery pane-injection path,
+  tg-cli#267) was attempted but reverted after a 3-round review surfaced an unresolved escalation
+  risk and an unverified rendering assumption — tracked as tg-cli#283 for a live-verified redesign.
+
+## 1.44.4
+
+**Fix: renamed the 1.44.3 routing-anchor feature's identifiers/filenames off the repo owner's own name.**
+
+- `last-alex-target.ts`/`LastAlexTarget`/`recordLastAlexTarget` (and siblings)
+  and the on-disk `tg-ctl.<bot>.last-alex-target.json` state file are renamed
+  to their `User` equivalents throughout. A daemon upgrading from 1.44.3
+  migrates a pre-existing anchor forward automatically (once it holds its
+  singleton lock); the denylist still blocks both the new and legacy
+  filenames from ever riding a Telegram attach.
+
+## 1.44.3
+
+**Fix: a non-reply message could route to whichever agent pane merely spoke last, instead of the pane the CTO was actually addressing.**
+
+- An unrelated agent proactively messaging the CTO — right before the CTO sent
+  his own fresh, non-reply message — could hijack that message: routing bound
+  to `routes.json`'s "last outbound sender" (`lastMessagePane`), which
+  conflated "who spoke last" with "who the CTO was addressing" (live
+  incident). Fixed by adding a dedicated anchor
+  (`tg-ctl.<bot>.last-user-target.json`) that records ONLY the CTO's own last
+  CONFIRMED inbound delivery — an auto-bound inject, a picker tap, a reply, or
+  a named `/agent` — never an agent's own outbound send and never a failed
+  inject. Guarded against tmux pane-id reuse the same way reply-routing
+  already was, and shared between inbound message routing and `/tasks`'s
+  default project scoping so the two no longer disagree.
+- Also fixed the same class of bug in the git-state-check banner (it could
+  silently check the daemon's own repo instead of skipping the banner when a
+  pane reported no known path), and widened the never-attach denylist to
+  cover the new anchor file's temp-write staging form.
+
+## 1.44.2
+
+**Fix: `/agent <selector> <message>` dropped the inbound `tg#<id>` wrap tag, breaking threaded replies for anything routed by name.**
+
+- `injectToPane` (the daemon's `/agent`-routing inject path) accepted a
+  `sourceMessageId` parameter — used only for deferred-queue bookkeeping — but
+  never forwarded it into `wrapInbound`. Every other inbound path (auto-bind
+  inject, reply-quote, deferred flush) already passed its message id and
+  rendered `[TG from Alex tg#<id>] <msg>`; a message sent via
+  `/agent <selector> <message>` rendered `[TG from Alex] <msg>` instead,
+  silently losing the id an agent needs for `tg --reply-to <id>` threading.
+  Present since the `/agent` selector routing was added (June 12) — the
+  `{id}` wrap convention landed later (PR #34) and was only wired into the
+  OTHER inject paths, never into this one. Fixed by forwarding
+  `sourceMessageId` into the existing `wrapInbound` call; covers the direct
+  hit, the ambiguous-picker confirm, and the defer-flush replay, since all
+  three share this one function. Three integration tests cover it:
+  `ctl-agent-route-message-id-integration.test.ts` (confident direct route),
+  a new case in `ctl-ambiguous-picker-integration.test.ts` (the picker-tap
+  call site of the same shared `injectToPane`), and
+  `ctl-agent-route-defer-flush-message-id-integration.test.ts` (a message
+  deferred behind an open question flushes with the id exactly once — no
+  double-tag from re-wrapping an already-wrapped deferred item). Also
+  corrected two stale doc comments (`inject.ts`, `types.ts`) that still
+  claimed a `/agent` route carries no id.
+
+## 1.44.1
+
+**Fix: `--tag question|decision`'s escalation-format gate rejected realistic decision-request content while only the tool's own toy template passed (#261, #262).**
+
+- `hasWallOfText` split a message body on literal `\n` only. A fully structured
+  Rich Message (`<h3>`/`<p>`/`<table>`/`<ul>`/`<hr>`) assembled as one
+  continuous string, with no literal newline between sections, still renders
+  as separate visual lines in Telegram — but the raw source string was one
+  giant "line" whose character count blew past the 350-char wall-of-text
+  threshold the moment the content was realistic. Fixed by scanning "visual
+  lines" (a virtual break before each opening block tag, after each
+  closing/void one) instead of literal-newline-split lines, so the same
+  content gets the same verdict regardless of the caller's newline
+  formatting. `hasContextProse` had the identical bug (found during review of
+  this fix) and got the same normalization, plus a matching
+  `blockquote`/`pre`/`code` skip-list so quoted text or a code dump can't
+  satisfy the Context requirement with none of the agent's own prose.
+
+## 1.44.0
+
+**Feature: late-deliver a permission tap by injecting the digit into the still-showing terminal menu (#267).**
+
+- A Telegram Approve/Reject tap that lands after a permission's hook socket
+  already closed (Claude Code's ~120s hook budget elapsed, harness fell back
+  to its own terminal "Do you want to proceed?" prompt) now re-checks the
+  pane via `tmux capture-pane` and, if the menu is still showing FOR THIS SAME
+  request, injects the matching digit directly — no waiting process, no
+  dependency on a hook reconnect that may never come. Previously the tap was
+  only ever QUEUED for delivery on a hook reconnect (tg-cli#31/#98), which
+  meant a terminal-fallback permission could wait forever despite the human
+  having already answered.
+- Scoped to `claude`: its numbered menu layout and bare-digit-submits-instantly
+  behavior (verified live, 2026-08-18 — a bare digit resolves the prompt in
+  well under a second, no trailing Enter) are the only ones confirmed; every
+  other agent kind, and claude when the menu can't be re-verified live, falls
+  through unchanged to the existing queue-and-wait-for-reconnect path.
+- The captured menu must ALSO still identify the SAME command/question the
+  request was originally asking about — not whatever permission happens to be
+  pending right now. Without this binding, a stale tap could inject "Yes" into
+  a newer, unrelated prompt within the retention window (review finding).
+- New pure module `features/tg-ctl/permission-menu.ts` parses the captured
+  pane text for the menu (from the LAST "Do you want to proceed?" occurrence,
+  not the first — the marker can also appear in scrollback) and picks the
+  digit matching an allow/deny decision by an EXACT "Yes"/"No" label match,
+  not a prefix — Claude Code has other wide "yes" variants beyond "don't ask
+  again" (e.g. auto-accepting edits for the session), and an exact allowlist
+  match is what actually enforces "never silently grant a broader standing
+  decision than the tapped Approve button represents."
 
 ## 1.43.1
 

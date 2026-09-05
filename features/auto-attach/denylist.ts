@@ -32,10 +32,23 @@ export const NEVER_ATTACH_PATTERNS: RegExp[] = [
   // kubernetes access config
   /^kubeconfig$/i,
   // tg-ctl daemon state: the message history is a full conversation transcript
-  // (`tg replies` source) and the routes map leaks pane→project layout. Neither
-  // should ever ride a Telegram attach, even when named explicitly.
+  // (`tg replies` source), the routes map leaks pane→project layout, and the
+  // last-user-target anchor (tg-cli#78) leaks the CTO's currently active pane
+  // id and its project cwd. None of these should ever ride a Telegram attach,
+  // even when named explicitly. The `.tmp.<pid>` form is the anchor's OWN
+  // write-then-rename staging file (tg-ctl's recordLastUserTarget) — a crash or
+  // failed rename between the write and the rename can leave it orphaned on
+  // disk with the same sensitive content, so it needs the same denylist
+  // coverage as the final filename (review finding), not just the final name.
   /^tg-ctl\..*\.history\.jsonl$/i,
   /^tg-ctl\..*\.routes\.json$/i,
+  /^tg-ctl\..*\.last-user-target\.json(\.tmp\.\d+)?$/i,
+  // Legacy name (tg-cli#281 rename): a pre-rename install can still have this
+  // file, or a crash-orphaned .tmp.<pid> of it, on disk carrying the same
+  // sensitive pane id + cwd — kept denylisted permanently, not just for a
+  // deprecation window, since it costs nothing and a missed cleanup should
+  // never silently regain attach eligibility.
+  /^tg-ctl\..*\.last-alex-target\.json(\.tmp\.\d+)?$/i,
 ];
 
 /** True when the file's BASENAME matches any never-attach pattern. */
