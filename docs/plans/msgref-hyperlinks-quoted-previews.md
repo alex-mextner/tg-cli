@@ -30,12 +30,19 @@ replies` uses at `tg` line ~345).
 Known properties the design must respect:
 
 - **Trimmed tail** — the log keeps the last ~5000 lines (`MAX_HISTORY`). Old ids age out.
-- **Single-chat by design** — `message_id` is only unique PER CHAT, and `HistoryRecord`
-  carries no chat field. This is safe today because the whole tool is one-chat-per-machine
-  (the daemon's allowlist admits only `TG_CHAT_ID`; outbound sends target that same chat,
-  topics included), so every history record belongs to the chat the preview links into. The
-  implementation must state this assumption next to the lookup; if multi-chat support ever
-  lands, the history record gains a chat field and the Map keys become `(chat, id)`.
+- **Scope every lookup by `chat_id`, reusing the existing pattern — do NOT add a new
+  ID-only Map.** `message_id` is only unique PER CHAT. `HistoryRecord` already carries an
+  optional `chat_id` (`features/replies/history.ts`), and the sibling bottom-reference
+  builder `buildMsgRefEntries` (`features/autolink-msgrefs/render.ts`) already resolves this
+  correctly via `chatMatchRank(rec, chatId)`: an exact `chat_id` match ranks highest, a
+  legacy record with no `chat_id` ranks as a fallback, and a record from a DIFFERENT chat is
+  excluded outright. (Review finding, P1: an earlier draft of this plan assumed a naive
+  ID-only lookup was "safe" because the tool is one-chat-per-machine — but a bound topic, a
+  second configured chat, or simply old cross-chat history rows sharing the file can already
+  produce a same-id collision; the fix is to reuse the existing scoping, not to special-case
+  a new one.) The new inline-preview lookup must call `buildMsgRefEntries` (or a shared
+  helper factored out of it) with the SAME `chatId` argument the bottom-reference path
+  already passes, rather than re-implementing its own `Map<number, HistoryRecord>`.
 - **Records with `message_id: null` are dropped** when building the lookup Map (some
   outbound paths log without an id; a null key must never match anything).
 - **Duplicate ids resolve first-write-wins.** Today no writer logs the same id twice
@@ -64,6 +71,18 @@ Given `tg#5663` and a history hit whose text begins «Запланируй чт�
 - **id not found in history**: today's rendering, byte-identical. A preview is NEVER
   fabricated (no "message #5663" pseudo-text) — absence of data renders as absence of
   preview.
+
+**Must not duplicate the existing bottom `<blockquote expandable>` entry (review finding,
+P2).** `buildMsgRefEntries` already renders a one-line excerpt for every mentioned id into a
+bottom reference block (`tg`'s autolink transform, `<blockquote expandable>`) — that is
+where today's byte-identical fallback rendering gets its excerpt from. Once an id gets an
+INLINE preview under this plan, its bottom-block entry must be SUPPRESSED for that id (pass
+the already-linkified id set into `buildMsgRefEntriesFor` as an exclusion, or filter the
+built entries before rendering the bottom block) — otherwise every previewed reference shows
+the same excerpt TWICE: once inline, once at the bottom. The id-not-found fallback above is
+exactly the case that still needs the bottom-block entry (no inline preview exists to show
+it), so the suppression must be per-id (found → suppress bottom entry; not-found → keep it),
+not a blanket "turn off the bottom block once this feature ships."
 
 Decision — **keep the trailing `(tg#id)` marker** in both cases. Rationale: the id is the
 stable handle. Replies quote these tokens back ("про tg#5663 — сделай наоборот"), agents
