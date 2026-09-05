@@ -45,6 +45,26 @@ import {
   type AutostartKind,
   type ProbedLaunchdJob,
 } from "./features/tg-ctl/autostart"
+import {
+  USAGE_SCHEDULE_LAUNCHD_LABEL,
+  buildUsageScheduleDisablePlan,
+  buildUsageScheduleEnablePlan,
+  missedUsageReportNotice,
+  parseUsageScheduleWatermark,
+  seedUsageScheduleWatermarkFor,
+  shouldSeedUsageScheduleWatermark,
+  usageScheduleGapNote,
+  usageScheduleLaunchdPlistPath,
+  usageSchedulePeriodsDue,
+  type UsageScheduleDuePeriod,
+  type UsageScheduleEnv,
+  type UsageScheduleWatermark,
+} from "./features/tg-ctl/usage-schedule"
+import { renderUsageReport } from "./features/tg-ctl/usage-format"
+import { mergePendingDailyReport, undeliveredReportTail } from "./features/tg-ctl/report-delivery"
+import { splitMessage } from "./features/auto-attach/split"
+import { MESSAGE_LIMIT } from "./features/auto-attach/types"
+import { escapeHtml } from "./features/render/html"
 import { parseControlConfig, resolveControlConfig } from "./features/tg-ctl/config"
 import { codexUsageTranscriptPath, latestCodexUsageTelemetryPayload } from "./features/tg-ctl/codex-usage"
 import { DeferQueues, driveFlush } from "./features/tg-ctl/defer"
@@ -251,6 +271,13 @@ export const USAGE = `Usage:
                          # install OS autostart (launchd / systemd --user) AND start now
                          # (--dry-run prints the plan and touches nothing)
   tg-ctl disable         # remove OS autostart AND stop
+  tg-ctl usage-schedule enable [--dry-run]
+                         # install a launchd job (macOS only) that checks daily at 23:50 and
+                         # sends a token/cost report to the chat once per completed week and
+                         # month; a check missed at 23:50 (machine asleep) is reported as
+                         # missed, never silently skipped (--dry-run prints the plan only)
+  tg-ctl usage-schedule disable
+                         # remove the scheduled usage-report launchd job
   tg-ctl ask             # internal: hook client, reads a ButtonRequest JSON from stdin
   tg-ctl install-hooks   # wire q→buttons + StopFailure + Claude/Codex usage telemetry
   tg-ctl voice-setup     # discover a local Whisper (~/xp) → configure inbound voice→text
@@ -1800,6 +1827,185 @@ function disableAutostart(ctx: Ctx): number {
       ? "tg-ctl: no OS autostart to remove — stopped the background instance."
       : `tg-ctl: autostart disabled (${plan.kind}).`,
   )
+  return 0
+}
+
+// --- /spend scheduled push (end-of-week / end-of-month) ---
+
+function usageScheduleWatermarkPath(ctx: Ctx): string {
+  return ctlPaths(ctx.configDir, botIdFromToken(ctx.token) || "unknown").usageSchedule
+}
+
+function usageScheduleEnv(ctx: Ctx): UsageScheduleEnv {
+  return {
+    home: ctx.home,
+    binPath: resolveDeployedBin(ctx.home),
+    bunPath: process.execPath,
+    logPath: ctx.paths.log,
+    configDir: ctx.configDir,
+    // Captured from the enabling shell — launchd's own PATH won't include wherever
+    // `tg`/`rig` live (see usageScheduleUnitEnv's comment in usage-schedule.ts).
+    pathEnv: process.env.PATH ?? '',
+  }
+}
+
+// `tg-ctl usage-schedule enable [--dry-run]` — install the launchd job that fires
+// `usage-schedule-check` daily at 23:50; `--dry-run` prints the plan and touches nothing
+// (mirrors enableAutostart's own --dry-run contract). launchd (macOS) only — see
+// usage-schedule.ts's SCOPE note.
+// Seeded ONLY on a truly first enable (no watermark file yet) so the FIRST scheduled check
+// never claims a period was "missed while the machine was asleep" — nothing was scheduled
+// yet, so nothing could have been missed. `enable` is also a supported RE-run (retry a
+// half-failed load, re-pin PATH after moving `tg`/`rig`) — an unconditional reseed there
+// would silently overwrite a real pending/failed period with "already reported" and swallow
+// it with neither a report nor a missed notice (review finding, converged on by two
+// independent reviewers). An existing watermark — even an all-null one written by a prior
+// enable — is therefore left untouched; only a genuinely absent file gets seeded.
+function seedUsageScheduleWatermark(watermarkPath: string, now: Date): void {
+  if (!shouldSeedUsageScheduleWatermark(readFileOrNull(watermarkPath))) return
+  const seed = seedUsageScheduleWatermarkFor(now)
+  try {
+    atomicWrite(watermarkPath, `${JSON.stringify(seed)}\n`)
+  } catch (err) {
+    console.error(`tg-ctl: usage-schedule: seeding the watermark failed (a false "missed" notice may fire once): ${err}`)
+  }
+}
+
+function enableUsageSchedule(ctx: Ctx, dryRun: boolean): number {
+  if (process.platform !== "darwin") {
+    console.error("tg-ctl: usage-schedule is only implemented for launchd (macOS) — not supported on this OS.")
+    return EXIT_AUTOSTART_FAILED
+  }
+  const env = usageScheduleEnv(ctx)
+  const plan = buildUsageScheduleEnablePlan(env)
+  if (dryRun) {
+    console.log(`tg-ctl: [dry-run] usage-schedule label: ${USAGE_SCHEDULE_LAUNCHD_LABEL}`)
+    console.log(`tg-ctl: [dry-run] would write ${plan.file.path}`)
+    for (const cmd of plan.commands) console.log(`tg-ctl: [dry-run] would run: ${cmd.argv.join(" ")}`)
+    return 0
+  }
+  try {
+    mkdirSync(dirname(plan.file.path), { recursive: true })
+    writeFileSync(plan.file.path, plan.file.content, { mode: plan.file.mode })
+  } catch (err) {
+    console.error(`tg-ctl: writing ${plan.file.path} failed: ${err}`)
+    return EXIT_AUTOSTART_FAILED
+  }
+  seedUsageScheduleWatermark(usageScheduleWatermarkPath(ctx), new Date())
+  let activated = true
+  for (const cmd of plan.commands) {
+    if (!runAutostartCommand(cmd)) activated = false
+  }
+  if (!activated) {
+    console.error("tg-ctl: usage-schedule launchctl command failed — the unit file is on disk but not loaded.")
+    return EXIT_AUTOSTART_FAILED
+  }
+  console.log(`tg-ctl: usage-schedule enabled — ${USAGE_SCHEDULE_LAUNCHD_LABEL} at ${plan.file.path}. Checks daily at 23:50, sends one report per completed week and month (a day missed while asleep is reported as missed, not skipped).`)
+  return 0
+}
+
+function disableUsageSchedule(ctx: Ctx): number {
+  if (process.platform !== "darwin") {
+    console.log("tg-ctl: usage-schedule was never installed on this OS — nothing to remove.")
+    return 0
+  }
+  const plan = buildUsageScheduleDisablePlan(ctx.home)
+  // The watermark is cleared on EVERY disable call that reaches this function — including
+  // the "already gone" early-return paths below — not just the branch that actually
+  // unloads/removes a plist. A re-disable after a partial failure, or a disable after the
+  // plist was already removed by hand, is still an intentional "stop watching" the user
+  // asked for; leaving the watermark behind in either case would make a LATER re-enable
+  // (which only reseeds an ABSENT file, see shouldSeedUsageScheduleWatermark) see it as
+  // present and skip reseeding, then fire a false "machine was asleep" notice for the whole
+  // disabled window — the exact bug an earlier fix (review MEDIUM finding) closed for the
+  // plist-present path but left open here (review HIGH finding: the early returns below
+  // used to skip this cleanup entirely).
+  const clearWatermark = () =>
+    unlinkGuarded(usageScheduleWatermarkPath(ctx), "tg-ctl: usage-schedule: removing the watermark failed (harmless — a stale one only delays the next reseed)")
+  if (!existsSync(plan.filePath)) {
+    clearWatermark()
+    console.log("tg-ctl: usage-schedule is not installed — nothing to remove.")
+    return 0
+  }
+  const ok = runAutostartCommand(plan.commands[0])
+  if (!ok) {
+    console.error("tg-ctl: usage-schedule deactivate failed — leaving the unit file in place.")
+    return EXIT_AUTOSTART_FAILED
+  }
+  try {
+    unlinkSync(plan.filePath)
+  } catch (err) {
+    console.error(`tg-ctl: removing ${plan.filePath} failed: ${err}`)
+    return EXIT_AUTOSTART_FAILED
+  }
+  clearWatermark()
+  console.log("tg-ctl: usage-schedule disabled.")
+  return 0
+}
+
+function writeUsageScheduleWatermark(path: string, watermark: UsageScheduleWatermark): void {
+  atomicWrite(path, `${JSON.stringify(watermark)}\n`)
+}
+
+// Send one scheduled report through the `tg` CLI. The report body is plain text built
+// from `rig usage --json` data (model names, the disclaimer) but `--format html` parses
+// it as HTML — `rig usage` really does emit a "<synthetic>" model name, and Telegram
+// rejects an unescaped stray "<" — so the body is escaped right here, at the HTML
+// boundary (the interactive /spend reply goes out as plain text and must NOT be escaped).
+// No splitting here: the `tg` CLI's own transmitter 4096-splits a non-rich HTML body
+// (features/auto-attach/transmitter.ts), unlike the daemon's direct Bot API sends.
+async function sendScheduledUsageReport(title: string, body: string): Promise<boolean> {
+  const r = await spawnGuarded(["tg", "--format", "html", "--tag", "report", "--title", title, escapeHtml(body)], 30_000)
+  if (r.exitCode === 0) return true
+  console.error(`tg-ctl: usage-schedule: sending "${title}" failed (exit ${r.exitCode}): ${r.stderr.trim() || "no error output"}`)
+  return false
+}
+
+// What the scheduled check sends for one due period: the real report when the check runs
+// ON the boundary day (`rig usage --period X` covers exactly the completing period), an
+// explicit missed-report notice when it runs late (rig can only report the CURRENT
+// period — see usage-schedule.ts's LIMIT note), or nothing (`null`, period stays due)
+// when rig itself failed: an error blurb delivered "successfully" must never advance the
+// watermark, or a transient rig failure on the boundary day consumes the period for good.
+async function scheduledUsageBody(due: UsageScheduleDuePeriod): Promise<string | null> {
+  if (!due.onTime) return missedUsageReportNotice(due)
+  const report = await composeUsageReport(due.period)
+  if (report.ok) return due.hasGap ? `${report.text}\n\n${usageScheduleGapNote(due.period)}` : report.text
+  console.error(`tg-ctl: usage-schedule: "${due.title}" (period ${due.id}) not generated, left due for the next check: ${report.text}`)
+  return null
+}
+
+// The job the installed launchd unit actually invokes once a day. A no-op unless a
+// week/month report is DUE per the persisted watermark (usage-schedule.ts's
+// usageSchedulePeriodsDue; both can be due the same day — both are handled). A period
+// whose compose or send fails stays due, so the next daily check retries it instead of
+// silently losing it. Dry-run (TG_USAGE_SCHEDULE_DRY_RUN=1 in the PROCESS env — not the
+// merged .env, so a line left in the config file can't turn the schedule into a permanent
+// no-op — or --dry-run) logs what WOULD be sent and never advances the watermark, so a
+// manual smoke check neither pushes a message nor masks a pending real report.
+async function runUsageScheduleCheck(now: Date, dryRun: boolean, watermarkPath: string): Promise<number> {
+  const watermark = parseUsageScheduleWatermark(readFileOrNull(watermarkPath))
+  const due = usageSchedulePeriodsDue(now, watermark)
+  if (due.length === 0) return 0
+  let next = watermark
+  for (const item of due) {
+    const body = await scheduledUsageBody(item)
+    if (body === null) continue
+    if (dryRun) {
+      console.log(`tg-ctl: [dry-run] would send "${item.title}" (period ${item.id}${item.onTime ? "" : ", LATE"}): ${body.slice(0, 200)}${body.length > 200 ? "…" : ""}`)
+      continue
+    }
+    if (!(await sendScheduledUsageReport(item.title, body))) continue
+    next = item.period === "week" ? { ...next, lastWeekReported: item.id } : { ...next, lastMonthReported: item.id }
+    // Persisted right after EACH successful send (not once after the whole loop) — a crash
+    // between send and write would otherwise leave a delivered report looking "NOT
+    // generated" to the next check (review LOW finding).
+    try {
+      writeUsageScheduleWatermark(watermarkPath, next)
+    } catch (err) {
+      console.error(`tg-ctl: usage-schedule: sent "${item.title}" but FAILED to persist the watermark — it may be reported as missed again tomorrow: ${err}`)
+    }
+  }
   return 0
 }
 
@@ -3550,6 +3756,113 @@ function composeLimitStatus(ctx: Ctx, agentFilter: string | null, now = Date.now
     lines.push(`- ${limit}: ${formatUsagePercent(rec.percent)}%${reset}${sampled}`)
   }
   return lines.join("\n")
+}
+
+// /daily — shells out to `rig daily` (rig-cli's own categorized what-shipped report
+// over merged PRs, source of truth `gh pr list --state merged`, never a ticket
+// status). Bare `rig daily` with no flags reports since each configured repo's own
+// saved watermark and advances it — exactly the semantics wanted for a repeatable
+// Telegram command (a second /daily right after the first reports "nothing new",
+// same as the CLI itself). 30s timeout: `gh pr list` across a couple of repos is
+// normally sub-second, but a slow/rate-limited GitHub API call must not wedge the
+// daemon's single event loop past a bounded ceiling (see spawnGuarded's own doc).
+// `ok: false` is a failure to RUN rig (nothing was generated, no watermark moved) —
+// only an `ok: true` report is worth persisting if its send later fails.
+async function composeDailyReport(): Promise<{ ok: boolean; text: string }> {
+  const r = await spawnGuarded(["rig", "daily"], 30_000)
+  if (r.exitCode === 127) {
+    return { ok: false, text: `daily: couldn't run \`rig\` (${r.stderr.trim() || "not found on PATH"}). Is rig-cli installed and on this daemon's PATH?` }
+  }
+  if (r.exitCode === 124) {
+    return { ok: false, text: "daily: `rig daily` timed out after 30s (GitHub API slow/rate-limited?) — try again shortly." }
+  }
+  if (r.exitCode !== 0) {
+    return { ok: false, text: `daily: \`rig daily\` failed (exit ${r.exitCode}): ${r.stderr.trim() || "no error output"}` }
+  }
+  const report = r.stdout.trim()
+  return { ok: true, text: report || "daily: nothing new since the last report." }
+}
+
+// Send a plain-text daemon reply as ≤4096-char chunks, in order (Telegram rejects a
+// longer sendMessage outright, and botPost only logs that — the user would get an ack
+// and no report). Stops at the first failed chunk; returns how many were accepted so the
+// caller can persist the rest.
+async function sendReportChunks(ctx: Ctx, text: string, extra: Record<string, unknown>): Promise<{ chunks: string[]; delivered: number }> {
+  const chunks = splitMessage(text, MESSAGE_LIMIT, "plain")
+  let delivered = 0
+  for (const chunk of chunks) {
+    if ((await sendMessage(ctx, chunk, extra)) === null) break
+    delivered++
+  }
+  return { chunks, delivered }
+}
+
+// /daily delivery: `rig daily` advances its watermark while GENERATING the report (rig
+// has no commit-after-send verb; --dry-run/--since are read-only), so a report whose
+// send fails would otherwise be lost for good — the next /daily says "nothing new". The
+// undelivered tail is persisted (per bot, 0600) and prepended to the next /daily reply.
+// The pending file is touched only AFTER the send is decided: overwritten (atomically)
+// with the new undelivered tail on a partial send, removed only once everything went
+// out. Deleting it up front would open a window (a slow `rig daily`, a daemon restart
+// mid-action) where the carried report — already consumed from rig's watermark — is
+// gone for good; the worst case of this ordering is a benign duplicate carry instead.
+async function deliverDailyReport(ctx: Ctx, extra: Record<string, unknown>): Promise<void> {
+  const pending = readFileOrNull(ctx.paths.dailyPending)
+  const fresh = await composeDailyReport()
+  const body = mergePendingDailyReport(pending, fresh.text)
+  const { chunks, delivered } = await sendReportChunks(ctx, body, extra)
+  const tail = undeliveredReportTail(chunks, delivered)
+  if (tail === null) {
+    if (pending !== null) unlinkGuarded(ctx.paths.dailyPending, "daily: removing the delivered pending-report file failed")
+    return
+  }
+  // Nothing generated this time (rig failed — its watermark did not move, a plain retry
+  // regenerates it): keep the carried report exactly as it was rather than persisting a
+  // tail that mixes it with an error text; with nothing carried there is nothing to keep.
+  const keep = fresh.ok ? tail : pending
+  if (keep === null) return
+  try {
+    atomicWrite(ctx.paths.dailyPending, keep)
+    log(`daily: send failed after ${delivered}/${chunks.length} chunks — kept the undelivered report for the next /daily`)
+  } catch (err) {
+    log(`daily: send failed AND persisting the undelivered report failed: ${err}`)
+  }
+}
+
+function unlinkGuarded(path: string, failureNote: string): void {
+  try {
+    unlinkSync(path)
+  } catch (err) {
+    log(`${failureNote}: ${err}`)
+  }
+}
+
+// /spend [day|week|month] — shells out to `rig usage --json`, rig-cli's own
+// streaming aggregation over ~/.claude/projects + every ~/.claude-accounts/account-*
+// (see rig-cli's riglib/usage.py). Cost is a HYPOTHETICAL estimate at published API
+// list prices — these are Claude.ai subscription accounts, never a real bill; that
+// disclaimer is threaded through from `rig usage` itself and repeated here so a lone
+// forwarded chat message still carries it. No period arg mirrors the CLI's own
+// default (both current week AND current month in one report). 30s timeout matches
+// composeDailyReport's own ceiling — this is a local, hermetic file scan, not a
+// network call, but a very large/first-run ~/.claude/projects tree could still take
+// a few seconds and must not wedge the daemon's single event loop past a bound.
+// `ok: false` is a failure to RUN rig or to read its output (no report exists) — the
+// scheduled push must not treat that text as a delivered report (usage-format.ts owns
+// the JSON contract + rendering, unit-tested there).
+async function composeUsageReport(period: "day" | "week" | "month" | null): Promise<{ ok: boolean; text: string }> {
+  const argv = period ? ["rig", "usage", "--json", "--period", period] : ["rig", "usage", "--json"]
+  const r = await spawnGuarded(argv, 30_000)
+  if (r.exitCode === 127) {
+    return { ok: false, text: `spend: couldn't run \`rig\` (${r.stderr.trim() || "not found on PATH"}). Is rig-cli installed and on this daemon's PATH?` }
+  }
+  if (r.exitCode === 124) {
+    return { ok: false, text: "spend: `rig usage` timed out after 30s — try again shortly." }
+  }
+  if (r.exitCode !== 0) {
+    return { ok: false, text: `spend: \`rig usage\` failed (exit ${r.exitCode}): ${r.stderr.trim() || "no error output"}` }
+  }
+  return renderUsageReport(r.stdout)
 }
 
 function parseUsageWarningRecords(blob: string | null, now: number): UsageWarningRecord[] {
@@ -7734,6 +8047,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       case "limit-status":
         await sendMessage(ctx, composeLimitStatus(ctx, action.agent), replyContext(action.threadId))
         return true
+      case "daily-report":
+        await deliverDailyReport(ctx, replyContext(action.threadId))
+        return true
+      case "usage-report":
+        await sendReportChunks(ctx, (await composeUsageReport(action.period)).text, replyContext(action.threadId))
+        return true
       case "tasks":
         await runTasksCommand(ctx, action)
         return true
@@ -8108,7 +8427,7 @@ if (import.meta.main) {
   }
   // Internal one-shot child spawned by `harness-event`; intentionally absent
   // from USAGE and guarded by persisted retry state before it can inject text.
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -8128,6 +8447,17 @@ if (import.meta.main) {
   const fileEnv = loadEnv(join(configDir, ".env"))
   const env = { ...fileEnv, ...process.env }
 
+  // usage-schedule-check is a LOCAL date check that shells out to `rig`/`tg` directly (no
+  // Bot API call via ctx) — runs before the bot-token gate, same reasoning as voice-setup.
+  // `tg` itself owns bot-token resolution for the actual send. The watermark path is still
+  // keyed by bot id (same scheme as every other per-bot state file, see ctlPaths) so two
+  // bots on one machine never share a schedule — that needs only the token's id part, not
+  // the full token gate below.
+  if (cmd === "usage-schedule-check") {
+    const dryRun = process.env.TG_USAGE_SCHEDULE_DRY_RUN === "1" || process.argv.includes("--dry-run")
+    const watermarkPath = ctlPaths(configDir, botIdFromToken(env.TG_BOT_TOKEN ?? "") || "unknown").usageSchedule
+    process.exit(await runUsageScheduleCheck(new Date(), dryRun, watermarkPath))
+  }
   // voice-setup is a LOCAL probe + config write — no Telegram I/O, so it runs
   // before the bot-token gate (a user may set up voice before configuring creds).
   if (cmd === "voice-setup") {
@@ -8182,6 +8512,13 @@ if (import.meta.main) {
   }
   if (cmd === "disable") {
     process.exit(disableAutostart(ctx))
+  }
+  if (cmd === "usage-schedule") {
+    const sub = process.argv[3]
+    if (sub === "enable") process.exit(enableUsageSchedule(ctx, process.argv.includes("--dry-run")))
+    if (sub === "disable") process.exit(disableUsageSchedule(ctx))
+    console.error("usage: tg-ctl usage-schedule enable|disable [--dry-run]")
+    process.exit(1)
   }
   if (cmd === "status") {
     console.log(composeStatus(ctx, null))

@@ -111,10 +111,11 @@ export function buildPrefix(opts: {
   //   1. Known tag WITH real, uploaded pill ids → the wordmark pill as N
   //      <tg-emoji> cells (premium-only; forces HTML). The plain branch keeps
   //      the unicode fallback so the >4096 splitter / non-HTML path still reads.
-  //   2. Known tag WITHOUT real ids (placeholder set, not yet uploaded) → the
-  //      unicode fallback badge (`🔵 ANSWER`) in BOTH forms. A placeholder id
-  //      must NEVER be emitted inside a <tg-emoji> tag — hasRealPillIds guards
-  //      this, so a broken/empty emoji can never go out.
+  //   2. Known tag WITHOUT real ids (a placeholder set, e.g. while a pill is
+  //      being regenerated) → the unicode fallback badge (`🔵 ANSWER`) in BOTH
+  //      forms. Every shipped tag has real ids today; the guard stays because a
+  //      placeholder id must NEVER be emitted inside a <tg-emoji> tag —
+  //      hasRealPillIds ensures a broken/empty emoji can never go out.
   //   3. Unknown tag → a soft `[WORD]` badge (no emoji, no fail) — UNCHANGED.
   if (tag && tag.trim()) {
     const resolved = resolveTag(tag);

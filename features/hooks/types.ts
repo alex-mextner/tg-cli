@@ -129,7 +129,7 @@ export interface HookOutput {
   hook_api?: string;
   decision?: Decision;
   message?: string;
-  // The --tag value the gate evaluated (e.g. "decision", "question").
+  // The --tag value the gate evaluated (e.g. "decision").
   gate_tag?: string;
   // Comma-separated list of what the gate found missing (e.g. "table"). Empty
   // or absent when nothing was missing.

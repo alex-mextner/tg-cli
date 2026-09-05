@@ -16,8 +16,8 @@ export interface TextHookInput {
   // The fully-assembled message body about to be sent (post render/autolink,
   // pre-transmit) — the same text a recipient will actually read.
   body: string;
-  // The `--tag` value, if any (e.g. "decision", "question"). Absent for an
-  // untagged send. The escalation-format gate only acts on decision/question;
+  // The `--tag` value, if any (e.g. "decision"). Absent for an untagged
+  // send. The escalation-format gate only acts on decision;
   // other hooks are free to ignore this field.
   tag?: string;
   chatId?: string;

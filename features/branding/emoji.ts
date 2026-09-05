@@ -123,15 +123,6 @@ export const TAG_PILL_IDS: Record<string, string[]> = {
   ANSWER: ["5294303944082762041", "5294414440706382789", "5294185480294808567"],   // answer_0..2
   DECISION: ["5294395852087926650", "5294110472985944747", "5294433613440395921"], // decision_0..2
   PROBLEM: ["5294376430245817725", "5294542383487164540", "5294432754446935044"],  // problem_0..2
-  // QUESTION has NO dedicated pill asset (none was uploaded). Deliberately
-  // PLACEHOLDER, not a reuse of DECISION's real ids: reusing them would make
-  // hasRealPillIds('QUESTION') true, so a premium client would render a
-  // DECISION-labeled wordmark pill for --tag question while a non-premium
-  // client sees the correct "🟠 QUESTION" unicode fallback — a visible
-  // mismatch (review finding). Placeholder keeps EVERY viewer on the
-  // consistent unicode fallback until a real QUESTION pill is uploaded
-  // (scripts/create-tag-emoji.ts) and these three ids are filled in.
-  QUESTION: [TAG_PILL_PLACEHOLDER, TAG_PILL_PLACEHOLDER, TAG_PILL_PLACEHOLDER],
   REPORT: ["5294525981007062296", "5294382683718200108", "5294436190420770975"],   // report_0..2
 }
 
@@ -142,7 +133,6 @@ export const TAG_PILL_DOT: Record<string, string> = {
   ANSWER: "🔵",
   DECISION: "🟠",
   PROBLEM: "🔴",
-  QUESTION: "🟠", // shares DECISION's color — see TAG_PILL_IDS above
   REPORT: "🟢",
 }
 
@@ -179,7 +169,6 @@ export const TAG_PILL_FALLBACK: Record<string, string> = {
   ANSWER: "🔵 ANSWER",
   DECISION: "🟠 DECISION",
   PROBLEM: "🔴 PROBLEM",
-  QUESTION: "🟠 QUESTION",
   REPORT: "🟢 REPORT",
 }
 

@@ -3,7 +3,7 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
-## 1.45.1
+## 1.45.2
 
 **Fix: bare `harness-event` StopFailure alerts mislabel the agent with the tmux window name, not the live harness (#263).**
 
@@ -33,6 +33,68 @@ semantic versioning.
   warnings; it now correctly does, same as any other bare-hook `claude`
   session. Expect a one-time uptick in these warnings for such panes — that's
   the fix reaching cases it silently missed before, not a new false positive.
+
+## 1.45.1
+
+**Feature: `/spend` and `/daily` bot commands + a scheduled weekly/monthly usage push (tg-cli#290).**
+
+- `/spend [day|week|month]` replies with `rig usage`'s token/cost report (hypothetical API-list-price
+  estimate over the Claude.ai subscription accounts). Named `/spend`, NOT `/usage`/`/cost`/`/stats`:
+  those are native commands in Codex and/or Claude Code and must keep reaching the agent pane
+  untouched (tests pin the whole reserved set in both routing modes).
+- `/daily` replies with `rig daily`'s what-shipped report over merged PRs since the last run.
+- `tg-ctl usage-schedule enable|disable` installs a launchd job (macOS only) that checks daily at
+  23:50 and sends one report per COMPLETED week and month. It compares a persisted per-bot
+  watermark (`tg-ctl.<bot>.usage-schedule.json`) against the current completed period, so the
+  check is idempotent (never a double send) and retryable: a period whose `rig usage` run,
+  Telegram send, or watermark persist fails stays (or becomes) due again for the next day. A
+  boundary day (a Sunday, a month's last day) isn't treated as complete until the scheduled fire
+  time itself (23:50) — a run earlier that day (a wake from an unrelated missed firing, a manual
+  invocation) simply isn't due yet, so it never sends a partial-day report and marks it done. A
+  firing genuinely missed at 23:50 (launchd runs a missed job at wake) is reported EXPLICITLY —
+  "was NOT generated, run `rig usage` by hand" — instead of silently skipped or sent over the
+  wrong window (`rig usage` can only report the CURRENT period; a real catch-up needs an as-of
+  flag in rig-cli first). A gap spanning more than one boundary collapses to a single notice for
+  the latest missed period — the notice says so, it does not claim every gap is enumerated. `enable`
+  seeds the watermark to the in-progress period so a fresh install's first night never claims a
+  period was "missed while asleep" (nothing was being watched yet). The job pins PATH and a
+  non-default `TG_CTL_CONFIG_DIR` into the plist (launchd's own env has neither). `disable`
+  tolerates a never-loaded plist left by a half-failed `enable`.
+- Reports longer than Telegram's 4096-char limit are split into ordered chunks (the shared
+  `splitMessage`). A `/daily` report whose send fails part-way is persisted
+  (`tg-ctl.<bot>.daily-pending.txt`) and prepended to the next `/daily` — `rig daily` advances its
+  own watermark while generating, so an undelivered report would otherwise be gone for good.
+- The scheduled push escapes the report at the HTML boundary (`rig usage` really emits a
+  `<synthetic>` model name); `rig usage --json` periods are shape-validated before formatting, and
+  an all-unpriced period renders as "unpriced" instead of "~$0.00".
+
+## 1.45.0
+
+**`--tag question` is removed — only the standard tags stay (`answer`, `decision`, `problem`, `report`); an open question IS a decision request (tg-cli#301).**
+
+Alex (2026-09-05): agents use one typed vocabulary. There is no separate "question"
+message type — an open question for him is a decision he has to make, so it goes out as
+`--tag decision` in the decision-request format (options, pros/cons, a recommendation).
+Two names for the same escalation split the format rules and let agents pick the softer one.
+
+- **`--tag question` is refused** at parse time (non-zero exit, nothing sent) with a one-line
+  redirect instead of the generic off-list error:
+
+  ```
+  --tag question was removed: an open question is a decision request — use --tag decision in the decision-request format
+  ```
+
+  It is refused even when the body is a fully compliant decision request — the problem is the
+  vocabulary, not the format. `--dry-run` refuses it the same way.
+- `--help`, `tg help format`, and the installed `tg` skill / blurb list exactly
+  `answer` / `decision` / `problem` / `report`; `decision` is now the single ESCALATION tag
+  behind the deny-by-default decision-request gate (`ESCALATION_TAGS`).
+- The QUESTION wordmark/emoji branding (`TAG_PILL_IDS` / `TAG_PILL_DOT` / `TAG_PILL_FALLBACK`
+  entries, the orange `🟠 QUESTION` fallback badge) is deleted; the header renderer is
+  unchanged (the placeholder-id guard stays, it is generic).
+- Companion change in agent-tools (#524): the `decision-request-format` hook's escalation tag
+  set becomes `decision` + `problem`, it blocks a `tg --tag question` command with the same
+  hint, and the `decision-request-discipline` skill no longer mentions `question`.
 
 ## 1.44.5
 
