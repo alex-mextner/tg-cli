@@ -437,11 +437,12 @@ main-vs-subagent signal (it appears on subprocesses of the main session too), so
 mislabelled the orchestrator itself as a generic `[subagent]`. That path was removed: a
 subagent bracket now comes ONLY from an explicit `--subagent`/`TG_AGENT`.
 
-Note: `tg-ctl`'s OWN `--agent <name>` (used by `tg-ctl ask --agent codex` / `tg-ctl
-harness-event`) is a DIFFERENT flag on a DIFFERENT binary — a closed harness-kind
-selector (`claude`/`codex`/`opencode`/`pi`/`aider`) for classifying inbound hook/telemetry
-payloads, not a free-form outbound sender label. The two never collide (separate argv
-parsers), but don't confuse them.
+Note: `tg-ctl`'s OWN `--agent <name>` is a DIFFERENT flag on a DIFFERENT binary, and
+comes in two shapes: `tg-ctl ask --agent codex` takes a CLOSED harness-kind selector
+(`claude`/`codex`/`opencode`/`pi`/`aider`/`omp` — the `HOOK_AGENT_KINDS` list) for
+classifying inbound hook payloads, while `tg-ctl harness-event --agent` accepts a
+free-form label for telemetry reports. Neither is an outbound sender label. They never
+collide with `tg`'s `--subagent` (separate argv parsers), but don't confuse them.
 
 ---
 

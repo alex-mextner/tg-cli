@@ -92,21 +92,36 @@ The picker reuses the `/agent` selection machinery (`pendingAgent`, `tga:`
 callbacks); the reply's pending message is stored `prewrapped` so the tap injects
 the anchored text verbatim (no double-wrap).
 
-### No-reply auto-bind to the most-recently-active agent (tg-cli#75)
+### No-reply auto-bind to the CTO's own last-addressed pane (tg-cli#78)
 
 A plain message that is **not** a reply has no anchor to recognize, so it goes
 through `discoverTarget` → `pickTargetPaneFromSet`. With several live agent panes
 and no registration pinning one, that picker returns `ambiguous`. Rather than
-immediately asking, `resolveAmbiguousByActivity` binds the message to the
-**most-recently-active agent** — the pane whose last outbound `tg` send is newest,
-the SAME `aggregateUsage` LRU/MRU signal the reply picker ranks by. The CTO almost
-always means "the agent I was just talking to", so a fresh message after a burst
-of activity lands there without a tap. Precedence is preserved: a recognized reply
-route still wins first; the auto-bind only resolves an otherwise-ambiguous
-**non-reply**; and when there is genuinely **no** "last agent" to prefer — no
-activity history, or a tie at the most-recent timestamp — it stays ambiguous and
-the button picker / ambiguous-target reply fires (the unscoped fail-closed). The
-auto-bind REDUCES how often the picker fires; it never replaces it.
+immediately asking, `discoverForInject` binds the message to the pane of the
+**CTO's own last resolved inbound delivery** — persisted in
+`tg-ctl.<bot>.last-user-target.json` (`features/tg-ctl/last-user-target.ts`) and
+written ONLY on a confirmed delivery: an auto-bound inject, an explicit picker
+tap, a named `/agent`, or a recognized reply — never on a failed inject, and
+never on an agent's own outbound send. `resolveTasksScopeDir` (the `/tasks`
+command's ambiguous-fleet default) shares this SAME anchor, so both surfaces
+agree on "the default target".
+
+This deliberately does **not** track "whoever spoke last" (an earlier mechanism,
+`lastMessagePane` over the outbound-send routes map): an unrelated agent
+proactively messaging the CTO could otherwise hijack his very next message —
+the live incident this fix closes. `resolveLastUserTarget` also guards against
+tmux pane-id reuse: the anchor's recorded cwd must match the live candidate's
+`pane_current_path` (mirroring `routeMatchesPane`'s reply-route protection,
+including rejecting an EMPTY live path, which would otherwise resolve to the
+daemon's own cwd) — a stale/mismatched anchor is rejected, not trusted on
+paneId alone.
+
+Precedence is preserved: a recognized reply route still wins first; the
+auto-bind only resolves an otherwise-ambiguous **non-reply**; and when there is
+genuinely **no** anchor to prefer — none recorded yet, or its pane is
+gone/pane-id-reused — it stays ambiguous and the button picker / ambiguous-target
+reply fires (the unscoped fail-closed). The auto-bind REDUCES how often the
+picker fires; it never replaces it.
 
 Both paths honor defer-while-waiting: a reply to a pane with an open question is
 queued (✍️) and flushed when the question is answered or released with no other

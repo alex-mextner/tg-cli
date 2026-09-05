@@ -1,5 +1,13 @@
 import { expect, test } from 'bun:test';
-import { ctlPaths, botIdFromToken, readPidFile, pidStatus, ownsPidFile, shouldAutoStart } from '../features/tg-ctl/lock';
+import {
+  ctlPaths,
+  botIdFromToken,
+  readPidFile,
+  pidStatus,
+  ownsPidFile,
+  shouldAutoStart,
+  planLegacyLastUserTargetMigration,
+} from '../features/tg-ctl/lock';
 import { DEFAULT_CONTROL, type ControlConfig } from '../features/tg-ctl/types';
 
 const cfg = (over: Partial<ControlConfig> = {}): ControlConfig => ({
@@ -25,6 +33,7 @@ test('ctlPaths builds lock/pid/offset/registration/socket/log under configDir', 
   expect(p.usageWarnings).toBe('/home/u/.config/tg-cli/tg-ctl.123456.usage-warnings.json');
   expect(p.usageLatest).toBe('/home/u/.config/tg-cli/tg-ctl.123456.usage-latest.json');
   expect(p.deferred).toBe('/home/u/.config/tg-cli/tg-ctl.123456.deferred.json');
+  expect(p.lastUserTarget).toBe('/home/u/.config/tg-cli/tg-ctl.123456.last-user-target.json');
 });
 
 test('ctlPaths tolerates a trailing slash in configDir', () => {
@@ -129,4 +138,32 @@ test('shouldAutoStart ignores everything except TMUX (no TTY gate)', () => {
     TERM: 'dumb',
   };
   expect(shouldAutoStart(env, cfg({ enabled: true }))).toBe(true);
+});
+
+// --- planLegacyLastUserTargetMigration (tg-cli#281): plan only, `exists` is
+// injected so this never touches real disk, same as pidStatus's kill0 ---
+test('plans a migration when only the legacy file exists', () => {
+  const present = new Set(['/cfg/tg-ctl.123.last-alex-target.json']);
+  const plan = planLegacyLastUserTargetMigration('/cfg', '123', (p) => present.has(p));
+  expect(plan).toEqual({
+    kind: 'migrate',
+    from: '/cfg/tg-ctl.123.last-alex-target.json',
+    to: '/cfg/tg-ctl.123.last-user-target.json',
+  });
+});
+
+// review finding, round 3: if both exist, the legacy file must be REMOVED, not
+// just skipped — leaving it would let a future restart, after a legitimate
+// invalidation later clears the new file, silently resurrect this stale copy.
+test('plans removal of the legacy file when the new file already exists — never overwrite live state, never let it linger to resurrect later', () => {
+  const present = new Set([
+    '/cfg/tg-ctl.123.last-alex-target.json',
+    '/cfg/tg-ctl.123.last-user-target.json',
+  ]);
+  const plan = planLegacyLastUserTargetMigration('/cfg', '123', (p) => present.has(p));
+  expect(plan).toEqual({ kind: 'remove-stale', path: '/cfg/tg-ctl.123.last-alex-target.json' });
+});
+
+test('plans nothing on a fresh install — neither file exists', () => {
+  expect(planLegacyLastUserTargetMigration('/cfg', '123', () => false)).toBeNull();
 });

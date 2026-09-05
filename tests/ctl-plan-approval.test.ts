@@ -13,7 +13,7 @@ import { expect, test } from 'bun:test';
 import { normalizeHookPayload, type HookEnv } from '../features/tg-ctl/hook-normalize';
 import { buildButtonMessage, resolveButtonCallback, formatAgentHookOutput } from '../features/tg-ctl/questions';
 
-const env: HookEnv = { agent: 'claude', paneId: '%7', cwd: '/env/cwd', sessionName: 'work' };
+const env: HookEnv = { agent: 'claude', paneId: '%7', cwd: '/env/cwd', sessionName: 'work', invocationNonce: 'plan-approval-nonce' };
 
 test('ExitPlanMode PreToolUse → plan-approval permission carrying the plan text + proceed/keep labels', () => {
   const req = normalizeHookPayload(

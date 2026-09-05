@@ -10,7 +10,6 @@ import {
   resolveRouteCwd,
   routeMatchesPane,
   aggregateUsage,
-  lastMessagePane,
   orderByLruMru,
   withRoutesLock,
   fsRoutesLockIo,
@@ -59,21 +58,6 @@ test('aggregateUsage: recency (max ts) + frequency (count) per pane', () => {
   const usage = aggregateUsage([R(1, '%1', 10), R(2, '%1', 30), R(3, '%2', 20)]);
   expect(usage.get('%1')).toEqual({ lastTs: 30, count: 2 });
   expect(usage.get('%2')).toEqual({ lastTs: 20, count: 1 });
-});
-
-test('lastMessagePane: the LAST entry by position is the last message', () => {
-  // %1 is the final route pushed (chronological tail) → it posted the last message.
-  expect(lastMessagePane([R(2, '%2', 30), R(3, '%1', 40)])).toBe('%1');
-});
-
-test('lastMessagePane: position wins over a higher ts earlier in the array (clock-step robustness)', () => {
-  // The earlier entry has a HIGHER ts (a backward clock step happened between sends),
-  // but the actual last message is the tail %b — position, not max-ts, decides.
-  expect(lastMessagePane([R(1, '%a', 30), R(2, '%b', 10)])).toBe('%b');
-});
-
-test('lastMessagePane: empty routes → null (no last message → caller falls to the picker)', () => {
-  expect(lastMessagePane([])).toBeNull();
 });
 
 test('orderByLruMru: most recent first, frequency tiebreak, unknown last', () => {
@@ -137,6 +121,14 @@ test('routeMatchesPane: pane-id reuse by a DIFFERENT project still mismatches (0
 test('routeMatchesPane: absent recorded cwd (old route) or absent pane → no match (picker fallback)', () => {
   expect(routeMatchesPane({ recognizedCwd: undefined, panePath: '/a' })).toBe(false);
   expect(routeMatchesPane({ recognizedCwd: '/a', panePath: undefined })).toBe(false);
+});
+
+test('routeMatchesPane: an EMPTY panePath never matches, even when recognizedCwd happens to equal the daemon\'s own cwd (review finding)', () => {
+  // resolve('') resolves to process.cwd() — without the explicit empty-string
+  // guard, a recognizedCwd that happens to equal wherever the daemon was
+  // launched from would falsely match ANY live candidate reporting no
+  // pane_current_path, bypassing the pane-id-reuse protection entirely.
+  expect(routeMatchesPane({ recognizedCwd: process.cwd(), panePath: '' })).toBe(false);
 });
 
 // --- withRoutesLock + fsRoutesLockIo (issue #53 part B: concurrent route writers must not clobber) ---

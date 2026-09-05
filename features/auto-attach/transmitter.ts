@@ -103,7 +103,10 @@ async function sendText(text: string, format: Format, t: Transport): Promise<voi
 // tg-cli#208. Counts chunks with the SAME splitMessage(text, MESSAGE_LIMIT, format)
 // call `sendText` uses to actually send — keep the two call sites parameter-identical,
 // or the preflight count can silently drift from the real send count.
-function floodCapViolation(
+// Exported for `tg --dry-run`, which validates the same guard the real send
+// enforces (features/cli's dry-run block) — without this it could print "OK"
+// for a body the real send would refuse (review finding).
+export function floodCapViolation(
   text: string,
   format: Format,
 ): { charCount: number; messageCount: number } | null {

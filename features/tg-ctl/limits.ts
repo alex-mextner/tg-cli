@@ -620,10 +620,18 @@ export function buildUsageLimitNotification(ev: UsageLimitEvent, now: number): L
     ev.language === 'ru'
       ? `⚠️ <b>${agent}</b>: использовано <b>${pct}%</b> ${limit}.`
       : `⚠️ <b>${agent}</b> is at <b>${pct}%</b> of ${limit}.`;
+  // The "banked/earned reset — redeem via /usage" claim is a CODEX-SPECIFIC
+  // mechanic (Codex genuinely has redeemable resets that tg-cli won't auto-spend).
+  // No other harness (claude included) has this, so showing it there is a false
+  // claim, not just noise — gate it on the actual agent instead of assuming codex.
   const advice =
-    ev.language === 'ru'
-      ? '\nЗапланируй паузу или переключи агента до жёсткой остановки. Показанный сброс — естественный; если доступен накопленный сброс, активируй его вручную через /usage. tg-cli не тратит такие сбросы автоматически.'
-      : '\nPlan around it or switch agents before the hard stop. The reset shown is the natural reset; if a banked/earned reset is available, redeem it explicitly with /usage. tg-cli does not auto-spend it.';
+    ev.agent === 'codex'
+      ? ev.language === 'ru'
+        ? '\nЗапланируй паузу или переключи агента до жёсткой остановки. Показанный сброс — естественный; если доступен накопленный сброс, активируй его вручную через /usage. tg-cli не тратит такие сбросы автоматически.'
+        : '\nPlan around it or switch agents before the hard stop. The reset shown is the natural reset; if a banked/earned reset is available, redeem it explicitly with /usage. tg-cli does not auto-spend it.'
+      : ev.language === 'ru'
+        ? '\nЗапланируй паузу или переключи агента до жёсткой остановки.'
+        : '\nPlan around it or switch agents before the hard stop.';
   return { text: `${head}${when}${advice}${detail}`, button: null, resetAt: ev.resetAt };
 }
 
