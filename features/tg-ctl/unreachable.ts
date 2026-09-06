@@ -112,24 +112,39 @@ export function agentInboxKey(name: string | null | undefined, cwd: string): str
   return `cwd-${digest.slice(0, 16)}`;
 }
 
-// Tokens that mark a NON-interactive / helper invocation of an agent binary. A `-p`
-// (`--print`) run is a one-shot tool call, `codex exec` is the headless mode, and the
-// `daemon`/`bg-*` shapes are Claude Code's own background helpers — none of them is a
-// session a human addresses from Telegram.
-const NON_INTERACTIVE_TOKENS = new Set([
-  '--print',
-  '-p',
-  'exec',
-  'daemon',
-  'bg-pty-host',
-  'bg-spare',
-  '--bg',
-  '--background',
-]);
+// Options that mark a NON-interactive invocation of an agent binary: a `-p`
+// (`--print`) run is a one-shot tool call, the `--bg*` flags are Claude Code's own
+// background helpers — none of them is a session a human addresses from Telegram.
+const NON_INTERACTIVE_OPTIONS = new Set(['--print', '-p', '--bg', '--background']);
+// Subcommands (the FIRST positional word) with the same meaning: `codex exec` is the
+// headless mode, `claude daemon` / `bg-*` are background helpers.
+const NON_INTERACTIVE_SUBCOMMANDS = new Set(['exec', 'daemon', 'bg-pty-host', 'bg-spare']);
+// Options that take a value — the value is never a subcommand or an option.
+const VALUE_OPTIONS = new Set(['--name', '--model', '--resume', '-r', '--session-id', '--add-dir', '--profile']);
 
+// Only the REAL option / subcommand positions count (review finding): an agent CLI
+// accepts an arbitrary initial prompt, so `claude "please exec tests"` must stay
+// interactive. Scanning stops at `--`; a positional is checked only when it is the
+// first one (the subcommand slot); a path-like positional (the launcher's
+// `node …/claude` shape) is skipped, as is the value of a value-taking option.
 export function isInteractiveAgentCommand(command: string): boolean {
   const tokens = command.trim().split(/\s+/).slice(1);
-  return !tokens.some((t) => NON_INTERACTIVE_TOKENS.has(t));
+  let sawPositional = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === '--') break;
+    if (t.startsWith('-')) {
+      if (NON_INTERACTIVE_OPTIONS.has(t)) return false;
+      if (VALUE_OPTIONS.has(t)) i++;
+      continue;
+    }
+    if (t.includes('/')) continue;
+    if (!sawPositional) {
+      sawPositional = true;
+      if (NON_INTERACTIVE_SUBCOMMANDS.has(t)) return false;
+    }
+  }
+  return true;
 }
 
 // Every pid that lives UNDER some tmux pane (the pane process itself + all its

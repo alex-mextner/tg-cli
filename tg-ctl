@@ -12,7 +12,7 @@
 // (`run`) takes the flock as its FIRST action and exits 0 when another
 // instance already owns the bot.
 
-import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { basename, dirname, isAbsolute, join, resolve } from "path"
 import { detectAgentLabel } from "./features/agent-detect/detect"
@@ -936,7 +936,17 @@ function readPidTtyMap(): Map<number, string> {
 }
 
 const LSOF_TIMEOUT_MS = 2000
+let lsofMissingWarned = false
+// The agent's cwd: `/proc/<pid>/cwd` where it exists (Linux — no external tool),
+// else `lsof` (macOS ships it; on a Linux box without it AND without procfs the cwd is
+// unknown, said ONCE in the log — review finding — and the agent is still listed, by
+// its --name or pid, just without a cwd-derived inbox key).
 function cwdOfPid(pid: number): string | null {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`)
+  } catch {
+    // no procfs (macOS) or the process is gone — fall through to lsof
+  }
   try {
     const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
       stdout: "pipe",
@@ -947,7 +957,11 @@ function cwdOfPid(pid: number): string | null {
     })
     if (lsof.exitCode !== 0) return null
     return parseLsofCwd(lsof.stdout.toString())
-  } catch {
+  } catch (err) {
+    if (!lsofMissingWarned) {
+      lsofMissingWarned = true
+      log(`unreachable scan: cannot resolve the cwd of pid ${pid} — no /proc and lsof failed (${err}); install lsof for cwd-keyed inboxes`)
+    }
     return null
   }
 }

@@ -96,6 +96,16 @@ test('isInteractiveAgentCommand excludes print/exec/daemon shapes', () => {
   expect(isInteractiveAgentCommand('claude bg-spare --bg-spare /tmp/x')).toBe(false);
 });
 
+test('isInteractiveAgentCommand ignores prompt words and values that merely look like helper tokens', () => {
+  expect(isInteractiveAgentCommand('claude -- please exec tests')).toBe(true);
+  expect(isInteractiveAgentCommand('claude "please exec tests and -p"')).toBe(true);
+  expect(isInteractiveAgentCommand('claude --name daemon')).toBe(true);
+  expect(isInteractiveAgentCommand('claude --name landing please exec')).toBe(true);
+  expect(isInteractiveAgentCommand('node /Users/u/.claude/local/claude --name exec-runner')).toBe(true);
+  expect(isInteractiveAgentCommand('node /Users/u/.claude/local/claude daemon run')).toBe(false);
+  expect(isInteractiveAgentCommand('claude --name x -- -p')).toBe(true);
+});
+
 // --- discovery ---
 
 test('findUnreachableAgents: an interactive claude with a tty and no tmux pane is unreachable', () => {
