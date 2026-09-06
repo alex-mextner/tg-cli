@@ -54,7 +54,7 @@ metadata:
 
 # tg — Telegram bridge for agents
 
-Push reports and files to Telegram; the user can reply back (tmux).
+Push reports and files to Telegram; the user can reply back (tmux pane, or the Stop-hook inbox for an agent outside tmux).
 
 ## Invocation
 \`\`\`
@@ -227,7 +227,13 @@ reply keeps the quote anchor and reaches the replied-to origin pane).
   transient network blip (3 attempts, jittered ~300ms→2.7s) before giving up,
   so a momentary hiccup no longer silently drops the message.
 
-Always use \`tg\`, never direct curl to the Telegram API. tmux only.
+## Two inbound channels — run inside tmux
+Replies are typed into your tmux pane. An agent started OUTSIDE tmux (no \`$TMUX\`)
+is listed by \`tg-ctl status\` as \`unreachable: not in tmux\` and only reachable via
+its Stop-hook inbox: a \`/agent <name> <text>\` is queued and delivered at your NEXT
+turn end (never while idle). Prefer starting inside tmux (\`claude-rotate --tmux <name>\`).
+
+Always use \`tg\`, never direct curl to the Telegram API.
 `;
 
 const SKILL_BLURB =

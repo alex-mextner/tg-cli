@@ -12,7 +12,7 @@
 // (`run`) takes the flock as its FIRST action and exits 0 when another
 // instance already owns the bot.
 
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
+import { appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { createConnection, createServer, type Server, type Socket } from "net"
 import { basename, dirname, isAbsolute, join, resolve } from "path"
 import { detectAgentLabel } from "./features/agent-detect/detect"
@@ -102,6 +102,33 @@ import {
   type UsageLimitEvent,
 } from "./features/tg-ctl/limits"
 import { isAllowedReaction, reactionForStage } from "./features/tg-ctl/reactions"
+import {
+  ACKED_FILE,
+  INBOX_DIR_MODE,
+  INBOX_FILE_MODE,
+  PENDING_FILE,
+  idsToAck,
+  inboxDirFor,
+  inboxRoot,
+  isDeliveredBatchFile,
+  parseInboxLines,
+  serializeInboxEntry,
+  type InboxEntry,
+} from "./features/tg-ctl/inbox"
+import {
+  describeUnreachable,
+  findUnreachableAgents,
+  inboxKeyCollisions,
+  matchUnreachable,
+  noAgentReplyText,
+  parseLsofCwd,
+  parsePidTtyList,
+  queuedReplyText,
+  unreachableKey,
+  unreachableLabel,
+  UNREACHABLE_HINT,
+  type UnreachableAgent,
+} from "./features/tg-ctl/unreachable"
 import {
   DEFAULT_TASK_VIEW,
   TASK_STATES,
@@ -265,7 +292,11 @@ export const USAGE = `Usage:
   tg-ctl start [--pane %N] [--cwd PATH] [--session NAME]
                          # background (detached) daemon, returns immediately
   tg-ctl run             # foreground (blocking) daemon — the process itself
-  tg-ctl status          # is it running? pid / bot / target pane / autostart
+  tg-ctl status          # is it running? pid / bot / target pane / autostart;
+                         # also lists agents running OUTSIDE tmux as unreachable (tg-cli#306)
+  tg-ctl inbox           # pending Stop-hook inbox entries per agent (the tmux-free channel)
+  tg-ctl inbox queue <name|dir> <text…>
+                         # queue text to a non-tmux agent's Stop-hook inbox by hand
   tg-ctl stop            # stop the background daemon
   tg-ctl restart         # graceful reload — drains in-flight, keeps queued messages + questions
   tg-ctl enable [--dry-run]
@@ -888,6 +919,211 @@ function listAgentCandidates(): AgentCandidate[] {
   return dedupeCandidates(out)
 }
 
+// --- agents OUTSIDE tmux (tg-cli#306) ---
+//
+// A second, cheap ps read (`pid tty` only) tells which processes have a controlling
+// terminal; the pure `findUnreachableAgents` then picks the interactive agent processes
+// that sit in NO tmux pane's process tree. Their cwd comes from lsof (one call per such
+// agent — a handful at most). Every failure degrades to "none seen", never a crash.
+function readPidTtyMap(): Map<number, string> {
+  try {
+    const ps = Bun.spawnSync(["ps", "-axo", "pid=,tty="], { stdout: "pipe", stderr: "pipe", env: SUBPROC_ENV })
+    if (ps.exitCode !== 0) return new Map()
+    return parsePidTtyList(ps.stdout.toString())
+  } catch {
+    return new Map()
+  }
+}
+
+const LSOF_TIMEOUT_MS = 2000
+function cwdOfPid(pid: number): string | null {
+  try {
+    const lsof = Bun.spawnSync(["lsof", "-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: SUBPROC_ENV,
+      timeout: LSOF_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    })
+    if (lsof.exitCode !== 0) return null
+    return parseLsofCwd(lsof.stdout.toString())
+  } catch {
+    return null
+  }
+}
+
+// Memoized for a short window: the scan is sync (ps + one lsof per agent, up to
+// LSOF_TIMEOUT_MS each) and one inbound message can ask for it several times in a row
+// (route attempt, then the no-agent reply); a poll tick asks once more. One scan per
+// ~2s keeps the single-threaded poll loop responsive (review finding).
+const UNREACHABLE_SCAN_TTL_MS = 2000
+let unreachableCache: { at: number; agents: UnreachableAgent[] } | null = null
+function listUnreachableAgents(): UnreachableAgent[] {
+  const now = Date.now()
+  if (unreachableCache && now - unreachableCache.at < UNREACHABLE_SCAN_TTL_MS) return unreachableCache.agents
+  const ttyByPid = readPidTtyMap()
+  let agents: UnreachableAgent[] = []
+  if (ttyByPid.size > 0) {
+    const { panes, procs } = snapshot()
+    agents = findUnreachableAgents(panes, procs, ttyByPid).map((a) => ({ ...a, cwd: cwdOfPid(a.pid) }))
+  }
+  unreachableCache = { at: now, agents }
+  return agents
+}
+
+// The no-agent reply, LISTING any agent that runs outside tmux (never the bare
+// "not in tmux" text while the agent is right there, unreachable for a reason).
+function noAgentReplyNow(): string {
+  return noAgentReplyText(NO_AGENT_REPLY, listUnreachableAgents())
+}
+
+// Count the lines of a JSONL file (0 when absent/unreadable, or the key is unknown).
+function pendingInboxCount(ctx: Ctx, key: string | null): number {
+  if (key === null) return 0
+  const raw = readFileOrNull(join(inboxDirFor(ctx.configDir, key), PENDING_FILE))
+  return raw ? parseInboxLines(raw).entries.length : 0
+}
+
+// The inbox holds the user's private Telegram text: directories 0700, files 0600 —
+// enforced on every write, including paths that already existed with looser modes
+// (review finding: a 022 umask would otherwise leave them world-readable).
+function tightenInboxModes(dir: string, file?: string): void {
+  chmodSync(inboxRoot(dirname(dirname(dir))), INBOX_DIR_MODE)
+  chmodSync(dir, INBOX_DIR_MODE)
+  if (file && existsSync(file)) chmodSync(file, INBOX_FILE_MODE)
+}
+
+// Append ONE entry to an agent's pending inbox: mkdir -p + a single O_APPEND write of
+// one complete line (never a torn record for the consuming Stop hook). Throws on IO
+// failure — the caller turns that into an explicit Telegram reply.
+function queueToInbox(ctx: Ctx, key: string, entry: InboxEntry): void {
+  const dir = inboxDirFor(ctx.configDir, key)
+  mkdirSync(dir, { recursive: true, mode: INBOX_DIR_MODE })
+  const pending = join(dir, PENDING_FILE)
+  appendFileSync(pending, serializeInboxEntry(entry), { mode: INBOX_FILE_MODE })
+  tightenInboxModes(dir, pending)
+}
+
+function listInboxKeys(ctx: Ctx): string[] {
+  try {
+    return readdirSync(inboxRoot(ctx.configDir), { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+// React 👌 on a delivered message. Returns false ONLY for a failure worth retrying
+// (network error, 5xx, 429) — a definitive Telegram refusal (4xx: message gone,
+// REACTION_INVALID) is final and counts as done, so a batch never wedges on it.
+async function reactDelivered(ctx: Ctx, messageId: number): Promise<boolean> {
+  const emoji = reactionForStage("done")
+  if (!isAllowedReaction(emoji)) return true
+  const r = await botPostResult(ctx, "setMessageReaction", {
+    chat_id: ctx.chatId,
+    message_id: messageId,
+    reaction: [{ type: "emoji", emoji }],
+  })
+  if (r.ok) return true
+  const retryable = r.status === undefined || r.status === 429 || r.status >= 500
+  log(`inbox: 👌 reaction on tg#${messageId} failed (${r.status ?? "network"}: ${r.description}) — ${retryable ? "will retry" : "final"}`)
+  return !retryable
+}
+
+// Ack what the Stop hook delivered. The hook publishes each consumption as ONE complete
+// `delivered-<pid>-<ts>.jsonl` (temp + rename), so a file we see is whole and no in-
+// flight hook write can be lost to our unlink. Per file: react 👌 on every Telegram id,
+// archive into acked.jsonl, unlink. A batch whose reaction hit a RETRYABLE failure is
+// left on disk for the next sweep (review finding: a transient Bot API outage must not
+// discard the promised receipt). Never throws into the poll loop.
+async function ackDeliveredInboxes(ctx: Ctx): Promise<void> {
+  for (const key of listInboxKeys(ctx)) {
+    const dir = inboxDirFor(ctx.configDir, key)
+    try {
+      for (const name of readdirSync(dir)) {
+        if (!isDeliveredBatchFile(name)) continue
+        const path = join(dir, name)
+        const raw = readFileOrNull(path) ?? ""
+        const parsed = parseInboxLines(raw)
+        let allReacted = true
+        for (const id of idsToAck(parsed.entries)) {
+          if (!(await reactDelivered(ctx, id))) allReacted = false
+        }
+        if (!allReacted) continue // keep the batch; retried next sweep
+        if (parsed.entries.length > 0 || parsed.malformed > 0) {
+          log(`inbox ${key}: ${parsed.entries.length} delivered by the Stop hook (${parsed.malformed} malformed) — acked`)
+        }
+        if (raw) appendFileSync(join(dir, ACKED_FILE), raw.endsWith("\n") ? raw : `${raw}\n`, { mode: INBOX_FILE_MODE })
+        unlinkSync(path)
+      }
+    } catch (err) {
+      log(`inbox ${key}: ack sweep failed: ${err}`)
+    }
+  }
+}
+
+// `tg-ctl inbox [queue <selector> <text…>]` — the CLI view of the tmux-free channel.
+function runInboxCommand(ctx: Ctx, argv: string[]): number {
+  const agents = listUnreachableAgents()
+  if (argv[0] === "queue") {
+    const selector = argv[1] ?? ""
+    const text = argv.slice(2).join(" ").trim()
+    if (!selector || !text) {
+      console.error("usage: tg-ctl inbox queue <name|dir> <text…>")
+      return 1
+    }
+    const hits = matchUnreachable(selector, agents)
+    if (hits.length !== 1) {
+      console.error(
+        hits.length === 0
+          ? `no agent outside tmux matches '${selector}' (running: ${agents.map(unreachableLabel).join(", ") || "none"})`
+          : `'${selector}' is ambiguous: ${hits.map((a) => describeUnreachable(a, 0)).join("; ")}`,
+      )
+      return 1
+    }
+    const key = unreachableKey(hits[0])
+    if (key === null) {
+      console.error(`${unreachableLabel(hits[0])}: inbox key unknown (no --name and its cwd could not be resolved) — cannot queue`)
+      return 1
+    }
+    const clashes = inboxKeyCollisions(hits[0], agents)
+    if (clashes.length > 0) {
+      console.error(`refusing: inbox key '${key}' is shared with another live session (${clashes.map((a) => describeUnreachable(a, 0)).join("; ")}) — give them distinct --name values`)
+      return 1
+    }
+    try {
+      queueToInbox(ctx, key, {
+        id: null,
+        ts: new Date().toISOString(),
+        from: "tg-ctl",
+        text,
+        wrapped: wrapInbound(ctx.cfg.injectWrap, "tg-ctl", text),
+      })
+    } catch (err) {
+      console.error(`could not write the inbox for ${key}: ${err}`)
+      return 1
+    }
+    console.log(`queued to ${key} (${describeUnreachable(hits[0], pendingInboxCount(ctx, key))})`)
+    return 0
+  }
+  const keys = listInboxKeys(ctx)
+  if (agents.length === 0 && keys.length === 0) {
+    console.log("inbox: no agent outside tmux, no inbox on disk")
+    return 0
+  }
+  for (const a of agents) console.log(`  - ${describeUnreachable(a, pendingInboxCount(ctx, unreachableKey(a)))}`)
+  const live = new Set(agents.map(unreachableKey).filter((k): k is string => k !== null))
+  for (const key of keys) {
+    if (live.has(key)) continue
+    const n = pendingInboxCount(ctx, key)
+    if (n > 0) console.log(`  - ${key}: ${n} queued, agent not running (delivered when an agent with this key next ends a turn)`)
+  }
+  console.log(UNREACHABLE_HINT)
+  return 0
+}
+
 // Execute an InjectStep plan. verify-pane re-runs discovery on a CURRENT
 // snapshot — the agent may have exited between picking the target and typing
 // into it, and injecting into a bare shell would EXECUTE the text (spec §5.2).
@@ -1227,6 +1463,14 @@ function composeStatus(ctx: Ctx, statusCwd: string | null): string {
         ? `target: ambiguous —\n${formatCandidates(found.candidates)}`
         : "target: no agent pane found",
   )
+  // Agents that run OUTSIDE tmux (tg-cli#306) — listed, not omitted, with the reason
+  // and how to reach them; the silent-invisibility this replaces was the incident.
+  const unreachable = listUnreachableAgents()
+  if (unreachable.length > 0) {
+    lines.push(`unreachable (not in tmux): ${unreachable.length}`)
+    for (const a of unreachable) lines.push(`  - ${describeUnreachable(a, pendingInboxCount(ctx, unreachableKey(a)))}`)
+    lines.push(`  ${UNREACHABLE_HINT}`)
+  }
   const offsetMtime = fileMtimeMs(ctx.paths.offset)
   lines.push(
     offsetMtime === null
@@ -5261,7 +5505,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
   // like /agent) instead of the old plain-text candidate dump (tg-cli#72). Kept as
   // a tiny helper for the no-agent message + the /kill path's reuse.
   const replyNoAgent = async (): Promise<void> => {
-    await sendMessage(ctx, NO_AGENT_REPLY)
+    await sendMessage(ctx, noAgentReplyNow())
   }
 
   // Pick a target, run the plan; every failure mode turns into a TG reply so
@@ -5412,10 +5656,10 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     subset: AgentCandidate[],
     message: string,
     sourceMessageId: number | null,
-    options: { armNextMessage?: boolean; messageExtra?: Record<string, unknown>; threadId?: number | null } = {},
+    options: { armNextMessage?: boolean; messageExtra?: Record<string, unknown>; threadId?: number | null; notice?: string } = {},
   ): Promise<boolean> => {
     const token = `a${++agentTokenSeq}`
-    const payload = buildAgentSelectMessage(ctx.chatId, subset, token, message)
+    const payload = buildAgentSelectMessage(ctx.chatId, subset, token, message, false, options.notice)
     const messageExtra = options.messageExtra ?? {}
     const messageId = await sendMessage(ctx, payload.text, { ...messageExtra, reply_markup: payload.reply_markup })
     // Picker send failed (Telegram rejected / >4096-char list / network): do NOT
@@ -5520,6 +5764,53 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     return true
   }
 
+  // A `/agent <selector> <message>` whose selector matched NO tmux pane: try the agents
+  // running OUTSIDE tmux (tg-cli#306). An exact match queues the (already wrapped) text
+  // to that agent's Stop-hook inbox and replies with WHERE it went and WHEN it arrives;
+  // an ambiguous match lists the choices; no match returns null so the caller keeps its
+  // legacy "no agent matching" error. Never a silent drop.
+  const tryQueueUnreachable = async (
+    selector: string,
+    from: string,
+    text: string,
+    wrapped: string,
+    messageId: number | null,
+    out: Record<string, unknown> = {},
+  ): Promise<boolean | null> => {
+    const agents = listUnreachableAgents()
+    const hits = matchUnreachable(selector, agents)
+    if (hits.length === 0) return null
+    if (hits.length > 1) {
+      const lines = hits.map((a) => `  - ${describeUnreachable(a, 0)}`)
+      await sendMessage(ctx, `'${selector}' matches several agents outside tmux — give them distinct --name values:\n${lines.join("\n")}`, out)
+      return false
+    }
+    const target = hits[0]
+    const key = unreachableKey(target)
+    if (key === null) {
+      await sendMessage(ctx, `${unreachableLabel(target)} is outside tmux and has no inbox key (no --name, cwd unresolved) — restart it with --name or inside tmux`, out)
+      return false
+    }
+    // Two live sessions reading ONE inbox (names that sanitize alike, or two unnamed
+    // sessions in one cwd) could hand this message to the wrong one — refuse, never guess.
+    const clashes = inboxKeyCollisions(target, agents)
+    if (clashes.length > 0) {
+      const lines = [target, ...clashes].map((a) => `  - ${describeUnreachable(a, 0)}`)
+      await sendMessage(ctx, `refusing: inbox key '${key}' is shared by several live sessions — give them distinct --name values:\n${lines.join("\n")}`, out)
+      return false
+    }
+    try {
+      queueToInbox(ctx, key, { id: messageId, ts: new Date().toISOString(), from, text, wrapped })
+    } catch (err) {
+      log(`agent-route: inbox write failed for ${key}: ${err}`)
+      await sendMessage(ctx, `${unreachableLabel(target)} is outside tmux and its inbox could not be written: ${err}`, out)
+      return false
+    }
+    log(`agent-route: selector="${selector}" → outside tmux ${key} (pid ${target.pid}) — queued to inbox`)
+    await sendMessage(ctx, queuedReplyText(target), out)
+    return true
+  }
+
   const routePrewrappedAgentMessage = async (
     route: ParsedAgentCommand,
     prewrappedText: string,
@@ -5529,8 +5820,12 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const candidates = listAgentCandidates()
     const msgPreview = prewrappedText.slice(0, 60).replace(/\n/g, " ")
     if (candidates.length === 0) {
+      if (route.selector) {
+        const queued = await tryQueueUnreachable(route.selector, "tg", route.rest, prewrappedText, sourceMessageId)
+        if (queued !== null) return queued
+      }
       log(`media-agent-route: no candidates — selector=${route.selector || "(none)"} msg="${msgPreview}"`)
-      await sendMessage(ctx, NO_AGENT_REPLY)
+      await sendMessage(ctx, noAgentReplyNow())
       return false
     }
 
@@ -5546,6 +5841,8 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         log(`media-agent-route: selector="${route.selector}" → ambiguous (${m.matches.length} matches: ${names}) → picker`)
         return postRoutePicker(m.matches, prewrappedText, undefined, sourceMessageId)
       }
+      const queued = await tryQueueUnreachable(route.selector, "tg", route.rest, prewrappedText, sourceMessageId)
+      if (queued !== null) return queued
       const names = candidates.map((c) => c.windowName).join(", ")
       log(`media-agent-route: selector="${route.selector}" → NO match among [${names}] — reporting error`)
       await sendMessage(ctx, `no agent matching '${route.selector}' (running: ${names}) — try /agent to pick`)
@@ -5605,15 +5902,27 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const candidates = listAgentCandidates()
     const msgPreview = action.all.slice(0, 60).replace(/\n/g, " ")
     if (candidates.length === 0) {
+      if (action.selector && action.rest.trim()) {
+        const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, action.rest, action.messageId)
+        const queued = await tryQueueUnreachable(action.selector, action.from, action.rest, wrapped, action.messageId, out)
+        if (queued !== null) return queued
+      }
       log(`agent-route: no candidates — selector=${action.selector || "(none)"} msg="${msgPreview}"`)
-      await sendMessage(ctx, NO_AGENT_REPLY, out)
+      await sendMessage(ctx, noAgentReplyNow(), out)
       return false
     }
     if (!action.all.trim()) {
       // Bare `/agent`: show the tappable picker so the CTO can SELECT an agent
-      // (the buttons he asked for — "где кнопки?"), with distinct labels.
+      // (the buttons he asked for — "где кнопки?"), with distinct labels. Agents
+      // running OUTSIDE tmux are named in a notice above the buttons (tg-cli#306):
+      // they cannot be tapped (no pane to inject into), but they are not hidden.
       log(`agent-route: bare /agent → picker over ${candidates.length} candidates`)
-      return postAgentPicker(candidates, "", null, { armNextMessage: true, messageExtra: out, threadId: action.threadId ?? null })
+      const outside = listUnreachableAgents()
+      const notice =
+        outside.length > 0
+          ? `Outside tmux (not tappable — use /agent <name> <text> to queue): ${outside.map((a) => `${unreachableLabel(a)} · ${a.agent}`).join(", ")}`
+          : undefined
+      return postAgentPicker(candidates, "", null, { armNextMessage: true, messageExtra: out, threadId: action.threadId ?? null, notice })
     }
 
     if (action.selector) {
@@ -5672,6 +5981,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       }
       // Named selector matched NOTHING — never silently fall back to a random agent.
       // Report the miss clearly so the user knows their intent was not routed.
+      if (action.rest.trim()) {
+        const wrapped = wrapInbound(ctx.cfg.injectWrap, action.from, action.rest, action.messageId)
+        const queued = await tryQueueUnreachable(action.selector, action.from, action.rest, wrapped, action.messageId, out)
+        if (queued !== null) return queued
+      }
       const names = candidates.map((c) => c.windowName).join(", ")
       log(`agent-route: selector="${action.selector}" → NO match among [${names}] — reporting error`)
       await sendMessage(ctx, `no agent matching '${action.selector}' (running: ${names}) — try /agent to pick`, out)
@@ -5917,7 +6231,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
         const candidates = listAgentCandidates()
         if (candidates.length === 0) {
           log(`reply-route: replyTo=${action.replyToMessageId} → origin ${recognized.paneId} invisible, no candidates`)
-          await sendMessage(ctx, NO_AGENT_REPLY)
+          await sendMessage(ctx, noAgentReplyNow())
           return false
         }
         // Even a single visible candidate is NOT trusted here: the recognized
@@ -5936,7 +6250,7 @@ async function runDaemon(ctx: Ctx): Promise<never> {
     const candidates = listAgentCandidates()
     if (candidates.length === 0) {
       log(`reply-route: replyTo=${action.replyToMessageId} → no candidates recognized=${!!recognized}`)
-      await sendMessage(ctx, NO_AGENT_REPLY)
+      await sendMessage(ctx, noAgentReplyNow())
       return false
     }
     // An UNRECOGNIZED reply (no origin known) with a single agent is unambiguous —
@@ -8301,6 +8615,11 @@ async function runDaemon(ctx: Ctx): Promise<never> {
       const regMtime = fileMtimeMs(ctx.paths.registration)
       if (regMtime !== null && regMtime > lastAgentSeenMs) lastAgentSeenMs = regMtime
       discover()
+      // An agent running OUTSIDE tmux keeps the daemon alive too (tg-cli#306): idle-exiting
+      // while one is up would make its queued inbox messages vanish exactly the way the
+      // incident did. The same sweep acks what the Stop hook delivered since last poll.
+      if (listUnreachableAgents().length > 0) lastAgentSeenMs = Date.now()
+      await ackDeliveredInboxes(ctx)
       if (Date.now() - lastAgentSeenMs > ctx.cfg.idleExitMin * 60_000) {
         log(`no agent pane for ${ctx.cfg.idleExitMin} min — idle exit`)
         cleanExit(0)
@@ -8524,7 +8843,7 @@ if (import.meta.main) {
   }
   // Internal one-shot child spawned by `harness-event`; intentionally absent
   // from USAGE and guarded by persisted retry state before it can inject text.
-  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check"].includes(cmd)) {
+  if (!["start", "run", "stop", "restart", "status", "enable", "disable", "ask", "install-hooks", "voice-setup", "harness-event", "codex-usage-hook", "auto-continue-once", "usage-schedule", "usage-schedule-check", "inbox"].includes(cmd)) {
     console.error(USAGE)
     process.exit(1)
   }
@@ -8619,6 +8938,9 @@ if (import.meta.main) {
   if (cmd === "status") {
     console.log(composeStatus(ctx, null))
     process.exit(0)
+  }
+  if (cmd === "inbox") {
+    process.exit(runInboxCommand(ctx, process.argv.slice(3)))
   }
   if (cmd === "ask") {
     await askDaemon(ctx)
