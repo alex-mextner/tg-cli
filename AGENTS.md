@@ -126,6 +126,12 @@ tests can pass fakes.
   walk — a Claude Code pane reports its VERSION string as `pane_current_command`, not `claude`),
   `agent-match.ts` (phonetic fuzzy window matching + session-grouped selection buttons),
   `routes.ts` (message_id→pane map for reply recognition + LRU/MRU picker),
+  `unreachable.ts` + `inbox.ts` (tg-cli#306: agents OUTSIDE tmux — a `ps pid,tty` scan +
+  lsof cwd finds interactive agent processes in no pane; they are listed as `unreachable:
+  not in tmux` and a `/agent <name> <text>` is queued to `<config>/inbox/<key>/pending.jsonl`,
+  which the agent-tools Stop hook (`cc_hook_bridge`) consumes at the agent's next turn end;
+  the inbox KEY — sanitized `--name`, else `cwd-<sha256(cwd)[:16]>` — is shared byte-for-byte
+  with agent-tools `lib/agenttools_tg_inbox`, test vectors mirrored in both suites),
   `last-user-target.ts` (tg-cli#78 anchor fix: the pane of the CTO's OWN last CONFIRMED
   inbound delivery — auto-bound, a recognized reply, or an explicit picker/`/agent`
   selection — distinct from the removed `lastMessagePane` mechanism, which used to track

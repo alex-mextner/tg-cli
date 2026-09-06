@@ -3,6 +3,40 @@
 All notable changes to `tg` are documented here. This project adheres to
 semantic versioning.
 
+## 1.46.0
+
+**Agents running OUTSIDE tmux are visible and reachable (tg-cli#306).**
+
+Incident 2026-09-05: two agents started from plain terminal tabs (no `$TMUX`) did not
+exist for tg-ctl — `tg-ctl status` listed neither, and Telegram messages to them vanished
+without a reply. Discovery was tmux-only (`tmux list-panes` + `send-keys`).
+
+- **Discovery scans the process table too.** An interactive `claude` / `codex` / `opencode`
+  with a controlling tty but no tmux pane is listed by `tg-ctl status`, `/status` and the
+  bare `/agent` picker as `unreachable: not in tmux (tty …, cwd …, name …, pid …)`, with
+  the hint how to reach it. Headless runs (`-p`/`--print`, `codex exec`, Claude's
+  `daemon`/`bg-*` helpers) are ignored.
+- **A second delivery channel: the Stop-hook inbox.** `/agent <name> <text>` addressed to
+  such an agent is appended to `<config dir>/inbox/<key>/pending.jsonl` and answered with
+  an explicit reply ("… is running outside tmux — queued to its Stop-hook inbox; delivered
+  when the agent next ends a turn"). The agent-tools Stop hook (`cc_hook_bridge` /
+  `codex_hook_bridge`, agent-tools#526) reads that inbox at every turn end and hands the
+  text to the agent as its next instruction. The daemon reacts 👌 on the Telegram message
+  once the hook reports delivery. **Limit:** an idle agent receives it only at its next
+  turn end — nothing can wake a tty-less Claude Code.
+- **The no-agent reply lists them** instead of the bare "not in tmux" text when such an
+  agent exists; a selector that matches nothing keeps its error reply.
+- `tg-ctl inbox` lists pending entries per agent; `tg-ctl inbox queue <name|dir> <text>`
+  queues by hand. The daemon no longer idle-exits while an agent outside tmux is up.
+- The inbox KEY is shared with agent-tools byte-for-byte (`--name` sanitized — a dots-only
+  name never escapes `inbox/` — else `cwd-<sha256(cwd)[:16]>`; `features/tg-ctl/unreachable.ts`,
+  vectors in `tests/ctl-unreachable.test.ts` mirrored by agent-tools' `tests/test_tg_inbox.py`).
+  Two live sessions whose keys collide (`a/b` vs `a?b`, or two unnamed sessions in one cwd)
+  are refused rather than guessed. Inbox dirs are 0700 and files 0600. The hook publishes each
+  delivery as a complete `delivered-<pid>-<ns>-<rnd>.jsonl` (no shared append target, so the
+  daemon's ack sweep can never lose an in-flight hook write); a batch whose 👌 reaction hit a
+  transient Bot API failure is kept and retried on the next sweep.
+
 ## 1.45.3
 
 **Feature: delegate codex hooks to rig (scoped) + gate the codex hook-trust bypass.** Codex hook
