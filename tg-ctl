@@ -938,9 +938,9 @@ function readPidTtyMap(): Map<number, string> {
 const LSOF_TIMEOUT_MS = 2000
 let lsofMissingWarned = false
 // The agent's cwd: `/proc/<pid>/cwd` where it exists (Linux — no external tool),
-// else `lsof` (macOS ships it; on a Linux box without it AND without procfs the cwd is
-// unknown, said ONCE in the log — review finding — and the agent is still listed, by
-// its --name or pid, just without a cwd-derived inbox key).
+// else `lsof` (macOS ships it). On a Linux box with neither the cwd is unknown — said
+// ONCE in the log, never silently — and the agent is still listed, by its --name or
+// pid, just without a cwd-derived inbox key.
 function cwdOfPid(pid: number): string | null {
   try {
     return readlinkSync(`/proc/${pid}/cwd`)

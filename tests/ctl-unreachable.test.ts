@@ -88,25 +88,66 @@ test('parseAgentNameFromCommand handles --name X, --name=X and a missing value',
 });
 
 test('isInteractiveAgentCommand excludes print/exec/daemon shapes', () => {
-  expect(isInteractiveAgentCommand('claude --name x')).toBe(true);
-  expect(isInteractiveAgentCommand('/Users/u/.local/bin/claude --print --output-format text')).toBe(false);
-  expect(isInteractiveAgentCommand('claude -p "hi"')).toBe(false);
-  expect(isInteractiveAgentCommand('node /opt/homebrew/bin/codex exec -s read-only')).toBe(false);
-  expect(isInteractiveAgentCommand('claude daemon run --json-path x')).toBe(false);
-  expect(isInteractiveAgentCommand('claude bg-spare --bg-spare /tmp/x')).toBe(false);
+  expect(isInteractiveAgentCommand('claude --name x', 'claude')).toBe(true);
+  expect(isInteractiveAgentCommand('/Users/u/.local/bin/claude --print --output-format text', 'claude')).toBe(false);
+  expect(isInteractiveAgentCommand('claude -p "hi"', 'claude')).toBe(false);
+  expect(isInteractiveAgentCommand('node /opt/homebrew/bin/codex exec -s read-only', 'codex')).toBe(false);
+  expect(isInteractiveAgentCommand('claude daemon run --json-path x', 'claude')).toBe(false);
+  expect(isInteractiveAgentCommand('claude bg-spare --bg-spare /tmp/x', 'claude')).toBe(false);
+  expect(isInteractiveAgentCommand('opencode run "do it"', 'opencode')).toBe(false);
+  expect(isInteractiveAgentCommand('opencode', 'opencode')).toBe(true);
 });
 
 test('isInteractiveAgentCommand ignores prompt words and values that merely look like helper tokens', () => {
-  expect(isInteractiveAgentCommand('claude -- please exec tests')).toBe(true);
-  expect(isInteractiveAgentCommand('claude "please exec tests and -p"')).toBe(true);
-  expect(isInteractiveAgentCommand('claude --name daemon')).toBe(true);
-  expect(isInteractiveAgentCommand('claude --name landing please exec')).toBe(true);
-  expect(isInteractiveAgentCommand('node /Users/u/.claude/local/claude --name exec-runner')).toBe(true);
-  expect(isInteractiveAgentCommand('node /Users/u/.claude/local/claude daemon run')).toBe(false);
-  expect(isInteractiveAgentCommand('claude --name x -- -p')).toBe(true);
+  expect(isInteractiveAgentCommand('claude -- please exec tests', 'claude')).toBe(true);
+  expect(isInteractiveAgentCommand('claude "please exec tests and -p"', 'claude')).toBe(true);
+  expect(isInteractiveAgentCommand('claude --name daemon', 'claude')).toBe(true);
+  expect(isInteractiveAgentCommand('claude --name landing please exec', 'claude')).toBe(true);
+  expect(isInteractiveAgentCommand('node /Users/u/.claude/local/claude --name exec-runner', 'claude')).toBe(true);
+  expect(isInteractiveAgentCommand('node /Users/u/.claude/local/claude daemon run', 'claude')).toBe(false);
+  expect(isInteractiveAgentCommand('claude --name x -- -p', 'claude')).toBe(true);
+});
+
+test('isInteractiveAgentCommand keys its tables on the harness: codex -p is a profile, -c takes a value', () => {
+  expect(isInteractiveAgentCommand('codex -p work', 'codex')).toBe(true);
+  expect(isInteractiveAgentCommand('codex -c model=o3 exec "run tests"', 'codex')).toBe(false);
+  expect(isInteractiveAgentCommand('codex -m o3 exec', 'codex')).toBe(false);
+  expect(isInteractiveAgentCommand('codex --full-auto exec', 'codex')).toBe(false);
+  expect(isInteractiveAgentCommand('codex resume', 'codex')).toBe(true);
+  expect(isInteractiveAgentCommand('codex "please exec"', 'codex')).toBe(true);
+  expect(isInteractiveAgentCommand('claude -p x', 'claude')).toBe(false);
+});
+
+test('isInteractiveAgentCommand: the launcher --name is skipped for every harness, optional-value flags never hide a subcommand', () => {
+  expect(isInteractiveAgentCommand('opencode --name web', 'opencode')).toBe(true);
+  expect(isInteractiveAgentCommand('codex --name debug', 'codex')).toBe(true);
+  expect(isInteractiveAgentCommand('opencode --name web run "x"', 'opencode')).toBe(false);
+  expect(isInteractiveAgentCommand('opencode -m gpt-4 run "x"', 'opencode')).toBe(false);
+  expect(isInteractiveAgentCommand('opencode --port 4096', 'opencode')).toBe(true);
+  expect(isInteractiveAgentCommand('claude -w daemon', 'claude')).toBe(false); // -w's value is optional: the subcommand still counts
+  expect(isInteractiveAgentCommand('claude -w feature-x', 'claude')).toBe(true);
+  expect(isInteractiveAgentCommand('claude -r', 'claude')).toBe(true);
+  expect(isInteractiveAgentCommand('aider -p', 'aider')).toBe(true);
+  expect(isInteractiveAgentCommand('omp', 'omp')).toBe(true);
 });
 
 // --- discovery ---
+
+test('findUnreachableAgents passes the harness through: codex -p <profile> is listed, claude -p is not', () => {
+  const procs = [
+    proc(1, 0, '/sbin/launchd'),
+    proc(6000, 1, 'login'),
+    proc(6001, 6000, '-zsh'),
+    proc(7200, 6001, 'codex -p work'),
+    proc(7300, 6001, 'claude -p "one-shot"'),
+  ];
+  const tty = new Map([
+    [7200, 'ttys010'],
+    [7300, 'ttys011'],
+  ]);
+  const found = findUnreachableAgents([], procs, tty);
+  expect(found.map((a) => [a.pid, a.agent])).toEqual([[7200, 'codex']]);
+});
 
 test('findUnreachableAgents: an interactive claude with a tty and no tmux pane is unreachable', () => {
   const procs = [

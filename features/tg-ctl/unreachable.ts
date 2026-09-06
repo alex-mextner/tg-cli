@@ -112,36 +112,92 @@ export function agentInboxKey(name: string | null | undefined, cwd: string): str
   return `cwd-${digest.slice(0, 16)}`;
 }
 
-// Options that mark a NON-interactive invocation of an agent binary: a `-p`
-// (`--print`) run is a one-shot tool call, the `--bg*` flags are Claude Code's own
-// background helpers — none of them is a session a human addresses from Telegram.
-const NON_INTERACTIVE_OPTIONS = new Set(['--print', '-p', '--bg', '--background']);
-// Subcommands (the FIRST positional word) with the same meaning: `codex exec` is the
-// headless mode, `claude daemon` / `bg-*` are background helpers.
-const NON_INTERACTIVE_SUBCOMMANDS = new Set(['exec', 'daemon', 'bg-pty-host', 'bg-spare']);
-// Options that take a value — the value is never a subcommand or an option.
-const VALUE_OPTIONS = new Set(['--name', '--model', '--resume', '-r', '--session-id', '--add-dir', '--profile']);
+// Per-harness command-line shapes. The CLIs disagree on what a token means — `-p` is
+// `--print` (headless) for claude but `--profile <name>` (interactive) for codex — so
+// the tables are keyed by the resolved binary, never merged, and `shapeFor` is an
+// exhaustive switch over AgentKind: a new harness fails to compile until it gets a row.
+interface CommandShape {
+  headlessOptions: Set<string>; // an option that makes the run a one-shot / helper
+  headlessSubcommands: Set<string>; // the FIRST positional word with the same meaning
+  valueOptions: Set<string>; // options that ALWAYS take a value — the value is skipped
+}
+// tg-ctl's own launcher flags, understood by every harness row (claude-rotate passes
+// `--name <label>` to whichever binary it starts): applied on top of each shape so a
+// label like `daemon`/`exec`/`run` is never read as a subcommand.
+const LAUNCHER_VALUE_OPTIONS = new Set(['--name']);
+const CLAUDE_SHAPE: CommandShape = {
+  headlessOptions: new Set(['--print', '-p', '--bg', '--background']),
+  headlessSubcommands: new Set(['daemon', 'bg-pty-host', 'bg-spare']),
+  // `-r/--resume [id]` and `-w/--worktree [name]` take an OPTIONAL value (verified in
+  // `claude --help`), so they are deliberately NOT here: a value-less `-w` followed by a
+  // real subcommand must still reach that subcommand. Their optional value is a plain
+  // positional and never a headless subcommand name in practice.
+  valueOptions: new Set([
+    '--model', '--session-id', '--add-dir', '--permission-mode', '--append-system-prompt',
+    '--system-prompt', '--allowedTools', '--disallowedTools', '--mcp-config', '--settings',
+    '--output-format', '--input-format', '--max-turns', '--agent', '--agents', '--fallback-model',
+  ]),
+};
+const CODEX_SHAPE: CommandShape = {
+  headlessOptions: new Set<string>(),
+  headlessSubcommands: new Set(['exec', 'e', 'login', 'logout', 'mcp', 'app-server', 'apply', 'completion', 'debug', 'sandbox', 'features']),
+  valueOptions: new Set(['-c', '--config', '-m', '--model', '-p', '--profile', '-s', '--sandbox', '-a', '--ask-for-approval', '-C', '--cd', '--add-dir', '-i', '--image']),
+};
+const OPENCODE_SHAPE: CommandShape = {
+  headlessOptions: new Set<string>(),
+  headlessSubcommands: new Set(['run', 'serve', 'web', 'acp', 'auth', 'agent', 'upgrade', 'export', 'import', 'github', 'models', 'stats', 'mcp']),
+  valueOptions: new Set(['-m', '--model', '--agent', '-s', '--session', '--port', '--hostname', '--prompt']),
+};
+// Harnesses tg-ctl knows only by name (no headless mode it can tell apart): every
+// invocation with a tty counts as interactive.
+const ALWAYS_INTERACTIVE_SHAPE: CommandShape = {
+  headlessOptions: new Set<string>(),
+  headlessSubcommands: new Set<string>(),
+  valueOptions: new Set<string>(),
+};
+function assertNever(x: never): never {
+  throw new Error(`unhandled AgentKind: ${String(x)}`);
+}
+function shapeFor(agent: AgentKind): CommandShape {
+  switch (agent) {
+    case 'claude':
+      return CLAUDE_SHAPE;
+    case 'codex':
+      return CODEX_SHAPE;
+    case 'opencode':
+      return OPENCODE_SHAPE;
+    case 'pi':
+    case 'aider':
+    case 'omp':
+    case 'unknown':
+      return ALWAYS_INTERACTIVE_SHAPE;
+    default:
+      return assertNever(agent);
+  }
+}
 
-// Only the REAL option / subcommand positions count (review finding): an agent CLI
-// accepts an arbitrary initial prompt, so `claude "please exec tests"` must stay
-// interactive. Scanning stops at `--`; a positional is checked only when it is the
-// first one (the subcommand slot); a path-like positional (the launcher's
-// `node …/claude` shape) is skipped, as is the value of a value-taking option.
-export function isInteractiveAgentCommand(command: string): boolean {
+// Only the REAL option / subcommand positions count: an agent CLI accepts an arbitrary
+// initial prompt, so `claude "please exec tests"` must stay interactive. Scanning stops
+// at `--`; a positional is checked only when it is the first one (the subcommand slot);
+// a path-like positional is skipped so the launcher shape `node …/claude daemon` still
+// reaches its real subcommand; the value of a value-taking option is skipped so
+// `--name daemon` / `codex -p work` are never mistaken for a subcommand or a flag.
+export function isInteractiveAgentCommand(command: string, agent: AgentKind): boolean {
+  const shape = shapeFor(agent);
   const tokens = command.trim().split(/\s+/).slice(1);
   let sawPositional = false;
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
     if (t === '--') break;
     if (t.startsWith('-')) {
-      if (NON_INTERACTIVE_OPTIONS.has(t)) return false;
-      if (VALUE_OPTIONS.has(t)) i++;
+      if (shape.headlessOptions.has(t)) return false;
+      if (shape.valueOptions.has(t) || LAUNCHER_VALUE_OPTIONS.has(t)) i++;
       continue;
     }
     if (t.includes('/')) continue;
     if (!sawPositional) {
       sawPositional = true;
-      if (NON_INTERACTIVE_SUBCOMMANDS.has(t)) return false;
+      if (shape.headlessSubcommands.has(t)) return false;
     }
   }
   return true;
@@ -190,7 +246,7 @@ export function findUnreachableAgents(
     const tty = ttyByPid.get(p.pid);
     if (!tty || covered.has(p.pid)) continue;
     const agent = matchAgentCommand(p.command);
-    if (!agent || !isInteractiveAgentCommand(p.command)) continue;
+    if (!agent || !isInteractiveAgentCommand(p.command, agent)) continue;
     matched.set(p.pid, agent);
   }
   const out: UnreachableAgent[] = [];
